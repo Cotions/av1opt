@@ -146,6 +146,8 @@ fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Scan { paths, ffprobe, jobs, min_savings, csv, top, target_vmaf } => {
             let model = estimate::Model::fit(&history::load(), target_vmaf);
+            // Absolute roots keep cache keys stable however the folder was typed.
+            let paths: Vec<PathBuf> = paths.iter().map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone())).collect();
             scan(&paths, &ffprobe, jobs, min_savings, csv.as_deref(), top, &model)
         }
         Cmd::Encode {
@@ -237,6 +239,17 @@ fn scan(paths: &[PathBuf], ffprobe: &str, jobs: usize, min_savings: f64, csv: Op
     let done = AtomicUsize::new(0);
     let fresh = AtomicUsize::new(0);
     let total = files.len();
+
+    // Forget files that were under the scanned folders last time but are gone now.
+    {
+        let found: std::collections::HashSet<&Path> = files.iter().map(|f| f.0.as_path()).collect();
+        let mut c = cache.lock().unwrap();
+        let before = c.len();
+        c.retain(|p, _| found.contains(p.as_path()) || !paths.iter().any(|root| p.starts_with(root)));
+        if c.len() < before {
+            eprintln!("dropped {} cache entries for files that no longer exist", before - c.len());
+        }
+    }
 
     let results: Vec<FileResult> = files
         .par_iter()

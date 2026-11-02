@@ -126,8 +126,8 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     if info.codec == "av1" && !o.force {
         skip!("already AV1 (use --force to re-encode anyway)");
     }
-    if info.hdr {
-        skip!("HDR input is not supported yet");
+    if info.dolby_vision {
+        skip!("Dolby Vision is not supported: re-encoding would drop its dynamic metadata");
     }
     if info.duration_s < 1.0 {
         skip!("no usable duration");
@@ -158,6 +158,11 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     // Scene mode joins constant-rate chunks; a variable-rate source would be retimed, so it
     // keeps the single-pass path.
     let mut notes = Vec::new();
+    if info.hdr {
+        // libvmaf's models are trained on SDR; on PQ/HLG pixels the score still tracks
+        // encoding damage, but its absolute meaning differs from SDR.
+        notes.push(format!("HDR ({}): colour and HDR metadata kept; VMAF measured on the HDR signal", info.color_transfer));
+    }
     let scenes = o.scenes && !info.vfr;
     if o.scenes && info.vfr {
         notes.push("variable frame rate source: encoded in one pass instead of per scene".to_string());
@@ -507,6 +512,9 @@ fn verify(
             "verify: output has {} audio / {} subtitle streams, expected {} / {}",
             out_info.audio_streams, out_info.subtitle_streams, streams.audio, streams.subs
         );
+    }
+    if out_info.color_transfer != info.color_transfer && info.hdr {
+        bail!("verify: output transfer is '{}', source is '{}' (HDR signalling lost)", out_info.color_transfer, info.color_transfer);
     }
     if out_info.covers.len() != streams.covers {
         bail!("verify: output has {} cover images, expected {}", out_info.covers.len(), streams.covers);

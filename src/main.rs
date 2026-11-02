@@ -285,7 +285,8 @@ fn cache_file() -> Result<PathBuf> {
         .context("no HOME or XDG_CACHE_HOME")?;
     let dir = base.join("av1opt");
     std::fs::create_dir_all(&dir)?;
-    Ok(dir.join("probe-cache.json"))
+    // Bump the version when MediaInfo gains fields that change verdicts, so old entries are re-probed.
+    Ok(dir.join("probe-cache-v2.json"))
 }
 
 fn save_cache(path: &Path, cache: &HashMap<PathBuf, CacheEntry>) -> Result<()> {

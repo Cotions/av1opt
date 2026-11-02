@@ -22,7 +22,7 @@ av1opt scan /videos /more/videos --csv report.csv
 ```
 
 Probes every video in parallel (results cached in `~/.cache/av1opt/`), sorts each file into
-*candidate* or a skip reason (already AV1, HDR, too short, low expected gain), and prints totals
+*candidate* or a skip reason (already AV1, Dolby Vision, too short, low expected gain), and prints totals
 by codec and folder plus the biggest wins. Savings are a rough metadata-based estimate shown as a
 range; `encode` measures the real numbers. Never writes to the scanned folders.
 
@@ -39,13 +39,15 @@ For each file:
 2. **Search** – finds the highest CRF whose mean VMAF over the samples meets the target. It
    interpolates between passing and failing CRFs, averaging ~3.4 trial encodes, then refines to
    SVT-AV1's quarter-step CRF. 4K uses the `vmaf_4k` model.
-3. **Decide** – skips files that are already AV1, HDR, can't reach the target, or would save less
-   than `--min-savings` (15%).
+3. **Decide** – skips files that are already AV1, Dolby Vision, can't reach the target, or would
+   save less than `--min-savings` (15%). HDR10 and HLG are encoded with their colour signalling
+   and mastering/light-level metadata intact (VMAF is then measured on the HDR signal, which
+   tracks encoding damage but is not calibrated like SDR scores).
 4. **Encode** – SVT-AV1, 10-bit. Audio already in AAC/Opus/MP3 is copied, anything else becomes
    Opus. MP4 output keeps text subtitles (as mov_text) and plays in Chrome and Firefox; use
    `--container mkv` to keep image subtitles too. Cover art is kept (MP4: attached picture,
    MKV: attachment with its original file name).
-5. **Verify** – codec, duration and stream counts, plus VMAF spot checks at positions the search
+5. **Verify** – codec, duration, stream and cover counts, HDR transfer, plus VMAF spot checks at positions the search
    did not sample. Nothing is written unless all checks pass.
 6. **Report** – the output plus `<name>.av1opt.json` with every CRF tried, scores, sizes and timings.
 

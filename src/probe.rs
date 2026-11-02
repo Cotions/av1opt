@@ -28,7 +28,13 @@ pub struct MediaInfo {
     /// Bits per second of the video stream alone (estimated if the container doesn't say).
     pub video_bitrate: f64,
     pub pix_fmt: String,
+    /// HDR10 (PQ), HLG or Dolby Vision.
     pub hdr: bool,
+    #[serde(default)]
+    pub dolby_vision: bool,
+    /// ffprobe's color_transfer, e.g. "smpte2084" for HDR10 or "arib-std-b67" for HLG.
+    #[serde(default)]
+    pub color_transfer: String,
     pub interlaced: bool,
     pub audio_streams: u32,
     pub subtitle_streams: u32,
@@ -145,6 +151,8 @@ pub fn probe(ffprobe: &str, path: &Path, file_size: u64) -> Result<MediaInfo> {
         video_bitrate,
         pix_fmt: video["pix_fmt"].as_str().unwrap_or("").to_string(),
         hdr: matches!(transfer, "smpte2084" | "arib-std-b67") || dolby_vision,
+        dolby_vision,
+        color_transfer: transfer.to_string(),
         interlaced: !matches!(field_order, "progressive" | "unknown"),
         audio_streams: audio.len() as u32,
         subtitle_streams: streams.iter().filter(|s| s["codec_type"] == "subtitle").count() as u32,

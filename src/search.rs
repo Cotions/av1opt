@@ -354,7 +354,7 @@ mod tests {
     fn info_with_fps(fps: f64) -> MediaInfo {
         MediaInfo {
             video_index: 0, codec: "h264".into(), width: 1920, height: 1080, fps, duration_s: 60.0,
-            video_bitrate: 5e6, pix_fmt: "yuv420p".into(), hdr: false, interlaced: false, vfr: false,
+            video_bitrate: 5e6, pix_fmt: "yuv420p".into(), hdr: false, dolby_vision: false, color_transfer: String::new(), interlaced: false, vfr: false,
             start_time: 0.0, video_start: 0.0, covers: vec![], attachments: 0,
             audio_streams: 0, subtitle_streams: 0, audio: vec![], subtitle_codecs: vec![],
         }

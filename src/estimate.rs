@@ -21,7 +21,7 @@ pub enum Verdict {
     Candidate,
     AlreadyAv1,
     LowGain,
-    Hdr,
+    DolbyVision,
     TooShort,
     Unreadable,
 }
@@ -32,7 +32,7 @@ impl Verdict {
             Verdict::Candidate => "candidate",
             Verdict::AlreadyAv1 => "skip: already AV1",
             Verdict::LowGain => "skip: low expected gain",
-            Verdict::Hdr => "skip: HDR (not supported yet)",
+            Verdict::DolbyVision => "skip: Dolby Vision",
             Verdict::TooShort => "skip: too short or no duration",
             Verdict::Unreadable => "skip: unreadable",
         }
@@ -61,8 +61,8 @@ pub fn judge(m: &MediaInfo, file_size: u64, min_savings: f64) -> (Verdict, SizeR
     if m.duration_s < 5.0 || m.width == 0 || m.fps <= 0.0 {
         return (Verdict::TooShort, keep);
     }
-    if m.hdr {
-        return (Verdict::Hdr, keep);
+    if m.dolby_vision {
+        return (Verdict::DolbyVision, keep);
     }
 
     let pixels = m.width as f64 * m.height as f64;

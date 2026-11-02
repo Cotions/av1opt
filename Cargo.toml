@@ -12,3 +12,9 @@ rayon = "1.12.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 walkdir = "2.5.0"
+tiny_http = { version = "0.12", optional = true }
+
+[features]
+default = []
+# Local web UI (`av1opt ui`). Off by default so the CLI build stays lean.
+ui = ["dep:tiny_http"]

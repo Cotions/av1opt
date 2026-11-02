@@ -86,6 +86,32 @@ skipped, and files skipped for a reason (low savings, ...) are not searched agai
 `--retry-skipped` is given. If two inputs would produce the same output name (same file name
 from two input folders), the second is reported as a name collision instead of being skipped.
 
+## ui (optional)
+
+```
+cargo build --release --features ui
+av1opt ui [--port 8765] [--no-open] [--memory-limit 12G]
+```
+
+A local web app in the browser (Chrome or Firefox), built from the same scan and encode code:
+
+- **Scan**: pick folders, see per-file and total savings estimates, select candidates and queue them.
+- **Queue**: encodes run one at a time with live progress: CRF search trials, chosen CRF,
+  per-chunk results in scene mode, percent, fps and ETA. Cancel stops ffmpeg at once; finished
+  scene chunks are kept, so queueing the same files again resumes.
+- **Compare**: source and AV1 output on top of each other with a split slider, synced playback,
+  frame stepping and zoom, plus the per-chunk VMAF timeline from the `.av1opt.json` report
+  (click to seek). Sources the browser can't decode (HEVC in some browsers, MPEG-2, ...) are shown as a
+  20 s near-lossless H.264 preview made on demand in `~/.cache/av1opt/previews`, never next to
+  the source; MKV outputs the browser won't open are remuxed to MP4 there too.
+- **History**: every report found in the output folders used so far (and folders you add).
+
+The server listens on 127.0.0.1 only and prints a sign-in link with a random token (the browser
+gets it as a cookie). Requests with a foreign Host or Origin are refused, and media are only
+served for files you picked in the app. Output folders on ZFS are refused (no override in the UI).
+`AV1OPT_UI_TOKEN` sets the token (for a desktop wrapper loading the same page);
+`AV1OPT_UI_DEV=<repo>/ui` serves the page files from disk while working on them.
+
 ### Safety
 
 - Inputs are never modified, moved or deleted.

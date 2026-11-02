@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; media-src 'self' blob:; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'">
+<title>av1opt</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Crect width=%2216%22 height=%2216%22 rx=%223%22 fill=%22%234fc3a1%22/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><span class="logo">av1</span>opt</div>
+  <nav>
+    <a href="#/scan" data-view="scan">Scan</a>
+    <a href="#/queue" data-view="queue">Queue <span id="queue-badge" class="badge" hidden></span></a>
+    <a href="#/history" data-view="history">History</a>
+    <a href="#/compare" data-view="compare">Compare</a>
+  </nav>
+  <div id="conn" class="conn" title="Live updates"></div>
+</header>
+<main id="view"></main>
+<div id="toast" class="toast" hidden></div>
+<script src="/app.js"></script>
+</body>
+</html>

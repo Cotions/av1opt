@@ -10,6 +10,8 @@ mod scan;
 mod scenes;
 mod search;
 mod tools;
+#[cfg(feature = "ui")]
+mod ui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -111,6 +113,30 @@ enum Cmd {
         #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(i32).range(0..=19))]
         nice: i32,
     },
+    /// Local web app: scan folders, queue encodes with live progress, compare source and AV1
+    /// output side by side, browse past encodes. Listens on 127.0.0.1 only.
+    #[cfg(feature = "ui")]
+    Ui {
+        /// Port to listen on (0 = pick a free one).
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        /// Don't open a browser; just print the sign-in link.
+        #[arg(long)]
+        no_open: bool,
+        #[arg(long, env = "AV1OPT_FFMPEG", default_value = "ffmpeg")]
+        ffmpeg: String,
+        #[arg(long, env = "AV1OPT_FFPROBE", default_value = "ffprobe")]
+        ffprobe: String,
+        /// Memory cap for each ffmpeg run, as for `encode`.
+        #[arg(long, default_value = "auto")]
+        memory_limit: String,
+        /// CPU priority for encodes (0-19).
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(i32).range(0..=19))]
+        nice: i32,
+        /// Parallel ffprobe processes for scans.
+        #[arg(short, long, default_value_t = 6)]
+        jobs: usize,
+    },
 }
 
 fn main() -> Result<()> {
@@ -152,6 +178,12 @@ fn main() -> Result<()> {
                 std::process::exit(2);
             }
             Ok(())
+        }
+        #[cfg(feature = "ui")]
+        Cmd::Ui { port, no_open, ffmpeg, ffprobe, memory_limit, nice, jobs } => {
+            // SAFETY: as for `encode`; the server itself is idle most of the time.
+            unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) };
+            ui::run(ui::Config { port, open: !no_open, ffmpeg, ffprobe, memory_limit, jobs })
         }
     }
 }

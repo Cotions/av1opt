@@ -98,7 +98,8 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
 - **Scan**: pick folders, see per-file and total savings estimates, select candidates and queue them.
 - **Queue**: encodes run one at a time with live progress: CRF search trials, chosen CRF,
   per-chunk results in scene mode, percent, fps and ETA. Cancel stops ffmpeg at once; finished
-  scene chunks are kept, so queueing the same files again resumes.
+  scene chunks are kept, so queueing the same files again resumes. Unfinished jobs are
+  re-queued automatically the next time `av1opt ui` starts.
 - **Compare**: source and AV1 output on top of each other with a split slider, synced playback,
   frame stepping and zoom, plus the per-chunk VMAF timeline from the `.av1opt.json` report
   (click to seek). Sources the browser can't decode (HEVC in some browsers, MPEG-2, ...) are shown as a

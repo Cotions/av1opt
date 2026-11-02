@@ -37,6 +37,20 @@ pub struct MediaInfo {
     pub audio: Vec<AudioInfo>,
     #[serde(default)]
     pub subtitle_codecs: Vec<String>,
+    /// Cover images: attached pictures, and still-image streams next to the real video.
+    #[serde(default)]
+    pub covers: Vec<Cover>,
+    /// Non-image attachments (fonts for ASS subtitles, ...).
+    #[serde(default)]
+    pub attachments: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Cover {
+    pub index: usize,
+    pub codec: String,
+    /// Original attachment file name (Matroska), if any.
+    pub filename: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,8 +120,20 @@ pub fn probe(ffprobe: &str, path: &Path, file_size: u64) -> Result<MediaInfo> {
         std::mem::swap(&mut width, &mut height);
     }
 
+    let main_index = video["index"].as_u64().unwrap_or(0);
+    let covers = streams
+        .iter()
+        .filter(|s| s["codec_type"] == "video" && s["index"].as_u64() != Some(main_index))
+        .filter(|s| s["disposition"]["attached_pic"].as_i64() == Some(1) || STILL_IMAGE.contains(&s["codec_name"].as_str().unwrap_or("")))
+        .map(|s| Cover {
+            index: s["index"].as_u64().unwrap_or(0) as usize,
+            codec: s["codec_name"].as_str().unwrap_or("unknown").to_string(),
+            filename: s["tags"]["filename"].as_str().map(String::from),
+        })
+        .collect();
+
     Ok(MediaInfo {
-        video_index: video["index"].as_u64().unwrap_or(0) as usize,
+        video_index: main_index as usize,
         codec: video["codec_name"].as_str().unwrap_or("unknown").to_string(),
         width,
         height,
@@ -134,6 +160,8 @@ pub fn probe(ffprobe: &str, path: &Path, file_size: u64) -> Result<MediaInfo> {
             .filter(|s| s["codec_type"] == "subtitle")
             .map(|s| s["codec_name"].as_str().unwrap_or("unknown").to_string())
             .collect(),
+        covers,
+        attachments: streams.iter().filter(|s| s["codec_type"] == "attachment").count() as u32,
     })
 }
 

@@ -43,7 +43,8 @@ For each file:
    than `--min-savings` (15%).
 4. **Encode** – SVT-AV1, 10-bit. Audio already in AAC/Opus/MP3 is copied, anything else becomes
    Opus. MP4 output keeps text subtitles (as mov_text) and plays in Chrome and Firefox; use
-   `--container mkv` to keep image subtitles too.
+   `--container mkv` to keep image subtitles too. Cover art is kept (MP4: attached picture,
+   MKV: attachment with its original file name).
 5. **Verify** – codec, duration and stream counts, plus VMAF spot checks at positions the search
    did not sample. Nothing is written unless all checks pass.
 6. **Report** – the output plus `<name>.av1opt.json` with every CRF tried, scores, sizes and timings.

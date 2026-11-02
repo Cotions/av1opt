@@ -202,9 +202,14 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     }
 
     let partial = tmp.path.join(format!("partial.{}", o.container.ext()));
+    let covers = prepare_covers(tools, input, &info, o.container, &tmp.path, &mut notes);
     let t1 = Instant::now();
     let mut search_secs = t0.elapsed().as_secs_f64();
     let (streams, chunks, expect_frames) = if let Some(work) = &work {
+        let vf = search::source_filters(&info);
+        if !vf.is_empty() {
+            notes.push(format!("video filters: {}", vf.join(",")));
+        }
         let probe = EncodeSettings { preset: (o.preset + 4).clamp(o.preset, 12), pix_fmt_out: enc.pix_fmt_out };
         let plan = match saved {
             Some(p) => p,
@@ -229,12 +234,12 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         };
         let chunks = scenes::encode_all(&ctx, &plan)?;
         let video = scenes::concat(&work.path, chunks.len())?;
-        let (args, streams) = mux_args(&video, input, &info, o.container, &partial, &mut notes);
+        let (args, streams) = mux_args(&video, input, &info, o.container, &covers, &partial, &mut notes);
         tools.run(&args)?;
         let _ = std::fs::remove_file(&video);
         (streams, Some(chunks), Some(plan.total_frames))
     } else {
-        let (args, streams) = full_encode_args(input, &info, &enc, best.crf, o.container, &partial, &mut notes);
+        let (args, streams) = full_encode_args(input, &info, &enc, best.crf, o.container, &covers, &partial, &mut notes);
         for n in &notes {
             eprintln!("note: {n}");
         }
@@ -320,12 +325,14 @@ fn work_dir(input: &Path, out_dir: &Path, size: u64, o: &Options) -> Result<Work
     Ok(WorkDir { path, key })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn full_encode_args(
     input: &Path,
     info: &MediaInfo,
     enc: &EncodeSettings,
     crf: f64,
     container: Container,
+    covers: &[CoverFile],
     out: &Path,
     notes: &mut Vec<String>,
 ) -> (Vec<String>, Streams) {
@@ -333,19 +340,27 @@ fn full_encode_args(
     let mut a: Vec<String> = ["-y", "-i", &path_arg(input), "-map", &map].map(String::from).to_vec();
     let vf = search::source_filters(info);
     if !vf.is_empty() {
-        a.extend(["-vf".into(), vf.join(",")]);
+        a.extend(["-filter:v:0".into(), vf.join(",")]);
         notes.push(format!("video filters: {}", vf.join(",")));
     }
     a.extend(enc.video_args(crf));
-    a.extend(["-fps_mode", "passthrough"].map(String::from));
-    let streams = stream_args(info, 0, container, notes);
+    a.extend(["-fps_mode:v:0", "passthrough"].map(String::from));
+    let streams = stream_args(info, 0, container, covers, notes);
     a.extend(streams.args.iter().cloned());
     a.push(path_arg(out));
     (a, streams)
 }
 
 /// Joined scene-chunk video plus audio, subtitles and metadata from the source.
-fn mux_args(video: &Path, input: &Path, info: &MediaInfo, container: Container, out: &Path, notes: &mut Vec<String>) -> (Vec<String>, Streams) {
+fn mux_args(
+    video: &Path,
+    input: &Path,
+    info: &MediaInfo,
+    container: Container,
+    covers: &[CoverFile],
+    out: &Path,
+    notes: &mut Vec<String>,
+) -> (Vec<String>, Streams) {
     // Keep the source's video/audio offset; the joined video itself starts at zero.
     let offset = info.video_start - info.start_time;
     let mut a: Vec<String> = [
@@ -354,20 +369,54 @@ fn mux_args(video: &Path, input: &Path, info: &MediaInfo, container: Container, 
     ]
     .map(String::from)
     .to_vec();
-    let streams = stream_args(info, 1, container, notes);
+    let streams = stream_args(info, 1, container, covers, notes);
     a.extend(streams.args.iter().cloned());
     a.push(path_arg(out));
     (a, streams)
 }
 
-/// Audio, subtitle, attachment and metadata arguments for source input number `src`.
+/// Audio, subtitle, cover, attachment and metadata arguments for source input number `src`.
 struct Streams {
     args: Vec<String>,
     audio: usize,
     subs: usize,
+    covers: usize,
 }
 
-fn stream_args(info: &MediaInfo, src: usize, container: Container, notes: &mut Vec<String>) -> Streams {
+/// A cover image extracted for Matroska output, which stores covers as file attachments.
+struct CoverFile {
+    path: PathBuf,
+    mime: &'static str,
+    name: String,
+}
+
+const COVER_TYPES: &[(&str, &str, &str)] = &[("mjpeg", "image/jpeg", "jpg"), ("png", "image/png", "png"), ("bmp", "image/bmp", "bmp"), ("webp", "image/webp", "webp")];
+
+/// MP4 keeps covers as attached-picture streams (copied as they are); Matroska keeps them as
+/// attachments, which ffmpeg can only add from files, so they are extracted first.
+fn prepare_covers(tools: &Tools, input: &Path, info: &MediaInfo, container: Container, tmp: &Path, notes: &mut Vec<String>) -> Vec<CoverFile> {
+    if container != Container::Mkv {
+        return Vec::new();
+    }
+    let mut files = Vec::new();
+    for (k, c) in info.covers.iter().enumerate() {
+        let Some(&(_, mime, ext)) = COVER_TYPES.iter().find(|t| t.0 == c.codec) else {
+            notes.push(format!("cover {k} ({}) dropped: unsupported image type", c.codec));
+            continue;
+        };
+        let path = tmp.join(format!("cover{k}.{ext}"));
+        let args: Vec<String> = ["-y", "-v", "error", "-i", &path_arg(input), "-map", &format!("0:{}", c.index), "-c", "copy", "-frames:v", "1", "-f", "image2", &path_arg(&path)]
+            .map(String::from)
+            .to_vec();
+        match tools.run(&args) {
+            Ok(_) => files.push(CoverFile { path, mime, name: c.filename.clone().unwrap_or_else(|| format!("cover.{ext}")) }),
+            Err(e) => notes.push(format!("cover {k} dropped: {}", e.to_string().lines().last().unwrap_or(""))),
+        }
+    }
+    files
+}
+
+fn stream_args(info: &MediaInfo, src: usize, container: Container, cover_files: &[CoverFile], notes: &mut Vec<String>) -> Streams {
     let mut a = Vec::new();
     for (i, s) in info.audio.iter().enumerate() {
         a.extend(["-map".into(), format!("{src}:a:{i}")]);
@@ -399,15 +448,36 @@ fn stream_args(info: &MediaInfo, src: usize, container: Container, notes: &mut V
         }
     }
 
-    if container == Container::Mkv {
-        // Fonts used by ASS subtitles live in attachments.
-        a.extend(["-map".into(), format!("{src}:t?"), "-c:t".into(), "copy".into()]);
+    let mut covers = 0;
+    match container {
+        Container::Mp4 => {
+            for c in &info.covers {
+                if !["mjpeg", "png"].contains(&c.codec.as_str()) {
+                    notes.push(format!("cover ({}) dropped: MP4 covers must be JPEG or PNG", c.codec));
+                    continue;
+                }
+                covers += 1;
+                a.extend(["-map".into(), format!("{src}:{}", c.index), format!("-c:v:{covers}"), "copy".into()]);
+                a.extend([format!("-disposition:v:{covers}"), "attached_pic".into()]);
+            }
+        }
+        Container::Mkv => {
+            // Fonts used by ASS subtitles live in attachments; covers are re-attached after them.
+            a.extend(["-map".into(), format!("{src}:t?"), "-c:t".into(), "copy".into()]);
+            for (k, f) in cover_files.iter().enumerate() {
+                let t = info.attachments as usize + k;
+                a.extend(["-attach".into(), path_arg(&f.path)]);
+                a.extend([format!("-metadata:s:t:{t}"), format!("mimetype={}", f.mime)]);
+                a.extend([format!("-metadata:s:t:{t}"), format!("filename={}", f.name)]);
+            }
+            covers = cover_files.len();
+        }
     }
     a.extend(["-map_metadata".into(), src.to_string(), "-map_chapters".into(), src.to_string()]);
     if container == Container::Mp4 {
         a.extend(["-movflags", "+faststart"].map(String::from));
     }
-    Streams { args: a, audio: info.audio.len(), subs: kept_subs }
+    Streams { args: a, audio: info.audio.len(), subs: kept_subs, covers }
 }
 
 /// Checks the encode before it replaces anything: stream layout, duration, and VMAF spot checks
@@ -437,6 +507,9 @@ fn verify(
             "verify: output has {} audio / {} subtitle streams, expected {} / {}",
             out_info.audio_streams, out_info.subtitle_streams, streams.audio, streams.subs
         );
+    }
+    if out_info.covers.len() != streams.covers {
+        bail!("verify: output has {} cover images, expected {}", out_info.covers.len(), streams.covers);
     }
     if let Some(want) = expect_frames {
         let got = tools.count_frames(out)?;

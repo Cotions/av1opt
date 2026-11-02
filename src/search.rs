@@ -31,9 +31,10 @@ pub struct EncodeSettings {
 impl EncodeSettings {
     /// SVT-AV1 takes CRF in quarter steps through its own parameters (ffmpeg's -crf is integer).
     pub fn video_args(&self, crf: f64) -> Vec<String> {
+        // Stream specifiers keep these off copied cover-art streams.
         [
-            "-c:v", "libsvtav1", "-preset", &self.preset.to_string(), "-pix_fmt", self.pix_fmt_out,
-            "-svtav1-params", &format!("tune=0:crf={}", quarter(crf)),
+            "-c:v:0", "libsvtav1", "-preset:v:0", &self.preset.to_string(), "-pix_fmt:v:0", self.pix_fmt_out,
+            "-svtav1-params:v:0", &format!("tune=0:crf={}", quarter(crf)),
         ]
         .map(String::from)
         .to_vec()
@@ -354,7 +355,7 @@ mod tests {
         MediaInfo {
             video_index: 0, codec: "h264".into(), width: 1920, height: 1080, fps, duration_s: 60.0,
             video_bitrate: 5e6, pix_fmt: "yuv420p".into(), hdr: false, interlaced: false, vfr: false,
-            start_time: 0.0, video_start: 0.0,
+            start_time: 0.0, video_start: 0.0, covers: vec![], attachments: 0,
             audio_streams: 0, subtitle_streams: 0, audio: vec![], subtitle_codecs: vec![],
         }
     }

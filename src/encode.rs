@@ -1,6 +1,7 @@
 //! Single-file optimize: CRF search, full encode, verification. Never modifies the input.
 
 use crate::probe::{self, MediaInfo};
+use crate::scenes;
 use crate::search::{self, EncodeSettings, SearchParams, Trial};
 use crate::tools::{Tools, hms, path_arg};
 use anyhow::{Context, Result, bail};
@@ -20,7 +21,15 @@ pub struct Options {
     pub force: bool,
     pub overwrite: bool,
     pub keep_temp: bool,
+    /// Per-scene CRF (chunked encode) instead of one CRF for the whole file.
+    pub scenes: bool,
+    /// Chunks encoded at the same time in scene mode.
+    pub workers: usize,
 }
+
+/// Name prefix of scene-mode work folders. Unlike temp folders they survive crashes on purpose:
+/// the next run resumes from them.
+pub const WORK_PREFIX: &str = ".av1opt-work-";
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Container {
@@ -47,11 +56,16 @@ struct Report<'a> {
     source_bytes: u64,
     output_bytes: u64,
     savings: f64,
-    crf: u8,
+    /// "whole" (one CRF) or "scenes" (CRF per chunk; `crf` is then the whole-file starting point).
+    mode: &'a str,
+    crf: f64,
     preset: u8,
     target_vmaf: f64,
     vmaf_model: &'a str,
+    /// Frame-weighted VMAF of the final chunks (scene mode only).
+    mean_vmaf: Option<f64>,
     search: &'a [Trial],
+    chunks: Option<&'a [scenes::ChunkResult]>,
     verify_vmaf: &'a [f64],
     search_secs: f64,
     encode_secs: f64,
@@ -141,12 +155,33 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         "{}: {} {}x{} {:.2} fps, {}, {:.1} Mbps video",
         input.display(), info.codec, info.width, info.height, info.fps, hms(info.duration_s), info.video_bitrate / 1e6
     );
-    eprintln!("searching CRF for VMAF >= {} ({model}, preset {})", o.target_vmaf, o.preset);
+    // Scene mode joins constant-rate chunks; a variable-rate source would be retimed, so it
+    // keeps the single-pass path.
+    let mut notes = Vec::new();
+    let scenes = o.scenes && !info.vfr;
+    if o.scenes && info.vfr {
+        notes.push("variable frame rate source: encoded in one pass instead of per scene".to_string());
+    }
+    let work = scenes.then(|| work_dir(input, out_dir, size, o)).transpose()?;
+    let saved: Option<scenes::Plan> = work.as_ref().and_then(|w| {
+        let p: scenes::Plan = serde_json::from_slice(&std::fs::read(w.path.join("plan.json")).ok()?).ok()?;
+        (p.key == w.key).then_some(p)
+    });
+
     let t0 = Instant::now();
-    let samples = search::extract_samples(tools, input, &info, &tmp.path, o.samples, o.sample_secs)?;
-    let params = SearchParams { target_vmaf: o.target_vmaf, min_crf: o.min_crf, max_crf: o.max_crf, vmaf_threads };
-    let (best, trials) = search::search(tools, &info, &samples, &tmp.path, &enc, &params)?;
-    let search_secs = t0.elapsed().as_secs_f64();
+    let (best, trials, mut samples) = match &saved {
+        Some(p) => {
+            eprintln!("resuming earlier run: crf {} from the saved search", p.best.crf);
+            (Some(p.best), p.trials.clone(), Vec::new())
+        }
+        None => {
+            eprintln!("searching CRF for VMAF >= {} ({model}, preset {})", o.target_vmaf, o.preset);
+            let samples = search::extract_samples(tools, input, &info, &tmp.path, o.samples, o.sample_secs)?;
+            let params = SearchParams { target_vmaf: o.target_vmaf, min_crf: o.min_crf, max_crf: o.max_crf, vmaf_threads };
+            let (best, trials) = search::search(tools, &info, &samples, &tmp.path, &enc, &params)?;
+            (best, trials, samples)
+        }
+    };
     let Some(best) = best else {
         skip!("even CRF {} misses VMAF {}; source is too lean to re-encode at this target", o.min_crf, o.target_vmaf);
     };
@@ -157,25 +192,64 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     }
 
     // Needs room for the encode plus slack; predicted size can be off for unusual content.
-    let need = (size as f64 * best.size_ratio.max(0.3) * 1.5) as u64 + 500_000_000;
+    // Scene mode holds the chunks, the joined stream and the final file at once.
+    let copies = if scenes { 3.0 } else { 1.5 };
+    let need = (size as f64 * best.size_ratio.max(0.3) * copies) as u64 + 500_000_000;
     if let Some(free) = free_bytes(out_dir)
         && free < need
     {
         bail!("not enough free space in {}: {:.1} GB free, ~{:.1} GB needed", out_dir.display(), free as f64 / 1e9, need as f64 / 1e9);
     }
 
-    let mut notes = Vec::new();
     let partial = tmp.path.join(format!("partial.{}", o.container.ext()));
-    let args = full_encode_args(input, &info, &enc, best.crf, o.container, &partial, &mut notes);
-    for n in &notes {
-        eprintln!("note: {n}");
-    }
     let t1 = Instant::now();
-    tools.run_with_progress(&args, info.duration_s, "encoding")?;
+    let mut search_secs = t0.elapsed().as_secs_f64();
+    let (streams, chunks, expect_frames) = if let Some(work) = &work {
+        let probe = EncodeSettings { preset: (o.preset + 4).clamp(o.preset, 12), pix_fmt_out: enc.pix_fmt_out };
+        let plan = match saved {
+            Some(p) => p,
+            None => {
+                // How much better the real preset scores than the fast probe preset at the
+                // same CRF; probe scores are shifted by this to predict the real encode.
+                let pt = search::trial(tools, &info, &samples, &tmp.path, &probe, best.crf, vmaf_threads, 1.0)?;
+                let bias = best.mean_vmaf - pt.mean_vmaf;
+                samples.clear();
+                let (cuts, total_frames) = scenes::detect(tools, input, &info, &work.path)?;
+                let (first_pts, chunks) = scenes::bounds(&info, &cuts, total_frames);
+                eprintln!("{} scene cuts, {total_frames} frames, {} chunks", cuts.len(), chunks.len());
+                let plan = scenes::Plan { key: work.key.clone(), best, trials: trials.clone(), bias, first_pts, total_frames, chunks };
+                std::fs::write(work.path.join("plan.json"), serde_json::to_vec_pretty(&plan)?)?;
+                plan
+            }
+        };
+        search_secs = t0.elapsed().as_secs_f64();
+        let ctx = scenes::Ctx {
+            tools, input, info: &info, work: &work.path, enc: &enc, probe: &probe, target: o.target_vmaf,
+            min_crf: o.min_crf, max_crf: o.max_crf, vmaf_threads, workers: o.workers,
+        };
+        let chunks = scenes::encode_all(&ctx, &plan)?;
+        let video = scenes::concat(&work.path, chunks.len())?;
+        let (args, streams) = mux_args(&video, input, &info, o.container, &partial, &mut notes);
+        tools.run(&args)?;
+        let _ = std::fs::remove_file(&video);
+        (streams, Some(chunks), Some(plan.total_frames))
+    } else {
+        let (args, streams) = full_encode_args(input, &info, &enc, best.crf, o.container, &partial, &mut notes);
+        for n in &notes {
+            eprintln!("note: {n}");
+        }
+        tools.run_with_progress(&args, info.duration_s, "encoding")?;
+        (streams, None, None)
+    };
     let encode_secs = t1.elapsed().as_secs_f64();
+    if chunks.is_some() {
+        for n in &notes {
+            eprintln!("note: {n}");
+        }
+    }
 
     eprintln!("verifying");
-    let verify_vmaf = verify(tools, input, &info, &partial, &args, o, vmaf_threads, &tmp.path)?;
+    let verify_vmaf = verify(tools, input, &info, &partial, &streams, expect_frames, o, vmaf_threads, &tmp.path)?;
 
     std::fs::rename(&partial, &output).or_else(|_| std::fs::copy(&partial, &output).map(|_| ()))?;
     let output_bytes = std::fs::metadata(&output)?.len();
@@ -185,17 +259,35 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         source_bytes: size,
         output_bytes,
         savings: 1.0 - output_bytes as f64 / size as f64,
+        mode: if chunks.is_some() { "scenes" } else { "whole" },
         crf: best.crf,
         preset: o.preset,
         target_vmaf: o.target_vmaf,
         vmaf_model: model,
+        mean_vmaf: chunks.as_deref().map(scenes::mean_vmaf),
         search: &trials,
+        chunks: chunks.as_deref(),
         verify_vmaf: &verify_vmaf,
         search_secs,
         encode_secs,
         notes: &notes,
     };
     std::fs::write(output.with_extension("av1opt.json"), serde_json::to_vec_pretty(&report)?)?;
+    if let Some(w) = &work
+        && !o.keep_temp
+    {
+        let _ = std::fs::remove_dir_all(&w.path);
+    }
+    if let Some(c) = &chunks {
+        let crfs = c.iter().map(|r| r.crf);
+        eprintln!(
+            "chunk crf {}-{}, mean VMAF {:.2}, worst chunk {:.2}",
+            crfs.clone().fold(f64::INFINITY, f64::min),
+            crfs.fold(0.0, f64::max),
+            scenes::mean_vmaf(c),
+            c.iter().map(|r| r.vmaf).fold(f64::INFINITY, f64::min)
+        );
+    }
     eprintln!(
         "done: {:.1} MB -> {:.1} MB ({:.0}% smaller), search {}, encode {}",
         size as f64 / 1e6,
@@ -207,15 +299,36 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     Ok(output)
 }
 
+/// Resumable work folder for scene mode, named after everything that affects its contents.
+struct WorkDir {
+    path: PathBuf,
+    key: String,
+}
+
+fn work_dir(input: &Path, out_dir: &Path, size: u64, o: &Options) -> Result<WorkDir> {
+    let mtime = std::fs::metadata(input)?
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs());
+    let key = format!(
+        "v1|{}|{size}|{mtime}|{}|{}|{}|{}|{}|{}",
+        std::path::absolute(input)?.display(), o.target_vmaf, o.preset, o.min_crf, o.max_crf, o.samples, o.sample_secs
+    );
+    let path = out_dir.join(format!("{WORK_PREFIX}{:016x}", scenes::fnv1a(&key)));
+    std::fs::create_dir_all(&path)?;
+    Ok(WorkDir { path, key })
+}
+
 fn full_encode_args(
     input: &Path,
     info: &MediaInfo,
     enc: &EncodeSettings,
-    crf: u8,
+    crf: f64,
     container: Container,
     out: &Path,
     notes: &mut Vec<String>,
-) -> Vec<String> {
+) -> (Vec<String>, Streams) {
     let map = format!("0:{}", info.video_index);
     let mut a: Vec<String> = ["-y", "-i", &path_arg(input), "-map", &map].map(String::from).to_vec();
     let vf = search::source_filters(info);
@@ -225,9 +338,39 @@ fn full_encode_args(
     }
     a.extend(enc.video_args(crf));
     a.extend(["-fps_mode", "passthrough"].map(String::from));
+    let streams = stream_args(info, 0, container, notes);
+    a.extend(streams.args.iter().cloned());
+    a.push(path_arg(out));
+    (a, streams)
+}
 
+/// Joined scene-chunk video plus audio, subtitles and metadata from the source.
+fn mux_args(video: &Path, input: &Path, info: &MediaInfo, container: Container, out: &Path, notes: &mut Vec<String>) -> (Vec<String>, Streams) {
+    // Keep the source's video/audio offset; the joined video itself starts at zero.
+    let offset = info.video_start - info.start_time;
+    let mut a: Vec<String> = [
+        "-y", "-v", "error", "-itsoffset", &format!("{offset:.6}"), "-framerate", &search::cfr(info),
+        "-i", &path_arg(video), "-i", &path_arg(input), "-map", "0:v", "-c:v", "copy",
+    ]
+    .map(String::from)
+    .to_vec();
+    let streams = stream_args(info, 1, container, notes);
+    a.extend(streams.args.iter().cloned());
+    a.push(path_arg(out));
+    (a, streams)
+}
+
+/// Audio, subtitle, attachment and metadata arguments for source input number `src`.
+struct Streams {
+    args: Vec<String>,
+    audio: usize,
+    subs: usize,
+}
+
+fn stream_args(info: &MediaInfo, src: usize, container: Container, notes: &mut Vec<String>) -> Streams {
+    let mut a = Vec::new();
     for (i, s) in info.audio.iter().enumerate() {
-        a.extend(["-map".into(), format!("0:a:{i}")]);
+        a.extend(["-map".into(), format!("{src}:a:{i}")]);
         if COPY_AUDIO.contains(&s.codec.as_str()) {
             a.extend([format!("-c:a:{i}"), "copy".into()]);
         } else {
@@ -243,12 +386,12 @@ fn full_encode_args(
             Container::Mkv => {
                 // MP4-style text subtitles can't be stored in Matroska; convert them to SRT.
                 let codec = if codec == "mov_text" { "srt" } else { "copy" };
-                a.extend(["-map".into(), format!("0:s:{i}")]);
+                a.extend(["-map".into(), format!("{src}:s:{i}")]);
                 a.extend([format!("-c:s:{kept_subs}"), codec.into()]);
                 kept_subs += 1;
             }
             Container::Mp4 if TEXT_SUBS.contains(&codec.as_str()) => {
-                a.extend(["-map".into(), format!("0:s:{i}")]);
+                a.extend(["-map".into(), format!("{src}:s:{i}")]);
                 a.extend([format!("-c:s:{kept_subs}"), "mov_text".into()]);
                 kept_subs += 1;
             }
@@ -258,14 +401,13 @@ fn full_encode_args(
 
     if container == Container::Mkv {
         // Fonts used by ASS subtitles live in attachments.
-        a.extend(["-map", "0:t?", "-c:t", "copy"].map(String::from));
+        a.extend(["-map".into(), format!("{src}:t?"), "-c:t".into(), "copy".into()]);
     }
-    a.extend(["-map_metadata", "0", "-map_chapters", "0"].map(String::from));
+    a.extend(["-map_metadata".into(), src.to_string(), "-map_chapters".into(), src.to_string()]);
     if container == Container::Mp4 {
         a.extend(["-movflags", "+faststart"].map(String::from));
     }
-    a.push(path_arg(out));
-    a
+    Streams { args: a, audio: info.audio.len(), subs: kept_subs }
 }
 
 /// Checks the encode before it replaces anything: stream layout, duration, and VMAF spot checks
@@ -276,7 +418,8 @@ fn verify(
     input: &Path,
     info: &MediaInfo,
     out: &Path,
-    args: &[String],
+    streams: &Streams,
+    expect_frames: Option<u64>,
     o: &Options,
     threads: usize,
     tmp: &Path,
@@ -289,13 +432,17 @@ fn verify(
     if (out_info.duration_s - info.duration_s).abs() > tolerance {
         bail!("verify: duration {:.1}s vs source {:.1}s", out_info.duration_s, info.duration_s);
     }
-    let mapped_audio = args.iter().filter(|a| a.starts_with("0:a:")).count();
-    let mapped_subs = args.iter().filter(|a| a.starts_with("0:s:")).count();
-    if out_info.audio_streams as usize != mapped_audio || out_info.subtitle_streams as usize != mapped_subs {
+    if out_info.audio_streams as usize != streams.audio || out_info.subtitle_streams as usize != streams.subs {
         bail!(
-            "verify: output has {} audio / {} subtitle streams, expected {mapped_audio} / {mapped_subs}",
-            out_info.audio_streams, out_info.subtitle_streams
+            "verify: output has {} audio / {} subtitle streams, expected {} / {}",
+            out_info.audio_streams, out_info.subtitle_streams, streams.audio, streams.subs
         );
+    }
+    if let Some(want) = expect_frames {
+        let got = tools.count_frames(out)?;
+        if got != want {
+            bail!("verify: output has {got} frames, expected {want}");
+        }
     }
 
     let secs = 5.0_f64.min(info.duration_s);
@@ -308,12 +455,12 @@ fn verify(
         let d = tmp.join(format!("verify{i}.out.mkv"));
         search::extract_reference(tools, input, info, true, start, secs, &r)?;
         search::extract_reference(tools, out, info, false, start, secs, &d)?;
-        let mut v = tools.vmaf(&d, &r, model, pix, threads, 0)?;
+        let mut v = tools.vmaf(&d, &r, model, pix, threads, 0, 1)?;
         // Seeking two different files can land a frame or two apart; retry nearby alignments
         // before calling the encode bad.
         if v < o.target_vmaf - 4.0 {
             for off in [-2, -1, 1, 2] {
-                v = v.max(tools.vmaf(&d, &r, model, pix, threads, off)?);
+                v = v.max(tools.vmaf(&d, &r, model, pix, threads, off, 1)?);
             }
         }
         eprintln!("  spot check at {}: VMAF {v:.2}", hms(start));

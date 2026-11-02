@@ -60,9 +60,19 @@ impl Tools {
     }
 
     /// Runs a long ffmpeg job, printing percent done, encode fps and ETA on one line.
-    pub fn run_with_progress(&self, args: &[String], total_secs: f64, label: &str) -> Result<()> {
-        let mut child = self
-            .command_for(args)
+    /// Returns the number of frames ffmpeg output.
+    pub fn run_with_progress(&self, args: &[String], total_secs: f64, label: &str) -> Result<u64> {
+        self.run_with_progress_in(None, args, total_secs, label)
+    }
+
+    /// Like [`Tools::run_with_progress`], with ffmpeg's working directory set to `dir` (lets
+    /// filters write files by relative name, avoiding filter-graph path escaping).
+    pub fn run_with_progress_in(&self, dir: Option<&Path>, args: &[String], total_secs: f64, label: &str) -> Result<u64> {
+        let mut cmd = self.command_for(args);
+        if let Some(d) = dir {
+            cmd.current_dir(d);
+        }
+        let mut child = cmd
             .args(["-progress", "pipe:1", "-nostats", "-v", "error"])
             .args(args)
             .stdout(Stdio::piped())
@@ -77,11 +87,13 @@ impl Tools {
         });
 
         let start = Instant::now();
-        let (mut done_secs, mut fps) = (0.0_f64, String::new());
+        let (mut done_secs, mut fps, mut frames) = (0.0_f64, String::new(), 0u64);
         for line in BufReader::new(child.stdout.take().unwrap()).lines() {
             let line = line?;
             if let Some(us) = line.strip_prefix("out_time_us=").and_then(|v| v.parse::<f64>().ok()) {
                 done_secs = us / 1e6;
+            } else if let Some(n) = line.strip_prefix("frame=").and_then(|v| v.trim().parse().ok()) {
+                frames = n;
             } else if let Some(f) = line.strip_prefix("fps=") {
                 fps = f.to_string();
             } else if line.starts_with("progress=") && total_secs > 0.0 {
@@ -97,19 +109,31 @@ impl Tools {
         if !status.success() {
             bail!("ffmpeg failed ({status}):\n{}", tail(&stderr, 15));
         }
-        Ok(())
+        Ok(frames)
     }
 
     /// VMAF of `distorted` against `reference`, pairing frames by index rather than timestamp
     /// (encoders and muxers shift start times, which made libvmaf compare neighbouring frames).
     /// `offset` > 0 skips that many leading distorted frames; < 0 skips reference frames.
-    pub fn vmaf(&self, distorted: &Path, reference: &Path, model: &str, pix_fmt: &str, threads: usize, offset: i32) -> Result<f64> {
+    /// `subsample` > 1 scores only every n-th frame (faster, slightly noisier).
+    #[allow(clippy::too_many_arguments)]
+    pub fn vmaf(
+        &self,
+        distorted: &Path,
+        reference: &Path,
+        model: &str,
+        pix_fmt: &str,
+        threads: usize,
+        offset: i32,
+        subsample: u32,
+    ) -> Result<f64> {
         let trim = |skip: bool| if skip { format!("trim=start_frame={},", offset.unsigned_abs()) } else { String::new() };
         let filter = format!(
             "[0:v]{}format={pix_fmt},settb=1,setpts=N[d];[1:v]{}format={pix_fmt},settb=1,setpts=N[r];\
-             [d][r]libvmaf=model=version={model}:n_threads={threads}:shortest=1",
+             [d][r]libvmaf=model=version={model}:n_threads={threads}:n_subsample={}:shortest=1",
             trim(offset > 0),
-            trim(offset < 0)
+            trim(offset < 0),
+            subsample.max(1)
         );
         let args: Vec<String> = ["-i".into(), path_arg(distorted), "-i".into(), path_arg(reference)]
             .into_iter()
@@ -121,6 +145,22 @@ impl Tools {
             .find_map(|l| l.split("VMAF score: ").nth(1))
             .and_then(|v| v.trim().parse().ok())
             .context("no VMAF score in ffmpeg output")
+    }
+}
+
+impl Tools {
+    /// Number of video packets (= frames) in the first video stream, without decoding.
+    pub fn count_frames(&self, path: &Path) -> Result<u64> {
+        let out = Command::new(&self.ffprobe)
+            .args(["-v", "error", "-select_streams", "v:0", "-count_packets", "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0"])
+            .arg(path)
+            .output()
+            .context("failed to run ffprobe")?;
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .trim_end_matches(',')
+            .parse()
+            .with_context(|| format!("cannot count frames in {}", path.display()))
     }
 }
 

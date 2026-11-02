@@ -16,7 +16,15 @@ pub struct MediaInfo {
     pub width: u32,
     pub height: u32,
     pub fps: f64,
+    /// Frame rate varies (average differs from the nominal rate), e.g. phone recordings.
+    #[serde(default)]
+    pub vfr: bool,
     pub duration_s: f64,
+    /// Container start time and the video stream's own start time, in seconds.
+    #[serde(default)]
+    pub start_time: f64,
+    #[serde(default)]
+    pub video_start: f64,
     /// Bits per second of the video stream alone (estimated if the container doesn't say).
     pub video_bitrate: f64,
     pub pix_fmt: String,
@@ -69,9 +77,12 @@ pub fn probe(ffprobe: &str, path: &Path, file_size: u64) -> Result<MediaInfo> {
     let duration_s = num(&j["format"]["duration"])
         .or_else(|| num(&video["duration"]))
         .unwrap_or(0.0);
-    let fps = parse_rate(video["avg_frame_rate"].as_str())
-        .or_else(|| parse_rate(video["r_frame_rate"].as_str()))
-        .unwrap_or(0.0);
+    let avg_rate = parse_rate(video["avg_frame_rate"].as_str());
+    let nominal_rate = parse_rate(video["r_frame_rate"].as_str());
+    let fps = avg_rate.or(nominal_rate).unwrap_or(0.0);
+    let vfr = matches!((avg_rate, nominal_rate), (Some(a), Some(r)) if (a - r).abs() / r > 0.005);
+    let start_time = num(&j["format"]["start_time"]).unwrap_or(0.0);
+    let video_start = num(&video["start_time"]).unwrap_or(start_time);
 
     let audio: Vec<&Value> = streams.iter().filter(|s| s["codec_type"] == "audio").collect();
     let audio_bitrate: f64 = audio.iter().filter_map(|s| num(&s["bit_rate"])).sum();
@@ -101,7 +112,10 @@ pub fn probe(ffprobe: &str, path: &Path, file_size: u64) -> Result<MediaInfo> {
         width,
         height,
         fps,
+        vfr,
         duration_s,
+        start_time,
+        video_start,
         video_bitrate,
         pix_fmt: video["pix_fmt"].as_str().unwrap_or("").to_string(),
         hdr: matches!(transfer, "smpte2084" | "arib-std-b67") || dolby_vision,

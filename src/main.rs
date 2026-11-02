@@ -4,6 +4,7 @@ mod estimate;
 mod fsguard;
 mod probe;
 mod report;
+mod scenes;
 mod search;
 mod tools;
 
@@ -102,6 +103,13 @@ enum Cmd {
         ffmpeg: String,
         #[arg(long, env = "AV1OPT_FFPROBE", default_value = "ffprobe")]
         ffprobe: String,
+        /// Choose the CRF per scene: split at scene changes, target VMAF for each chunk, then join.
+        /// Evens out quality across the video; slower than one CRF for the whole file.
+        #[arg(long)]
+        scenes: bool,
+        /// Chunks encoded in parallel with --scenes. Each ffmpeg gets its share of --memory-limit.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=8))]
+        workers: u8,
         /// Memory cap for each ffmpeg run (systemd MemoryMax syntax, e.g. 12G). "auto" = 40% of RAM, "none" = no cap.
         #[arg(long, default_value = "auto")]
         memory_limit: String,
@@ -137,7 +145,7 @@ fn main() -> Result<()> {
         }
         Cmd::Encode {
             inputs, out_dir, container, target_vmaf, preset, min_crf, max_crf, samples, sample_secs,
-            min_savings, force, overwrite, retry_skipped, keep_temp, allow_zfs, ffmpeg, ffprobe, memory_limit, nice,
+            min_savings, force, overwrite, retry_skipped, keep_temp, allow_zfs, ffmpeg, ffprobe, scenes, workers, memory_limit, nice,
         } => {
             if min_crf > max_crf {
                 anyhow::bail!("--min-crf {min_crf} is above --max-crf {max_crf}");
@@ -146,10 +154,10 @@ fn main() -> Result<()> {
             std::fs::create_dir_all(&out_dir)?;
             // SAFETY: plain syscall on our own process; children inherit the priority.
             unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) };
-            let tools = tools::Tools::new(ffmpeg, ffprobe, memory_cap(&memory_limit));
+            let tools = tools::Tools::new(ffmpeg, ffprobe, memory_cap(&memory_limit, if scenes { workers } else { 1 }));
             let opts = encode::Options {
                 container, target_vmaf, preset, min_crf, max_crf, samples, sample_secs,
-                min_savings, force, overwrite, keep_temp,
+                min_savings, force, overwrite, keep_temp, scenes, workers: workers.into(),
             };
             let jobs = batch::expand(&inputs, &out_dir, is_video);
             if jobs.is_empty() {
@@ -170,15 +178,29 @@ fn main() -> Result<()> {
     }
 }
 
-fn memory_cap(setting: &str) -> Option<String> {
-    match setting {
-        "none" => None,
+/// Per-ffmpeg memory cap: the configured total, split between parallel workers.
+fn memory_cap(setting: &str, workers: u8) -> Option<String> {
+    let mb = match setting {
+        "none" => return None,
         "auto" => std::fs::read_to_string("/proc/meminfo")
             .ok()
             .and_then(|m| m.lines().find(|l| l.starts_with("MemTotal:"))?.split_whitespace().nth(1)?.parse::<u64>().ok())
-            .map(|kb| format!("{}M", kb * 4 / 10 / 1024)),
-        s => Some(s.to_string()),
-    }
+            .map(|kb| kb * 4 / 10 / 1024)?,
+        s if workers <= 1 => return Some(s.to_string()),
+        s => {
+            let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
+            let n: u64 = num.parse().ok()?;
+            match unit.to_ascii_uppercase().as_str() {
+                "" => n / 1024 / 1024,
+                "K" => n / 1024,
+                "M" => n,
+                "G" => n * 1024,
+                "T" => n * 1024 * 1024,
+                _ => return Some(s.to_string()),
+            }
+        }
+    };
+    Some(format!("{}M", mb / workers.max(1) as u64))
 }
 
 fn scan(paths: &[PathBuf], ffprobe: &str, jobs: usize, min_savings: f64, csv: Option<&Path>, top: usize) -> Result<()> {

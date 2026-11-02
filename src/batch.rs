@@ -28,7 +28,7 @@ pub fn expand(inputs: &[PathBuf], out_dir: &Path, is_video: impl Fn(&Path) -> bo
                 .filter_entry(|e| {
                     // Never descend into our own output or temp folders.
                     let abs = std::path::absolute(e.path()).unwrap_or_else(|_| e.path().to_path_buf());
-                    !abs.starts_with(&out_abs) && !e.file_name().to_string_lossy().starts_with(".av1opt-tmp-")
+                    !abs.starts_with(&out_abs) && !e.file_name().to_string_lossy().starts_with(".av1opt-")
                 })
                 .flatten()
                 .filter(|e| e.file_type().is_file() && is_video(e.path()))

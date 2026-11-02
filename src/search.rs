@@ -4,7 +4,7 @@
 use crate::probe::MediaInfo;
 use crate::tools::{Tools, path_arg};
 use anyhow::{Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -13,9 +13,10 @@ pub struct Sample {
     pub secs: f64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Trial {
-    pub crf: u8,
+    /// Integer for real trials; the chosen trial may be interpolated to a quarter step.
+    pub crf: f64,
     pub mean_vmaf: f64,
     pub min_vmaf: f64,
     /// Predicted video stream size relative to the source video stream.
@@ -28,14 +29,20 @@ pub struct EncodeSettings {
 }
 
 impl EncodeSettings {
-    pub fn video_args(&self, crf: u8) -> Vec<String> {
+    /// SVT-AV1 takes CRF in quarter steps through its own parameters (ffmpeg's -crf is integer).
+    pub fn video_args(&self, crf: f64) -> Vec<String> {
         [
-            "-c:v", "libsvtav1", "-preset", &self.preset.to_string(), "-crf", &crf.to_string(),
-            "-pix_fmt", self.pix_fmt_out, "-svtav1-params", "tune=0",
+            "-c:v", "libsvtav1", "-preset", &self.preset.to_string(), "-pix_fmt", self.pix_fmt_out,
+            "-svtav1-params", &format!("tune=0:crf={}", quarter(crf)),
         ]
         .map(String::from)
         .to_vec()
     }
+}
+
+/// Rounds down to SVT-AV1's quarter-step CRF grid.
+pub fn quarter(crf: f64) -> f64 {
+    (crf * 4.0).floor() / 4.0
 }
 
 /// Lossless reference pixel format matching the source bit depth.
@@ -61,6 +68,15 @@ pub fn cfr(info: &MediaInfo) -> String {
         .map_or_else(|| format!("{:.3}", info.fps), |(_, s)| s.to_string())
 }
 
+/// Numeric value of [`cfr`], i.e. frames per second of the constant-rate stream.
+pub fn cfr_value(info: &MediaInfo) -> f64 {
+    let r = cfr(info);
+    match r.split_once('/') {
+        Some((n, d)) => n.parse::<f64>().unwrap_or(0.0) / d.parse::<f64>().unwrap_or(1.0),
+        None => r.parse().unwrap_or(info.fps),
+    }
+}
+
 /// Filters every encode of this source needs: deinterlace, and crop to even dimensions
 /// (4:2:0 AV1 can't have odd sizes). The same filters go into the references, so VMAF
 /// compares like with like.
@@ -75,7 +91,12 @@ pub fn source_filters(info: &MediaInfo) -> Vec<String> {
     f
 }
 
-const PREROLL_SECS: f64 = 2.0;
+/// Score every 3rd frame: within ~0.01 of scoring all of them, ~45% less VMAF time. Must be odd:
+/// SVT-AV1's hierarchical GOP alternates better and worse frames, so an even stride sees only
+/// one kind (measured +0.2 VMAF with a stride of 2).
+pub const VMAF_STRIDE: u32 = 3;
+
+pub const PREROLL_SECS: f64 = 2.0;
 
 /// Lossless, constant-frame-rate cut of `input` starting at `start` seconds.
 /// `is_source` applies [`source_filters`]; pass false when cutting from an already-encoded output.
@@ -149,18 +170,18 @@ const START_CRF: u8 = 35;
 
 /// Winning CRF (None if even the minimum fails) and every (crf, score) evaluated.
 pub type CrfSearch = (Option<u8>, Vec<(u8, f64)>);
-const VMAF_PER_CRF: f64 = 0.4;
+pub const VMAF_PER_CRF: f64 = 0.4;
 
 /// Finds the highest CRF in `min..=max` whose score is >= `target`, assuming the score falls
 /// as CRF rises. Instead of halving the range, it interpolates between the nearest passing
 /// and failing CRFs, which usually needs 3-4 evaluations instead of 5-6.
 /// Returns the winning CRF (None if even `min` fails) and every (crf, score) evaluated.
-pub fn find_crf(min: u8, max: u8, target: f64, mut eval: impl FnMut(u8) -> Result<f64>) -> Result<CrfSearch> {
+pub fn find_crf(start: u8, min: u8, max: u8, target: f64, mut eval: impl FnMut(u8) -> Result<f64>) -> Result<CrfSearch> {
     if min > max {
         bail!("--min-crf {min} is above --max-crf {max}");
     }
     let mut tried: BTreeMap<u8, f64> = BTreeMap::new();
-    let mut crf = START_CRF.clamp(min, max);
+    let mut crf = start.clamp(min, max);
     loop {
         let score = eval(crf)?;
         tried.insert(crf, score);
@@ -203,8 +224,8 @@ pub fn search(
 ) -> Result<(Option<Trial>, Vec<Trial>)> {
     let source_bps = info.video_bitrate / 8.0;
     let mut trials: BTreeMap<u8, Trial> = BTreeMap::new();
-    let (best, _) = find_crf(p.min_crf, p.max_crf, p.target_vmaf, |crf| {
-        let t = trial(tools, info, samples, tmp, enc, crf, p.vmaf_threads, source_bps)?;
+    let (best, _) = find_crf(START_CRF, p.min_crf, p.max_crf, p.target_vmaf, |crf| {
+        let t = trial(tools, info, samples, tmp, enc, crf as f64, p.vmaf_threads, source_bps)?;
         eprintln!(
             "  crf {crf:2}: VMAF {:.2} (worst sample {:.2}), size ~{:.0}% of source",
             t.mean_vmaf, t.min_vmaf, t.size_ratio * 100.0
@@ -212,17 +233,34 @@ pub fn search(
         trials.insert(crf, t);
         Ok(t.mean_vmaf)
     })?;
-    Ok((best.map(|c| trials[&c]), trials.into_values().collect()))
+    // The answer lies between the best passing CRF and the next one up; interpolate to the
+    // quarter step where the score crosses the target (rounded down, toward quality).
+    let chosen = best.map(|c| match trials.get(&(c + 1)) {
+        Some(next) if trials[&c].mean_vmaf > next.mean_vmaf => {
+            let (a, b) = (trials[&c], *next);
+            let frac = quarter((a.mean_vmaf - p.target_vmaf) / (a.mean_vmaf - b.mean_vmaf)).clamp(0.0, 0.75);
+            let mix = |x: f64, y: f64| x + (y - x) * frac;
+            Trial {
+                crf: c as f64 + frac,
+                mean_vmaf: mix(a.mean_vmaf, b.mean_vmaf),
+                min_vmaf: mix(a.min_vmaf, b.min_vmaf),
+                size_ratio: mix(a.size_ratio, b.size_ratio),
+            }
+        }
+        _ => trials[&c],
+    });
+    Ok((chosen, trials.into_values().collect()))
 }
 
+/// Encodes every sample at `crf` and scores it against its reference.
 #[allow(clippy::too_many_arguments)]
-fn trial(
+pub fn trial(
     tools: &Tools,
     info: &MediaInfo,
     samples: &[Sample],
     tmp: &Path,
     enc: &EncodeSettings,
-    crf: u8,
+    crf: f64,
     threads: usize,
     source_bps: f64,
 ) -> Result<Trial> {
@@ -236,7 +274,7 @@ fn trial(
         args.extend(enc.video_args(crf));
         args.push(path_arg(&out));
         tools.run(&args)?;
-        scores.push(tools.vmaf(&out, &s.reference, vmaf_model(info), reference_pix_fmt(info), threads, 0)?);
+        scores.push(tools.vmaf(&out, &s.reference, vmaf_model(info), reference_pix_fmt(info), threads, 0, VMAF_STRIDE)?);
         bytes += std::fs::metadata(&out)?.len();
         secs += s.secs;
         std::fs::remove_file(&out)?;
@@ -257,7 +295,7 @@ mod tests {
     }
 
     fn check(min: u8, max: u8, target: f64, f: impl Fn(u8) -> f64 + Copy) -> usize {
-        let (got, tried) = find_crf(min, max, target, |c| Ok(f(c))).unwrap();
+        let (got, tried) = find_crf(START_CRF, min, max, target, |c| Ok(f(c))).unwrap();
         assert_eq!(got, brute(min, max, target, f), "target {target}, tried {tried:?}");
         tried.len()
     }
@@ -283,9 +321,9 @@ mod tests {
 
     #[test]
     fn handles_unreachable_and_always_passing_targets() {
-        let (got, _) = find_crf(20, 55, 99.0, |c| Ok(90.0 - c as f64 * 0.1)).unwrap();
+        let (got, _) = find_crf(START_CRF, 20, 55, 99.0, |c| Ok(90.0 - c as f64 * 0.1)).unwrap();
         assert_eq!(got, None);
-        let (got, _) = find_crf(20, 55, 50.0, |_| Ok(99.0)).unwrap();
+        let (got, _) = find_crf(START_CRF, 20, 55, 50.0, |_| Ok(99.0)).unwrap();
         assert_eq!(got, Some(55));
     }
 
@@ -303,19 +341,20 @@ mod tests {
 
     #[test]
     fn rejects_inverted_range() {
-        assert!(find_crf(40, 30, 93.0, |_| Ok(95.0)).is_err());
+        assert!(find_crf(START_CRF, 40, 30, 93.0, |_| Ok(95.0)).is_err());
     }
 
     #[test]
     fn single_value_range() {
-        let (got, tried) = find_crf(30, 30, 93.0, |_| Ok(94.0)).unwrap();
+        let (got, tried) = find_crf(START_CRF, 30, 30, 93.0, |_| Ok(94.0)).unwrap();
         assert_eq!((got, tried.len()), (Some(30), 1));
     }
 
     fn info_with_fps(fps: f64) -> MediaInfo {
         MediaInfo {
             video_index: 0, codec: "h264".into(), width: 1920, height: 1080, fps, duration_s: 60.0,
-            video_bitrate: 5e6, pix_fmt: "yuv420p".into(), hdr: false, interlaced: false,
+            video_bitrate: 5e6, pix_fmt: "yuv420p".into(), hdr: false, interlaced: false, vfr: false,
+            start_time: 0.0, video_start: 0.0,
             audio_streams: 0, subtitle_streams: 0, audio: vec![], subtitle_codecs: vec![],
         }
     }

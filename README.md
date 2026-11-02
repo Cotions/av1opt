@@ -37,8 +37,8 @@ For each file:
 1. **Sample** – cuts up to 4 clips spread through the video into lossless, constant-frame-rate
    references (deinterlaced and cropped to even size when needed).
 2. **Search** – finds the highest CRF whose mean VMAF over the samples meets the target. It
-   interpolates between passing and failing CRFs, averaging ~3.4 trial encodes. 4K uses the
-   `vmaf_4k` model.
+   interpolates between passing and failing CRFs, averaging ~3.4 trial encodes, then refines to
+   SVT-AV1's quarter-step CRF. 4K uses the `vmaf_4k` model.
 3. **Decide** – skips files that are already AV1, HDR, can't reach the target, or would save less
    than `--min-savings` (15%).
 4. **Encode** – SVT-AV1, 10-bit. Audio already in AAC/Opus/MP3 is copied, anything else becomes
@@ -47,6 +47,29 @@ For each file:
 5. **Verify** – codec, duration and stream counts, plus VMAF spot checks at positions the search
    did not sample. Nothing is written unless all checks pass.
 6. **Report** – the output plus `<name>.av1opt.json` with every CRF tried, scores, sizes and timings.
+
+### Per-scene CRF (`--scenes`)
+
+One CRF for a whole video spends too many bits on easy scenes and too few on hard ones. With
+`--scenes`, after the search above:
+
+1. Scene changes are detected (`scdet`) and the video is cut into chunks of 4-20 s (10 s for 4K)
+   at scene boundaries, frame-exactly, as lossless constant-frame-rate references.
+2. Each chunk gets its own CRF from 2-3 fast probe encodes (preset +4), corrected by the measured
+   VMAF gap between the probe preset and the real preset.
+3. Each chunk is encoded at the real preset and measured; a chunk more than 1 VMAF off target is
+   redone once with a corrected CRF.
+4. Chunks are joined into one AV1 stream and muxed with the source's audio, subtitles, chapters
+   and metadata. Verification additionally checks the exact frame count.
+
+On a 60 s test clip mixing six kinds of footage, `--scenes` gave a 6% smaller file at identical
+full-length VMAF (93.07), with per-segment VMAF between 91.9 and 94.1 instead of 90.8 to 95.9.
+On a single continuous shot it gives no gain. It takes about 1.5-2x as long; `--workers 2`
+encodes two chunks at once (each ffmpeg then gets half of `--memory-limit`).
+
+Finished chunks are kept in `.av1opt-work-*` in the output folder, so an interrupted run resumes
+where it stopped (including the search). Variable-frame-rate sources are encoded in one pass,
+since chunking needs a constant frame rate.
 
 Folders are walked recursively and their layout is mirrored under `--out-dir`. Every result is
 appended to `av1opt-log.tsv` there; re-running the same command resumes: finished files are
@@ -74,9 +97,13 @@ skipped, and files skipped for a reason (low savings, ...) are not searched agai
   and misaligns comparisons.
 - **Pre-roll before cutting.** Seeking straight into MPEG-2/TS or open-GOP H.264 can return frames
   from the wrong place; seek 2 s early and discard the warm-up after decoding.
+- **Score every 3rd frame, not every 2nd.** SVT-AV1's hierarchical GOP alternates better and
+  worse frames; an even VMAF stride measures only one kind (+0.2 VMAF bias).
+- **CRF has quarter steps.** `-svtav1-params crf=35.25` works; integer CRF alone left every
+  chunk ~0.3 VMAF above target.
 - **Cover art can be a plain video stream.** Pick the real video by codec, not "first video stream".
 
 ## Tests
 
-`cargo test` covers the CRF search (exactness against brute force, trial count), sample placement,
-frame-rate snapping and source filters.
+`cargo test` covers the CRF search (exactness against brute force, trial count), chunk CRF
+estimation, scene chunk planning, sample placement, frame-rate snapping and source filters.

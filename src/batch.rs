@@ -47,13 +47,20 @@ pub fn expand(inputs: &[PathBuf], out_dir: &Path, is_video: impl Fn(&Path) -> bo
     jobs
 }
 
+/// The settings a skip decision depends on. A skip made with other settings (say a faster
+/// preset that can't reach the target) doesn't stop a run with these settings.
+fn settings_key(o: &Options) -> String {
+    format!("vmaf={} preset={} crf={}-{} min_savings={} force={}", o.target_vmaf, o.preset, o.min_crf, o.max_crf, o.min_savings, o.force)
+}
+
 /// Previous skip decisions, keyed by absolute input path and size (a changed file is retried).
-fn read_skips(log: &Path) -> HashMap<(PathBuf, u64), String> {
+/// Lines from older versions carry no settings and count for any settings.
+fn read_skips(log: &Path, settings: &str) -> HashMap<(PathBuf, u64), String> {
     let Ok(text) = std::fs::read_to_string(log) else { return HashMap::new() };
     text.lines()
         .filter_map(|l| {
             let f: Vec<&str> = l.split('\t').collect();
-            if f.len() < 5 || f[1] != "skip" {
+            if f.len() < 5 || f[1] != "skip" || f.get(5).is_some_and(|s| *s != settings) {
                 return None;
             }
             Some(((PathBuf::from(f[2]), f[3].parse().ok()?), f[4].to_string()))
@@ -61,11 +68,11 @@ fn read_skips(log: &Path) -> HashMap<(PathBuf, u64), String> {
         .collect()
 }
 
-fn log_line(log: &Path, status: &str, input: &Path, size: u64, detail: &str) -> Result<()> {
+fn log_line(log: &Path, status: &str, input: &Path, size: u64, detail: &str, settings: &str) -> Result<()> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let clean = |s: &str| s.replace(['\t', '\n'], " ");
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(log)?;
-    writeln!(f, "{now}\t{status}\t{}\t{size}\t{}", clean(&input.display().to_string()), clean(detail))?;
+    writeln!(f, "{now}\t{status}\t{}\t{size}\t{}\t{settings}", clean(&input.display().to_string()), clean(detail))?;
     Ok(())
 }
 
@@ -90,7 +97,8 @@ pub struct Summary {
 
 pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipped: bool) -> Result<Summary> {
     let log = out_dir.join(LOG_NAME);
-    let skips = if retry_skipped { HashMap::new() } else { read_skips(&log) };
+    let settings = settings_key(o);
+    let skips = if retry_skipped { HashMap::new() } else { read_skips(&log, &settings) };
     let mut sum = Summary::default();
     for (i, job) in jobs.iter().enumerate() {
         let abs = std::fs::canonicalize(&job.input).or_else(|_| std::path::absolute(&job.input))?;
@@ -116,7 +124,7 @@ pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipp
                     eprintln!("FAILED: {msg}");
                     end("error", &msg, 0);
                     sum.failed += 1;
-                    log_line(&log, "error", &abs, size, &msg)?;
+                    log_line(&log, "error", &abs, size, &msg, &settings)?;
                 }
                 _ => {
                     eprintln!("already done: {}", output.display());
@@ -141,7 +149,7 @@ pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipp
                 sum.bytes_in += size;
                 sum.bytes_out += out_size;
                 end("ok", &out.display().to_string(), out_size);
-                log_line(&log, "ok", &abs, size, &out.display().to_string())?;
+                log_line(&log, "ok", &abs, size, &out.display().to_string(), &settings)?;
             }
             Err(e) if events::is_cancelled(&e) => {
                 // Not logged: the next run picks the file up again (scene work resumes).
@@ -154,15 +162,37 @@ pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipp
                 eprintln!("skipped: {e}");
                 end("skip", &e.to_string(), 0);
                 sum.skipped += 1;
-                log_line(&log, "skip", &abs, size, &e.to_string())?;
+                log_line(&log, "skip", &abs, size, &e.to_string(), &settings)?;
             }
             Err(e) => {
                 eprintln!("FAILED: {e:#}");
                 end("error", &format!("{e:#}"), 0);
                 sum.failed += 1;
-                log_line(&log, "error", &abs, size, &format!("{e:#}"))?;
+                log_line(&log, "error", &abs, size, &format!("{e:#}"), &settings)?;
             }
         }
     }
     Ok(sum)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skips_only_count_for_the_same_settings() {
+        let dir = std::env::temp_dir().join(format!("av1opt-skiptest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join(LOG_NAME);
+        let p = Path::new("/videos/a.mp4");
+        log_line(&log, "skip", p, 10, "too lean", "vmaf=93 preset=10").unwrap();
+        // Older format without settings.
+        std::fs::OpenOptions::new().append(true).open(&log).map(|mut f| writeln!(f, "1\tskip\t/videos/b.mp4\t20\told")).unwrap().unwrap();
+        let same = read_skips(&log, "vmaf=93 preset=10");
+        let other = read_skips(&log, "vmaf=93 preset=6");
+        assert!(same.contains_key(&(p.to_path_buf(), 10)));
+        assert!(!other.contains_key(&(p.to_path_buf(), 10)));
+        assert!(other.contains_key(&(PathBuf::from("/videos/b.mp4"), 20)));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

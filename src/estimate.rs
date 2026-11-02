@@ -105,12 +105,13 @@ fn solve3(mut a: [[f64; 3]; 3], mut b: [f64; 3]) -> Option<[f64; 3]> {
         }
         a.swap(col, piv);
         b.swap(col, piv);
+        let (pivot_row, pivot_b) = (a[col], b[col]);
         for row in col + 1..3 {
-            let f = a[row][col] / a[col][col];
-            for k in col..3 {
-                a[row][k] -= f * a[col][k];
+            let f = a[row][col] / pivot_row[col];
+            for (x, p) in a[row].iter_mut().zip(pivot_row).skip(col) {
+                *x -= f * p;
             }
-            b[row] -= f * b[col];
+            b[row] -= f * pivot_b;
         }
     }
     let mut x = [0.0; 3];

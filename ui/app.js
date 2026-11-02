@@ -601,10 +601,11 @@ views.compare = (root, params) => {
   const wrap = h("div", { class: "empty" }, h("span", { class: "spin" }), " loading report…");
   root.append(wrap);
   let destroy = () => {};
+  let closed = false;
   api("/api/report?path=" + encodeURIComponent(reportPath))
-    .then((r) => { wrap.remove(); destroy = comparePlayer(root, r); })
+    .then((r) => { if (closed) return; wrap.remove(); destroy = comparePlayer(root, r); })
     .catch((e) => { wrap.className = "panel bad"; wrap.textContent = e.message; });
-  return () => destroy();
+  return () => { closed = true; destroy(); };
 };
 
 function mediaUrl(p) { return "/media?path=" + encodeURIComponent(p); }
@@ -785,7 +786,9 @@ function comparePlayer(root, r) {
     timeEl.textContent = `${tc(t)} / ${tc(duration)}`;
     head.setAttribute("x1", x(t)); head.setAttribute("x2", x(t));
     if (srcMode === "preview" && !vo.paused && t >= segEnd) { vo.pause(); seekTo(segEnd - 0.05); }
-    if (!vo.paused && !vs.seeking && vs.readyState >= 2) {
+    const srcT = t - offset;
+    const srcDone = srcT >= (vs.duration || Infinity) - 0.05;
+    if (!vo.paused && srcMode !== "loading" && !srcDone && !vs.seeking && vs.readyState >= 2) {
       if (vs.paused) vs.play().catch(() => {});
       const drift = vs.currentTime - (t - offset);
       if (Math.abs(drift) > 0.25) vs.currentTime = t - offset;
@@ -810,7 +813,7 @@ function comparePlayer(root, r) {
       const finish = (ok, why) => { if (done) return; done = true; clearTimeout(timer); v.removeEventListener("loadeddata", onData); v.removeEventListener("error", onErr); ok ? resolve() : reject(new Error(why)); };
       const onData = () => (v.videoWidth > 0 ? finish(true) : finish(false, "no decodable video track"));
       const onErr = () => finish(false, (v.error && v.error.message) || "cannot play this format");
-      const timer = setTimeout(() => finish(false, "timed out"), 12000);
+      const timer = setTimeout(() => finish(false, "timed out"), 30000);
       v.addEventListener("loadeddata", onData);
       v.addEventListener("error", onErr);
       v.src = url;
@@ -829,6 +832,8 @@ function comparePlayer(root, r) {
     vo.pause();
     busy(`Making a ${Math.round(secs)} s near-lossless H.264 preview of the source from ${tc(start)}…`);
     previewBtn.disabled = true;
+    const prev = { offset, segEnd, srcMode, src: vs.src };
+    srcMode = "loading";
     try {
       const p = await api("/api/preview", { path: r.input_path, kind: "transcode", start, secs });
       await tryLoad(vs, p.url);
@@ -839,6 +844,8 @@ function comparePlayer(root, r) {
       seekTo(offset);
       busy(null);
     } catch (e) {
+      ({ offset, segEnd, srcMode } = prev);
+      if (prev.src && srcMode !== "loading") { vs.src = prev.src; vs.currentTime = Math.max(0, vo.currentTime - offset); }
       busy(null);
       overlay.hidden = false;
       overlay.replaceChildren(h("div", { class: "bad" }, "Could not make a source preview: " + e.message));

@@ -91,7 +91,7 @@ impl Tools {
     /// Runs ffmpeg and returns its stderr. Fails with the tail of stderr on error.
     pub fn run(&self, args: &[String]) -> Result<String> {
         let mut cmd = self.command_for(args);
-        cmd.args(args).stdout(Stdio::null()).stderr(Stdio::piped());
+        cmd.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
         let child = self.spawn(&mut cmd)?;
         let out = self.finish(child)?;
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -114,7 +114,7 @@ impl Tools {
         if let Some(d) = dir {
             cmd.current_dir(d);
         }
-        cmd.args(["-progress", "pipe:1", "-nostats", "-v", "error"]).args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.args(["-progress", "pipe:1", "-nostats", "-v", "error"]).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = self.spawn(&mut cmd)?;
         let mut stderr = child.stderr.take().unwrap();
         let err_reader = std::thread::spawn(move || {
@@ -125,8 +125,9 @@ impl Tools {
 
         let start = Instant::now();
         let (mut done_secs, mut fps, mut frames) = (0.0_f64, String::new(), 0u64);
-        for line in BufReader::new(child.stdout.take().unwrap()).lines() {
-            let line = line?;
+        // Read errors end the loop instead of returning, so the child is always reaped
+        // (and untracked) below.
+        for line in BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok) {
             if let Some(us) = line.strip_prefix("out_time_us=").and_then(|v| v.parse::<f64>().ok()) {
                 done_secs = us / 1e6;
             } else if let Some(n) = line.strip_prefix("frame=").and_then(|v| v.trim().parse().ok()) {

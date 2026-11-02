@@ -255,6 +255,13 @@ fn resolve(report: &Path, p: &str, same_dir: bool) -> PathBuf {
     dir.ancestors().map(|a| a.join(&p)).find(|c| c.exists()).unwrap_or_else(|| dir.join(&p))
 }
 
+/// Reports are plain JSON on disk; only let them unlock video files, never arbitrary ones.
+fn allow_video(app: &App, p: &Path) {
+    if is_video(p) && p.is_file() {
+        app.allow(p);
+    }
+}
+
 fn report_files(dirs: &[PathBuf]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for d in dirs {
@@ -283,8 +290,8 @@ pub fn history(app: &App) -> Value {
             let input = resolve(&p, r["input"].as_str()?, false);
             let output = resolve(&p, r["output"].as_str()?, true);
             let mtime = std::fs::metadata(&p).ok()?.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_secs();
-            app.allow(&input);
-            app.allow(&output);
+            allow_video(app, &input);
+            allow_video(app, &output);
             Some(json!({
                 "report": p,
                 "input": input,
@@ -370,8 +377,8 @@ pub fn report(app: &App, path: &str) -> Result<Value> {
     let mut r: Value = serde_json::from_slice(&std::fs::read(&p)?).context("unreadable report")?;
     let input = resolve(&p, r["input"].as_str().unwrap_or(""), false);
     let output = resolve(&p, r["output"].as_str().unwrap_or(""), true);
-    app.allow(&input);
-    app.allow(&output);
+    allow_video(app, &input);
+    allow_video(app, &output);
     r["report_path"] = json!(p);
     r["input_path"] = json!(input);
     r["output_path"] = json!(output);

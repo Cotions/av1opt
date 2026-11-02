@@ -6,7 +6,7 @@ use crate::batch;
 use crate::encode::{Container, Options};
 use crate::events::{Event, Hooks};
 use crate::scan::is_video;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -131,6 +131,9 @@ pub struct Job {
     batch: Vec<batch::Job>,
     #[serde(skip)]
     hooks: Option<Arc<Hooks>>,
+    /// Cancel arrived before the job's hooks existed.
+    #[serde(skip)]
+    cancel_requested: bool,
 }
 
 #[derive(Default)]
@@ -167,14 +170,13 @@ pub fn add(app: &App, body: &Value) -> Result<Value> {
     }
     // Same safety rule as the command line, without the override.
     crate::fsguard::ensure_writable_location(&r.out_dir, false)?;
-    for i in &r.inputs {
-        if !i.exists() {
-            bail!("{} does not exist", i.display());
-        }
-    }
+    // Canonical paths: no `..` tricks when output folders are derived from scan roots.
+    let canon = |p: &PathBuf| std::fs::canonicalize(p).with_context(|| format!("{} does not exist", p.display()));
+    let inputs: Vec<PathBuf> = r.inputs.iter().map(canon).collect::<Result<_>>()?;
+    let roots: Vec<PathBuf> = r.roots.iter().filter_map(|p| std::fs::canonicalize(p).ok()).collect();
     let mut batch_jobs = Vec::new();
-    for input in &r.inputs {
-        let root = r.roots.iter().filter(|root| input.starts_with(root) && input != *root).max_by_key(|p| p.as_os_str().len());
+    for input in &inputs {
+        let root = roots.iter().filter(|root| input.starts_with(root) && input != *root).max_by_key(|p| p.as_os_str().len());
         let out_dir = match root {
             Some(root) if input.is_file() => {
                 let rel = input.parent().and_then(|p| p.strip_prefix(root).ok()).unwrap_or(Path::new(""));
@@ -186,6 +188,12 @@ pub fn add(app: &App, body: &Value) -> Result<Value> {
     }
     if batch_jobs.is_empty() {
         bail!("no video files in the selection");
+    }
+    for j in &batch_jobs {
+        if !j.out_dir.starts_with(&r.out_dir) {
+            bail!("{} would be written outside the output folder", j.input.display());
+        }
+        crate::fsguard::ensure_writable_location(&j.out_dir, false)?;
     }
     let files: Vec<FileState> = batch_jobs
         .iter()
@@ -213,7 +221,7 @@ pub fn add(app: &App, body: &Value) -> Result<Value> {
     app.jobs.jobs.lock().unwrap().push(Job {
         id,
         created: now(),
-        inputs: r.inputs,
+        inputs,
         out_dir: r.out_dir.clone(),
         options,
         status: "queued".into(),
@@ -222,6 +230,7 @@ pub fn add(app: &App, body: &Value) -> Result<Value> {
         files,
         batch: batch_jobs,
         hooks: None,
+        cancel_requested: false,
     });
     {
         let mut s = app.settings.lock().unwrap();
@@ -246,11 +255,10 @@ pub fn cancel(app: &App, id: u64) -> Result<Value> {
                 f.status = "cancelled".into();
             }
         }
-        "running" => {
-            if let Some(h) = &j.hooks {
-                h.cancel();
-            }
-        }
+        "running" => match &j.hooks {
+            Some(h) => h.cancel(),
+            None => j.cancel_requested = true,
+        },
         _ => {}
     }
     drop(jobs);
@@ -397,6 +405,9 @@ fn run_job(app: &Arc<App>, id: u64, opts: Result<Options>, retry: bool, out_dir:
     let batch_jobs = {
         let mut jobs = app.jobs.jobs.lock().unwrap();
         let Some(j) = jobs.iter_mut().find(|j| j.id == id) else { bail!("job vanished") };
+        if j.cancel_requested {
+            hooks.cancel();
+        }
         j.hooks = Some(hooks);
         std::mem::take(&mut j.batch)
     };

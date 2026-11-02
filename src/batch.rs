@@ -68,6 +68,13 @@ fn log_line(log: &Path, status: &str, input: &Path, size: u64, detail: &str) -> 
     Ok(())
 }
 
+/// Absolute input path recorded in an output's `.av1opt.json` report.
+fn report_input(output: &Path) -> Option<PathBuf> {
+    let r: serde_json::Value = serde_json::from_slice(&std::fs::read(output.with_extension("av1opt.json")).ok()?).ok()?;
+    let p = PathBuf::from(r["input"].as_str()?);
+    std::fs::canonicalize(&p).ok().or_else(|| std::path::absolute(&p).ok())
+}
+
 #[derive(Default)]
 pub struct Summary {
     pub ok: usize,
@@ -83,15 +90,27 @@ pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipp
     let skips = if retry_skipped { HashMap::new() } else { read_skips(&log) };
     let mut sum = Summary::default();
     for (i, job) in jobs.iter().enumerate() {
-        let abs = std::path::absolute(&job.input)?;
+        let abs = std::fs::canonicalize(&job.input).or_else(|_| std::path::absolute(&job.input))?;
         let size = std::fs::metadata(&job.input).map_or(0, |m| m.len());
         let stem = job.input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         let output = job.out_dir.join(format!("{stem}.{}", o.container.ext()));
         eprintln!("\n[{}/{}] {}", i + 1, jobs.len(), job.input.display());
 
         if output.exists() && !o.overwrite {
-            eprintln!("already done: {}", output.display());
-            sum.already_done += 1;
+            // Same file name from two input folders would map to one output; only count it as
+            // done if its report says it came from this input.
+            match report_input(&output) {
+                Some(src) if src != abs => {
+                    let msg = format!("output name collision: {} was made from {}", output.display(), src.display());
+                    eprintln!("FAILED: {msg}");
+                    sum.failed += 1;
+                    log_line(&log, "error", &abs, size, &msg)?;
+                }
+                _ => {
+                    eprintln!("already done: {}", output.display());
+                    sum.already_done += 1;
+                }
+            }
             continue;
         }
         if let Some(reason) = skips.get(&(abs.clone(), size)) {

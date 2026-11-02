@@ -83,7 +83,8 @@ since chunking needs a constant frame rate.
 Folders are walked recursively and their layout is mirrored under `--out-dir`. Every result is
 appended to `av1opt-log.tsv` there; re-running the same command resumes: finished files are
 skipped, and files skipped for a reason (low savings, ...) are not searched again unless
-`--retry-skipped` is given.
+`--retry-skipped` is given. If two inputs would produce the same output name (same file name
+from two input folders), the second is reported as a name collision instead of being skipped.
 
 ### Safety
 

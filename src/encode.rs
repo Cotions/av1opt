@@ -199,8 +199,10 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
 
     // Needs room for the encode plus slack; predicted size can be off for unusual content.
     // Scene mode holds the chunks, the joined stream and the final file at once.
+    // Lossless chunk references add up to ~2 GB each (4K) per worker.
     let copies = if scenes { 3.0 } else { 1.5 };
-    let need = (size as f64 * best.size_ratio.max(0.3) * copies) as u64 + 500_000_000;
+    let refs = if scenes { o.workers as u64 * 2_000_000_000 } else { 0 };
+    let need = (size as f64 * best.size_ratio.max(0.3) * copies) as u64 + 500_000_000 + refs;
     if let Some(free) = free_bytes(out_dir)
         && free < need
     {
@@ -225,6 +227,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
                 let pt = search::trial(tools, &info, &samples, &tmp.path, &probe, best.crf, vmaf_threads, 1.0)?;
                 let bias = best.mean_vmaf - pt.mean_vmaf;
                 samples.clear();
+                std::fs::create_dir_all(&work.path)?;
                 let (cuts, total_frames) = scenes::detect(tools, input, &info, &work.path)?;
                 let (first_pts, chunks) = scenes::bounds(&info, &cuts, total_frames);
                 eprintln!("{} scene cuts, {total_frames} frames, {} chunks", cuts.len(), chunks.len());
@@ -264,8 +267,9 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
 
     std::fs::rename(&partial, &output).or_else(|_| std::fs::copy(&partial, &output).map(|_| ()))?;
     let output_bytes = std::fs::metadata(&output)?.len();
+    let abs_input = std::fs::canonicalize(input)?;
     let report = Report {
-        input,
+        input: &abs_input,
         output: &output,
         source_bytes: size,
         output_bytes,
@@ -335,8 +339,8 @@ fn work_dir(input: &Path, out_dir: &Path, size: u64, o: &Options) -> Result<Work
         "v1|{}|{size}|{mtime}|{}|{}|{}|{}|{}|{}",
         std::path::absolute(input)?.display(), o.target_vmaf, o.preset, o.min_crf, o.max_crf, o.samples, o.sample_secs
     );
+    // Created only when chunk work starts, so skipped files leave nothing behind.
     let path = out_dir.join(format!("{WORK_PREFIX}{:016x}", scenes::fnv1a(&key)));
-    std::fs::create_dir_all(&path)?;
     Ok(WorkDir { path, key })
 }
 

@@ -1,9 +1,11 @@
 //! Runs ffmpeg with resource limits, progress reporting and VMAF parsing.
 
+use crate::events::{Cancelled, Event, Hooks};
 use anyhow::{Context, Result, bail};
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::Arc;
 use std::time::Instant;
 
 pub struct Tools {
@@ -11,6 +13,8 @@ pub struct Tools {
     pub ffprobe: String,
     /// Prepended to every ffmpeg call, e.g. a systemd-run scope with a memory cap.
     prefix: Vec<String>,
+    /// Progress listener and cancel switch (the UI); None on the command line.
+    pub hooks: Option<Arc<Hooks>>,
 }
 
 impl Tools {
@@ -27,7 +31,7 @@ impl Tools {
             }
             None => Vec::new(),
         };
-        Tools { ffmpeg, ffprobe, prefix }
+        Tools { ffmpeg, ffprobe, prefix, hooks: None }
     }
 
     /// Builds the ffmpeg command; with AV1OPT_DEBUG set, prints it first.
@@ -49,9 +53,47 @@ impl Tools {
         c
     }
 
+    /// Reports progress to the listener, if any.
+    pub fn emit(&self, e: Event) {
+        if let Some(h) = &self.hooks {
+            h.emit(e);
+        }
+    }
+
+    /// Fails with [`Cancelled`] once the user asked to stop.
+    pub fn check_cancel(&self) -> Result<()> {
+        match &self.hooks {
+            Some(h) if h.is_cancelled() => Err(Cancelled.into()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Starts a child that a cancel request can kill.
+    fn spawn(&self, cmd: &mut Command) -> Result<Child> {
+        self.check_cancel()?;
+        let child = cmd.spawn().context("failed to start ffmpeg")?;
+        if let Some(h) = &self.hooks {
+            h.track(child.id());
+        }
+        Ok(child)
+    }
+
+    fn finish(&self, child: Child) -> Result<Output> {
+        let id = child.id();
+        let out = child.wait_with_output();
+        if let Some(h) = &self.hooks {
+            h.untrack(id);
+        }
+        self.check_cancel()?;
+        Ok(out?)
+    }
+
     /// Runs ffmpeg and returns its stderr. Fails with the tail of stderr on error.
     pub fn run(&self, args: &[String]) -> Result<String> {
-        let out = self.command_for(args).args(args).output().context("failed to start ffmpeg")?;
+        let mut cmd = self.command_for(args);
+        cmd.args(args).stdout(Stdio::null()).stderr(Stdio::piped());
+        let child = self.spawn(&mut cmd)?;
+        let out = self.finish(child)?;
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         if !out.status.success() {
             bail!("ffmpeg failed ({}):\n{}", out.status, tail(&stderr, 15));
@@ -72,13 +114,8 @@ impl Tools {
         if let Some(d) = dir {
             cmd.current_dir(d);
         }
-        let mut child = cmd
-            .args(["-progress", "pipe:1", "-nostats", "-v", "error"])
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("failed to start ffmpeg")?;
+        cmd.args(["-progress", "pipe:1", "-nostats", "-v", "error"]).args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = self.spawn(&mut cmd)?;
         let mut stderr = child.stderr.take().unwrap();
         let err_reader = std::thread::spawn(move || {
             let mut s = String::new();
@@ -100,11 +137,18 @@ impl Tools {
                 let frac = (done_secs / total_secs).clamp(0.0, 1.0);
                 let elapsed = start.elapsed().as_secs_f64();
                 let eta = if frac > 0.01 { elapsed / frac - elapsed } else { 0.0 };
-                eprint!("\r{label} {:5.1}%  {fps:>6} fps  ETA {}   ", frac * 100.0, hms(eta));
+                if self.hooks.is_some() {
+                    self.emit(Event::Progress { label: label.to_string(), frac, fps: fps.trim().parse().unwrap_or(0.0), eta_secs: eta });
+                } else {
+                    eprint!("\r{label} {:5.1}%  {fps:>6} fps  ETA {}   ", frac * 100.0, hms(eta));
+                }
             }
         }
-        eprintln!();
-        let status = child.wait()?;
+        if self.hooks.is_none() {
+            eprintln!();
+        }
+        let out = self.finish(child)?;
+        let status = out.status;
         let stderr = err_reader.join().unwrap_or_default();
         if !status.success() {
             bail!("ffmpeg failed ({status}):\n{}", tail(&stderr, 15));

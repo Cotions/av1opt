@@ -1,5 +1,6 @@
 //! Single-file optimize: CRF search, full encode, verification. Never modifies the input.
 
+use crate::events::Event;
 use crate::probe::{self, MediaInfo};
 use crate::history;
 use crate::scenes;
@@ -156,6 +157,10 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         "{}: {} {}x{} {:.2} fps, {}, {:.1} Mbps video",
         input.display(), info.codec, info.width, info.height, info.fps, hms(info.duration_s), info.video_bitrate / 1e6
     );
+    tools.emit(Event::Source {
+        codec: info.codec.clone(), width: info.width, height: info.height, fps: info.fps, duration_s: info.duration_s,
+        video_mbps: info.video_bitrate / 1e6, hdr: info.hdr,
+    });
     // Scene mode joins constant-rate chunks; a variable-rate source would be retimed, so it
     // keeps the single-pass path.
     let mut notes = Vec::new();
@@ -182,8 +187,10 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         }
         None => {
             eprintln!("searching CRF for VMAF >= {} ({model}, preset {})", o.target_vmaf, o.preset);
+            tools.emit(Event::Phase { phase: "sampling".into(), detail: format!("{} samples", o.samples) });
             let samples = search::extract_samples(tools, input, &info, &tmp.path, o.samples, o.sample_secs)?;
             let params = SearchParams { target_vmaf: o.target_vmaf, min_crf: o.min_crf, max_crf: o.max_crf, vmaf_threads };
+            tools.emit(Event::Phase { phase: "searching".into(), detail: format!("VMAF >= {} ({model}, preset {})", o.target_vmaf, o.preset) });
             let (best, trials) = search::search(tools, &info, &samples, &tmp.path, &enc, &params)?;
             (best, trials, samples)
         }
@@ -192,6 +199,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         skip!("even CRF {} misses VMAF {}; source is too lean to re-encode at this target", o.min_crf, o.target_vmaf);
     };
     let predicted_savings = 1.0 - best.size_ratio;
+    tools.emit(Event::Chosen { crf: best.crf, vmaf: best.mean_vmaf, predicted_savings });
     eprintln!("chose crf {} (VMAF {:.2}), predicted video savings {:.0}%", best.crf, best.mean_vmaf, predicted_savings * 100.0);
     if predicted_savings < o.min_savings && !o.force {
         skip!("predicted savings {:.0}% below --min-savings {:.0}%", predicted_savings * 100.0, o.min_savings * 100.0);
@@ -228,6 +236,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
                 let bias = best.mean_vmaf - pt.mean_vmaf;
                 samples.clear();
                 std::fs::create_dir_all(&work.path)?;
+                tools.emit(Event::Phase { phase: "scenes".into(), detail: "finding scene changes".into() });
                 let (cuts, total_frames) = scenes::detect(tools, input, &info, &work.path)?;
                 let (first_pts, chunks) = scenes::bounds(&info, &cuts, total_frames);
                 eprintln!("{} scene cuts, {total_frames} frames, {} chunks", cuts.len(), chunks.len());
@@ -242,6 +251,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
             min_crf: o.min_crf, max_crf: o.max_crf, vmaf_threads, workers: o.workers,
         };
         let chunks = scenes::encode_all(&ctx, &plan)?;
+        tools.emit(Event::Phase { phase: "muxing".into(), detail: format!("joining {} chunks", chunks.len()) });
         let video = scenes::concat(&work.path, chunks.len())?;
         let (args, streams) = mux_args(&video, input, &info, o.container, &covers, &partial, &mut notes);
         tools.run(&args)?;
@@ -251,7 +261,9 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         let (args, streams) = full_encode_args(input, &info, &enc, best.crf, o.container, &covers, &partial, &mut notes);
         for n in &notes {
             eprintln!("note: {n}");
+            tools.emit(Event::Note { text: n.clone() });
         }
+        tools.emit(Event::Phase { phase: "encoding".into(), detail: format!("crf {}, preset {}", best.crf, o.preset) });
         tools.run_with_progress(&args, info.duration_s, "encoding")?;
         (streams, None, None)
     };
@@ -259,18 +271,21 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     if chunks.is_some() {
         for n in &notes {
             eprintln!("note: {n}");
+            tools.emit(Event::Note { text: n.clone() });
         }
     }
 
     eprintln!("verifying");
+    tools.emit(Event::Phase { phase: "verifying".into(), detail: "streams, duration, VMAF spot checks".into() });
     let (verify_vmaf, out_info) = verify(tools, input, &info, &partial, &streams, expect_frames, o, vmaf_threads, &tmp.path)?;
 
     std::fs::rename(&partial, &output).or_else(|_| std::fs::copy(&partial, &output).map(|_| ()))?;
     let output_bytes = std::fs::metadata(&output)?.len();
     let abs_input = std::fs::canonicalize(input)?;
+    let abs_output = std::fs::canonicalize(&output)?;
     let report = Report {
         input: &abs_input,
-        output: &output,
+        output: &abs_output,
         source_bytes: size,
         output_bytes,
         savings: 1.0 - output_bytes as f64 / size as f64,
@@ -559,6 +574,7 @@ fn verify(
             }
         }
         eprintln!("  spot check at {}: VMAF {v:.2}", hms(start));
+        tools.emit(Event::SpotCheck { at_secs: start, vmaf: v });
         scores.push(v);
         let _ = std::fs::remove_file(&r);
         let _ = std::fs::remove_file(&d);

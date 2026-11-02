@@ -1,31 +1,21 @@
 mod batch;
 mod encode;
 mod estimate;
+mod events;
 mod fsguard;
 mod history;
 mod probe;
 mod report;
+mod scan;
 mod scenes;
 mod search;
 mod tools;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
-use estimate::{SizeRange, Verdict};
-use probe::MediaInfo;
-use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use scan::is_video;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::UNIX_EPOCH;
-use walkdir::WalkDir;
 
-const VIDEO_EXTS: &[&str] = &[
-    "mp4", "mkv", "m4v", "mov", "webm", "avi", "wmv", "flv", "ts", "m2ts", "mpg", "mpeg", "3gp",
-];
-const SKIP_DIRS: &[&str] = &["System Volume Information", "$RECYCLE.BIN", "lost+found"];
 
 #[derive(Parser)]
 #[command(version, about = "Find videos worth re-encoding to AV1 and estimate the savings")]
@@ -123,25 +113,6 @@ enum Cmd {
     },
 }
 
-/// Probe results are cached by path, size and mtime so rescans of big libraries are fast.
-#[derive(Serialize, Deserialize, Clone)]
-struct CacheEntry {
-    size: u64,
-    mtime: u64,
-    info: Option<MediaInfo>,
-    error: Option<String>,
-}
-
-pub struct FileResult {
-    pub path: PathBuf,
-    pub root: PathBuf,
-    pub size: u64,
-    pub info: Option<MediaInfo>,
-    pub error: Option<String>,
-    pub verdict: Verdict,
-    pub estimate: SizeRange,
-}
-
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Scan { paths, ffprobe, jobs, min_savings, csv, top, target_vmaf } => {
@@ -211,78 +182,19 @@ fn memory_cap(setting: &str, workers: u8) -> Option<String> {
 }
 
 fn scan(paths: &[PathBuf], ffprobe: &str, jobs: usize, min_savings: f64, csv: Option<&Path>, top: usize, model: &estimate::Model) -> Result<()> {
-    rayon::ThreadPoolBuilder::new().num_threads(jobs).build_global()?;
-
-    let mut files: Vec<(PathBuf, PathBuf, u64, u64)> = Vec::new();
-    for root in paths {
-        for entry in WalkDir::new(root).into_iter().filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            !(e.file_type().is_dir() && (SKIP_DIRS.contains(&name.as_ref()) || name.starts_with(".Trash")))
-        }) {
-            let Ok(entry) = entry else { continue };
-            if !entry.file_type().is_file() || !is_video(entry.path()) {
-                continue;
-            }
-            let Ok(meta) = entry.metadata() else { continue };
-            let mtime = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
-            files.push((entry.path().to_path_buf(), root.clone(), meta.len(), mtime));
+    let progress = |n: usize, total: usize| {
+        if n == 0 {
+            eprintln!("found {total} video files");
+        } else if n.is_multiple_of(250) || n == total {
+            eprint!("\rprobed {n}/{total}");
         }
-    }
-    eprintln!("found {} video files", files.len());
-
-    let cache_path = cache_file()?;
-    let cache: HashMap<PathBuf, CacheEntry> = std::fs::read(&cache_path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
-    let cache = Mutex::new(cache);
-    let done = AtomicUsize::new(0);
-    let fresh = AtomicUsize::new(0);
-    let total = files.len();
-
-    // Forget files that were under the scanned folders last time but are gone now.
-    {
-        let found: std::collections::HashSet<&Path> = files.iter().map(|f| f.0.as_path()).collect();
-        let mut c = cache.lock().unwrap();
-        let before = c.len();
-        c.retain(|p, _| found.contains(p.as_path()) || !paths.iter().any(|root| p.starts_with(root)));
-        if c.len() < before {
-            eprintln!("dropped {} cache entries for files that no longer exist", before - c.len());
-        }
-    }
-
-    let results: Vec<FileResult> = files
-        .par_iter()
-        .map(|(path, root, size, mtime)| {
-            let cached = cache.lock().unwrap().get(path).filter(|c| c.size == *size && c.mtime == *mtime).cloned();
-            let entry = cached.unwrap_or_else(|| {
-                let (info, error) = match probe::probe(ffprobe, path, *size) {
-                    Ok(i) => (Some(i), None),
-                    Err(e) => (None, Some(format!("{e:#}"))),
-                };
-                let e = CacheEntry { size: *size, mtime: *mtime, info, error };
-                let mut c = cache.lock().unwrap();
-                c.insert(path.clone(), e.clone());
-                // Save progress periodically so a crash doesn't lose a long scan.
-                if fresh.fetch_add(1, Ordering::Relaxed) % 500 == 499 {
-                    let _ = save_cache(&cache_path, &c);
-                }
-                e
-            });
-            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if n.is_multiple_of(250) || n == total {
-                eprint!("\rprobed {n}/{total}");
-            }
-            let (verdict, estimate) = match &entry.info {
-                Some(i) => estimate::judge(i, *size, min_savings, model),
-                None => (Verdict::Unreadable, SizeRange { low: *size as f64, likely: *size as f64, high: *size as f64 }),
-            };
-            FileResult { path: path.clone(), root: root.clone(), size: *size, info: entry.info, error: entry.error, verdict, estimate }
-        })
-        .collect();
+    };
+    let (results, stats) = scan::collect(paths, ffprobe, jobs, min_savings, model, &progress)?;
     eprintln!();
-    save_cache(&cache_path, &cache.lock().unwrap())?;
-    eprintln!("probed {} new files, {} from cache", fresh.load(Ordering::Relaxed), total - fresh.load(Ordering::Relaxed));
+    if stats.dropped > 0 {
+        eprintln!("dropped {} cache entries for files that no longer exist", stats.dropped);
+    }
+    eprintln!("probed {} new files, {} from cache", stats.fresh, stats.cached);
 
     if model.samples == 0 {
         eprintln!("estimates: built-in pilot model (no encodes in the history yet; `encode` improves them)");
@@ -294,27 +206,5 @@ fn scan(paths: &[PathBuf], ffprobe: &str, jobs: usize, min_savings: f64, csv: Op
         report::write_csv(&results, csv)?;
         eprintln!("wrote {}", csv.display());
     }
-    Ok(())
-}
-
-fn is_video(p: &Path) -> bool {
-    p.extension().and_then(|e| e.to_str()).is_some_and(|e| VIDEO_EXTS.contains(&e.to_ascii_lowercase().as_str()))
-}
-
-fn cache_file() -> Result<PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .context("no HOME or XDG_CACHE_HOME")?;
-    let dir = base.join("av1opt");
-    std::fs::create_dir_all(&dir)?;
-    // Bump the version when MediaInfo gains fields that change verdicts, so old entries are re-probed.
-    Ok(dir.join("probe-cache-v2.json"))
-}
-
-fn save_cache(path: &Path, cache: &HashMap<PathBuf, CacheEntry>) -> Result<()> {
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec(cache)?)?;
-    std::fs::rename(&tmp, path)?;
     Ok(())
 }

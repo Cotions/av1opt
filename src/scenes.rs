@@ -6,6 +6,7 @@
 //! lossless references (constant frame rate), which serve as encoder input and VMAF reference.
 //! Finished chunks survive interruption, so a re-run resumes where it stopped.
 
+use crate::events::Event;
 use crate::probe::MediaInfo;
 use crate::search::{self, EncodeSettings, Trial};
 use crate::tools::{Tools, hms, path_arg};
@@ -333,6 +334,8 @@ pub fn encode_all(c: &Ctx, plan: &Plan) -> Result<Vec<ChunkResult>> {
     if todo.len() < n {
         eprintln!("resuming: {} of {n} chunks already encoded", n - todo.len());
     }
+    c.tools.emit(Event::ChunkPlan { chunks: n, done: n - todo.len() });
+    c.tools.emit(Event::Phase { phase: "chunks".into(), detail: format!("{} of {n} chunks to encode", todo.len()) });
     eprintln!(
         "encoding {} chunks (whole-file crf {}, probe preset {}, bias {:+.2})",
         todo.len(), plan.best.crf, c.probe.preset, plan.bias
@@ -352,6 +355,11 @@ pub fn encode_all(c: &Ctx, plan: &Plan) -> Result<Vec<ChunkResult>> {
                             let done = frames_done.fetch_add(r.frames, Ordering::Relaxed) + r.frames;
                             let frac = (done as f64 / todo_frames.max(1) as f64).min(1.0);
                             let el = t0.elapsed().as_secs_f64();
+                            let eta = if frac > 0.0 { el / frac - el } else { 0.0 };
+                            c.tools.emit(Event::Chunk {
+                                index: i, chunks: n, start_secs: r.start_secs, frames: r.frames, crf: r.crf, vmaf: r.vmaf,
+                                bytes: r.bytes, corrected: r.corrected, frac, eta_secs: eta,
+                            });
                             let probes: Vec<String> = r.probes.iter().map(|(c, v)| format!("{c}:{v:.1}")).collect();
                             eprintln!(
                                 "  chunk {}/{n} at {} ({} frames): crf {}{} [probes {}] VMAF {:.2}, {:.2} MB | {:.0}% ETA {}",

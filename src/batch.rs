@@ -2,6 +2,7 @@
 //! result to `av1opt-log.tsv`, and resumes by skipping finished or previously skipped files.
 
 use crate::encode::{self, Options, Skip};
+use crate::events::{self, Event};
 use crate::tools::Tools;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -83,6 +84,8 @@ pub struct Summary {
     pub already_done: usize,
     pub bytes_in: u64,
     pub bytes_out: u64,
+    /// The user stopped the run; remaining files were not started.
+    pub cancelled: bool,
 }
 
 pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipped: bool) -> Result<Summary> {
@@ -95,6 +98,14 @@ pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipp
         let stem = job.input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         let output = job.out_dir.join(format!("{stem}.{}", o.container.ext()));
         eprintln!("\n[{}/{}] {}", i + 1, jobs.len(), job.input.display());
+        if tools.check_cancel().is_err() {
+            sum.cancelled = true;
+            break;
+        }
+        tools.emit(Event::FileStart { index: i, total: jobs.len(), input: abs.clone(), output: output.clone() });
+        let end = |status: &str, detail: &str, out_bytes: u64| {
+            tools.emit(Event::FileEnd { index: i, status: status.into(), detail: detail.into(), input_bytes: size, output_bytes: out_bytes });
+        };
 
         if output.exists() && !o.overwrite {
             // Same file name from two input folders would map to one output; only count it as
@@ -103,11 +114,13 @@ pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipp
                 Some(src) if src != abs => {
                     let msg = format!("output name collision: {} was made from {}", output.display(), src.display());
                     eprintln!("FAILED: {msg}");
+                    end("error", &msg, 0);
                     sum.failed += 1;
                     log_line(&log, "error", &abs, size, &msg)?;
                 }
                 _ => {
                     eprintln!("already done: {}", output.display());
+                    end("done_before", &output.display().to_string(), std::fs::metadata(&output).map_or(0, |m| m.len()));
                     sum.already_done += 1;
                 }
             }
@@ -115,6 +128,7 @@ pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipp
         }
         if let Some(reason) = skips.get(&(abs.clone(), size)) {
             eprintln!("skipped earlier: {reason} (use --retry-skipped to try again)");
+            end("skip", &format!("skipped earlier: {reason}"), 0);
             sum.skipped += 1;
             continue;
         }
@@ -126,15 +140,25 @@ pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipp
                 sum.ok += 1;
                 sum.bytes_in += size;
                 sum.bytes_out += out_size;
+                end("ok", &out.display().to_string(), out_size);
                 log_line(&log, "ok", &abs, size, &out.display().to_string())?;
+            }
+            Err(e) if events::is_cancelled(&e) => {
+                // Not logged: the next run picks the file up again (scene work resumes).
+                eprintln!("cancelled");
+                end("cancelled", "", 0);
+                sum.cancelled = true;
+                break;
             }
             Err(e) if e.downcast_ref::<Skip>().is_some() => {
                 eprintln!("skipped: {e}");
+                end("skip", &e.to_string(), 0);
                 sum.skipped += 1;
                 log_line(&log, "skip", &abs, size, &e.to_string())?;
             }
             Err(e) => {
                 eprintln!("FAILED: {e:#}");
+                end("error", &format!("{e:#}"), 0);
                 sum.failed += 1;
                 log_line(&log, "error", &abs, size, &format!("{e:#}"))?;
             }

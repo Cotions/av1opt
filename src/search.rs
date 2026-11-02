@@ -153,6 +153,7 @@ pub fn extract_samples(tools: &Tools, input: &Path, info: &MediaInfo, tmp: &Path
         .map(|(i, (start, secs))| {
             let reference = tmp.join(format!("sample{i}.ref.mkv"));
             eprintln!("  sample {}/{n} at {} ({secs:.0}s)", i + 1, crate::tools::hms(start));
+            tools.emit(crate::events::Event::Phase { phase: "sampling".into(), detail: format!("sample {}/{n} at {}", i + 1, crate::tools::hms(start)) });
             extract_reference(tools, input, info, true, start, secs, &reference)?;
             Ok(Sample { reference, secs })
         })
@@ -231,6 +232,7 @@ pub fn search(
             "  crf {crf:2}: VMAF {:.2} (worst sample {:.2}), size ~{:.0}% of source",
             t.mean_vmaf, t.min_vmaf, t.size_ratio * 100.0
         );
+        tools.emit(crate::events::Event::Trial { crf: t.crf, mean_vmaf: t.mean_vmaf, min_vmaf: t.min_vmaf, size_ratio: t.size_ratio });
         trials.insert(crf, t);
         Ok(t.mean_vmaf)
     })?;

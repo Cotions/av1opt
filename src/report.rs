@@ -1,6 +1,6 @@
 //! Human-readable summary and per-file CSV for a scan.
 
-use crate::FileResult;
+use crate::scan::FileResult;
 use crate::estimate::{Verdict, bits_per_pixel};
 use anyhow::Result;
 use std::collections::BTreeMap;

@@ -26,6 +26,12 @@ Probes every video in parallel (results cached in `~/.cache/av1opt/`), sorts eac
 by codec and folder plus the biggest wins. Savings are a rough metadata-based estimate shown as a
 range; `encode` measures the real numbers. Never writes to the scanned folders.
 
+Every successful `encode` appends its source and output bitrates to
+`~/.local/share/av1opt/history.jsonl`. `scan` fits its size model to that history (a log-linear
+fit of AV1 bits per pixel against source bits per pixel and resolution, pulled toward the
+built-in pilot model while there are few encodes), so estimates and their ranges tighten as
+you encode more.
+
 ## encode
 
 ```

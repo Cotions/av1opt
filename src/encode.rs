@@ -1,6 +1,7 @@
 //! Single-file optimize: CRF search, full encode, verification. Never modifies the input.
 
 use crate::probe::{self, MediaInfo};
+use crate::history;
 use crate::scenes;
 use crate::search::{self, EncodeSettings, SearchParams, Trial};
 use crate::tools::{Tools, hms, path_arg};
@@ -259,7 +260,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     }
 
     eprintln!("verifying");
-    let verify_vmaf = verify(tools, input, &info, &partial, &streams, expect_frames, o, vmaf_threads, &tmp.path)?;
+    let (verify_vmaf, out_info) = verify(tools, input, &info, &partial, &streams, expect_frames, o, vmaf_threads, &tmp.path)?;
 
     std::fs::rename(&partial, &output).or_else(|_| std::fs::copy(&partial, &output).map(|_| ()))?;
     let output_bytes = std::fs::metadata(&output)?.len();
@@ -283,6 +284,15 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         notes: &notes,
     };
     std::fs::write(output.with_extension("av1opt.json"), serde_json::to_vec_pretty(&report)?)?;
+    // Chunk sizes are exact; container-reported bitrates can include audio (Matroska).
+    let video_bitrate = match &chunks {
+        Some(c) => c.iter().map(|r| r.bytes).sum::<u64>() as f64 * 8.0 / info.duration_s,
+        None => out_info.video_bitrate,
+    };
+    let record = history::Record::new(&info, video_bitrate, o.target_vmaf, o.preset, report.mode);
+    if let Err(e) = history::append(&record) {
+        eprintln!("warning: could not record this encode in the history: {e:#}");
+    }
     if let Some(w) = &work
         && !o.keep_temp
     {
@@ -498,7 +508,7 @@ fn verify(
     o: &Options,
     threads: usize,
     tmp: &Path,
-) -> Result<Vec<f64>> {
+) -> Result<(Vec<f64>, MediaInfo)> {
     let out_info = probe::probe(&tools.ffprobe, out, std::fs::metadata(out)?.len())?;
     if out_info.codec != "av1" {
         bail!("verify: output video is {}, expected av1", out_info.codec);
@@ -554,7 +564,7 @@ fn verify(
     if let Some(bad) = scores.iter().find(|&&v| v < floor) {
         bail!("verify: spot check VMAF {bad:.2} below {floor:.1}; keeping nothing");
     }
-    Ok(scores)
+    Ok((scores, out_info))
 }
 
 fn free_bytes(dir: &Path) -> Option<u64> {

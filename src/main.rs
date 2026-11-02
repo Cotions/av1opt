@@ -2,6 +2,7 @@ mod batch;
 mod encode;
 mod estimate;
 mod fsguard;
+mod history;
 mod probe;
 mod report;
 mod scenes;
@@ -55,6 +56,9 @@ enum Cmd {
         /// Number of top candidates to list.
         #[arg(long, default_value_t = 15)]
         top: usize,
+        /// VMAF target the estimates assume (past encodes for nearby targets calibrate them).
+        #[arg(long, default_value_t = 93.0)]
+        target_vmaf: f64,
     },
     /// Re-encode videos to AV1 at a target quality. Inputs are never modified; results go to --out-dir.
     /// Folders are processed recursively and their layout is mirrored. Re-running resumes.
@@ -140,8 +144,9 @@ pub struct FileResult {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
-        Cmd::Scan { paths, ffprobe, jobs, min_savings, csv, top } => {
-            scan(&paths, &ffprobe, jobs, min_savings, csv.as_deref(), top)
+        Cmd::Scan { paths, ffprobe, jobs, min_savings, csv, top, target_vmaf } => {
+            let model = estimate::Model::fit(&history::load(), target_vmaf);
+            scan(&paths, &ffprobe, jobs, min_savings, csv.as_deref(), top, &model)
         }
         Cmd::Encode {
             inputs, out_dir, container, target_vmaf, preset, min_crf, max_crf, samples, sample_secs,
@@ -203,7 +208,7 @@ fn memory_cap(setting: &str, workers: u8) -> Option<String> {
     Some(format!("{}M", mb / workers.max(1) as u64))
 }
 
-fn scan(paths: &[PathBuf], ffprobe: &str, jobs: usize, min_savings: f64, csv: Option<&Path>, top: usize) -> Result<()> {
+fn scan(paths: &[PathBuf], ffprobe: &str, jobs: usize, min_savings: f64, csv: Option<&Path>, top: usize, model: &estimate::Model) -> Result<()> {
     rayon::ThreadPoolBuilder::new().num_threads(jobs).build_global()?;
 
     let mut files: Vec<(PathBuf, PathBuf, u64, u64)> = Vec::new();
@@ -256,7 +261,7 @@ fn scan(paths: &[PathBuf], ffprobe: &str, jobs: usize, min_savings: f64, csv: Op
                 eprint!("\rprobed {n}/{total}");
             }
             let (verdict, estimate) = match &entry.info {
-                Some(i) => estimate::judge(i, *size, min_savings),
+                Some(i) => estimate::judge(i, *size, min_savings, model),
                 None => (Verdict::Unreadable, SizeRange { low: *size as f64, likely: *size as f64, high: *size as f64 }),
             };
             FileResult { path: path.clone(), root: root.clone(), size: *size, info: entry.info, error: entry.error, verdict, estimate }
@@ -266,6 +271,11 @@ fn scan(paths: &[PathBuf], ffprobe: &str, jobs: usize, min_savings: f64, csv: Op
     save_cache(&cache_path, &cache.lock().unwrap())?;
     eprintln!("probed {} new files, {} from cache", fresh.load(Ordering::Relaxed), total - fresh.load(Ordering::Relaxed));
 
+    if model.samples == 0 {
+        eprintln!("estimates: built-in pilot model (no encodes in the history yet; `encode` improves them)");
+    } else {
+        eprintln!("estimates: learned from {} past encodes (spread x{:.2})", model.samples, (1.28 * model.sigma).exp());
+    }
     report::print(&results, top);
     if let Some(csv) = csv {
         report::write_csv(&results, csv)?;

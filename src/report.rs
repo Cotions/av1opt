@@ -6,8 +6,9 @@ use anyhow::Result;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+/// Size with a unit that keeps small folders readable (GB for big totals, MB below 1 GB).
 fn gb(bytes: f64) -> String {
-    format!("{:.1} GB", bytes / 1e9)
+    if bytes.abs() >= 1e9 { format!("{:.1} GB", bytes / 1e9) } else { format!("{:.0} MB", bytes / 1e6) }
 }
 
 #[derive(Default)]

@@ -622,6 +622,10 @@ function comparePlayer(root, r) {
   const vs = h("video", { preload: "auto", playsinline: true, muted: true });
   vs.muted = true;
   let offset = 0, segEnd = Infinity, srcMode = "direct";
+  // Extra source shift in seconds, found by auto-align or set by hand: variable-frame-rate
+  // sources are retimed by the encode, so frame k of the source isn't always at k/fps.
+  let nudge = 0;
+  const srcTime = (t) => Math.max(0, t - offset + nudge);
   let split = 0.5, zoom = 1, origin = "50% 50%";
 
   const layerS = h("div", { class: "layer" }, vs);
@@ -678,6 +682,62 @@ function comparePlayer(root, r) {
   const step = (n) => { vo.pause(); seekTo(vo.currentTime + n / fps); };
   const srcStatus = h("span", { class: "dim" });
   const previewBtn = h("button", { class: "small", onclick: () => makePreview(vo.currentTime) }, "Preview source from here");
+  const alignEl = h("span", { class: "mono" }, "0 frames");
+  function setNudge(v, how) {
+    nudge = v;
+    const k = Math.round(nudge * fps);
+    alignEl.textContent = `${k > 0 ? "+" : ""}${k} frame${Math.abs(k) === 1 ? "" : "s"}${how ? " (" + how + ")" : ""}`;
+    vs.currentTime = srcTime(vo.currentTime);
+  }
+  // Picks the source shift (−3..+3 frames) whose picture differs least from the output at a
+  // few paused positions. Ties keep the current shift, so static scenes change nothing.
+  const seekWait = (v, t) => new Promise((res) => {
+    if (Math.abs(v.currentTime - t) < 1e-4 && !v.seeking) return res();
+    const done = () => { clearTimeout(tm); res(); };
+    const tm = setTimeout(done, 3000);
+    v.addEventListener("seeked", done, { once: true });
+    v.currentTime = t;
+  });
+  const grab = (v) => {
+    const c = document.createElement("canvas"); c.width = 128; c.height = 72;
+    const g = c.getContext("2d", { willReadFrequently: true }); g.drawImage(v, 0, 0, 128, 72);
+    return g.getImageData(0, 0, 128, 72).data;
+  };
+  const pixDiff = (a, b) => { let d = 0; for (let i = 0; i < a.length; i += 4) d += Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]); return d; };
+  let aligning = false;
+  async function autoAlign() {
+    if (aligning || srcMode === "loading" || !vs.videoWidth || !vo.videoWidth) return;
+    aligning = true;
+    const was = vo.currentTime;
+    vo.pause();
+    alignEl.textContent = "aligning…";
+    try {
+      const lo = srcMode === "preview" ? offset : 0, hi = srcMode === "preview" ? segEnd : duration;
+      const span = Math.max(0, hi - lo - 1);
+      const points = [0.25, 0.5, 0.75].map((f) => lo + 0.5 + span * f);
+      const score = new Map();
+      const base = Math.round(nudge * fps);
+      for (const t of points) {
+        await seekWait(vo, t);
+        const o = grab(vo);
+        for (let k = base - 3; k <= base + 3; k++) {
+          await seekWait(vs, Math.max(0, t - offset + k / fps));
+          score.set(k, (score.get(k) || 0) + pixDiff(o, grab(vs)));
+        }
+      }
+      let best = base;
+      for (const [k, v] of score) if (v < score.get(best)) best = k;
+      // Only move for a clear win (3% less difference), so noise doesn't shift the source.
+      if (score.get(best) >= score.get(base) * 0.97) best = base;
+      setNudge(best / fps, "auto");
+    } catch (e) {
+      alignEl.textContent = "align failed";
+    } finally {
+      aligning = false;
+      await seekWait(vo, was);
+      vs.currentTime = srcTime(was);
+    }
+  }
 
   const controls = h("div", { class: "controls" },
     playBtn, h("button", { title: "Previous frame (,)", onclick: () => step(-1) }, "◀ frame"), h("button", { title: "Next frame (.)", onclick: () => step(1) }, "frame ▶"),
@@ -754,6 +814,10 @@ function comparePlayer(root, r) {
       r.search.map((t) => h("tr", {}, h("td", {}, t.crf), h("td", { class: "num " + (t.mean_vmaf >= target ? "ok" : "bad") }, num(t.mean_vmaf)), h("td", { class: "num dim" }, num(t.min_vmaf)), h("td", { class: "num" }, pct(t.size_ratio)))))) : null,
     (r.notes || []).length ? h("div", { class: "panel" }, h("h3", {}, "Notes"), r.notes.map((n) => h("div", { class: "dim" }, n))) : null,
     h("div", { class: "panel" }, h("h3", {}, "Playback"), h("div", {}, srcStatus), h("div", { class: "row" }, previewBtn),
+      h("h3", {}, "Frame alignment"),
+      h("div", { class: "row" }, h("button", { class: "small", title: "Shift the source one frame earlier", onclick: () => setNudge(nudge - 1 / fps, "manual") }, "−1"),
+        alignEl, h("button", { class: "small", title: "Shift the source one frame later", onclick: () => setNudge(nudge + 1 / fps, "manual") }, "+1"),
+        h("button", { class: "small", onclick: () => autoAlign() }, "Auto")),
       h("p", { class: "dim" }, "Drag on the picture to move the split. Double-click zooms in at that point (4× → back to 1×); shift-click moves the zoom centre. Keys: space play, , and . step frames.")));
 
   root.append(h("div", { class: "row" }, h("h1", { class: "grow" }, basename(r.input_path)), h("a", { href: "#/history" }, "← History")),
@@ -764,7 +828,7 @@ function comparePlayer(root, r) {
     t = Math.max(0, Math.min(duration || t, t));
     if (srcMode === "preview") t = Math.max(offset, Math.min(segEnd - 0.05, t));
     vo.currentTime = t;
-    vs.currentTime = Math.max(0, t - offset);
+    vs.currentTime = srcTime(t);
   }
   function togglePlay() {
     if (vo.paused) {
@@ -772,9 +836,9 @@ function comparePlayer(root, r) {
       vo.play().catch((e) => toast("Cannot play: " + e.message, true));
     } else vo.pause();
   }
-  vo.addEventListener("play", () => { playBtn.textContent = "Pause"; vs.currentTime = Math.max(0, vo.currentTime - offset); vs.play().catch(() => {}); });
-  vo.addEventListener("pause", () => { playBtn.textContent = "Play"; vs.pause(); vs.currentTime = Math.max(0, vo.currentTime - offset); });
-  vo.addEventListener("seeking", () => { vs.currentTime = Math.max(0, vo.currentTime - offset); });
+  vo.addEventListener("play", () => { playBtn.textContent = "Pause"; vs.currentTime = srcTime(vo.currentTime); vs.play().catch(() => {}); });
+  vo.addEventListener("pause", () => { playBtn.textContent = "Play"; vs.pause(); vs.currentTime = srcTime(vo.currentTime); });
+  vo.addEventListener("seeking", () => { vs.currentTime = srcTime(vo.currentTime); });
   vo.addEventListener("ratechange", () => { vs.playbackRate = vo.playbackRate; });
   seek.addEventListener("input", () => seekTo(Number(seek.value)));
 
@@ -786,12 +850,12 @@ function comparePlayer(root, r) {
     timeEl.textContent = `${tc(t)} / ${tc(duration)}`;
     head.setAttribute("x1", x(t)); head.setAttribute("x2", x(t));
     if (srcMode === "preview" && !vo.paused && t >= segEnd) { vo.pause(); seekTo(segEnd - 0.05); }
-    const srcT = t - offset;
+    const srcT = srcTime(t);
     const srcDone = srcT >= (vs.duration || Infinity) - 0.05;
     if (!vo.paused && srcMode !== "loading" && !srcDone && !vs.seeking && vs.readyState >= 2) {
       if (vs.paused) vs.play().catch(() => {});
-      const drift = vs.currentTime - (t - offset);
-      if (Math.abs(drift) > 0.25) vs.currentTime = t - offset;
+      const drift = vs.currentTime - srcTime(t);
+      if (Math.abs(drift) > 0.25) vs.currentTime = srcTime(t);
       else vs.playbackRate = vo.playbackRate * (1 - Math.max(-0.1, Math.min(0.1, drift * 0.8)));
     }
   };
@@ -843,9 +907,11 @@ function comparePlayer(root, r) {
       tagL.textContent = `Source preview · ${ii.codec || "?"} → H.264 near-lossless`;
       seekTo(offset);
       busy(null);
+      await autoAlign();
+      seekTo(offset);
     } catch (e) {
       ({ offset, segEnd, srcMode } = prev);
-      if (prev.src && srcMode !== "loading") { vs.src = prev.src; vs.currentTime = Math.max(0, vo.currentTime - offset); }
+      if (prev.src && srcMode !== "loading") { vs.src = prev.src; vs.currentTime = srcTime(vo.currentTime); }
       busy(null);
       overlay.hidden = false;
       overlay.replaceChildren(h("div", { class: "bad" }, "Could not make a source preview: " + e.message));
@@ -877,6 +943,7 @@ function comparePlayer(root, r) {
       srcStatus.replaceChildren(h("span", { class: "ok" }, "Source: original file"), " played directly.");
       previewBtn.hidden = false;
       busy(null);
+      autoAlign();
     } catch (e) {
       busy(null);
       await makePreview(0);

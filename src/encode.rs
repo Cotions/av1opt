@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 pub struct Options {
-    pub out_dir: PathBuf,
     pub container: Container,
     pub target_vmaf: f64,
     pub preset: u8,
@@ -32,7 +31,7 @@ pub enum Container {
 }
 
 impl Container {
-    fn ext(self) -> &'static str {
+    pub fn ext(self) -> &'static str {
         match self {
             Container::Mp4 => "mp4",
             Container::Mkv => "mkv",
@@ -73,31 +72,63 @@ impl Drop for TempDir {
     }
 }
 
+/// A deliberate decision not to encode (as opposed to a failure). Batch runs remember these
+/// so resumed runs don't redo the CRF search.
+#[derive(Debug)]
+pub struct Skip(pub String);
+
+impl std::fmt::Display for Skip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Skip {}
+
+macro_rules! skip {
+    ($($arg:tt)*) => { return Err(Skip(format!($($arg)*)).into()) };
+}
+
 const COPY_AUDIO: &[&str] = &["aac", "opus", "mp3"];
 const TEXT_SUBS: &[&str] = &["subrip", "ass", "ssa", "mov_text", "webvtt", "text"];
 
-pub fn optimize(tools: &Tools, input: &Path, o: &Options) -> Result<PathBuf> {
+/// Removes temp folders left by runs that crashed or were interrupted (their PID is gone).
+pub fn clean_stale_temp(out_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(out_dir) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(pid) = name.strip_prefix(".av1opt-tmp-").and_then(|p| p.parse::<u32>().ok()) else { continue };
+        if pid != std::process::id() && !Path::new(&format!("/proc/{pid}")).exists() {
+            eprintln!("removing stale temp folder {}", e.path().display());
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
+/// Re-encodes one file into `out_dir`. Returns the output path.
+pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Result<PathBuf> {
     let size = std::fs::metadata(input).with_context(|| format!("cannot read {}", input.display()))?.len();
     let info = probe::probe(&tools.ffprobe, input, size)?;
     if info.codec == "av1" && !o.force {
-        bail!("already AV1 (use --force to re-encode anyway)");
+        skip!("already AV1 (use --force to re-encode anyway)");
     }
     if info.hdr {
-        bail!("HDR input is not supported yet");
+        skip!("HDR input is not supported yet");
     }
     if info.duration_s < 1.0 {
-        bail!("no usable duration");
+        skip!("no usable duration");
     }
 
     let stem = input.file_stem().context("input has no file name")?.to_string_lossy();
-    let output = o.out_dir.join(format!("{stem}.{}", o.container.ext()));
+    let output = out_dir.join(format!("{stem}.{}", o.container.ext()));
     if output.exists() && !o.overwrite {
         bail!("{} already exists (use --overwrite)", output.display());
     }
     if std::fs::canonicalize(input)? == std::path::absolute(&output)? {
         bail!("output would overwrite the input");
     }
-    let tmp = TempDir { path: o.out_dir.join(format!(".av1opt-tmp-{}", std::process::id())), keep: o.keep_temp };
+    std::fs::create_dir_all(out_dir)?;
+    let tmp = TempDir { path: out_dir.join(format!(".av1opt-tmp-{}", std::process::id())), keep: o.keep_temp };
     std::fs::create_dir_all(&tmp.path)?;
 
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
@@ -117,12 +148,20 @@ pub fn optimize(tools: &Tools, input: &Path, o: &Options) -> Result<PathBuf> {
     let (best, trials) = search::search(tools, &info, &samples, &tmp.path, &enc, &params)?;
     let search_secs = t0.elapsed().as_secs_f64();
     let Some(best) = best else {
-        bail!("even CRF {} misses VMAF {}; source is too lean to re-encode at this target", o.min_crf, o.target_vmaf);
+        skip!("even CRF {} misses VMAF {}; source is too lean to re-encode at this target", o.min_crf, o.target_vmaf);
     };
     let predicted_savings = 1.0 - best.size_ratio;
     eprintln!("chose crf {} (VMAF {:.2}), predicted video savings {:.0}%", best.crf, best.mean_vmaf, predicted_savings * 100.0);
     if predicted_savings < o.min_savings && !o.force {
-        bail!("predicted savings {:.0}% below --min-savings {:.0}%; skipping", predicted_savings * 100.0, o.min_savings * 100.0);
+        skip!("predicted savings {:.0}% below --min-savings {:.0}%", predicted_savings * 100.0, o.min_savings * 100.0);
+    }
+
+    // Needs room for the encode plus slack; predicted size can be off for unusual content.
+    let need = (size as f64 * best.size_ratio.max(0.3) * 1.5) as u64 + 500_000_000;
+    if let Some(free) = free_bytes(out_dir)
+        && free < need
+    {
+        bail!("not enough free space in {}: {:.1} GB free, ~{:.1} GB needed", out_dir.display(), free as f64 / 1e9, need as f64 / 1e9);
     }
 
     let mut notes = Vec::new();
@@ -177,7 +216,13 @@ fn full_encode_args(
     out: &Path,
     notes: &mut Vec<String>,
 ) -> Vec<String> {
-    let mut a: Vec<String> = ["-y", "-i", &path_arg(input), "-map", "0:v:0"].map(String::from).to_vec();
+    let map = format!("0:{}", info.video_index);
+    let mut a: Vec<String> = ["-y", "-i", &path_arg(input), "-map", &map].map(String::from).to_vec();
+    let vf = search::source_filters(info);
+    if !vf.is_empty() {
+        a.extend(["-vf".into(), vf.join(",")]);
+        notes.push(format!("video filters: {}", vf.join(",")));
+    }
     a.extend(enc.video_args(crf));
     a.extend(["-fps_mode", "passthrough"].map(String::from));
 
@@ -196,8 +241,10 @@ fn full_encode_args(
     for (i, codec) in info.subtitle_codecs.iter().enumerate() {
         match container {
             Container::Mkv => {
+                // MP4-style text subtitles can't be stored in Matroska; convert them to SRT.
+                let codec = if codec == "mov_text" { "srt" } else { "copy" };
                 a.extend(["-map".into(), format!("0:s:{i}")]);
-                a.extend([format!("-c:s:{kept_subs}"), "copy".into()]);
+                a.extend([format!("-c:s:{kept_subs}"), codec.into()]);
                 kept_subs += 1;
             }
             Container::Mp4 if TEXT_SUBS.contains(&codec.as_str()) => {
@@ -209,6 +256,10 @@ fn full_encode_args(
         }
     }
 
+    if container == Container::Mkv {
+        // Fonts used by ASS subtitles live in attachments.
+        a.extend(["-map", "0:t?", "-c:t", "copy"].map(String::from));
+    }
     a.extend(["-map_metadata", "0", "-map_chapters", "0"].map(String::from));
     if container == Container::Mp4 {
         a.extend(["-movflags", "+faststart"].map(String::from));
@@ -255,8 +306,8 @@ fn verify(
         let start = ((info.duration_s - secs) * frac).max(0.0);
         let r = tmp.join(format!("verify{i}.ref.mkv"));
         let d = tmp.join(format!("verify{i}.out.mkv"));
-        search::extract_reference(tools, input, info, start, secs, &r)?;
-        search::extract_reference(tools, out, info, start, secs, &d)?;
+        search::extract_reference(tools, input, info, true, start, secs, &r)?;
+        search::extract_reference(tools, out, info, false, start, secs, &d)?;
         let mut v = tools.vmaf(&d, &r, model, pix, threads, 0)?;
         // Seeking two different files can land a frame or two apart; retry nearby alignments
         // before calling the encode bad.
@@ -276,4 +327,12 @@ fn verify(
         bail!("verify: spot check VMAF {bad:.2} below {floor:.1}; keeping nothing");
     }
     Ok(scores)
+}
+
+fn free_bytes(dir: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: valid NUL-terminated path and a properly sized out-parameter.
+    (unsafe { libc::statvfs(c.as_ptr(), &mut st) } == 0).then(|| st.f_bavail as u64 * st.f_frsize as u64)
 }

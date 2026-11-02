@@ -9,6 +9,9 @@ use std::process::Command;
 /// Technical facts about one video file, as reported by ffprobe.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaInfo {
+    /// Absolute stream index of the main video (cover art can come first, so `0:v:0` is wrong).
+    #[serde(default)]
+    pub video_index: usize,
     pub codec: String,
     pub width: u32,
     pub height: u32,
@@ -46,10 +49,18 @@ pub fn probe(ffprobe: &str, path: &Path, file_size: u64) -> Result<MediaInfo> {
     let j: Value = serde_json::from_slice(&out.stdout).context("ffprobe returned invalid JSON")?;
     let streams = j["streams"].as_array().cloned().unwrap_or_default();
 
-    // Cover art is stored as a video stream with attached_pic=1; ignore it.
-    let video = streams
+    // Cover art is a video stream with attached_pic=1, but some files (often MKV) carry it
+    // as a plain still-image stream. Prefer real video codecs; fall back to any video.
+    const STILL_IMAGE: &[&str] = &["mjpeg", "png", "bmp", "webp", "tiff", "jpegls"];
+    let candidates: Vec<&Value> = streams
         .iter()
-        .find(|s| s["codec_type"] == "video" && s["disposition"]["attached_pic"].as_i64() != Some(1))
+        .filter(|s| s["codec_type"] == "video" && s["disposition"]["attached_pic"].as_i64() != Some(1))
+        .collect();
+    let video = candidates
+        .iter()
+        .find(|s| !STILL_IMAGE.contains(&s["codec_name"].as_str().unwrap_or("")))
+        .or(candidates.first())
+        .copied()
         .context("no video stream")?;
 
     let num = |v: &Value| -> Option<f64> {
@@ -73,11 +84,22 @@ pub fn probe(ffprobe: &str, path: &Path, file_size: u64) -> Result<MediaInfo> {
         .as_array()
         .is_some_and(|l| l.iter().any(|d| d["side_data_type"].as_str().is_some_and(|t| t.contains("DOVI"))));
     let field_order = video["field_order"].as_str().unwrap_or("progressive");
+    // Phones store portrait video as landscape plus a 90/270 degree display rotation. ffmpeg
+    // applies the rotation when decoding, so report the dimensions as displayed.
+    let rotation = video["side_data_list"]
+        .as_array()
+        .and_then(|l| l.iter().find_map(|d| d["rotation"].as_f64()))
+        .unwrap_or(0.0);
+    let (mut width, mut height) = (video["width"].as_u64().unwrap_or(0) as u32, video["height"].as_u64().unwrap_or(0) as u32);
+    if (rotation.abs() - 90.0).abs() < 1.0 || (rotation.abs() - 270.0).abs() < 1.0 {
+        std::mem::swap(&mut width, &mut height);
+    }
 
     Ok(MediaInfo {
+        video_index: video["index"].as_u64().unwrap_or(0) as usize,
         codec: video["codec_name"].as_str().unwrap_or("unknown").to_string(),
-        width: video["width"].as_u64().unwrap_or(0) as u32,
-        height: video["height"].as_u64().unwrap_or(0) as u32,
+        width,
+        height,
         fps,
         duration_s,
         video_bitrate,

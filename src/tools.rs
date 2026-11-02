@@ -16,13 +16,13 @@ pub struct Tools {
 impl Tools {
     pub fn new(ffmpeg: String, ffprobe: String, memory_limit: Option<String>) -> Self {
         let prefix = match memory_limit {
-            Some(limit) if in_path("systemd-run") => [
+            Some(limit) if systemd_scope_works() => [
                 "systemd-run", "--user", "--scope", "-q", "-p", &format!("MemoryMax={limit}"), "-p", "MemorySwapMax=0",
             ]
             .map(String::from)
             .to_vec(),
             Some(_) => {
-                eprintln!("warning: systemd-run not found, running ffmpeg without a memory limit");
+                eprintln!("warning: systemd-run --user unavailable, running ffmpeg without a memory limit");
                 Vec::new()
             }
             None => Vec::new(),
@@ -30,7 +30,12 @@ impl Tools {
         Tools { ffmpeg, ffprobe, prefix }
     }
 
-    fn command(&self) -> Command {
+    /// Builds the ffmpeg command; with AV1OPT_DEBUG set, prints it first.
+    fn command_for(&self, args: &[String]) -> Command {
+        if std::env::var_os("AV1OPT_DEBUG").is_some() && !args.is_empty() {
+            let quoted: Vec<String> = args.iter().map(|a| if a.contains([' ', ';', '[']) { format!("'{a}'") } else { a.clone() }).collect();
+            eprintln!("+ ffmpeg {}", quoted.join(" "));
+        }
         let mut c = match self.prefix.split_first() {
             Some((first, rest)) => {
                 let mut c = Command::new(first);
@@ -46,7 +51,7 @@ impl Tools {
 
     /// Runs ffmpeg and returns its stderr. Fails with the tail of stderr on error.
     pub fn run(&self, args: &[String]) -> Result<String> {
-        let out = self.command().args(args).output().context("failed to start ffmpeg")?;
+        let out = self.command_for(args).args(args).output().context("failed to start ffmpeg")?;
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         if !out.status.success() {
             bail!("ffmpeg failed ({}):\n{}", out.status, tail(&stderr, 15));
@@ -57,7 +62,7 @@ impl Tools {
     /// Runs a long ffmpeg job, printing percent done, encode fps and ETA on one line.
     pub fn run_with_progress(&self, args: &[String], total_secs: f64, label: &str) -> Result<()> {
         let mut child = self
-            .command()
+            .command_for(args)
             .args(["-progress", "pipe:1", "-nostats", "-v", "error"])
             .args(args)
             .stdout(Stdio::piped())
@@ -135,4 +140,15 @@ fn tail(s: &str, n: usize) -> String {
 
 fn in_path(bin: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
+}
+
+/// systemd-run can exist without a user manager (e.g. over plain SSH); check it actually works.
+fn systemd_scope_works() -> bool {
+    in_path("systemd-run")
+        && Command::new("systemd-run")
+            .args(["--user", "--scope", "-q", "true"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
 }

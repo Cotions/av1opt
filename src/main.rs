@@ -1,3 +1,4 @@
+mod batch;
 mod encode;
 mod estimate;
 mod fsguard;
@@ -55,7 +56,9 @@ enum Cmd {
         top: usize,
     },
     /// Re-encode videos to AV1 at a target quality. Inputs are never modified; results go to --out-dir.
+    /// Folders are processed recursively and their layout is mirrored. Re-running resumes.
     Encode {
+        /// Video files and/or folders.
         #[arg(required = true)]
         inputs: Vec<PathBuf>,
         /// Folder for finished files (plus a .av1opt.json report each). Must not be on ZFS.
@@ -86,6 +89,9 @@ enum Cmd {
         force: bool,
         #[arg(long)]
         overwrite: bool,
+        /// Retry files an earlier run skipped (low savings, unreachable target, ...).
+        #[arg(long)]
+        retry_skipped: bool,
         /// Keep sample and partial files for debugging.
         #[arg(long)]
         keep_temp: bool,
@@ -131,30 +137,33 @@ fn main() -> Result<()> {
         }
         Cmd::Encode {
             inputs, out_dir, container, target_vmaf, preset, min_crf, max_crf, samples, sample_secs,
-            min_savings, force, overwrite, keep_temp, allow_zfs, ffmpeg, ffprobe, memory_limit, nice,
+            min_savings, force, overwrite, retry_skipped, keep_temp, allow_zfs, ffmpeg, ffprobe, memory_limit, nice,
         } => {
+            if min_crf > max_crf {
+                anyhow::bail!("--min-crf {min_crf} is above --max-crf {max_crf}");
+            }
             fsguard::ensure_writable_location(&out_dir, allow_zfs)?;
             std::fs::create_dir_all(&out_dir)?;
             // SAFETY: plain syscall on our own process; children inherit the priority.
             unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) };
             let tools = tools::Tools::new(ffmpeg, ffprobe, memory_cap(&memory_limit));
             let opts = encode::Options {
-                out_dir, container, target_vmaf, preset, min_crf, max_crf, samples, sample_secs,
+                container, target_vmaf, preset, min_crf, max_crf, samples, sample_secs,
                 min_savings, force, overwrite, keep_temp,
             };
-            let mut failed = 0;
-            for input in &inputs {
-                match encode::optimize(&tools, input, &opts) {
-                    Ok(out) => println!("ok\t{}\t{}", input.display(), out.display()),
-                    Err(e) => {
-                        failed += 1;
-                        eprintln!("skipped {}: {e:#}", input.display());
-                        println!("skip\t{}\t{e}", input.display());
-                    }
-                }
+            let jobs = batch::expand(&inputs, &out_dir, is_video);
+            if jobs.is_empty() {
+                anyhow::bail!("no video files found in the given inputs");
             }
-            if failed == inputs.len() {
-                std::process::exit(1);
+            let s = batch::run(&tools, &jobs, &out_dir, &opts, retry_skipped)?;
+            let saved = s.bytes_in.saturating_sub(s.bytes_out) as f64 / 1e9;
+            eprintln!(
+                "\nencoded {}, skipped {}, failed {}, already done {} | {:.2} GB -> {:.2} GB ({saved:.2} GB saved)",
+                s.ok, s.skipped, s.failed, s.already_done, s.bytes_in as f64 / 1e9, s.bytes_out as f64 / 1e9
+            );
+            eprintln!("log: {}", out_dir.join(batch::LOG_NAME).display());
+            if s.failed > 0 {
+                std::process::exit(2);
             }
             Ok(())
         }
@@ -221,7 +230,7 @@ fn scan(paths: &[PathBuf], ffprobe: &str, jobs: usize, min_savings: f64, csv: Op
                 e
             });
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if n % 250 == 0 || n == total {
+            if n.is_multiple_of(250) || n == total {
                 eprint!("\rprobed {n}/{total}");
             }
             let (verdict, estimate) = match &entry.info {

@@ -113,6 +113,7 @@ pub fn run(cfg: Config) -> Result<()> {
         preview_dir,
         preview_lock: Mutex::new(()),
     });
+    jobs::restore(&app);
     jobs::start_worker(app.clone());
 
     let url = format!("http://127.0.0.1:{port}/?token={}", app.token);

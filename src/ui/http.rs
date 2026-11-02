@@ -149,6 +149,7 @@ fn api(app: &Arc<App>, m: &Method, path: &str, q: &[(String, String)], body: &Va
         (Method::Post, ["scans"]) => library::start_scan(app, body),
         (Method::Get, ["scans", id]) => library::scan_result(app, id.parse()?),
         (Method::Get, ["jobs"]) => Ok(jobs::list(app)),
+        (Method::Get, ["jobs", id]) => jobs::get(app, id.parse()?),
         (Method::Post, ["jobs"]) => jobs::add(app, body),
         (Method::Post, ["jobs", id, "cancel"]) => jobs::cancel(app, id.parse()?),
         (Method::Post, ["jobs", id, "remove"]) => jobs::remove(app, id.parse()?),

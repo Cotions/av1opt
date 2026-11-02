@@ -120,6 +120,8 @@ pub struct Job {
     id: u64,
     created: u64,
     inputs: Vec<PathBuf>,
+    #[serde(default)]
+    roots: Vec<PathBuf>,
     out_dir: PathBuf,
     options: JobOptions,
     /// queued, running, done, cancelled, failed
@@ -145,6 +147,12 @@ pub struct Queue {
 
 pub fn list(app: &App) -> Value {
     json!({ "jobs": &*app.jobs.jobs.lock().unwrap() })
+}
+
+pub fn get(app: &App, id: u64) -> Result<Value> {
+    let jobs = app.jobs.jobs.lock().unwrap();
+    let j = jobs.iter().find(|j| j.id == id).ok_or_else(|| anyhow::anyhow!("not found: job {id}"))?;
+    Ok(serde_json::to_value(j)?)
 }
 
 #[derive(Deserialize)]
@@ -222,6 +230,7 @@ pub fn add(app: &App, body: &Value) -> Result<Value> {
         id,
         created: now(),
         inputs,
+        roots,
         out_dir: r.out_dir.clone(),
         options,
         status: "queued".into(),
@@ -240,9 +249,47 @@ pub fn add(app: &App, body: &Value) -> Result<Value> {
         }
     }
     app.save_settings();
+    persist(app);
     app.jobs.wake.notify_all();
     app.broadcast(json!({ "kind": "jobs" }));
     Ok(json!({ "id": id, "files": count }))
+}
+
+fn queue_path() -> Option<PathBuf> {
+    super::library::settings_path().map(|p| p.with_file_name("ui-queue.json"))
+}
+
+/// Saves unfinished jobs so the next `av1opt ui` picks them up again.
+fn persist(app: &App) {
+    let pending: Vec<Value> = app
+        .jobs
+        .jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|j| matches!(j.status.as_str(), "queued" | "running"))
+        .map(|j| json!({ "inputs": j.inputs, "roots": j.roots, "out_dir": j.out_dir, "options": j.options }))
+        .collect();
+    if let Some(p) = queue_path() {
+        let tmp = p.with_extension("json.tmp");
+        if std::fs::write(&tmp, serde_json::to_vec_pretty(&pending).unwrap_or_default()).is_ok() {
+            let _ = std::fs::rename(tmp, p);
+        }
+    }
+}
+
+/// Re-queues jobs left unfinished by the previous session. Finished files are recognised as
+/// done and scene-mode chunks resume, as with a re-run of `av1opt encode`.
+pub fn restore(app: &App) {
+    let Some(saved) = queue_path().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice::<Vec<Value>>(&b).ok()) else {
+        return;
+    };
+    for j in saved {
+        match add(app, &j) {
+            Ok(r) => eprintln!("re-queued {} file(s) from the last session", r["files"]),
+            Err(e) => eprintln!("could not re-queue a job from the last session: {e:#}"),
+        }
+    }
 }
 
 pub fn cancel(app: &App, id: u64) -> Result<Value> {
@@ -262,6 +309,7 @@ pub fn cancel(app: &App, id: u64) -> Result<Value> {
         _ => {}
     }
     drop(jobs);
+    persist(app);
     app.broadcast(json!({ "kind": "jobs" }));
     Ok(json!({ "ok": true }))
 }
@@ -273,6 +321,7 @@ pub fn remove(app: &App, id: u64) -> Result<Value> {
     }
     jobs.retain(|j| j.id != id);
     drop(jobs);
+    persist(app);
     app.broadcast(json!({ "kind": "jobs" }));
     Ok(json!({ "ok": true }))
 }
@@ -371,6 +420,7 @@ pub fn start_worker(app: Arc<App>) {
                 }
             }
             drop(jobs);
+            persist(&app);
             app.broadcast(json!({ "kind": "jobs" }));
         }
     });

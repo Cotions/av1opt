@@ -436,26 +436,68 @@ views.queue = (root) => {
       h("button", { onclick: async () => { await api("/api/jobs/clear", {}); load(); } }, "Clear finished"),
       h("button", { class: "primary", onclick: async () => { const p = await pick({ title: "Videos or folders to encode", mode: "multi" }); if (p) encodeDialog(p); } }, "New encode…")),
     list);
-  const fileEls = new Map(); // "job:file" -> { el, update(progress) }
+  const fileEls = new Map(); // "job:file" -> { el, update(progress) } for running files
+  // Rendered jobs. Only parts whose data changed are rebuilt, so buttons stay put while an
+  // encode streams events.
+  const jobEls = new Map(); // id -> { box, head, headSig, files, nodes[], sigs[], err }
+  const empty = h("div", { class: "panel empty" }, "No encodes yet. Pick files in Scan, or use “New encode…”.");
   let jobs = [];
   let timer = null;
+  const pending = new Map(); // job id -> timeout
 
   async function load() {
     try { jobs = (await api("/api/jobs")).jobs; } catch (e) { toast(e.message, true); return; }
     draw();
   }
+  async function loadOne(id) {
+    let j;
+    try { j = await api("/api/jobs/" + id); } catch { return load(); }
+    const k = jobs.findIndex((x) => x.id === id);
+    if (k < 0) return load();
+    jobs[k] = j;
+    patchJob(j);
+  }
   const reload = () => { clearTimeout(timer); timer = setTimeout(load, 150); };
+  const reloadOne = (id) => { clearTimeout(pending.get(id)); pending.set(id, setTimeout(() => loadOne(id), 120)); };
 
   function draw() {
-    fileEls.clear();
-    if (!jobs.length) {
-      list.replaceChildren(h("div", { class: "panel empty" }, "No encodes yet. Pick files in Scan, or use “New encode…”."));
-      return;
-    }
-    list.replaceChildren(...[...jobs].reverse().map(drawJob));
+    const ids = new Set(jobs.map((j) => j.id));
+    for (const [id, e] of jobEls) if (!ids.has(id)) { e.box.remove(); jobEls.delete(id); }
+    if (!jobs.length) { list.replaceChildren(empty); return; }
+    empty.remove();
+    for (const j of [...jobs].reverse()) list.append(patchJob(j)); // append moves nodes into order
   }
 
-  function drawJob(j) {
+  const headSig = (j) => JSON.stringify([j.status, j.error, j.files.map((f) => [f.status, f.input_bytes, f.output_bytes])]);
+  const fileSig = (f) => JSON.stringify({ ...f, progress: null });
+
+  function patchJob(j) {
+    let e = jobEls.get(j.id);
+    if (!e) {
+      e = { box: h("div", { class: "job" }), head: null, headSig: "", files: h("div", { class: "files" }), nodes: [], sigs: [], err: null };
+      e.box.append(e.files);
+      jobEls.set(j.id, e);
+    }
+    const hs = headSig(j);
+    if (hs !== e.headSig) {
+      const nh = drawHead(j);
+      if (e.head) e.head.replaceWith(nh); else e.box.prepend(nh);
+      e.head = nh; e.headSig = hs;
+      if (e.err) { e.err.remove(); e.err = null; }
+      if (j.error) { e.err = h("div", { class: "file bad" }, j.error); e.box.append(e.err); }
+    }
+    j.files.forEach((f, i) => {
+      const sg = fileSig(f);
+      if (sg === e.sigs[i]) return;
+      fileEls.delete(`${j.id}:${i}`);
+      const n = drawFile(j, f, i);
+      if (e.nodes[i]) e.nodes[i].replaceWith(n); else e.files.append(n);
+      e.nodes[i] = n; e.sigs[i] = sg;
+    });
+    return e.box;
+  }
+
+  function drawHead(j) {
     const o = j.options;
     const counts = {};
     for (const f of j.files) counts[f.status] = (counts[f.status] || 0) + 1;
@@ -471,10 +513,7 @@ views.queue = (root) => {
       j.status === "running" || j.status === "queued"
         ? h("button", { class: "danger small", onclick: async (e) => { e.target.disabled = true; try { await api(`/api/jobs/${j.id}/cancel`, {}); toast("Cancelling… (finished chunks are kept; re-queue to resume)"); } catch (er) { toast(er.message, true); } } }, "Cancel")
         : h("button", { class: "small", onclick: async () => { await api(`/api/jobs/${j.id}/remove`, {}); load(); } }, "Remove"));
-    const files = h("div", { class: "files" }, ...j.files.map((f, i) => drawFile(j, f, i)));
-    const box = h("div", { class: "job" }, head, files);
-    if (j.error) box.append(h("div", { class: "file bad" }, j.error));
-    return box;
+    return head;
   }
 
   function drawFile(j, f, i) {
@@ -544,10 +583,10 @@ views.queue = (root) => {
       const live = fileEls.get(`${m.id}:${m.file}`);
       if (live) return live.update(m.event);
     }
-    reload();
+    reloadOne(m.id);
   });
   load();
-  return () => { off(); clearTimeout(timer); };
+  return () => { off(); clearTimeout(timer); for (const t of pending.values()) clearTimeout(t); };
 };
 
 // ----- history -----

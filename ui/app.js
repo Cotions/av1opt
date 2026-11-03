@@ -111,7 +111,15 @@ onEvent((m) => { if (m.kind === "jobs") refreshBadge(); });
 // ---------- state ----------
 
 let STATE = null;
-async function loadState() { STATE = await api("/api/state"); return STATE; }
+async function loadState() { STATE = await api("/api/state"); renderBanner(); return STATE; }
+
+// Shown on every view while encodes cannot run (usually: ffmpeg without libvmaf).
+function renderBanner() {
+  const b = document.getElementById("banner");
+  const p = STATE && STATE.tools && STATE.tools.problem;
+  b.hidden = !p;
+  if (p) b.replaceChildren("Encoding is off: " + p + ".", h("a", { href: "#/settings" }, "Settings"));
+}
 
 // ---------- folder / file picker ----------
 
@@ -995,6 +1003,55 @@ function comparePlayer(root, r) {
     for (const v of [vo, vs]) { v.pause(); v.removeAttribute("src"); v.load(); }
   };
 }
+
+// ---------- settings ----------
+
+views.settings = (root) => {
+  const t = (STATE && STATE.tools) || {};
+  const ffmpeg = h("input", { type: "text", value: t.ffmpeg === t.default_ffmpeg ? "" : t.ffmpeg || "", placeholder: t.default_ffmpeg || "ffmpeg", spellcheck: "false" });
+  const ffprobe = h("input", { type: "text", value: t.ffprobe === t.default_ffprobe ? "" : t.ffprobe || "", placeholder: t.default_ffprobe || "ffprobe", spellcheck: "false" });
+  const result = h("div");
+  const save = h("button", { class: "primary" }, "Save and check");
+
+  const show = (tools) => {
+    const c = tools.capabilities || {};
+    const item = (ok, text) => h("li", { class: ok ? "ok" : "bad" }, (ok ? "✓ " : "✗ ") + text);
+    result.replaceChildren(
+      h("ul", { class: "checks" },
+        item(!!c.ffmpeg_version, c.ffmpeg_version || `ffmpeg does not run (${tools.ffmpeg})`),
+        item(c.svtav1, "libsvtav1 encoder"),
+        item(c.vmaf, "libvmaf filter"),
+        item(c.ffprobe_ok, c.ffprobe_ok ? `ffprobe (${tools.ffprobe})` : `ffprobe does not run (${tools.ffprobe})`)),
+      h("p", { class: tools.problem ? "warn" : "ok" }, tools.problem ? tools.problem : "Ready to encode."));
+  };
+  save.onclick = async () => {
+    save.disabled = true;
+    try {
+      const tools = await api("/api/settings/tools", { ffmpeg: ffmpeg.value, ffprobe: ffprobe.value });
+      STATE.tools = tools;
+      renderBanner();
+      show(tools);
+      refreshBadge();
+    } catch (e) { toast(e.message, true); }
+    save.disabled = false;
+  };
+  for (const i of [ffmpeg, ffprobe]) i.addEventListener("keydown", (e) => { if (e.key === "Enter") save.click(); });
+
+  root.append(
+    h("h1", {}, "Settings"),
+    h("div", { class: "panel" },
+      h("h3", {}, "Tools"),
+      h("p", { class: "dim" }, "av1opt needs an ffmpeg with the libsvtav1 encoder and the libvmaf filter. Leave a field empty to use the default from the command line or environment (shown greyed). Give an absolute path or a program name on PATH."),
+      h("div", { class: "form" }, h("label", {}, "ffmpeg"), ffmpeg, h("label", {}, "ffprobe"), ffprobe),
+      h("div", { class: "row gap-top" }, save),
+      result),
+    h("div", { class: "panel" },
+      h("h3", {}, "About"),
+      h("div", { class: "kv" },
+        h("span", { class: "k" }, "Version"), h("span", {}, STATE ? STATE.version : "–"),
+        h("span", { class: "k" }, "Encodes behind scan estimates"), h("span", {}, STATE ? STATE.history_encodes : "–"))));
+  show(t);
+};
 
 // ---------- start ----------
 

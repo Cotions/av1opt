@@ -8,6 +8,60 @@ use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::Instant;
 
+/// What an ffmpeg/ffprobe pair can do. Encoding needs the libsvtav1 encoder and the libvmaf
+/// filter, which many distribution builds of ffmpeg lack.
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct Capabilities {
+    /// First line of `ffmpeg -version`; None when ffmpeg does not run.
+    pub ffmpeg_version: Option<String>,
+    pub ffprobe_ok: bool,
+    pub svtav1: bool,
+    pub vmaf: bool,
+}
+
+impl Capabilities {
+    pub fn probe(ffmpeg: &str, ffprobe: &str) -> Self {
+        let out = |prog: &str, arg: &str| {
+            Command::new(prog)
+                .args(["-hide_banner", arg])
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        };
+        let ffmpeg_version = out(ffmpeg, "-version").and_then(|v| v.lines().next().map(str::to_owned));
+        // Listing lines look like " V....D libsvtav1   SVT-AV1..." and " ... libvmaf   VV->V ...".
+        let lists = |list: Option<String>, name: &str| list.is_some_and(|l| l.lines().any(|x| x.split_whitespace().nth(1) == Some(name)));
+        let (svtav1, vmaf) = if ffmpeg_version.is_some() {
+            (lists(out(ffmpeg, "-encoders"), "libsvtav1"), lists(out(ffmpeg, "-filters"), "libvmaf"))
+        } else {
+            (false, false)
+        };
+        let ffprobe_ok = out(ffprobe, "-version").is_some();
+        Capabilities { ffmpeg_version, ffprobe_ok, svtav1, vmaf }
+    }
+
+    /// Why encoding cannot work with these tools, if it cannot.
+    pub fn problem(&self, ffmpeg: &str, ffprobe: &str) -> Option<String> {
+        let mut missing = Vec::new();
+        if self.ffmpeg_version.is_none() {
+            return Some(format!("cannot run ffmpeg ({ffmpeg})"));
+        }
+        if !self.svtav1 {
+            missing.push("the libsvtav1 encoder");
+        }
+        if !self.vmaf {
+            missing.push("the libvmaf filter");
+        }
+        if !missing.is_empty() {
+            return Some(format!("{ffmpeg} lacks {}; av1opt needs an ffmpeg build with libsvtav1 and libvmaf", missing.join(" and ")));
+        }
+        (!self.ffprobe_ok).then(|| format!("cannot run ffprobe ({ffprobe})"))
+    }
+}
+
 pub struct Tools {
     pub ffmpeg: String,
     pub ffprobe: String,

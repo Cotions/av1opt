@@ -11,7 +11,7 @@ mod http;
 mod jobs;
 mod library;
 
-use crate::tools::Tools;
+use crate::tools::{Capabilities, Tools};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -38,6 +38,12 @@ pub struct Settings {
     pub out_dir: Option<PathBuf>,
     #[serde(default)]
     pub scan_paths: Vec<PathBuf>,
+    /// Chosen in the page; wins over --ffmpeg / AV1OPT_FFMPEG. A desktop launcher has no shell
+    /// environment, so this is how the desktop app finds an ffmpeg with libvmaf.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ffmpeg: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ffprobe: Option<String>,
 }
 
 pub struct App {
@@ -53,6 +59,10 @@ pub struct App {
     pub scans: Mutex<Vec<library::Scan>>,
     pub preview_dir: PathBuf,
     pub preview_lock: Mutex<()>,
+    /// Shared by preview transcodes so shutdown can stop them.
+    pub preview_hooks: Arc<crate::events::Hooks>,
+    /// Capabilities of the current ffmpeg/ffprobe pair, keyed by their paths.
+    caps: Mutex<Option<(String, String, Capabilities)>>,
 }
 
 impl App {
@@ -74,7 +84,33 @@ impl App {
     }
 
     pub fn tools(&self, workers: u8) -> Tools {
-        Tools::new(self.cfg.ffmpeg.clone(), self.cfg.ffprobe.clone(), crate::memory_cap(&self.cfg.memory_limit, workers))
+        Tools::new(self.ffmpeg(), self.ffprobe(), crate::memory_cap(&self.cfg.memory_limit, workers))
+    }
+
+    pub fn ffmpeg(&self) -> String {
+        self.settings.lock().unwrap().ffmpeg.clone().unwrap_or_else(|| self.cfg.ffmpeg.clone())
+    }
+
+    pub fn ffprobe(&self) -> String {
+        self.settings.lock().unwrap().ffprobe.clone().unwrap_or_else(|| self.cfg.ffprobe.clone())
+    }
+
+    pub fn capabilities(&self) -> Capabilities {
+        let (ffmpeg, ffprobe) = (self.ffmpeg(), self.ffprobe());
+        let mut c = self.caps.lock().unwrap();
+        match &*c {
+            Some((a, b, caps)) if *a == ffmpeg && *b == ffprobe => caps.clone(),
+            _ => {
+                let caps = Capabilities::probe(&ffmpeg, &ffprobe);
+                *c = Some((ffmpeg, ffprobe, caps.clone()));
+                caps
+            }
+        }
+    }
+
+    /// Why encodes cannot run with the current tools, if they cannot.
+    pub fn encode_problem(&self) -> Option<String> {
+        self.capabilities().problem(&self.ffmpeg(), &self.ffprobe())
     }
 
     pub fn save_settings(&self) {
@@ -112,7 +148,13 @@ pub fn run(cfg: Config) -> Result<()> {
         scans: Mutex::new(Vec::new()),
         preview_dir,
         preview_lock: Mutex::new(()),
+        preview_hooks: Arc::new(crate::events::Hooks::new(|_| {})),
+        caps: Mutex::new(None),
     });
+    if let Some(p) = app.encode_problem() {
+        eprintln!("warning: {p}; encodes stay off until it is fixed (Settings in the page)");
+    }
+    stop_on_signal(app.clone());
     jobs::restore(&app);
     jobs::start_worker(app.clone());
 
@@ -127,6 +169,56 @@ pub fn run(cfg: Config) -> Result<()> {
         std::thread::spawn(move || http::handle(&app, req));
     }
     Ok(())
+}
+
+static SIGNAL_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+extern "C" fn on_signal(_: libc::c_int) {
+    let fd = SIGNAL_PIPE.load(std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: write(2) is async-signal-safe; the pipe stays open for the life of the process.
+    unsafe { libc::write(fd, b"x".as_ptr().cast(), 1) };
+}
+
+/// On SIGINT, SIGTERM or SIGHUP (and, for a wrapper app, when stdin closes with
+/// `AV1OPT_UI_EXIT_WITH_STDIN=1`), stops the encodes cleanly and exits.
+fn stop_on_signal(app: Arc<App>) {
+    let mut fds = [0; 2];
+    // SAFETY: plain pipe(2) and sigaction(2) calls; the handler only writes one byte.
+    let ok = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == 0;
+    if ok {
+        SIGNAL_PIPE.store(fds[1], std::sync::atomic::Ordering::Relaxed);
+        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            unsafe {
+                let mut sa: libc::sigaction = std::mem::zeroed();
+                sa.sa_sigaction = on_signal as *const () as usize;
+                sa.sa_flags = libc::SA_RESTART;
+                libc::sigaction(sig, &sa, std::ptr::null_mut());
+            }
+        }
+        let a = app.clone();
+        std::thread::spawn(move || {
+            let mut b = [0u8; 1];
+            // SAFETY: read(2) on our own pipe.
+            while unsafe { libc::read(fds[0], b.as_mut_ptr().cast(), 1) } < 0 {}
+            note("stopping");
+            jobs::shutdown(&a);
+            std::process::exit(0);
+        });
+    }
+    if std::env::var_os("AV1OPT_UI_EXIT_WITH_STDIN").is_some_and(|v| v == "1") {
+        std::thread::spawn(move || {
+            let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+            note("parent went away, stopping");
+            jobs::shutdown(&app);
+            std::process::exit(0);
+        });
+    }
+}
+
+/// Like `eprintln!` but never panics: when a wrapper app dies, stderr is a broken pipe.
+fn note(msg: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{msg}");
 }
 
 /// Hands the sign-in link to the desktop's default browser through a private file, so the

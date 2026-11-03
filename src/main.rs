@@ -154,6 +154,9 @@ fn main() -> Result<()> {
             if min_crf > max_crf {
                 anyhow::bail!("--min-crf {min_crf} is above --max-crf {max_crf}");
             }
+            if let Some(p) = tools::Capabilities::probe(&ffmpeg, &ffprobe).problem(&ffmpeg, &ffprobe) {
+                anyhow::bail!("{p} (--ffmpeg / AV1OPT_FFMPEG, --ffprobe / AV1OPT_FFPROBE)");
+            }
             fsguard::ensure_writable_location(&out_dir, allow_zfs)?;
             std::fs::create_dir_all(&out_dir)?;
             // SAFETY: plain syscall on our own process; children inherit the priority.

@@ -41,6 +41,7 @@ pub struct Hooks {
     children: Mutex<Vec<u32>>,
 }
 
+#[cfg_attr(not(feature = "ui"), allow(dead_code))]
 impl Hooks {
     pub fn new(sink: impl Fn(Event) + Send + Sync + 'static) -> Self {
         Hooks { sink: Box::new(sink), cancelled: AtomicBool::new(false), children: Mutex::new(Vec::new()) }

@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -143,6 +144,28 @@ pub struct Queue {
     jobs: Mutex<Vec<Job>>,
     wake: Condvar,
     next_id: Mutex<u64>,
+    /// Set while the server stops: jobs interrupted now stay in the saved queue.
+    shutting_down: AtomicBool,
+}
+
+/// Stops running encodes and previews so no ffmpeg outlives the server. Interrupted jobs stay
+/// in the saved queue and resume on the next start.
+pub fn shutdown(app: &App) {
+    app.jobs.shutting_down.store(true, Ordering::SeqCst);
+    app.preview_hooks.cancel();
+    for j in app.jobs.jobs.lock().unwrap().iter_mut() {
+        j.cancel_requested = true;
+        if let Some(h) = &j.hooks {
+            h.cancel();
+        }
+    }
+    // Give the worker a moment to reap ffmpeg and clear its temp folder.
+    for _ in 0..50 {
+        if !app.jobs.jobs.lock().unwrap().iter().any(|j| j.hooks.is_some()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 pub fn list(app: &App) -> Value {
@@ -167,6 +190,18 @@ struct AddRequest {
 }
 
 pub fn add(app: &App, body: &Value) -> Result<Value> {
+    if let Some(p) = app.encode_problem() {
+        bail!("{p} (see Settings)");
+    }
+    add_unchecked(app, body)
+}
+
+/// Wakes the worker, e.g. after the tools were fixed.
+pub fn kick(app: &App) {
+    app.jobs.wake.notify_all();
+}
+
+fn add_unchecked(app: &App, body: &Value) -> Result<Value> {
     let r: AddRequest = serde_json::from_value(body.clone())?;
     let options = r.options.unwrap_or_else(|| serde_json::from_value(json!({})).expect("defaults"));
     let opts = options.to_options()?;
@@ -261,6 +296,9 @@ fn queue_path() -> Option<PathBuf> {
 
 /// Saves unfinished jobs so the next `av1opt ui` picks them up again.
 fn persist(app: &App) {
+    if app.jobs.shutting_down.load(Ordering::SeqCst) {
+        return;
+    }
     let pending: Vec<Value> = app
         .jobs
         .jobs
@@ -285,7 +323,8 @@ pub fn restore(app: &App) {
         return;
     };
     for j in saved {
-        match add(app, &j) {
+        // Not `add`: with broken tools the jobs wait in the queue rather than get dropped.
+        match add_unchecked(app, &j) {
             Ok(r) => eprintln!("re-queued {} file(s) from the last session", r["files"]),
             Err(e) => eprintln!("could not re-queue a job from the last session: {e:#}"),
         }
@@ -392,7 +431,10 @@ pub fn start_worker(app: Arc<App>) {
             let (id, opts, retry, out_dir, workers) = {
                 let mut jobs = app.jobs.jobs.lock().unwrap();
                 loop {
-                    if let Some(j) = jobs.iter_mut().find(|j| j.status == "queued") {
+                    // With unusable tools, queued jobs wait (the page shows why) instead of failing.
+                    if let Some(j) = jobs.iter_mut().find(|j| j.status == "queued")
+                        && app.encode_problem().is_none()
+                    {
                         j.status = "running".into();
                         break (j.id, j.options.to_options(), j.options.retry_skipped, j.out_dir.clone(), j.options.workers);
                     }

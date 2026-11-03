@@ -49,9 +49,43 @@ pub fn state(app: &App) -> Value {
         "settings": s,
         "default_out_dir": s.out_dir.clone().unwrap_or_else(|| home().join("av1opt-out")),
         "history_encodes": model.samples,
-        "ffmpeg": app.cfg.ffmpeg,
+        "tools": tools_state(app),
         "version": env!("CARGO_PKG_VERSION"),
     })
+}
+
+fn tools_state(app: &App) -> Value {
+    let caps = app.capabilities();
+    json!({
+        "ffmpeg": app.ffmpeg(),
+        "ffprobe": app.ffprobe(),
+        "default_ffmpeg": app.cfg.ffmpeg,
+        "default_ffprobe": app.cfg.ffprobe,
+        "problem": caps.problem(&app.ffmpeg(), &app.ffprobe()),
+        "capabilities": caps,
+    })
+}
+
+/// Sets the ffmpeg and ffprobe programs (empty = back to the command-line default) and
+/// reports what they can do.
+pub fn set_tools(app: &App, body: &Value) -> Result<Value> {
+    let pick = |k: &str| -> Result<Option<String>> {
+        match body.get(k).and_then(Value::as_str).map(str::trim) {
+            None | Some("") => Ok(None),
+            Some(p) if p.contains('/') && !Path::new(p).is_absolute() => bail!("{k}: use an absolute path or a program name"),
+            Some(p) => Ok(Some(p.to_string())),
+        }
+    };
+    let (ffmpeg, ffprobe) = (pick("ffmpeg")?, pick("ffprobe")?);
+    {
+        let mut s = app.settings.lock().unwrap();
+        s.ffmpeg = ffmpeg;
+        s.ffprobe = ffprobe;
+    }
+    app.save_settings();
+    super::jobs::kick(app);
+    app.broadcast(json!({ "kind": "jobs" }));
+    Ok(tools_state(app))
 }
 
 /// Lists sub-folders and video files of a folder (names and sizes only, never contents).
@@ -170,7 +204,7 @@ pub fn start_scan(app: &Arc<App>, body: &Value) -> Result<Value> {
                 app.broadcast(json!({ "kind": "scan", "id": id, "done": done, "total": total }));
             }
         };
-        let r = scan::collect(&paths, &app.cfg.ffprobe, app.cfg.jobs, r.min_savings, &model, &progress);
+        let r = scan::collect(&paths, &app.ffprobe(), app.cfg.jobs, r.min_savings, &model, &progress);
         {
             let mut scans = app.scans.lock().unwrap();
             if let Some(s) = scans.iter_mut().find(|s| s.id == id) {
@@ -362,7 +396,7 @@ fn known_report(app: &App, p: &Path) -> Result<PathBuf> {
 
 fn media_info(app: &App, p: &Path) -> Value {
     let size = std::fs::metadata(p).map_or(0, |m| m.len());
-    match crate::probe::probe(&app.cfg.ffprobe, p, size) {
+    match crate::probe::probe(&app.ffprobe(), p, size) {
         Ok(i) => json!({
             "codec": i.codec, "width": i.width, "height": i.height, "fps": i.fps, "duration_s": i.duration_s,
             "start_time": i.start_time, "video_start": i.video_start, "hdr": i.hdr, "size": size,
@@ -420,7 +454,7 @@ pub fn preview(app: &App, body: &Value) -> Result<Value> {
     if out.exists() {
         return Ok(json!({ "url": url(&out), "start": start, "secs": secs, "kind": r.kind }));
     }
-    let info = crate::probe::probe(&app.cfg.ffprobe, &src, meta.len())?;
+    let info = crate::probe::probe(&app.ffprobe(), &src, meta.len())?;
     let part = out.with_extension("part.mp4");
     let mut a: Vec<String> = vec!["-y".into(), "-v".into(), "error".into()];
     match r.kind.as_str() {
@@ -441,7 +475,9 @@ pub fn preview(app: &App, body: &Value) -> Result<Value> {
     }
     a.extend(["-movflags".into(), "+faststart".into(), "-f".into(), "mp4".into(), path_arg(&part)]);
     trim_previews(&app.preview_dir, 12);
-    let tools = app.tools(1);
+    let mut tools = app.tools(1);
+    // Tracked so shutting down stops a preview transcode too.
+    tools.hooks = Some(app.preview_hooks.clone());
     tools.run(&a).context("preview encode failed")?;
     std::fs::rename(&part, &out)?;
     Ok(json!({ "url": url(&out), "start": start, "secs": secs, "kind": r.kind }))

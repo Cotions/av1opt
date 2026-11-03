@@ -155,6 +155,7 @@ fn api(app: &Arc<App>, m: &Method, path: &str, q: &[(String, String)], body: &Va
         (Method::Post, ["jobs", id, "remove"]) => jobs::remove(app, id.parse()?),
         (Method::Post, ["jobs", "clear"]) => jobs::clear_finished(app),
         (Method::Get, ["history"]) => Ok(library::history(app)),
+        (Method::Post, ["settings", "tools"]) => library::set_tools(app, body),
         (Method::Post, ["history", "dirs"]) => library::add_history_dir(app, body),
         (Method::Post, ["history", "dirs", "remove"]) => library::remove_history_dir(app, body),
         (Method::Get, ["report"]) => library::report(app, param(q, "path").ok_or_else(|| anyhow!("missing path"))?),

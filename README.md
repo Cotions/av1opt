@@ -134,6 +134,7 @@ cd desktop
 npm install          # if npm skips electron's download script: node node_modules/electron/install.js
 npm start            # runs ../target/release/av1opt
 npm run dist         # dist/av1opt-<version>.AppImage with the av1opt binary inside
+npm run install-desktop   # copies it to ~/.local/opt/av1opt and adds av1opt to the app menu
 ```
 
 The app uses, in order: `$AV1OPT_BIN`, the binary packed into the AppImage,

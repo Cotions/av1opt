@@ -9,8 +9,19 @@
 // Extra arguments for `av1opt ui` go in $AV1OPT_UI_ARGS, e.g. AV1OPT_UI_ARGS="--memory-limit 12G".
 
 "use strict";
-const { app, BrowserWindow, dialog, shell, session } = require("electron");
 const { spawn } = require("node:child_process");
+
+// Started with ELECTRON_RUN_AS_NODE set (inherited from an editor or another Electron app),
+// this would run as plain Node with no window. Start again without it.
+if (typeof require("electron") === "string") {
+  const env = { ...process.env };
+  delete env.ELECTRON_RUN_AS_NODE;
+  const again = spawn(process.execPath, process.argv.slice(1), { env, stdio: "inherit" });
+  again.on("exit", (code) => process.exit(code ?? 1));
+  return;
+}
+
+const { app, BrowserWindow, dialog, shell, session } = require("electron");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -72,6 +83,8 @@ function startServer() {
     });
     child.on("error", (e) => {
       clearTimeout(timer);
+      // A failed spawn may never emit "exit".
+      if (server === child) server = null;
       reject(new Error(`cannot run ${bin}: ${e.message}`));
     });
     child.on("exit", (code, signal) => {
@@ -82,6 +95,7 @@ function startServer() {
       if (!origin) {
         reject(new Error(why));
       } else {
+        console.error(why);
         dialog.showErrorBox("av1opt", why);
         app.quit();
       }
@@ -151,8 +165,8 @@ function createWindow({ origin, token }) {
 }
 
 function stopServer() {
-  if (!server) return Promise.resolve();
   const child = server;
+  if (!child || child.exitCode !== null || child.signalCode !== null || child.pid === undefined) return Promise.resolve();
   return new Promise((resolve) => {
     const kill = setTimeout(() => child.kill("SIGKILL"), 8000);
     child.once("exit", () => {
@@ -180,6 +194,7 @@ if (!app.requestSingleInstanceLock()) {
       mainWindow = createWindow(await startServer());
       mainWindow.on("closed", () => (mainWindow = null));
     } catch (e) {
+      console.error(`av1opt could not start: ${e.message || e}`);
       dialog.showErrorBox("av1opt could not start", String(e.message || e));
       quitting = true;
       await stopServer();

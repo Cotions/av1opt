@@ -83,6 +83,7 @@ pub fn set_tools(app: &App, body: &Value) -> Result<Value> {
         s.ffprobe = ffprobe;
     }
     app.save_settings();
+    app.recheck_tools();
     super::jobs::kick(app);
     app.broadcast(json!({ "kind": "jobs" }));
     Ok(tools_state(app))

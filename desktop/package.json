@@ -38,6 +38,13 @@
     },
     "directories": {
       "output": "dist"
+    },
+    "electronFuses": {
+      "runAsNode": false,
+      "enableNodeOptionsEnvironmentVariable": false,
+      "enableNodeCliInspectArguments": false,
+      "onlyLoadAppFromAsar": true,
+      "enableCookieEncryption": true
     }
   },
   "desktopName": "av1opt-desktop.desktop"

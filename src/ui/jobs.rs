@@ -146,6 +146,9 @@ pub struct Queue {
     next_id: Mutex<u64>,
     /// Set while the server stops: jobs interrupted now stay in the saved queue.
     shutting_down: AtomicBool,
+    /// Saved jobs that could not be restored (say, a drive not mounted yet). Kept in the saved
+    /// queue so they come back once their files are there again.
+    unrestored: Mutex<Vec<Value>>,
 }
 
 /// Stops running encodes and previews so no ffmpeg outlives the server. Interrupted jobs stay
@@ -190,6 +193,9 @@ struct AddRequest {
 }
 
 pub fn add(app: &App, body: &Value) -> Result<Value> {
+    if app.jobs.shutting_down.load(Ordering::SeqCst) {
+        bail!("av1opt is shutting down");
+    }
     if let Some(p) = app.encode_problem() {
         bail!("{p} (see Settings)");
     }
@@ -198,6 +204,8 @@ pub fn add(app: &App, body: &Value) -> Result<Value> {
 
 /// Wakes the worker, e.g. after the tools were fixed.
 pub fn kick(app: &App) {
+    // Under the lock, so the worker can't miss it between its check and its wait.
+    let _jobs = app.jobs.jobs.lock().unwrap();
     app.jobs.wake.notify_all();
 }
 
@@ -307,6 +315,7 @@ fn persist(app: &App) {
         .iter()
         .filter(|j| matches!(j.status.as_str(), "queued" | "running"))
         .map(|j| json!({ "inputs": j.inputs, "roots": j.roots, "out_dir": j.out_dir, "options": j.options }))
+        .chain(app.jobs.unrestored.lock().unwrap().iter().cloned())
         .collect();
     if let Some(p) = queue_path() {
         let tmp = p.with_extension("json.tmp");
@@ -326,7 +335,10 @@ pub fn restore(app: &App) {
         // Not `add`: with broken tools the jobs wait in the queue rather than get dropped.
         match add_unchecked(app, &j) {
             Ok(r) => eprintln!("re-queued {} file(s) from the last session", r["files"]),
-            Err(e) => eprintln!("could not re-queue a job from the last session: {e:#}"),
+            Err(e) => {
+                eprintln!("could not re-queue a job from the last session (kept for later): {e:#}");
+                app.jobs.unrestored.lock().unwrap().push(j);
+            }
         }
     }
 }
@@ -428,18 +440,20 @@ fn apply(job: &mut Job, e: &Event) -> Option<usize> {
 pub fn start_worker(app: Arc<App>) {
     std::thread::spawn(move || {
         loop {
-            let (id, opts, retry, out_dir, workers) = {
+            let (id, opts, retry, out_dir, workers) = loop {
+                // Checked before taking the lock: probing runs ffmpeg. With unusable tools,
+                // queued jobs wait (the page shows why) instead of failing.
+                let tools_ok = app.encode_problem().is_none();
                 let mut jobs = app.jobs.jobs.lock().unwrap();
-                loop {
-                    // With unusable tools, queued jobs wait (the page shows why) instead of failing.
-                    if let Some(j) = jobs.iter_mut().find(|j| j.status == "queued")
-                        && app.encode_problem().is_none()
-                    {
-                        j.status = "running".into();
-                        break (j.id, j.options.to_options(), j.options.retry_skipped, j.out_dir.clone(), j.options.workers);
-                    }
-                    jobs = app.jobs.wake.wait(jobs).unwrap();
+                if tools_ok
+                    && !app.jobs.shutting_down.load(Ordering::SeqCst)
+                    && let Some(j) = jobs.iter_mut().find(|j| j.status == "queued")
+                {
+                    j.status = "running".into();
+                    break (j.id, j.options.to_options(), j.options.retry_skipped, j.out_dir.clone(), j.options.workers);
                 }
+                // Woken by new jobs and tool changes; the timeout is only a safety net.
+                drop(app.jobs.wake.wait_timeout(jobs, std::time::Duration::from_secs(30)).unwrap());
             };
             app.broadcast(json!({ "kind": "jobs" }));
             let result = run_job(&app, id, opts, retry, &out_dir, workers);

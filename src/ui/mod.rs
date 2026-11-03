@@ -97,15 +97,21 @@ impl App {
 
     pub fn capabilities(&self) -> Capabilities {
         let (ffmpeg, ffprobe) = (self.ffmpeg(), self.ffprobe());
-        let mut c = self.caps.lock().unwrap();
-        match &*c {
-            Some((a, b, caps)) if *a == ffmpeg && *b == ffprobe => caps.clone(),
-            _ => {
-                let caps = Capabilities::probe(&ffmpeg, &ffprobe);
-                *c = Some((ffmpeg, ffprobe, caps.clone()));
-                caps
-            }
+        if let Some((a, b, caps)) = &*self.caps.lock().unwrap()
+            && *a == ffmpeg
+            && *b == ffprobe
+        {
+            return caps.clone();
         }
+        // Probed without the lock held: it runs ffmpeg.
+        let caps = Capabilities::probe(&ffmpeg, &ffprobe);
+        *self.caps.lock().unwrap() = Some((ffmpeg, ffprobe, caps.clone()));
+        caps
+    }
+
+    /// Forgets the probe result, e.g. after the user installed a new ffmpeg at the same path.
+    pub fn recheck_tools(&self) {
+        *self.caps.lock().unwrap() = None;
     }
 
     /// Why encodes cannot run with the current tools, if they cannot.
@@ -189,6 +195,12 @@ fn stop_on_signal(app: Arc<App>) {
         SIGNAL_PIPE.store(fds[1], std::sync::atomic::Ordering::Relaxed);
         for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
             unsafe {
+                // Keep signals the parent chose to ignore ignored (`nohup`, background jobs).
+                let mut old: libc::sigaction = std::mem::zeroed();
+                libc::sigaction(sig, std::ptr::null(), &mut old);
+                if old.sa_sigaction == libc::SIG_IGN {
+                    continue;
+                }
                 let mut sa: libc::sigaction = std::mem::zeroed();
                 sa.sa_sigaction = on_signal as *const () as usize;
                 sa.sa_flags = libc::SA_RESTART;

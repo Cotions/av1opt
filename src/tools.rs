@@ -21,15 +21,35 @@ pub struct Capabilities {
 
 impl Capabilities {
     pub fn probe(ffmpeg: &str, ffprobe: &str) -> Self {
-        let out = |prog: &str, arg: &str| {
-            Command::new(prog)
+        // A program that hangs (a wrong path pointing at something else) is given up on after 10 s.
+        let out = |prog: &str, arg: &str| -> Option<String> {
+            let mut child = Command::new(prog)
                 .args(["-hide_banner", arg])
                 .stdin(Stdio::null())
+                .stdout(Stdio::piped())
                 .stderr(Stdio::null())
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .spawn()
+                .ok()?;
+            let mut stdout = child.stdout.take()?;
+            let reader = std::thread::spawn(move || {
+                let mut s = String::new();
+                let _ = stdout.read_to_string(&mut s);
+                s
+            });
+            let start = Instant::now();
+            let status = loop {
+                match child.try_wait() {
+                    Ok(Some(st)) => break st,
+                    Ok(None) if start.elapsed() < std::time::Duration::from_secs(10) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                    _ => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return None;
+                    }
+                }
+            };
+            let text = reader.join().ok()?;
+            status.success().then_some(text)
         };
         let ffmpeg_version = out(ffmpeg, "-version").and_then(|v| v.lines().next().map(str::to_owned));
         // Listing lines look like " V....D libsvtav1   SVT-AV1..." and " ... libvmaf   VV->V ...".

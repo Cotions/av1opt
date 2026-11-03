@@ -45,7 +45,10 @@
       "enableNodeCliInspectArguments": false,
       "onlyLoadAppFromAsar": true,
       "enableCookieEncryption": true
-    }
+    },
+    "electronLanguages": [
+      "en-US"
+    ]
   },
   "desktopName": "av1opt-desktop.desktop"
 }

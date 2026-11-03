@@ -99,7 +99,7 @@ function connect() {
 // Queue badge: number of queued + running jobs.
 async function refreshBadge() {
   try {
-    const { jobs } = await api("/api/jobs");
+    const { jobs } = await api("/api/jobs/heads");
     const n = jobs.filter((j) => j.status === "queued" || j.status === "running").length;
     const b = document.getElementById("queue-badge");
     b.textContent = n;
@@ -379,9 +379,9 @@ function renderScan(out, r) {
     selInfo.textContent = selected.size ? `${selected.size} selected · ${bytes(rows.filter((x) => selected.has(x.path)).reduce((a, x) => a + savedOf(x), 0))} est. saved` : "";
     encodeBtn.disabled = !selected.size;
   };
+  let limit = 500; // more rows make every sort and filter click slow
   const draw = () => {
     const v = shown();
-    const limit = 2000;
     body.replaceChildren(...v.slice(0, limit).map((x) => {
       const cb = h("input", { type: "checkbox", checked: selected.has(x.path), onchange: () => { if (cb.checked) selected.add(x.path); else selected.delete(x.path); updateSel(); } });
       const cls = x.verdict === "Candidate" ? "ok" : x.verdict === "Unreadable" ? "bad" : "";
@@ -397,7 +397,8 @@ function renderScan(out, r) {
         h("td", { class: "num" }, x.verdict === "Candidate" ? h("span", { title: `range ${bytes(x.size - x.estimate.high)} – ${bytes(x.size - x.estimate.low)}` }, `${bytes(savedOf(x))} (${pct(savedOf(x) / x.size)})`) : "–"),
         h("td", {}, h("span", { class: "pill " + cls, title: x.error || "" }, x.verdict_label)));
     }));
-    if (v.length > limit) body.append(h("tr", {}, h("td", { colspan: 10, class: "dim" }, `${v.length - limit} more not shown; narrow the filter.`)));
+    if (v.length > limit) body.append(h("tr", {}, h("td", { colspan: 10, class: "dim" }, `${v.length - limit} more not shown. `,
+      h("button", { class: "small", onclick: () => { limit = Infinity; draw(); } }, "Show all"))));
     if (!v.length) body.append(h("tr", {}, h("td", { colspan: 10, class: "empty" }, "Nothing here.")));
     allBox.checked = v.length > 0 && v.every((x) => selected.has(x.path));
   };
@@ -457,16 +458,24 @@ views.queue = (root) => {
     try { jobs = (await api("/api/jobs")).jobs; } catch (e) { toast(e.message, true); return; }
     draw();
   }
-  async function loadOne(id) {
-    let j;
-    try { j = await api("/api/jobs/" + id); } catch { return load(); }
-    const k = jobs.findIndex((x) => x.id === id);
-    if (k < 0) return load();
-    jobs[k] = j;
-    patchJob(j);
+  // A live event touches one file: fetch just that file and the job's header.
+  async function loadFile(id, i) {
+    let r;
+    try { r = await api(`/api/jobs/${id}/files/${i}`); } catch { return load(); }
+    const j = jobs.find((x) => x.id === id);
+    const e = jobEls.get(id);
+    if (!j || !e || !e.nodes[i]) return load();
+    Object.assign(j, r.head);
+    j.files[i] = r.file;
+    patchHead(e, j);
+    patchFile(e, j, r.file, i);
   }
   const reload = () => { clearTimeout(timer); timer = setTimeout(load, 150); };
-  const reloadOne = (id) => { clearTimeout(pending.get(id)); pending.set(id, setTimeout(() => loadOne(id), 120)); };
+  const reloadFile = (id, i) => {
+    const key = `${id}:${i}`;
+    clearTimeout(pending.get(key));
+    pending.set(key, setTimeout(() => { pending.delete(key); loadFile(id, i); }, 120));
+  };
 
   function draw() {
     const ids = new Set(jobs.map((j) => j.id));
@@ -476,7 +485,7 @@ views.queue = (root) => {
     for (const j of [...jobs].reverse()) list.append(patchJob(j)); // append moves nodes into order
   }
 
-  const headSig = (j) => JSON.stringify([j.status, j.error, j.files.map((f) => [f.status, f.input_bytes, f.output_bytes])]);
+  const headSig = (j) => JSON.stringify([j.status, j.error, j.counts, j.saved]);
   const fileSig = (f) => JSON.stringify({ ...f, progress: null });
 
   function patchJob(j) {
@@ -486,33 +495,37 @@ views.queue = (root) => {
       e.box.append(e.files);
       jobEls.set(j.id, e);
     }
-    const hs = headSig(j);
-    if (hs !== e.headSig) {
-      const nh = drawHead(j);
-      if (e.head) e.head.replaceWith(nh); else e.box.prepend(nh);
-      e.head = nh; e.headSig = hs;
-      if (e.err) { e.err.remove(); e.err = null; }
-      if (j.error) { e.err = h("div", { class: "file bad" }, j.error); e.box.append(e.err); }
-    }
-    j.files.forEach((f, i) => {
-      const sg = fileSig(f);
-      if (sg === e.sigs[i]) return;
-      fileEls.delete(`${j.id}:${i}`);
-      const n = drawFile(j, f, i);
-      if (e.nodes[i]) e.nodes[i].replaceWith(n); else e.files.append(n);
-      e.nodes[i] = n; e.sigs[i] = sg;
-    });
+    patchHead(e, j);
+    j.files.forEach((f, i) => patchFile(e, j, f, i));
     return e.box;
+  }
+
+  function patchHead(e, j) {
+    const hs = headSig(j);
+    if (hs === e.headSig) return;
+    const nh = drawHead(j);
+    if (e.head) e.head.replaceWith(nh); else e.box.prepend(nh);
+    e.head = nh; e.headSig = hs;
+    if (e.err) { e.err.remove(); e.err = null; }
+    if (j.error) { e.err = h("div", { class: "file bad" }, j.error); e.box.append(e.err); }
+  }
+
+  function patchFile(e, j, f, i) {
+    const sg = fileSig(f);
+    if (sg === e.sigs[i]) return;
+    fileEls.delete(`${j.id}:${i}`);
+    const n = drawFile(j, f, i);
+    if (e.nodes[i]) e.nodes[i].replaceWith(n); else e.files.append(n);
+    e.nodes[i] = n; e.sigs[i] = sg;
   }
 
   function drawHead(j) {
     const o = j.options;
-    const counts = {};
-    for (const f of j.files) counts[f.status] = (counts[f.status] || 0) + 1;
-    const saved = j.files.filter((f) => f.status === "ok").reduce((a, f) => a + (f.input_bytes - f.output_bytes), 0);
+    const counts = j.counts || {};
+    const saved = j.saved || 0;
     const head = h("div", { class: "head" },
       statusPill(j.status),
-      h("strong", {}, `${j.files.length} file${j.files.length === 1 ? "" : "s"}`),
+      h("strong", {}, `${j.total} file${j.total === 1 ? "" : "s"}`),
       h("span", { class: "dim" }, `→ ${j.out_dir}`),
       h("span", { class: "dim" }, `VMAF ${o.target_vmaf} · preset ${o.preset} · ${o.container}${o.scenes ? " · scenes×" + o.workers : ""}`),
       h("span", { class: "spacer" }),
@@ -591,7 +604,7 @@ views.queue = (root) => {
       const live = fileEls.get(`${m.id}:${m.file}`);
       if (live) return live.update(m.event);
     }
-    reloadOne(m.id);
+    if (m.file == null) reload(); else reloadFile(m.id, m.file);
   });
   load();
   return () => { off(); clearTimeout(timer); for (const t of pending.values()) clearTimeout(t); };
@@ -611,7 +624,9 @@ views.history = (root) => {
     const tin = reps.reduce((a, x) => a + (x.source_bytes || 0), 0), tout = reps.reduce((a, x) => a + (x.output_bytes || 0), 0);
     const dirs = h("div", { class: "chips" }, r.dirs.map((d) => h("span", { class: "chip" }, h("code", {}, d), h("button", { title: "Forget folder", onclick: async () => { await api("/api/history/dirs/remove", { path: d }); load(); } }, "×"))));
     if (!r.dirs.length) dirs.append(h("span", { class: "dim" }, "No folders yet. Output folders of queued encodes are added automatically."));
-    const rows = reps.map((x) => h("tr", { class: "click", onclick: () => (location.hash = "#/compare?report=" + encodeURIComponent(x.report)) },
+    // Thousands of rows take a while to lay out; the newest come first, the rest on request.
+    const LIMIT = 500;
+    const row = (x) => h("tr", { class: "click", onclick: () => (location.hash = "#/compare?report=" + encodeURIComponent(x.report)) },
       h("td", { class: "dim" }, when(x.time)),
       h("td", { class: "path", title: x.input }, basename(x.input), x.input_exists ? null : h("span", { class: "pill warn", title: "source no longer at this path" }, "source gone"), x.output_exists ? null : h("span", { class: "pill bad" }, "output gone")),
       h("td", {}, x.mode === "scenes" ? `scenes (${x.chunks})` : "whole"),
@@ -621,7 +636,13 @@ views.history = (root) => {
       h("td", { class: "num" }, bytes(x.source_bytes)),
       h("td", { class: "num" }, bytes(x.output_bytes)),
       h("td", { class: "num ok" }, pct(x.savings)),
-      h("td", { class: "num dim" }, hms((x.search_secs || 0) + (x.encode_secs || 0)))));
+      h("td", { class: "num dim" }, hms((x.search_secs || 0) + (x.encode_secs || 0))));
+    const tbody = h("tbody", {}, reps.slice(0, LIMIT).map(row));
+    if (reps.length > LIMIT) {
+      const more = h("tr", {}, h("td", { colspan: 10, class: "dim" }, `${reps.length - LIMIT} older encodes not shown. `,
+        h("button", { class: "small", onclick: () => { more.remove(); tbody.append(...reps.slice(LIMIT).map(row)); } }, "Show all")));
+      tbody.append(more);
+    }
     out.className = "";
     out.replaceChildren(
       h("div", { class: "panel" }, h("h3", {}, "Folders searched for reports"), dirs),
@@ -631,7 +652,7 @@ views.history = (root) => {
         h("div", { class: "stat" }, h("div", { class: "v ok" }, bytes(tin - tout)), h("div", { class: "l" }, `saved (${pct(tin ? 1 - tout / tin : 0)})`)),
         h("div", { class: "stat" }, h("div", { class: "v" }, STATE ? STATE.history_encodes : "–"), h("div", { class: "l" }, "encodes calibrating scan estimates"))),
       h("div", { class: "panel" }, reps.length
-        ? h("div", { class: "tablewrap" }, h("table", {}, h("thead", {}, h("tr", {}, ["When", "File", "Mode", "CRF", "Target", "VMAF", "Source", "AV1", "Saved", "Time"].map((t, k) => h("th", { class: k >= 3 ? "num" : "" }, t)))), h("tbody", {}, rows)))
+        ? h("div", { class: "tablewrap" }, h("table", {}, h("thead", {}, h("tr", {}, ["When", "File", "Mode", "CRF", "Target", "VMAF", "Source", "AV1", "Saved", "Time"].map((t, k) => h("th", { class: k >= 3 ? "num" : "" }, t)))), tbody))
         : h("div", { class: "empty" }, "No reports found in these folders.")));
   }
   load();

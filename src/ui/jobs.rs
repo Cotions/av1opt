@@ -171,14 +171,54 @@ pub fn shutdown(app: &App) {
     }
 }
 
+/// A job without its file list: status plus per-status counts and bytes saved, so the page can
+/// keep a job's header current from one file at a time.
+fn head(j: &Job) -> Value {
+    let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+    let mut saved = 0u64;
+    for f in &j.files {
+        *counts.entry(f.status.as_str()).or_default() += 1;
+        if f.status == "ok" {
+            saved += f.input_bytes.saturating_sub(f.output_bytes);
+        }
+    }
+    json!({
+        "id": j.id, "created": j.created, "out_dir": j.out_dir, "options": j.options,
+        "status": j.status, "error": j.error, "current": j.current,
+        "total": j.files.len(), "counts": counts, "saved": saved,
+    })
+}
+
+fn full(j: &Job) -> Value {
+    let mut v = head(j);
+    v["files"] = serde_json::to_value(&j.files).unwrap_or_default();
+    v
+}
+
 pub fn list(app: &App) -> Value {
-    json!({ "jobs": &*app.jobs.jobs.lock().unwrap() })
+    json!({ "jobs": app.jobs.jobs.lock().unwrap().iter().map(full).collect::<Vec<_>>() })
+}
+
+/// Headers only, for the queue badge.
+pub fn heads(app: &App) -> Value {
+    json!({ "jobs": app.jobs.jobs.lock().unwrap().iter().map(head).collect::<Vec<_>>() })
+}
+
+fn find(jobs: &[Job], id: u64) -> Result<&Job> {
+    jobs.iter().find(|j| j.id == id).ok_or_else(|| anyhow::anyhow!("not found: job {id}"))
 }
 
 pub fn get(app: &App, id: u64) -> Result<Value> {
+    Ok(full(find(&app.jobs.jobs.lock().unwrap(), id)?))
+}
+
+/// One file of a job plus the job's header: what a live event changes, without resending a
+/// folder of thousands of files.
+pub fn get_file(app: &App, id: u64, index: usize) -> Result<Value> {
     let jobs = app.jobs.jobs.lock().unwrap();
-    let j = jobs.iter().find(|j| j.id == id).ok_or_else(|| anyhow::anyhow!("not found: job {id}"))?;
-    Ok(serde_json::to_value(j)?)
+    let j = find(&jobs, id)?;
+    let f = j.files.get(index).ok_or_else(|| anyhow::anyhow!("not found: file {index} of job {id}"))?;
+    Ok(json!({ "head": head(j), "index": index, "file": f }))
 }
 
 #[derive(Deserialize)]
@@ -431,6 +471,12 @@ fn apply(job: &mut Job, e: &Event) -> Option<usize> {
             f.ended = Some(now());
             f.progress = None;
             f.phase.clear();
+            // Live details are in the report now; dropping them keeps long queues small.
+            f.phase_detail.clear();
+            f.source = None;
+            f.trials = Vec::new();
+            f.chunks = Vec::new();
+            f.spot_checks = Vec::new();
         }
     }
     Some(idx)

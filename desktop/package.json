@@ -1,0 +1,44 @@
+{
+  "name": "av1opt-desktop",
+  "productName": "av1opt",
+  "version": "0.1.0",
+  "description": "Desktop window for av1opt ui (bundled Chromium, so AV1 always plays)",
+  "private": true,
+  "main": "main.js",
+  "scripts": {
+    "start": "env -u ELECTRON_RUN_AS_NODE electron .",
+    "postinstall": "node node_modules/electron/install.js",
+    "dist": "electron-builder --linux AppImage"
+  },
+  "devDependencies": {
+    "electron": "^45.2.1",
+    "electron-builder": "^26.18.0"
+  },
+  "author": "Cotions",
+  "build": {
+    "appId": "local.av1opt.desktop",
+    "productName": "av1opt",
+    "files": [
+      "main.js",
+      "icon.png",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../target/release/av1opt",
+        "to": "av1opt"
+      }
+    ],
+    "linux": {
+      "target": "AppImage",
+      "category": "AudioVideo",
+      "executableName": "av1opt-desktop",
+      "icon": "icon.png",
+      "syncDesktopName": true
+    },
+    "directories": {
+      "output": "dist"
+    }
+  },
+  "desktopName": "av1opt-desktop.desktop"
+}

@@ -113,6 +113,34 @@ served for files you picked in the app. Output folders on ZFS are refused (no ov
 `AV1OPT_UI_TOKEN` sets the token (for a desktop wrapper loading the same page);
 `AV1OPT_UI_DEV=<repo>/ui` serves the page files from disk while working on them.
 
+**Settings** sets the ffmpeg and ffprobe programs (saved in `~/.local/share/av1opt/ui.json`,
+winning over `--ffmpeg` / `AV1OPT_FFMPEG`) and checks them for libsvtav1 and libvmaf. While they
+lack either, a banner says so and queued jobs wait instead of failing. `av1opt encode` runs the
+same check before it starts.
+
+Stopping the server (Ctrl-C, SIGTERM) stops running ffmpeg processes and keeps unfinished jobs
+for the next start.
+
+### Desktop app (optional)
+
+`desktop/` wraps the same page in an Electron window. Its bundled Chromium always plays AV1 and
+H.264, whatever browser is installed. It starts `av1opt ui` with a random token, shows the page,
+and stops the server when the window closes. If the window process dies, the server notices
+(stdin closes) and stops too.
+
+```
+cargo build --release --features ui
+cd desktop
+npm install          # if npm skips electron's download script: node node_modules/electron/install.js
+npm start            # runs ../target/release/av1opt
+npm run dist         # dist/av1opt-<version>.AppImage with the av1opt binary inside
+```
+
+The app uses, in order: `$AV1OPT_BIN`, the binary packed into the AppImage,
+`../target/release/av1opt`, then `av1opt` on PATH. Extra arguments go in `AV1OPT_UI_ARGS`
+(for example `AV1OPT_UI_ARGS="--memory-limit 12G"`). A desktop launcher has no shell
+environment, so set the ffmpeg path once in Settings.
+
 ### Safety
 
 - Inputs are never modified, moved or deleted.

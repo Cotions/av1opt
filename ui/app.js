@@ -107,6 +107,18 @@ async function refreshBadge() {
   } catch { /* offline */ }
 }
 onEvent((m) => { if (m.kind === "jobs") refreshBadge(); });
+// Desktop app: tell the user when a job ends while the window is in the background.
+onEvent((m) => {
+  if (m.kind !== "job_done" || !desktop) return;
+  const j = m.job, c = j.counts || {};
+  const parts = [];
+  if (c.ok) parts.push(`${c.ok} encoded`);
+  if (c.skip) parts.push(`${c.skip} skipped`);
+  if (c.error) parts.push(`${c.error} failed`);
+  if (j.saved) parts.push(`${bytes(j.saved)} saved`);
+  const title = j.status === "done" ? "Encode finished" : j.status === "failed" ? "Encode failed" : "Encode cancelled";
+  desktop.notify(title, parts.join(" · ") || j.error || "");
+});
 
 // ---------- state ----------
 
@@ -125,7 +137,18 @@ function renderBanner() {
 
 // Resolves to an array of absolute paths, or null if cancelled.
 // mode: "dir" picks one folder; "multi" picks any mix of folders and video files.
+// In the desktop app, folders come from the system's own dialog. Files and folders mixed
+// ("multi") stay with the in-page picker, which can select both at once.
+const desktop = window.av1optDesktop || null;
+
 function pick({ title, mode = "dir", start }) {
+  if (desktop && mode === "dir") {
+    return desktop.pickFolder(title, start || prefs.get("pickerDir", null) || (STATE && STATE.home) || "").then((p) => {
+      if (!p) return null;
+      prefs.set("pickerDir", p);
+      return [p];
+    });
+  }
   return new Promise((resolve) => {
     const selected = new Set();
     let cur = start || prefs.get("pickerDir", null) || (STATE && STATE.home) || "/";
@@ -440,11 +463,26 @@ function vmafColor(v, target) {
 
 views.queue = (root) => {
   const list = h("div");
+  const missing = h("div"); // saved jobs whose files were not there at start
   root.append(
     h("div", { class: "row" }, h("h1", { class: "grow" }, "Encode queue"),
       h("button", { onclick: async () => { await api("/api/jobs/clear", {}); load(); } }, "Clear finished"),
       h("button", { class: "primary", onclick: async () => { const p = await pick({ title: "Videos or folders to encode", mode: "multi" }); if (p) encodeDialog(p); } }, "New encode…")),
-    list);
+    missing, list);
+  const drawMissing = (un) => {
+    if (!un || !un.length) { missing.replaceChildren(); return; }
+    const act = (what) => async () => {
+      try {
+        const r = await api(`/api/jobs/unrestored/${what}`, {});
+        if (what === "retry") toast(r.restored ? `Re-queued ${r.restored} job${r.restored === 1 ? "" : "s"}` : "Files still missing", !r.restored);
+        load();
+      } catch (e) { toast(e.message, true); }
+    };
+    missing.replaceChildren(h("div", { class: "panel" },
+      h("div", { class: "row" }, h("strong", { class: "warn grow" }, `${un.length} saved job${un.length === 1 ? "" : "s"} from the last session could not be re-queued`),
+        h("button", { onclick: act("retry") }, "Try again"), h("button", { class: "danger", onclick: act("forget") }, "Forget")),
+      un.map((u) => h("div", { class: "dim mono" }, `${(u.inputs || []).join(", ")} → ${u.out_dir}: ${u.error}`))));
+  };
   const fileEls = new Map(); // "job:file" -> { el, update(progress) } for running files
   // Rendered jobs. Only parts whose data changed are rebuilt, so buttons stay put while an
   // encode streams events.
@@ -455,7 +493,10 @@ views.queue = (root) => {
   const pending = new Map(); // job id -> timeout
 
   async function load() {
-    try { jobs = (await api("/api/jobs")).jobs; } catch (e) { toast(e.message, true); return; }
+    let r;
+    try { r = await api("/api/jobs"); } catch (e) { toast(e.message, true); return; }
+    jobs = r.jobs;
+    drawMissing(r.unrestored);
     draw();
   }
   // A live event touches one file: fetch just that file and the job's header.

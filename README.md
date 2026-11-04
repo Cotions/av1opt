@@ -126,7 +126,9 @@ for the next start.
 `desktop/` wraps the same page in an Electron window. Its bundled Chromium always plays AV1 and
 H.264, whatever browser is installed. It starts `av1opt ui` with a random token, shows the page,
 and stops the server when the window closes. If the window process dies, the server notices
-(stdin closes) and stops too.
+(stdin closes) and stops too. Closing the window while an encode runs asks first. Folder
+choices use the system dialog, and a notification says when a job ends while the window is in
+the background.
 
 ```
 cargo build --release --features ui

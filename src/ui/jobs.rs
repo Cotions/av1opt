@@ -148,7 +148,7 @@ pub struct Queue {
     shutting_down: AtomicBool,
     /// Saved jobs that could not be restored (say, a drive not mounted yet). Kept in the saved
     /// queue so they come back once their files are there again.
-    unrestored: Mutex<Vec<Value>>,
+    unrestored: Mutex<Vec<(Value, String)>>,
 }
 
 /// Stops running encodes and previews so no ffmpeg outlives the server. Interrupted jobs stay
@@ -196,12 +196,14 @@ fn full(j: &Job) -> Value {
 }
 
 pub fn list(app: &App) -> Value {
-    json!({ "jobs": app.jobs.jobs.lock().unwrap().iter().map(full).collect::<Vec<_>>() })
+    let jobs: Vec<Value> = app.jobs.jobs.lock().unwrap().iter().map(full).collect();
+    json!({ "jobs": jobs, "unrestored": unrestored_list(app) })
 }
 
 /// Headers only, for the queue badge.
 pub fn heads(app: &App) -> Value {
-    json!({ "jobs": app.jobs.jobs.lock().unwrap().iter().map(head).collect::<Vec<_>>() })
+    let jobs: Vec<Value> = app.jobs.jobs.lock().unwrap().iter().map(head).collect();
+    json!({ "jobs": jobs, "unrestored": unrestored_list(app) })
 }
 
 fn find(jobs: &[Job], id: u64) -> Result<&Job> {
@@ -355,7 +357,7 @@ fn persist(app: &App) {
         .iter()
         .filter(|j| matches!(j.status.as_str(), "queued" | "running"))
         .map(|j| json!({ "inputs": j.inputs, "roots": j.roots, "out_dir": j.out_dir, "options": j.options }))
-        .chain(app.jobs.unrestored.lock().unwrap().iter().cloned())
+        .chain(app.jobs.unrestored.lock().unwrap().iter().map(|(j, _)| j.clone()))
         .collect();
     if let Some(p) = queue_path() {
         let tmp = p.with_extension("json.tmp");
@@ -377,10 +379,33 @@ pub fn restore(app: &App) {
             Ok(r) => eprintln!("re-queued {} file(s) from the last session", r["files"]),
             Err(e) => {
                 eprintln!("could not re-queue a job from the last session (kept for later): {e:#}");
-                app.jobs.unrestored.lock().unwrap().push(j);
+                app.jobs.unrestored.lock().unwrap().push((j, format!("{e:#}")));
             }
         }
     }
+}
+
+/// Saved jobs that could not be restored, with the reason.
+fn unrestored_list(app: &App) -> Vec<Value> {
+    let list = app.jobs.unrestored.lock().unwrap();
+    list.iter().map(|(j, why)| json!({ "inputs": j["inputs"], "out_dir": j["out_dir"], "error": why })).collect()
+}
+
+/// Tries the saved-but-missing jobs again (say, after mounting a drive), or forgets them.
+pub fn unrestored_action(app: &App, retry: bool) -> Result<Value> {
+    let list = std::mem::take(&mut *app.jobs.unrestored.lock().unwrap());
+    let mut restored = 0;
+    if retry {
+        for (j, _) in list {
+            match add_unchecked(app, &j) {
+                Ok(_) => restored += 1,
+                Err(e) => app.jobs.unrestored.lock().unwrap().push((j, format!("{e:#}"))),
+            }
+        }
+    }
+    persist(app);
+    app.broadcast(json!({ "kind": "jobs" }));
+    Ok(json!({ "restored": restored, "unrestored": unrestored_list(app) }))
 }
 
 pub fn cancel(app: &App, id: u64) -> Result<Value> {
@@ -504,6 +529,7 @@ pub fn start_worker(app: Arc<App>) {
             app.broadcast(json!({ "kind": "jobs" }));
             let result = run_job(&app, id, opts, retry, &out_dir, workers);
             let mut jobs = app.jobs.jobs.lock().unwrap();
+            let mut done = None;
             if let Some(j) = jobs.iter_mut().find(|j| j.id == id) {
                 j.hooks = None;
                 j.current = None;
@@ -520,10 +546,17 @@ pub fn start_worker(app: Arc<App>) {
                         j.error = Some(format!("{e:#}"));
                     }
                 }
+                done = Some(head(j));
             }
             drop(jobs);
             persist(&app);
             app.broadcast(json!({ "kind": "jobs" }));
+            // For a desktop notification; not sent for jobs stopped by shutting down.
+            if let Some(h) = done
+                && !app.jobs.shutting_down.load(Ordering::SeqCst)
+            {
+                app.broadcast(json!({ "kind": "job_done", "job": h }));
+            }
         }
     });
 }

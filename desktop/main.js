@@ -21,7 +21,7 @@ if (typeof require("electron") === "string") {
   return;
 }
 
-const { app, BrowserWindow, dialog, shell, session } = require("electron");
+const { app, BrowserWindow, Notification, dialog, ipcMain, shell, session } = require("electron");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -133,6 +133,7 @@ function createWindow({ origin, token }) {
     show: false,
     webPreferences: {
       session: ses,
+      preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       sandbox: true,
       nodeIntegration: false,
@@ -160,8 +161,66 @@ function createWindow({ origin, token }) {
     if (!quitting && d.reason !== "clean-exit") win.reload();
   });
 
+  // Closing while an encode runs stops it (it resumes next time); ask first.
+  let closeOk = false;
+  win.on("close", (e) => {
+    if (closeOk || quitting) return;
+    e.preventDefault();
+    busy(origin, token).then(async (n) => {
+      if (n > 0) {
+        const r = await dialog.showMessageBox(win, {
+          type: "question",
+          buttons: ["Quit", "Keep open"],
+          defaultId: 1,
+          cancelId: 1,
+          message: n === 1 ? "An encode is running." : `${n} encode jobs are running or waiting.`,
+          detail: "Quitting stops it now. Finished chunks are kept and the job resumes the next time you open av1opt.",
+        });
+        if (r.response !== 0) return;
+      }
+      closeOk = true;
+      win.close();
+    });
+  });
+
+  // Requests from the page, accepted only from our own page in this window.
+  const fromPage = (e) => e.sender === win.webContents && isOwn(e.senderFrame ? e.senderFrame.url : "");
+  ipcMain.handle("av1opt:pick-folder", async (e, { title, start }) => {
+    if (!fromPage(e)) return null;
+    const r = await dialog.showOpenDialog(win, {
+      title: title || "Choose a folder",
+      defaultPath: start && path.isAbsolute(start) ? start : app.getPath("home"),
+      properties: ["openDirectory", "createDirectory"],
+    });
+    return r.canceled || !r.filePaths.length ? null : r.filePaths[0];
+  });
+  ipcMain.on("av1opt:notify", (e, { title, body }) => {
+    if (!fromPage(e) || win.isFocused() || !Notification.isSupported()) return;
+    const n = new Notification({ title: String(title).slice(0, 120), body: String(body).slice(0, 300), icon: path.join(__dirname, "icon.png") });
+    n.on("click", () => {
+      if (win.isDestroyed()) return;
+      if (win.isMinimized()) win.restore();
+      win.show();
+      win.focus();
+    });
+    n.show();
+  });
+
   win.loadURL(`${origin}/?token=${token}`);
   return win;
+}
+
+// Number of jobs running or queued, asked from the server the way the page would.
+async function busy(origin, token) {
+  try {
+    const port = new URL(origin).port;
+    const r = await fetch(`${origin}/api/jobs/heads`, { headers: { Cookie: `av1opt_${port}=${token}` }, signal: AbortSignal.timeout(2000) });
+    if (!r.ok) return 0;
+    const { jobs } = await r.json();
+    return jobs.filter((j) => j.status === "running" || j.status === "queued").length;
+  } catch {
+    return 0;
+  }
 }
 
 function stopServer() {

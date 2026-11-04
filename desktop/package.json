@@ -21,6 +21,7 @@
     "productName": "av1opt",
     "files": [
       "main.js",
+      "preload.js",
       "icon.png",
       "package.json"
     ],

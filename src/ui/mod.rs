@@ -130,10 +130,10 @@ impl App {
 
 pub fn run(cfg: Config) -> Result<()> {
     // A wrapper app (Electron-style) can choose the token and load `/?token=...` itself.
-    let token = match std::env::var("AV1OPT_UI_TOKEN") {
-        Ok(t) if t.len() >= 16 && t.bytes().all(|b| b.is_ascii_alphanumeric()) => t,
+    let (token, token_given) = match std::env::var("AV1OPT_UI_TOKEN") {
+        Ok(t) if t.len() >= 16 && t.bytes().all(|b| b.is_ascii_alphanumeric()) => (t, true),
         Ok(_) => anyhow::bail!("AV1OPT_UI_TOKEN must be at least 16 letters or digits"),
-        Err(_) => random_hex(16)?,
+        Err(_) => (random_hex(16)?, false),
     };
     let server = tiny_http::Server::http(("127.0.0.1", cfg.port)).map_err(|e| anyhow::anyhow!("cannot listen on 127.0.0.1:{}: {e}", cfg.port))?;
     let port = server.server_addr().to_ip().context("not an IP listener")?.port();
@@ -165,7 +165,13 @@ pub fn run(cfg: Config) -> Result<()> {
     jobs::start_worker(app.clone());
 
     let url = format!("http://127.0.0.1:{port}/?token={}", app.token);
-    eprintln!("av1opt ui on http://127.0.0.1:{port}/ (local only). Open this link to sign in:\n  {url}");
+    // A caller that chose the token knows it; keep it out of logs (a desktop launcher's output
+    // may end up in the journal).
+    if token_given {
+        eprintln!("av1opt ui on http://127.0.0.1:{port}/ (local only; sign in with the token you set)");
+    } else {
+        eprintln!("av1opt ui on http://127.0.0.1:{port}/ (local only). Open this link to sign in:\n  {url}");
+    }
     eprintln!("press Ctrl-C to stop (a running encode resumes on the next run)");
     if open {
         open_browser(&url);

@@ -3,6 +3,7 @@
 use crate::events::Event;
 use crate::probe::{self, MediaInfo};
 use crate::history;
+use crate::metadata::{self, MetaOptions, Resolved};
 use crate::scenes;
 use crate::search::{self, EncodeSettings, SearchParams, Trial};
 use crate::tools::{Tools, hms, path_arg};
@@ -27,6 +28,8 @@ pub struct Options {
     pub scenes: bool,
     /// Chunks encoded at the same time in scene mode.
     pub workers: usize,
+    /// Source tags kept or dropped, tags added, file date.
+    pub meta: MetaOptions,
 }
 
 /// Name prefix of scene-mode work folders. Unlike temp folders they survive crashes on purpose:
@@ -81,6 +84,10 @@ struct Report<'a> {
     search: &'a [Trial],
     chunks: Option<&'a [scenes::ChunkResult]>,
     verify_vmaf: &'a [f64],
+    /// Tags av1opt wrote on top of (or instead of) the source's.
+    tags: std::collections::BTreeMap<&'a str, &'a str>,
+    /// The yt-dlp info file the tags were filled from.
+    info_json: Option<&'a Path>,
     search_secs: f64,
     encode_secs: f64,
     notes: &'a [String],
@@ -181,6 +188,14 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         // encoding damage, but its absolute meaning differs from SDR.
         notes.push(format!("HDR ({}): colour and HDR metadata kept; VMAF measured on the HDR signal", info.color_transfer));
     }
+    let meta = metadata::resolve(&o.meta, input, &info.tags);
+    if !meta.tags.is_empty() {
+        let from = meta.info_json.as_ref().and_then(|p| p.file_name()).map(|n| format!(" (from {})", n.to_string_lossy())).unwrap_or_default();
+        notes.push(format!("metadata: set {}{from}", meta.tags.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(", ")));
+    }
+    if !o.meta.keep {
+        notes.push("metadata: source tags and chapters dropped".to_string());
+    }
     let scenes = o.scenes && !info.vfr;
     if o.scenes && info.vfr {
         notes.push("variable frame rate source: encoded in one pass instead of per scene".to_string());
@@ -265,12 +280,12 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         let chunks = scenes::encode_all(&ctx, &plan)?;
         tools.emit(Event::Phase { phase: "muxing".into(), detail: format!("joining {} chunks", chunks.len()) });
         let video = scenes::concat(&work.path, chunks.len())?;
-        let (args, streams) = mux_args(&video, input, &info, o.container, &covers, &partial, &mut notes);
+        let (args, streams) = mux_args(&video, input, &info, o.container, &covers, &meta, &o.meta, &partial, &mut notes);
         tools.run(&args)?;
         let _ = std::fs::remove_file(&video);
         (streams, Some(chunks), Some(plan.total_frames))
     } else {
-        let (args, streams) = full_encode_args(input, &info, &enc, best.crf, o.container, &covers, &partial, &mut notes);
+        let (args, streams) = full_encode_args(input, &info, &enc, best.crf, o.container, &covers, &meta, &o.meta, &partial, &mut notes);
         for n in &notes {
             eprintln!("note: {n}");
             tools.emit(Event::Note { text: n.clone() });
@@ -290,8 +305,23 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     eprintln!("verifying");
     tools.emit(Event::Phase { phase: "verifying".into(), detail: "streams, duration, VMAF spot checks".into() });
     let (verify_vmaf, out_info) = verify(tools, input, &info, &partial, &streams, expect_frames, o, vmaf_threads, &tmp.path)?;
+    let lost = metadata::missing(&meta, &out_info.tags);
+    if !lost.is_empty() {
+        let n = format!(
+            "metadata: {} not stored: {} has no field for {} (MKV keeps any tag)",
+            lost.join(", "), o.container.ext().to_uppercase(), if lost.len() == 1 { "it" } else { "them" }
+        );
+        eprintln!("note: {n}");
+        tools.emit(Event::Note { text: n.clone() });
+        notes.push(n);
+    }
 
     std::fs::rename(&partial, &output).or_else(|_| std::fs::copy(&partial, &output).map(|_| ()))?;
+    if o.meta.keep_dates
+        && let Err(e) = metadata::copy_mtime(input, &output)
+    {
+        eprintln!("warning: could not copy the file date: {e}");
+    }
     let output_bytes = std::fs::metadata(&output)?.len();
     let abs_input = std::fs::canonicalize(input)?;
     let abs_output = std::fs::canonicalize(&output)?;
@@ -312,6 +342,8 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         search: &trials,
         chunks: chunks.as_deref(),
         verify_vmaf: &verify_vmaf,
+        tags: meta.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect(),
+        info_json: meta.info_json.as_deref(),
         search_secs,
         encode_secs,
         notes: &notes,
@@ -381,6 +413,8 @@ fn full_encode_args(
     crf: f64,
     container: Container,
     covers: &[CoverFile],
+    tags: &Resolved,
+    mo: &MetaOptions,
     out: &Path,
     notes: &mut Vec<String>,
 ) -> (Vec<String>, Streams) {
@@ -394,18 +428,22 @@ fn full_encode_args(
     a.extend(enc.video_args(crf));
     a.extend(["-fps_mode:v:0", "passthrough"].map(String::from));
     let streams = stream_args(info, 0, container, covers, notes);
+    a.extend(metadata::ffmpeg_args(mo, tags, 0));
     a.extend(streams.args.iter().cloned());
     a.push(path_arg(out));
     (a, streams)
 }
 
 /// Joined scene-chunk video plus audio, subtitles and metadata from the source.
+#[allow(clippy::too_many_arguments)]
 fn mux_args(
     video: &Path,
     input: &Path,
     info: &MediaInfo,
     container: Container,
     covers: &[CoverFile],
+    tags: &Resolved,
+    mo: &MetaOptions,
     out: &Path,
     notes: &mut Vec<String>,
 ) -> (Vec<String>, Streams) {
@@ -418,12 +456,13 @@ fn mux_args(
     .map(String::from)
     .to_vec();
     let streams = stream_args(info, 1, container, covers, notes);
+    a.extend(metadata::ffmpeg_args(mo, tags, 1));
     a.extend(streams.args.iter().cloned());
     a.push(path_arg(out));
     (a, streams)
 }
 
-/// Audio, subtitle, cover, attachment and metadata arguments for source input number `src`.
+/// Audio, subtitle, cover and attachment arguments for source input number `src`.
 struct Streams {
     args: Vec<String>,
     audio: usize,
@@ -521,7 +560,6 @@ fn stream_args(info: &MediaInfo, src: usize, container: Container, cover_files: 
             covers = cover_files.len();
         }
     }
-    a.extend(["-map_metadata".into(), src.to_string(), "-map_chapters".into(), src.to_string()]);
     if container == Container::Mp4 {
         a.extend(["-movflags", "+faststart"].map(String::from));
     }

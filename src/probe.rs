@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
@@ -49,6 +50,9 @@ pub struct MediaInfo {
     /// Non-image attachments (fonts for ASS subtitles, ...).
     #[serde(default)]
     pub attachments: u32,
+    /// Global container tags. Not cached by scans (descriptions can be long); encodes probe fresh.
+    #[serde(skip)]
+    pub tags: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,6 +174,10 @@ pub fn probe(ffprobe: &str, path: &Path, file_size: u64) -> Result<MediaInfo> {
             .collect(),
         covers,
         attachments: streams.iter().filter(|s| s["codec_type"] == "attachment").count() as u32,
+        tags: j["format"]["tags"]
+            .as_object()
+            .map(|t| t.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect())
+            .unwrap_or_default(),
     })
 }
 

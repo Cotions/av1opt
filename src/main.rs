@@ -4,6 +4,7 @@ mod estimate;
 mod events;
 mod fsguard;
 mod history;
+mod metadata;
 mod probe;
 mod report;
 mod scan;
@@ -112,6 +113,24 @@ enum Cmd {
         /// CPU priority for encodes (0-19, higher = more polite to the desktop).
         #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(i32).range(0..=19))]
         nice: i32,
+        /// Drop the source's tags and chapters (stream languages and track names stay).
+        #[arg(long)]
+        strip_metadata: bool,
+        /// Give each output the source's modification time.
+        #[arg(long)]
+        keep_dates: bool,
+        /// Add tags from a preset: youtube (as yt-dlp --embed-metadata), movie, tv, music.
+        /// Values come from a yt-dlp <name>.info.json next to the video, else the source's tags.
+        #[arg(long, value_name = "PRESET")]
+        meta_preset: Option<String>,
+        /// Set a tag, e.g. --meta genre=Documentary or --meta 'title={title|file}'.
+        /// `{field}` is filled from the .info.json or the source tags, `{file}` is the file name.
+        /// Repeatable; overrides the preset; an empty value removes a preset tag.
+        #[arg(long = "meta", value_name = "KEY=VALUE", value_parser = metadata::parse_tag)]
+        meta: Vec<(String, String)>,
+        /// Don't read yt-dlp .info.json files.
+        #[arg(long)]
+        no_info_json: bool,
     },
     /// Local web app: scan folders, queue encodes with live progress, compare source and AV1
     /// output side by side, browse past encodes. Listens on 127.0.0.1 only.
@@ -150,7 +169,14 @@ fn main() -> Result<()> {
         Cmd::Encode {
             inputs, out_dir, container, target_vmaf, preset, min_crf, max_crf, samples, sample_secs,
             min_savings, force, overwrite, retry_skipped, keep_temp, allow_zfs, ffmpeg, ffprobe, scenes, workers, memory_limit, nice,
+            strip_metadata, keep_dates, meta_preset, meta, no_info_json,
         } => {
+            let meta = metadata::MetaOptions {
+                keep: !strip_metadata,
+                keep_dates,
+                info_json: !no_info_json,
+                tags: metadata::with_preset(meta_preset.as_deref(), &meta)?,
+            };
             if min_crf > max_crf {
                 anyhow::bail!("--min-crf {min_crf} is above --max-crf {max_crf}");
             }
@@ -164,7 +190,7 @@ fn main() -> Result<()> {
             let tools = tools::Tools::new(ffmpeg, ffprobe, memory_cap(&memory_limit, if scenes { workers } else { 1 }));
             let opts = encode::Options {
                 container, target_vmaf, preset, min_crf, max_crf, samples, sample_secs,
-                min_savings, force, overwrite, keep_temp, scenes, workers: workers.into(),
+                min_savings, force, overwrite, keep_temp, scenes, workers: workers.into(), meta,
             };
             let jobs = batch::expand(&inputs, &out_dir, is_video);
             if jobs.is_empty() {

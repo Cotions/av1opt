@@ -228,8 +228,89 @@ function pick({ title, mode = "dir", start }) {
 
 // ---------- encode options + enqueue dialog ----------
 
+function metaLabel(o) {
+  const parts = [];
+  if (o.keep_metadata === false) parts.push("tags stripped");
+  if (o.meta_tags && o.meta_tags.length) {
+    const p = ((STATE && STATE.meta_presets) || []).find((x) => x.id === o.meta_preset);
+    parts.push(p ? `${p.name} tags` : `${o.meta_tags.length} tag${o.meta_tags.length === 1 ? "" : "s"}`);
+  }
+  if (o.keep_dates) parts.push("dates kept");
+  return parts.length ? " · " + parts.join(" · ") : "";
+}
+
 function defaultOptions() {
-  return Object.assign({ container: "mp4", target_vmaf: 93, preset: 6, scenes: false, workers: 1, min_savings: 0.15, force: false, retry_skipped: false }, prefs.get("encodeOptions", {}));
+  return Object.assign({
+    container: "mp4", target_vmaf: 93, preset: 6, scenes: false, workers: 1, min_savings: 0.15, force: false, retry_skipped: false,
+    keep_metadata: true, keep_dates: false, info_json: true, meta_preset: "", meta_tags: [],
+  }, prefs.get("encodeOptions", {}));
+}
+
+// Tag editor for the encode dialog: preset picker, name/template rows, and (for one file)
+// a preview of what would be written. `get()` returns the current option fields.
+function metaEditor(o, inputs) {
+  const presets = (STATE && STATE.meta_presets) || [];
+  const keep = h("input", { type: "checkbox", checked: o.keep_metadata });
+  const dates = h("input", { type: "checkbox", checked: o.keep_dates });
+  const infoJson = h("input", { type: "checkbox", checked: o.info_json });
+  const presetSel = h("select", {}, h("option", { value: "" }, "None"), presets.map((p) => h("option", { value: p.id, title: p.about }, p.name)));
+  presetSel.value = presets.some((p) => p.id === o.meta_preset) ? o.meta_preset : "";
+  const about = h("span", { class: "dim" });
+  const rows = h("div", { class: "tags" });
+  const out = h("div", { class: "tag-preview" });
+  const showAbout = () => { const p = presets.find((x) => x.id === presetSel.value); about.textContent = p ? p.about : ""; };
+  function addRow(k = "", v = "") {
+    const key = h("input", { type: "text", class: "tag-key", value: k, placeholder: "tag", spellcheck: "false" });
+    const val = h("input", { type: "text", class: "tag-val", value: v, placeholder: "value or {field}", spellcheck: "false" });
+    const row = h("div", { class: "tag-row" }, key, val, h("button", { class: "small", title: "Remove", onclick: () => row.remove() }, "×"));
+    rows.append(row);
+    return key;
+  }
+  const setTags = (tags) => { rows.replaceChildren(); for (const [k, v] of tags) addRow(k, v); };
+  setTags(o.meta_tags || []);
+  showAbout();
+  presetSel.addEventListener("change", () => {
+    const p = presets.find((x) => x.id === presetSel.value);
+    setTags(p ? p.tags : []);
+    showAbout();
+    out.replaceChildren();
+  });
+  function get() {
+    const meta_tags = [...rows.querySelectorAll(".tag-row")]
+      .map((r) => [r.querySelector(".tag-key").value.trim(), r.querySelector(".tag-val").value])
+      .filter(([k, v]) => k && v.trim());
+    return { keep_metadata: keep.checked, keep_dates: dates.checked, info_json: infoJson.checked, meta_preset: presetSel.value || null, meta_tags };
+  }
+  const one = inputs.length === 1 && /\.[A-Za-z0-9]{2,5}$/.test(inputs[0]) ? inputs[0] : null;
+  const previewBtn = one && h("button", { class: "small", onclick: async () => {
+    previewBtn.disabled = true;
+    try {
+      const r = await api("/api/meta/preview", { input: one, options: get() });
+      const set = new Map(r.tags.map(([k, v]) => [k.toLowerCase(), v]));
+      const kept = r.keep ? Object.entries(r.source).filter(([k]) => !set.has(k.toLowerCase()) && !/^(encoder|major_brand|minor_version|compatible_brands|creation_time)$/i.test(k)) : [];
+      const short = (v) => (v.length > 160 ? v.slice(0, 160) + "…" : v);
+      out.replaceChildren(
+        h("div", { class: "dim" }, r.info_json ? `Filled from ${basename(r.info_json)}` : "No .info.json next to this file; templates use its own tags"),
+        r.tags.length || kept.length
+          ? h("div", { class: "kv" },
+              r.tags.map(([k, v]) => [h("span", { class: "k" }, k), h("span", { class: "mono" }, short(v))]),
+              kept.map(([k, v]) => [h("span", { class: "k" }, k), h("span", { class: "mono dim", title: "kept from the source" }, short(v))]))
+          : h("div", { class: "dim" }, "No tags would be written."),
+        !r.keep && Object.keys(r.source).length ? h("div", { class: "dim" }, `${Object.keys(r.source).length} source tags dropped`) : null);
+    } catch (e) { toast(e.message, true); }
+    previewBtn.disabled = false;
+  } }, "Preview tags");
+  const el = h("div", {},
+    h("div", { class: "row" },
+      h("label", { class: "check", title: "Title, description, dates, chapters… Stream languages and track names are always kept." }, keep, "Keep source metadata and chapters"),
+      h("label", { class: "check", title: "Set the output's modification time to the source's" }, dates, "Keep file date"),
+      h("label", { class: "check", title: "Fill tags from <name>.info.json (yt-dlp --write-info-json) next to each video" }, infoJson, "Read yt-dlp .info.json")),
+    h("div", { class: "row" }, h("label", { class: "field" }, "Add tags", presetSel), about),
+    rows,
+    h("div", { class: "row" }, h("button", { class: "small", onclick: () => addRow().focus() }, "+ Tag"), previewBtn),
+    h("p", { class: "dim" }, "{field} comes from the video's .info.json, else its own tags; {a|b} takes the first with a value; {file} is the file name. Tags that come out empty are skipped. MP4 stores only the common tags (title, artist, date, description, comment, genre, show, episode…); MKV keeps any."),
+    out);
+  return { el, get };
 }
 
 // Shows the encode dialog for `inputs` (paths). Resolves true if queued.
@@ -247,11 +328,13 @@ function encodeDialog(inputs, roots = []) {
     const minSav = h("input", { type: "number", min: "0", max: "95", step: "1", value: Math.round(o.min_savings * 100) });
     const force = h("input", { type: "checkbox", checked: o.force });
     const retry = h("input", { type: "checkbox", checked: o.retry_skipped });
+    const meta = metaEditor(o, inputs);
     const close = (v) => { bg.remove(); resolve(v); };
     const go = h("button", { class: "primary", onclick: async () => {
       const options = {
         container: container.value, target_vmaf: Number(vmaf.value), preset: Number(preset.value), scenes: scenes.checked,
         workers: Number(workers.value), min_savings: Number(minSav.value) / 100, force: force.checked, retry_skipped: retry.checked,
+        ...meta.get(),
       };
       prefs.set("encodeOptions", options);
       prefs.set("outDir", outDir);
@@ -285,7 +368,9 @@ function encodeDialog(inputs, roots = []) {
             h("label", { class: "check" }, scenes, "Per-scene CRF (--scenes)"),
             h("label", { class: "field" }, "Chunk workers", workers),
             h("label", { class: "check" }, force, "Force (also AV1 / low gain)"),
-            h("label", { class: "check" }, retry, "Retry earlier skips"))),
+            h("label", { class: "check" }, retry, "Retry earlier skips")),
+          h("h3", {}, "Metadata"),
+          meta.el),
         h("div", { class: "foot" }, h("button", { onclick: () => close(false) }, "Cancel"), go)));
     document.body.append(bg);
   });
@@ -568,7 +653,7 @@ views.queue = (root) => {
       statusPill(j.status),
       h("strong", {}, `${j.total} file${j.total === 1 ? "" : "s"}`),
       h("span", { class: "dim" }, `→ ${j.out_dir}`),
-      h("span", { class: "dim" }, `VMAF ${o.target_vmaf} · preset ${o.preset} · ${o.container}${o.scenes ? " · scenes×" + o.workers : ""}`),
+      h("span", { class: "dim" }, `VMAF ${o.target_vmaf} · preset ${o.preset} · ${o.container}${o.scenes ? " · scenes×" + o.workers : ""}${metaLabel(o)}`),
       h("span", { class: "spacer" }),
       saved > 0 ? h("span", { class: "ok" }, `${bytes(saved)} saved`) : null,
       h("span", { class: "dim" }, Object.entries(counts).map(([k, v]) => `${v} ${(STATUS[k] || [k])[0].toLowerCase()}`).join(" · ")),
@@ -921,6 +1006,9 @@ function comparePlayer(root, r) {
     r.search && r.search.length ? h("div", { class: "panel" }, h("h3", {}, "CRF search (samples)"), h("table", { class: "trials" },
       h("tr", {}, h("th", {}, "CRF"), h("th", { class: "num" }, "VMAF"), h("th", { class: "num" }, "worst"), h("th", { class: "num" }, "size")),
       r.search.map((t) => h("tr", {}, h("td", {}, t.crf), h("td", { class: "num " + (t.mean_vmaf >= target ? "ok" : "bad") }, num(t.mean_vmaf)), h("td", { class: "num dim" }, num(t.min_vmaf)), h("td", { class: "num" }, pct(t.size_ratio)))))) : null,
+    r.tags && Object.keys(r.tags).length ? h("div", { class: "panel" }, h("h3", {}, "Tags written"),
+      r.info_json ? h("div", { class: "dim" }, `from ${basename(r.info_json)}`) : null,
+      h("div", { class: "kv" }, Object.entries(r.tags).map(([k, v]) => kv(k, h("span", { class: "mono", title: v }, v.length > 120 ? v.slice(0, 120) + "…" : v))))) : null,
     (r.notes || []).length ? h("div", { class: "panel" }, h("h3", {}, "Notes"), r.notes.map((n) => h("div", { class: "dim" }, n))) : null,
     h("div", { class: "panel" }, h("h3", {}, "Playback"), h("div", {}, srcStatus), h("div", { class: "row" }, previewBtn),
       h("h3", {}, "Frame alignment"),

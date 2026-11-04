@@ -343,3 +343,33 @@ impl Server {
         })
     }
 }
+
+#[test]
+fn metadata_presets_and_options() {
+    let s = Server::start("meta", |d| {
+        std::fs::write(d.join("videos/a.mkv"), b"x").unwrap();
+        std::fs::write(d.join("videos/notes.txt"), b"x").unwrap();
+        let options = json!({ "keep_metadata": false, "keep_dates": true, "meta_preset": "youtube", "meta_tags": [["title", "{title|file}"]] });
+        let saved = json!({ "format": 1, "jobs": [{ "inputs": [d.join("videos/a.mkv")], "roots": [], "out_dir": d.join("out"), "options": options }] });
+        std::fs::write(d.join("data/av1opt/ui-queue.json"), saved.to_string()).unwrap();
+    });
+    let st = s.get("/api/state").json();
+    let presets = st["meta_presets"].as_array().unwrap();
+    let yt = presets.iter().find(|p| p["id"] == "youtube").expect("youtube preset");
+    assert!(yt["tags"].as_array().unwrap().iter().any(|t| t[0] == "purl" && t[1] == "{webpage_url}"), "{yt}");
+
+    // Saved metadata options come back with the job.
+    let o = &s.get("/api/jobs/heads").json()["jobs"][0]["options"];
+    assert_eq!(o["keep_metadata"], false, "{o}");
+    assert_eq!(o["keep_dates"], true);
+    assert_eq!(o["meta_tags"][0][1], "{title|file}");
+
+    // Preview checks tag names before touching the file, and only looks at videos.
+    let a = s.dir.join("videos/a.mkv");
+    let r = s.post("/api/meta/preview", &json!({ "input": a, "options": { "meta_tags": [["bad key", "x"]] } }));
+    assert_eq!(r.status, 400);
+    assert!(r.body.contains("bad key"), "{}", r.body);
+    let r = s.post("/api/meta/preview", &json!({ "input": s.dir.join("videos/notes.txt") }));
+    assert_eq!(r.status, 400);
+    assert!(r.body.contains("not a video"), "{}", r.body);
+}

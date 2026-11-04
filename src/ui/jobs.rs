@@ -5,6 +5,7 @@ use super::{App, now};
 use crate::batch;
 use crate::encode::{Container, Options};
 use crate::events::{Event, Hooks};
+use crate::metadata::MetaOptions;
 use crate::scan::is_video;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -31,8 +32,25 @@ pub struct JobOptions {
     pub force: bool,
     #[serde(default)]
     pub retry_skipped: bool,
+    /// Copy the source's tags and chapters.
+    #[serde(default = "d_true")]
+    pub keep_metadata: bool,
+    #[serde(default)]
+    pub keep_dates: bool,
+    /// Fill tag templates from yt-dlp .info.json files.
+    #[serde(default = "d_true")]
+    pub info_json: bool,
+    /// Preset the tags started from (shown in the queue; the tags themselves are in `meta_tags`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta_preset: Option<String>,
+    /// Tag name and template pairs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub meta_tags: Vec<(String, String)>,
 }
 
+fn d_true() -> bool {
+    true
+}
 fn d_container() -> String {
     "mp4".into()
 }
@@ -79,7 +97,15 @@ impl JobOptions {
             keep_temp: false,
             scenes: self.scenes,
             workers: self.workers as usize,
+            meta: self.meta()?,
         })
+    }
+
+    pub fn meta(&self) -> Result<MetaOptions> {
+        let tags: Vec<(String, String)> =
+            self.meta_tags.iter().map(|(k, v)| (k.trim().to_string(), v.clone())).filter(|(k, v)| !k.is_empty() && !v.trim().is_empty()).collect();
+        crate::metadata::validate(&tags)?;
+        Ok(MetaOptions { keep: self.keep_metadata, keep_dates: self.keep_dates, info_json: self.info_json, tags })
     }
 }
 

@@ -52,7 +52,36 @@ pub fn state(app: &App) -> Value {
         "tools": tools_state(app),
         "version": env!("CARGO_PKG_VERSION"),
         "api": super::API_VERSION,
+        "meta_presets": crate::metadata::PRESETS,
     })
+}
+
+#[derive(Deserialize)]
+struct MetaPreviewRequest {
+    input: PathBuf,
+    #[serde(default)]
+    options: Option<super::jobs::JobOptions>,
+}
+
+/// The tags an encode of `input` would write with these options, next to the source's own.
+pub fn meta_preview(app: &App, body: &Value) -> Result<Value> {
+    let r: MetaPreviewRequest = serde_json::from_value(body.clone())?;
+    let input = std::fs::canonicalize(&r.input).with_context(|| format!("{} does not exist", r.input.display()))?;
+    if !input.is_file() || !is_video(&input) {
+        bail!("not a video file");
+    }
+    let options = r.options.unwrap_or_else(|| serde_json::from_value(json!({})).expect("defaults"));
+    let meta = options.meta()?;
+    let size = std::fs::metadata(&input)?.len();
+    let info = crate::probe::probe(&app.ffprobe(), &input, size)?;
+    let resolved = crate::metadata::resolve(&meta, &input, &info.tags);
+    Ok(json!({
+        "input": input,
+        "source": info.tags,
+        "keep": meta.keep,
+        "tags": resolved.tags,
+        "info_json": resolved.info_json,
+    }))
 }
 
 fn tools_state(app: &App) -> Value {

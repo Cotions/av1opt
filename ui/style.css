@@ -171,3 +171,10 @@ tr.click:hover td { background: var(--panel2); }
 .toast.err { border-color: var(--bad); color: var(--bad); }
 .spin { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--dim); border-top-color: transparent; border-radius: 50%; animation: spin 1s linear infinite; vertical-align: -2px; }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+.tags { display: flex; flex-direction: column; gap: 4px; margin: 6px 0; }
+.tag-row { display: flex; gap: 6px; align-items: center; }
+.tag-row .tag-key { width: 130px; font-family: ui-monospace, monospace; font-size: 12.5px; }
+.tag-row .tag-val { flex: 1; min-width: 0; font-family: ui-monospace, monospace; font-size: 12.5px; }
+.tag-preview { margin-top: 6px; display: flex; flex-direction: column; gap: 6px; }
+.tag-preview .mono { white-space: pre-wrap; word-break: break-word; }

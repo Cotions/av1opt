@@ -57,6 +57,37 @@ For each file:
    did not sample. Nothing is written unless all checks pass.
 6. **Report** – the output plus `<name>.av1opt.json` with every CRF tried, scores, sizes and timings.
 
+### Metadata
+
+The source's tags (title, description, dates, ...) and chapters are copied by default;
+`--strip-metadata` drops them. Stream languages and track names always stay, since players use
+them to pick audio and subtitle tracks. `--keep-dates` gives each output the source's
+modification time.
+
+Tags can be added from a preset or one by one:
+
+```
+av1opt encode downloads/ -o /out --meta-preset youtube
+av1opt encode show/ -o /out --meta-preset tv --meta 'show=My Show' --meta network=
+```
+
+| Preset    | Tags                                                                              |
+|-----------|-----------------------------------------------------------------------------------|
+| `youtube` | what yt-dlp `--embed-metadata` writes: title, date (upload date), description, synopsis, purl and comment (video URL), artist (uploader), album, genre, show, season/episode, ... |
+| `movie`   | title, date (year), genre, description, synopsis, comment                         |
+| `tv`      | show, season_number, episode_sort, episode_id, title, network, date, description  |
+| `music`   | title, artist, album_artist, album, track, genre, date                            |
+
+Values are templates: `{field}` is filled from a yt-dlp info file next to the video
+(`<name>.info.json`, as written by `--write-info-json`), else from the source's own tags;
+`{a|b}` takes the first field with a value, `{file}` is the file name without extension, and
+`{{`/`}}` are literal braces. A tag whose fields are all missing is skipped, and `--meta key=`
+removes a preset tag. `--no-info-json` ignores info files. MP4 stores only the common tags
+(title, artist, album, date, comment, genre, description, synopsis, show, episode/season
+numbers, network, ...); others, like yt-dlp's `purl`, are reported in a note. MKV keeps any tag.
+The tags written are listed in the `.av1opt.json` report. In the web UI the same options are in
+the encode dialog, with **Preview tags** for a single file.
+
 ### Per-scene CRF (`--scenes`)
 
 One CRF for a whole video spends too many bits on easy scenes and too few on hard ones. With

@@ -322,6 +322,10 @@ pub fn history(app: &App) -> Value {
         .into_iter()
         .filter_map(|p| {
             let r: Value = serde_json::from_slice(&std::fs::read(&p).ok()?).ok()?;
+            // Reports from before versioning have no `format`; newer layouts are skipped.
+            if r["format"].as_u64().unwrap_or(1) > u64::from(crate::encode::REPORT_FORMAT) {
+                return None;
+            }
             let input = resolve(&p, r["input"].as_str()?, false);
             let output = resolve(&p, r["output"].as_str()?, true);
             let mtime = std::fs::metadata(&p).ok()?.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_secs();

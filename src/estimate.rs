@@ -192,6 +192,7 @@ mod tests {
     fn rec(src_bpp: f64, out_bpp: f64, w: u32, h: u32) -> Record {
         let px = w as f64 * h as f64 * 30.0;
         Record {
+            format: 1,
             time: 0, codec: "h264".into(), width: w, height: h, fps: 30.0, duration_s: 60.0,
             source_bitrate: src_bpp * px, output_bitrate: out_bpp * px, target_vmaf: 93.0, preset: 6,
             mode: "whole".into(),

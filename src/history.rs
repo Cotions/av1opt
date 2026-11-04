@@ -7,8 +7,19 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
 
+/// Version of a history line. Bump it when a field changes meaning or is removed (adding
+/// fields is fine); lines newer than this are ignored rather than misread. Lines from
+/// before versioning have no `format` and count as 1.
+pub const FORMAT: u32 = 1;
+
+fn format_one() -> u32 {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Record {
+    #[serde(default = "format_one")]
+    pub format: u32,
     pub time: u64,
     pub codec: String,
     pub width: u32,
@@ -27,6 +38,7 @@ impl Record {
     pub fn new(info: &MediaInfo, output_bitrate: f64, target_vmaf: f64, preset: u8, mode: &str) -> Self {
         let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         Record {
+            format: FORMAT,
             time,
             codec: info.codec.clone(),
             width: info.width,
@@ -65,5 +77,5 @@ pub fn append(r: &Record) -> Result<()> {
 /// All readable records; a missing or partly corrupt file just yields fewer.
 pub fn load() -> Vec<Record> {
     let Some(text) = path().and_then(|p| std::fs::read_to_string(p).ok()) else { return Vec::new() };
-    text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
+    text.lines().filter_map(|l| serde_json::from_str::<Record>(l).ok()).filter(|r| r.format <= FORMAT).collect()
 }

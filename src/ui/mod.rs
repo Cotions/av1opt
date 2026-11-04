@@ -30,8 +30,15 @@ pub struct Config {
 }
 
 /// Remembered between sessions in `$XDG_DATA_HOME/av1opt/ui.json`.
+/// Version of `ui.json`. Bump it when a field changes meaning or is removed (adding
+/// fields is fine). A file from a newer av1opt is used as far as it is understood but never
+/// overwritten, so going back to an older version loses nothing.
+pub const SETTINGS_FORMAT: u32 = 1;
+
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct Settings {
+    #[serde(default)]
+    pub format: u32,
     #[serde(default)]
     pub history_dirs: Vec<PathBuf>,
     #[serde(default)]
@@ -120,7 +127,12 @@ impl App {
     }
 
     pub fn save_settings(&self) {
-        let s = self.settings.lock().unwrap().clone();
+        let mut s = self.settings.lock().unwrap().clone();
+        if s.format > SETTINGS_FORMAT {
+            note("settings not saved: ui.json is from a newer av1opt");
+            return;
+        }
+        s.format = SETTINGS_FORMAT;
         if let Some(p) = library::settings_path() {
             let _ = p.parent().map(std::fs::create_dir_all);
             let _ = std::fs::write(&p, serde_json::to_vec_pretty(&s).unwrap_or_default());

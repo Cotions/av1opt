@@ -50,9 +50,21 @@ impl Container {
     }
 }
 
+/// Version of the `.av1opt.json` report layout. Bump it when a field changes meaning or
+/// is removed (adding fields is fine); readers skip reports newer than they understand.
+pub const REPORT_FORMAT: u32 = 1;
+
+/// Version of the scene-mode work folder (`plan.json` and the chunk files). Bump it when
+/// their layout or meaning changes: a work folder from another format is started over
+/// instead of resumed, since mixing chunks from two versions could give a bad output.
+const PLAN_FORMAT: u32 = 1;
+
 /// Written next to the output so later tuning can learn from real results.
 #[derive(Serialize)]
 struct Report<'a> {
+    format: u32,
+    /// The av1opt version that wrote it.
+    av1opt: &'static str,
     input: &'a Path,
     output: &'a Path,
     source_bytes: u64,
@@ -284,6 +296,8 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     let abs_input = std::fs::canonicalize(input)?;
     let abs_output = std::fs::canonicalize(&output)?;
     let report = Report {
+        format: REPORT_FORMAT,
+        av1opt: env!("CARGO_PKG_VERSION"),
         input: &abs_input,
         output: &abs_output,
         source_bytes: size,
@@ -351,7 +365,7 @@ fn work_dir(input: &Path, out_dir: &Path, size: u64, o: &Options) -> Result<Work
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_secs());
     let key = format!(
-        "v1|{}|{size}|{mtime}|{}|{}|{}|{}|{}|{}",
+        "v{PLAN_FORMAT}|{}|{size}|{mtime}|{}|{}|{}|{}|{}|{}",
         std::path::absolute(input)?.display(), o.target_vmaf, o.preset, o.min_crf, o.max_crf, o.samples, o.sample_secs
     );
     // Created only when chunk work starts, so skipped files leave nothing behind.

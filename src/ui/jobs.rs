@@ -340,6 +340,10 @@ fn add_unchecked(app: &App, body: &Value) -> Result<Value> {
     Ok(json!({ "id": id, "files": count }))
 }
 
+/// Version of `ui-queue.json`. Bump it when a saved job's layout changes meaning. The
+/// first layout was a bare array of jobs; since versioning it is `{format, jobs}`.
+const QUEUE_FORMAT: u64 = 1;
+
 fn queue_path() -> Option<PathBuf> {
     super::library::settings_path().map(|p| p.with_file_name("ui-queue.json"))
 }
@@ -361,7 +365,8 @@ fn persist(app: &App) {
         .collect();
     if let Some(p) = queue_path() {
         let tmp = p.with_extension("json.tmp");
-        if std::fs::write(&tmp, serde_json::to_vec_pretty(&pending).unwrap_or_default()).is_ok() {
+        let doc = json!({ "format": QUEUE_FORMAT, "jobs": pending });
+        if std::fs::write(&tmp, serde_json::to_vec_pretty(&doc).unwrap_or_default()).is_ok() {
             let _ = std::fs::rename(tmp, p);
         }
     }
@@ -370,8 +375,25 @@ fn persist(app: &App) {
 /// Re-queues jobs left unfinished by the previous session. Finished files are recognised as
 /// done and scene-mode chunks resume, as with a re-run of `av1opt encode`.
 pub fn restore(app: &App) {
-    let Some(saved) = queue_path().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice::<Vec<Value>>(&b).ok()) else {
-        return;
+    let Some(path) = queue_path() else { return };
+    let Some(doc) = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) else { return };
+    let saved: Vec<Value> = match doc {
+        Value::Array(jobs) => jobs,
+        Value::Object(mut o) => {
+            let format = o.get("format").and_then(Value::as_u64).unwrap_or(0);
+            if format > QUEUE_FORMAT {
+                // Written by a newer av1opt. Set it aside rather than overwrite it.
+                let aside = path.with_file_name(format!("ui-queue.format{format}.json"));
+                let _ = std::fs::rename(&path, &aside);
+                eprintln!("warning: the saved queue is from a newer av1opt; moved to {} and not restored", aside.display());
+                return;
+            }
+            match o.remove("jobs") {
+                Some(Value::Array(jobs)) => jobs,
+                _ => return,
+            }
+        }
+        _ => return,
     };
     for j in saved {
         // Not `add`: with broken tools the jobs wait in the queue rather than get dropped.

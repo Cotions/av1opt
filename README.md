@@ -126,9 +126,13 @@ for the next start.
 `desktop/` wraps the same page in an Electron window. Its bundled Chromium always plays AV1 and
 H.264, whatever browser is installed. It starts `av1opt ui` with a random token, shows the page,
 and stops the server when the window closes. If the window process dies, the server notices
-(stdin closes) and stops too. Closing the window while an encode runs asks first. Folder
+(stdin closes) and stops too. Closing the window or pressing Ctrl+Q while jobs are running or
+waiting asks first; logging out or SIGTERM quits without asking (jobs are kept). Folder
 choices use the system dialog, and a notification says when a job ends while the window is in
-the background.
+the background. The server's messages are kept, with times, in
+`~/.local/share/av1opt/desktop.log` (5 MB, then one older file `desktop.log.1`); Settings has
+*Open log*. If the av1opt it runs speaks another API version than the app was built for, it
+warns at start.
 
 ```
 cargo build --release --features ui
@@ -153,9 +157,19 @@ environment, so set the ffmpeg path once in Settings.
 - Temp files live in a hidden folder in the output directory and are removed afterwards; leftovers
   from crashed runs are cleaned up on the next run.
 
+### Saved files and versions
+
+Reports, history lines, `ui.json`, `ui-queue.json` and the scene-mode work folders carry a
+`format` number. Files from before versioning count as format 1. A newer av1opt keeps reading
+older files; an older one skips reports and history lines from a newer format, leaves a newer
+`ui.json` untouched, sets a newer `ui-queue.json` aside as `ui-queue.format<N>.json`, and starts
+a scene-mode file over rather than resuming a work folder of another format.
+
 ### Debugging
 
 `AV1OPT_DEBUG=1` prints every ffmpeg command. `--keep-temp` keeps samples and the partial encode.
+`cargo test --features ui` also runs `tests/ui_api.rs`, which starts the real `av1opt ui` and
+checks sign-in, request checks, media access and the job queue over HTTP (no ffmpeg needed).
 
 ## Lessons baked in
 

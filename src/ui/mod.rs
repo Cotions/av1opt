@@ -30,6 +30,10 @@ pub struct Config {
 }
 
 /// Remembered between sessions in `$XDG_DATA_HOME/av1opt/ui.json`.
+/// Version of the HTTP API, reported as `api` in `/api/state`. Bump it when a route or a
+/// response changes incompatibly, so a wrapper app bundled with another av1opt can tell.
+pub const API_VERSION: u32 = 1;
+
 /// Version of `ui.json`. Bump it when a field changes meaning or is removed (adding
 /// fields is fine). A file from a newer av1opt is used as far as it is understood but never
 /// overwritten, so going back to an older version loses nothing.

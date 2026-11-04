@@ -51,6 +51,7 @@ pub fn state(app: &App) -> Value {
         "history_encodes": model.samples,
         "tools": tools_state(app),
         "version": env!("CARGO_PKG_VERSION"),
+        "api": super::API_VERSION,
     })
 }
 

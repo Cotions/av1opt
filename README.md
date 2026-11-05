@@ -170,11 +170,12 @@ cargo build --release --features ui
 cd desktop
 npm install          # if npm skips electron's download script: node node_modules/electron/install.js
 npm start            # runs ../target/release/av1opt
-npm run dist         # dist/av1opt-<version>.AppImage with the av1opt binary inside
-npm run install-desktop   # copies it to ~/.local/opt/av1opt and adds av1opt to the app menu
+npm run dist         # dist/av1opt-desktop_<version>_amd64.deb with the av1opt binary inside
+npm run install-desktop   # sudo apt installs it (/opt/av1opt, app menu entry, av1opt-desktop command)
+npm run dist:appimage     # an AppImage instead, if wanted
 ```
 
-The app uses, in order: `$AV1OPT_BIN`, the binary packed into the AppImage,
+The app uses, in order: `$AV1OPT_BIN`, the binary packed into the package,
 `../target/release/av1opt`, then `av1opt` on PATH. Extra arguments go in `AV1OPT_UI_ARGS`
 (for example `AV1OPT_UI_ARGS="--memory-limit 12G"`). A desktop launcher has no shell
 environment, so set the ffmpeg path once in Settings.

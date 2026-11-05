@@ -8,17 +8,20 @@
   "scripts": {
     "start": "env -u ELECTRON_RUN_AS_NODE electron .",
     "postinstall": "node node_modules/electron/install.js",
-    "dist": "electron-builder --linux AppImage",
-    "install-desktop": "sh install-desktop.sh"
+    "dist": "electron-builder --linux deb",
+    "install-desktop": "sh install-desktop.sh",
+    "dist:appimage": "electron-builder --linux AppImage"
   },
   "devDependencies": {
     "electron": "^45.2.1",
     "electron-builder": "^26.18.0"
   },
   "author": "Cotions",
+  "homepage": "https://av1opt.invalid",
   "build": {
     "appId": "local.av1opt.desktop",
     "productName": "av1opt",
+    "afterPack": "./after-pack.js",
     "files": [
       "main.js",
       "preload.js",
@@ -32,11 +35,13 @@
       }
     ],
     "linux": {
-      "target": "AppImage",
-      "category": "AudioVideo",
+      "target": "deb",
+      "category": "AudioVideo;Video",
       "executableName": "av1opt-desktop",
       "icon": "icon.png",
-      "syncDesktopName": true
+      "syncDesktopName": true,
+      "maintainer": "Cotions",
+      "description": "Shrink videos to AV1 at a target quality"
     },
     "directories": {
       "output": "dist"
@@ -50,7 +55,10 @@
     },
     "electronLanguages": [
       "en-US"
-    ]
+    ],
+    "deb": {
+      "packageName": "av1opt-desktop"
+    }
   },
   "desktopName": "av1opt.desktop"
 }

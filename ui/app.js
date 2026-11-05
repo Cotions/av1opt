@@ -253,9 +253,9 @@ function metaEditor(o, inputs) {
   const keep = h("input", { type: "checkbox", checked: o.keep_metadata });
   const dates = h("input", { type: "checkbox", checked: o.keep_dates });
   const infoJson = h("input", { type: "checkbox", checked: o.info_json });
-  const presetSel = h("select", {}, h("option", { value: "" }, "None"), presets.map((p) => h("option", { value: p.id, title: p.about }, p.name)));
+  const presetSel = h("select", {}, h("option", { value: "" }, "Custom (add your own below)"), presets.map((p) => h("option", { value: p.id, title: p.about }, p.name)));
   presetSel.value = presets.some((p) => p.id === o.meta_preset) ? o.meta_preset : "";
-  const about = h("span", { class: "dim" });
+  const about = h("p", { class: "dim about" });
   const rows = h("div", { class: "tags" });
   const out = h("div", { class: "tag-preview" });
   const showAbout = () => { const p = presets.find((x) => x.id === presetSel.value); about.textContent = p ? p.about : ""; };
@@ -301,16 +301,22 @@ function metaEditor(o, inputs) {
     previewBtn.disabled = false;
   } }, "Preview tags");
   const el = h("div", {},
-    h("div", { class: "row" },
+    h("div", { class: "checks-col" },
       h("label", { class: "check", title: "Title, description, dates, chapters… Stream languages and track names are always kept." }, keep, "Keep source metadata and chapters"),
       h("label", { class: "check", title: "Set the output's modification time to the source's" }, dates, "Keep file date"),
-      h("label", { class: "check", title: "Fill tags from <name>.info.json (yt-dlp --write-info-json) next to each video" }, infoJson, "Read yt-dlp .info.json")),
-    h("div", { class: "row" }, h("label", { class: "field" }, "Add tags", presetSel), about),
+      h("label", { class: "check", title: "Fill tags from <name>.info.json (yt-dlp --write-info-json) next to each video" }, infoJson, "Read yt-dlp .info.json next to each video")),
+    h("div", { class: "form-grid" }, setting(one ? "Tags for this file" : "Tags for these files", presetSel, null)),
+    about,
     rows,
     h("div", { class: "row" }, h("button", { class: "small", onclick: () => addRow().focus() }, "+ Tag"), previewBtn),
     h("p", { class: "dim" }, "{field} comes from the video's .info.json, else its own tags; {a|b} takes the first with a value; {file} is the file name. Tags that come out empty are skipped. MP4 stores only the common tags (title, artist, date, description, comment, genre, show, episode…); MKV keeps any."),
     out);
   return { el, get };
+}
+
+// One label / control / hint line of a .form-grid.
+function setting(label, control, hint) {
+  return [h("label", { class: "k" }, label), h("div", { class: "ctl" }, control, hint ? h("span", { class: "dim hint" }, hint) : null)];
 }
 
 // Shows the encode dialog for `inputs` (paths). Resolves true if queued.
@@ -329,6 +335,9 @@ function encodeDialog(inputs, roots = []) {
     const force = h("input", { type: "checkbox", checked: o.force });
     const retry = h("input", { type: "checkbox", checked: o.retry_skipped });
     const meta = metaEditor(o, inputs);
+    const syncWorkers = () => { workers.disabled = !scenes.checked; };
+    scenes.addEventListener("change", syncWorkers);
+    syncWorkers();
     const close = (v) => { bg.remove(); resolve(v); };
     const go = h("button", { class: "primary", onclick: async () => {
       const options = {
@@ -359,16 +368,16 @@ function encodeDialog(inputs, roots = []) {
           } }, "Change…")),
           h("p", { class: "dim" }, "Folders are mirrored below it. Inputs are never modified. Re-adding the same files resumes."),
           h("h3", {}, "Settings"),
-          h("div", { class: "row" },
-            h("label", { class: "field" }, "Target VMAF", vmaf),
-            h("label", { class: "field" }, "Preset (lower = smaller, slower)", preset),
-            h("label", { class: "field" }, "Container", container),
-            h("label", { class: "field" }, "Min savings %", minSav)),
-          h("div", { class: "row" },
-            h("label", { class: "check" }, scenes, "Per-scene CRF (--scenes)"),
-            h("label", { class: "field" }, "Chunk workers", workers),
-            h("label", { class: "check" }, force, "Force (also AV1 / low gain)"),
-            h("label", { class: "check" }, retry, "Retry earlier skips")),
+          h("div", { class: "form-grid" },
+            setting("Target VMAF", vmaf, "Quality to match: 93 looks like the source, higher keeps more and saves less"),
+            setting("Preset", preset, "0–13: lower makes smaller files but encodes slower"),
+            setting("Container", container, null),
+            setting("Skip if saving under", h("span", { class: "unit" }, minSav, "%"), "Files that wouldn't shrink this much are left alone")),
+          h("div", { class: "checks-col" },
+            h("label", { class: "check", title: "Splits at scene cuts and picks a CRF per scene; slower but smaller on mixed content" }, scenes, "Per-scene CRF (slower, smaller on mixed content)"),
+            h("label", { class: "check sub" }, workers, "scenes encoded at once"),
+            h("label", { class: "check" }, force, "Force: also re-encode AV1 files and low-gain ones"),
+            h("label", { class: "check" }, retry, "Retry files skipped in earlier runs")),
           h("h3", {}, "Metadata"),
           meta.el),
         h("div", { class: "foot" }, h("button", { onclick: () => close(false) }, "Cancel"), go)));

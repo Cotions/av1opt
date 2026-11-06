@@ -145,8 +145,8 @@ pub fn sample_positions(duration: f64, count: usize, secs: f64) -> Vec<(f64, f64
         .collect()
 }
 
-pub fn extract_samples(tools: &Tools, input: &Path, info: &MediaInfo, tmp: &Path, count: usize, secs: f64) -> Result<Vec<Sample>> {
-    let pos = sample_positions(info.duration_s, count, secs);
+/// Cuts the sample clips at `pos` ((start, length) pairs in source seconds).
+pub fn extract_samples(tools: &Tools, input: &Path, info: &MediaInfo, tmp: &Path, pos: Vec<(f64, f64)>) -> Result<Vec<Sample>> {
     let n = pos.len();
     pos.into_iter()
         .enumerate()

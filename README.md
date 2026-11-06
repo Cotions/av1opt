@@ -88,6 +88,26 @@ numbers, network, ...); others, like yt-dlp's `purl`, are reported in a note. MK
 The tags written are listed in the `.av1opt.json` report. In the web UI the same options are in
 the encode dialog, with **Preview tags** for a single file.
 
+### Removing sections (`--remove`)
+
+```
+av1opt encode talk.mp4 -o /out --remove 0:00-0:42 --remove 12:03.5-14:10 --remove 58:30-end
+```
+
+Leaves those parts out of the output (one input file only). Times are `h:mm:ss`, `m:ss` or
+seconds, with decimals; `end` (or nothing after the dash) means the end of the video. Sections
+may overlap and come in any order. The video is re-encoded anyway, so the cuts are
+frame-accurate: the kept parts are trimmed from the decoded source and joined (ffmpeg
+`trim`/`concat`). Audio is cut the same way and re-encoded to Opus; text subtitles and chapters
+are moved to their new times (lines and chapters inside removed parts go); image subtitles
+(PGS, DVD) are dropped. Sample clips and spot checks are taken from kept parts only. A cut is
+never skipped for being AV1 already or saving too little, and if the VMAF target is out of reach
+it is encoded at the best CRF tried. Per-scene mode isn't combined with cuts (one pass instead).
+The report lists the removed sections; an existing output with other sections removed is not
+overwritten. In the web UI, **Choose sections to remove…** in the encode dialog (one file) has
+a player with Mark start / Mark end (keys I and O), frame stepping, and playback that skips the
+marked parts; Compare maps the cut output back onto the source.
+
 ### Per-scene CRF (`--scenes`)
 
 One CRF for a whole video spends too many bits on easy scenes and too few on hard ones. With

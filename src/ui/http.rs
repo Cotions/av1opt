@@ -165,6 +165,7 @@ fn api(app: &Arc<App>, m: &Method, path: &str, q: &[(String, String)], body: &Va
         (Method::Get, ["report"]) => library::report(app, param(q, "path").ok_or_else(|| anyhow!("missing path"))?),
         (Method::Post, ["preview"]) => library::preview(app, body),
         (Method::Post, ["meta", "preview"]) => library::meta_preview(app, body),
+        (Method::Post, ["source"]) => library::source(app, body),
         _ => bail!("not found: {path}"),
     }
 }

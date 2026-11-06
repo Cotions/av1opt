@@ -50,7 +50,12 @@ pub fn expand(inputs: &[PathBuf], out_dir: &Path, is_video: impl Fn(&Path) -> bo
 /// The settings a skip decision depends on. A skip made with other settings (say a faster
 /// preset that can't reach the target) doesn't stop a run with these settings.
 fn settings_key(o: &Options) -> String {
-    format!("vmaf={} preset={} crf={}-{} min_savings={} force={}", o.target_vmaf, o.preset, o.min_crf, o.max_crf, o.min_savings, o.force)
+    let mut k = format!("vmaf={} preset={} crf={}-{} min_savings={} force={}", o.target_vmaf, o.preset, o.min_crf, o.max_crf, o.min_savings, o.force);
+    if !o.remove.is_empty() {
+        let r: Vec<String> = o.remove.iter().map(|(a, b)| format!("{a}-{b}")).collect();
+        k.push_str(&format!(" remove={}", r.join(",")));
+    }
+    k
 }
 
 /// Previous skip decisions, keyed by absolute input path and size (a changed file is retried).
@@ -76,11 +81,29 @@ fn log_line(log: &Path, status: &str, input: &Path, size: u64, detail: &str, set
     Ok(())
 }
 
-/// Absolute input path recorded in an output's `.av1opt.json` report.
-fn report_input(output: &Path) -> Option<PathBuf> {
+/// Absolute input path recorded in an output's `.av1opt.json` report, and the sections
+/// that output left out.
+fn report_input(output: &Path) -> Option<(PathBuf, Vec<(f64, f64)>)> {
     let r: serde_json::Value = serde_json::from_slice(&std::fs::read(output.with_extension("av1opt.json")).ok()?).ok()?;
     let p = PathBuf::from(r["input"].as_str()?);
-    std::fs::canonicalize(&p).ok().or_else(|| std::path::absolute(&p).ok())
+    let removed = serde_json::from_value(r["removed"].clone()).unwrap_or_default();
+    Some((std::fs::canonicalize(&p).ok().or_else(|| std::path::absolute(&p).ok())?, removed))
+}
+
+/// Whether an earlier output left out the sections asked for now. The report holds them
+/// sorted, merged and clipped to the video's length, so compare in that form.
+fn same_sections(asked: &[(f64, f64)], done: &[(f64, f64)]) -> bool {
+    let mut a = asked.to_vec();
+    a.sort_by(|x, y| x.0.total_cmp(&y.0));
+    let mut merged: Vec<(f64, f64)> = Vec::new();
+    for (s, e) in a {
+        match merged.last_mut() {
+            Some(l) if s <= l.1 => l.1 = l.1.max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+    merged.len() == done.len()
+        && merged.iter().zip(done).all(|(x, y)| (x.0 - y.0).abs() < 0.002 && ((x.1 - y.1).abs() < 0.002 || (x.1 > y.1 && x == merged.last().unwrap())))
 }
 
 #[derive(Default)]
@@ -119,7 +142,14 @@ pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipp
             // Same file name from two input folders would map to one output; only count it as
             // done if its report says it came from this input.
             match report_input(&output) {
-                Some(src) if src != abs => {
+                Some((_, removed)) if !same_sections(&o.remove, &removed) => {
+                    let msg = format!("{} exists but has other sections removed; move or delete it to encode again", output.display());
+                    eprintln!("FAILED: {msg}");
+                    end("error", &msg, 0);
+                    sum.failed += 1;
+                    log_line(&log, "error", &abs, size, &msg, &settings)?;
+                }
+                Some((src, _)) if src != abs => {
                     let msg = format!("output name collision: {} was made from {}", output.display(), src.display());
                     eprintln!("FAILED: {msg}");
                     end("error", &msg, 0);

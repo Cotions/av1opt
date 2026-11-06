@@ -189,3 +189,18 @@ tr.click:hover td { background: var(--panel2); }
 .tag-row .tag-val { flex: 1; min-width: 0; font-family: ui-monospace, monospace; font-size: 12.5px; }
 .tag-preview { margin-top: 6px; display: flex; flex-direction: column; gap: 6px; }
 .tag-preview .mono { white-space: pre-wrap; word-break: break-word; }
+
+/* encode dialog: sections to remove */
+.cut { display: flex; flex-direction: column; gap: 8px; }
+.cut p { margin: 0; }
+.cut-stage { background: #000; border-radius: var(--radius); overflow: hidden; display: flex; justify-content: center; }
+.cut-stage video { max-width: 100%; max-height: 300px; display: block; }
+.cut-bar { position: relative; height: 22px; background: var(--panel2); border: 1px solid var(--line); border-radius: var(--radius); cursor: pointer; overflow: hidden; }
+.cut-span { position: absolute; top: 0; bottom: 0; background: var(--bad); opacity: .75; }
+.cut-clip { position: absolute; top: 0; bottom: 0; background: var(--info); opacity: .18; }
+.cut-pending { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--warn); }
+.cut-head { position: absolute; top: -2px; bottom: -2px; width: 2px; margin-left: -1px; background: #fff; pointer-events: none; }
+.cut-rows { display: flex; flex-direction: column; gap: 6px; }
+.cut-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.cut-row input[type=text] { width: 110px; }
+.cut-row.invalid input[type=text] { border-color: var(--bad); }

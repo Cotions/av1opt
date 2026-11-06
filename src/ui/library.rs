@@ -518,6 +518,21 @@ pub fn preview(app: &App, body: &Value) -> Result<Value> {
     Ok(json!({ "url": url(&out), "start": start, "secs": secs, "kind": r.kind }))
 }
 
+/// A video about to be encoded, for the encode dialog's section picker: its details and a
+/// URL the player can stream it from.
+pub fn source(app: &App, body: &Value) -> Result<Value> {
+    let r: DirRequest = serde_json::from_value(body.clone())?;
+    let p = std::fs::canonicalize(&r.path).with_context(|| format!("not found: {}", r.path.display()))?;
+    if !p.is_file() || !is_video(&p) {
+        bail!("{} is not a video file", p.display());
+    }
+    app.allow(&p);
+    let mut info = media_info(app, &p);
+    info["url"] = json!(format!("/media?path={}", percent_encode(&p.to_string_lossy())));
+    info["path"] = json!(p);
+    Ok(info)
+}
+
 /// Keeps the preview folder to the `keep` most recent files.
 fn trim_previews(dir: &Path, keep: usize) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };

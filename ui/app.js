@@ -236,6 +236,7 @@ function metaLabel(o) {
     parts.push(p ? `${p.name} tags` : `${o.meta_tags.length} tag${o.meta_tags.length === 1 ? "" : "s"}`);
   }
   if (o.keep_dates) parts.push("dates kept");
+  if (o.remove && o.remove.length) parts.push(`${o.remove.length} section${o.remove.length === 1 ? "" : "s"} removed`);
   return parts.length ? " · " + parts.join(" · ") : "";
 }
 
@@ -314,6 +315,215 @@ function metaEditor(o, inputs) {
   return { el, get };
 }
 
+// ---------- removing sections ----------
+
+// "75.5", "1:15.5" or "1:02:03" → seconds; null if it isn't a time.
+function parseTime(str) {
+  const parts = String(str).trim().split(":");
+  if (parts.length > 3 || parts.some((p) => p === "")) return null;
+  const last = parts.pop();
+  if (!/^\d+(\.\d+)?$|^\.\d+$/.test(last) || parts.some((p) => !/^\d+$/.test(p))) return null;
+  const sec = Number(last);
+  if (parts.length && sec >= 60) return null;
+  return parts.reduce((t, p) => t * 60 + Number(p), 0) * 60 + sec;
+}
+// Seconds → "1:02:03.25" (hundredths, trailing zeros dropped).
+function fmtTime(t) {
+  const cs = Math.round(Math.max(0, t) * 100);
+  const hh = Math.floor(cs / 360000), mm = Math.floor(cs / 6000) % 60, ss = Math.floor(cs / 100) % 60, f = cs % 100;
+  let out = (hh ? hh + ":" + String(mm).padStart(2, "0") : mm) + ":" + String(ss).padStart(2, "0");
+  if (f) out += "." + String(f).padStart(2, "0").replace(/0$/, "");
+  return out;
+}
+// Removed (start, end) sections → the kept parts, as the encoder works them out: sorted,
+// merged, clipped to the video, and kept slivers under 0.25 s dropped too.
+const MIN_KEEP = 0.25;
+function keptParts(removed, duration) {
+  const r = removed.map(([a, b]) => [a, Math.min(b, duration)]).filter(([a, b]) => a < duration && b > a).sort((x, y) => x[0] - y[0]);
+  const keep = [];
+  let t = 0;
+  for (const [a, b] of r) { if (a - t >= MIN_KEEP) keep.push([t, a]); t = Math.max(t, b); }
+  if (duration - t >= MIN_KEEP) keep.push([t, duration]);
+  return keep;
+}
+// Output time → source time for an output made from `keep` parts.
+function outToSrc(keep, t) {
+  let base = 0;
+  for (const [a, b] of keep) { if (t < base + (b - a)) return a + Math.max(0, t - base); base += b - a; }
+  return keep.length ? keep[keep.length - 1][1] : t;
+}
+
+// Section picker for the encode dialog (one file): a player with a bar showing what goes,
+// "mark start / mark end" from the playhead, and editable rows. `get()` returns
+// [[start, end], ...] in seconds or throws with a message for the user.
+function sectionsEditor(path) {
+  let info = null, duration = 0, fps = 25;
+  // Source time of the player's 0: non-zero when playing a preview clip.
+  let offset = 0, clipEnd = Infinity;
+  let pending = null;
+  const v = h("video", { preload: "metadata", playsinline: true, controls: true });
+  const stage = h("div", { class: "cut-stage" }, v);
+  const status = h("div", { class: "dim" }, "Loading the video…");
+  const bar = h("div", { class: "cut-bar", title: "Click to seek" });
+  const playhead = h("div", { class: "cut-head" });
+  const pendingEl = h("div", { class: "cut-pending", hidden: true });
+  const timeEl = h("span", { class: "mono" }, "–");
+  const rows = h("div", { class: "cut-rows" });
+  const summary = h("div", { class: "dim" });
+  const skip = h("input", { type: "checkbox", checked: true });
+  const now = () => offset + (v.currentTime || 0);
+  const seek = (t) => {
+    t = Math.max(0, Math.min(duration || t, t));
+    if (t < offset || t > clipEnd) { makeClip(t); return; }
+    v.currentTime = t - offset;
+  };
+
+  function readRows(strict) {
+    const out = [];
+    for (const r of rows.querySelectorAll(".cut-row")) {
+      const [si, ei] = r.querySelectorAll("input");
+      const a = parseTime(si.value), b = ei.value.trim() === "" || /^end$/i.test(ei.value.trim()) ? duration : parseTime(ei.value);
+      const bad = a == null || b == null || b <= a || (duration && a >= duration);
+      r.classList.toggle("invalid", bad);
+      if (bad) { if (strict) throw new Error(`Section "${si.value} – ${ei.value}" is not a valid range`); continue; }
+      out.push([a, b]);
+    }
+    return out;
+  }
+  function draw() {
+    const removed = readRows(false);
+    const pctOf = (t) => (duration ? (t / duration) * 100 : 0) + "%";
+    bar.replaceChildren(...removed.map(([a, b]) => h("div", { class: "cut-span", style: { left: pctOf(a), width: `calc(${pctOf(Math.min(b, duration) - a)} + 1px)` } })), pendingEl, playhead);
+    if (offset > 0 || clipEnd < Infinity) bar.prepend(h("div", { class: "cut-clip", style: { left: pctOf(offset), width: pctOf(Math.min(clipEnd, duration) - offset) } }));
+    if (!duration) { summary.textContent = ""; return; }
+    const keep = keptParts(removed, duration);
+    const kept = keep.reduce((t, [a, b]) => t + b - a, 0);
+    summary.textContent = removed.length
+      ? `Output ${fmtTime(kept)} of ${fmtTime(duration)}: ${fmtTime(duration - kept)} removed in ${removed.length} section${removed.length === 1 ? "" : "s"}. Cuts are frame-accurate; audio is re-encoded to Opus.`
+      : "Nothing removed.";
+  }
+  function addRow(a, b, focus) {
+    const si = h("input", { type: "text", class: "mono", value: a == null ? "" : fmtTime(a), placeholder: "start", spellcheck: "false" });
+    const ei = h("input", { type: "text", class: "mono", value: b == null ? "" : b >= duration && duration ? "end" : fmtTime(b), placeholder: "end", spellcheck: "false" });
+    const go = (inp) => () => { const t = /^end$/i.test(inp.value.trim()) ? duration : parseTime(inp.value); if (t != null) seek(t); };
+    const row = h("div", { class: "cut-row" },
+      h("button", { class: "small", title: "Go to the start", onclick: go(si) }, "▶"), si, h("span", { class: "dim" }, "to"), ei,
+      h("button", { class: "small", title: "Go to the end", onclick: go(ei) }, "▶"),
+      h("button", { class: "small", title: "Set the end to the playhead", onclick: () => { ei.value = fmtTime(now()); draw(); } }, "end = here"),
+      h("button", { class: "small", title: "Keep this part", onclick: () => { row.remove(); draw(); } }, "×"));
+    for (const i of [si, ei]) i.addEventListener("input", draw);
+    rows.append(row);
+    draw();
+    if (focus) si.focus();
+  }
+  function markStart() {
+    pending = now();
+    pendingEl.hidden = false;
+    pendingEl.style.left = (duration ? (pending / duration) * 100 : 0) + "%";
+    markEndBtn.disabled = false;
+  }
+  function markEnd() {
+    if (pending == null) return;
+    const [a, b] = [pending, now()].sort((x, y) => x - y);
+    pending = null;
+    pendingEl.hidden = true;
+    markEndBtn.disabled = true;
+    if (b - a > 0.01) addRow(a, b);
+  }
+  const step = (n) => { v.pause(); seek(now() + n / fps); };
+  const markStartBtn = h("button", { class: "small", title: "Start a section at the playhead (key I)", onclick: markStart }, "Mark start");
+  const markEndBtn = h("button", { class: "small", title: "End the section at the playhead and add it (key O)", disabled: true, onclick: markEnd }, "Mark end");
+  const clipBtn = h("button", { class: "small", hidden: true, onclick: () => makeClip(now()) }, "Preview from here");
+
+  bar.addEventListener("click", (e) => { const b = bar.getBoundingClientRect(); seek(((e.clientX - b.left) / b.width) * duration); });
+  // Plays the output as it will be: jumps over removed sections.
+  let raf = 0;
+  const tick = () => {
+    if (!v.isConnected) return; // dialog closed
+    raf = requestAnimationFrame(tick);
+    const t = now();
+    timeEl.textContent = `${fmtTime(t)} / ${fmtTime(duration)}`;
+    playhead.style.left = (duration ? (t / duration) * 100 : 0) + "%";
+    if (skip.checked && !v.paused) {
+      const hit = readRows(false).find(([a, b]) => t >= a && t < b - 0.05);
+      if (hit) seek(hit[1]);
+    }
+  };
+  const onKey = (e) => {
+    if (!v.isConnected) { document.removeEventListener("keydown", onKey); return; }
+    if (["INPUT", "SELECT", "TEXTAREA"].includes(e.target.tagName)) return;
+    if (e.key === "i" || e.key === "I") markStart();
+    else if (e.key === "o" || e.key === "O") markEnd();
+    else if (e.key === ",") step(-1);
+    else if (e.key === ".") step(1);
+  };
+  document.addEventListener("keydown", onKey);
+
+  function load(url) {
+    return new Promise((resolve, reject) => {
+      const ok = () => { cleanup(); v.videoWidth ? resolve() : reject(new Error("no video track the browser can show")); };
+      const bad = () => { cleanup(); reject(new Error((v.error && v.error.message) || "cannot play this format")); };
+      const cleanup = () => { v.removeEventListener("loadeddata", ok); v.removeEventListener("error", bad); };
+      v.addEventListener("loadeddata", ok);
+      v.addEventListener("error", bad);
+      v.src = url;
+    });
+  }
+  // For sources the browser can't decode: a 2-minute near-lossless H.264 clip from `at`.
+  async function makeClip(at) {
+    if (!info) return;
+    const start = Math.max(0, Math.min(at, duration - 2));
+    v.pause();
+    clipBtn.disabled = true;
+    status.textContent = `Making a playable 2-minute preview from ${fmtTime(start)}…`;
+    try {
+      const p = await api("/api/preview", { path, kind: "transcode", start, secs: 120 });
+      await load(p.url);
+      offset = p.start; clipEnd = p.start + p.secs;
+      status.textContent = `Preview of ${fmtTime(offset)}–${fmtTime(Math.min(clipEnd, duration))} (this browser can't play ${info.codec} directly). Click the bar outside it for another part.`;
+      v.currentTime = Math.max(0, at - offset);
+    } catch (e) {
+      status.textContent = "Could not make a preview: " + e.message + ". You can still type the times.";
+    }
+    clipBtn.disabled = false;
+    draw();
+  }
+
+  (async () => {
+    try {
+      info = await api("/api/source", { path });
+      if (info.error) throw new Error(info.error);
+      duration = info.duration_s || 0;
+      fps = info.fps || 25;
+      draw();
+      try {
+        await load(info.url);
+        status.textContent = "";
+      } catch {
+        clipBtn.hidden = false;
+        await makeClip(0);
+      }
+    } catch (e) {
+      status.textContent = "Cannot open the video: " + e.message + ". You can still type the times.";
+    }
+    raf = requestAnimationFrame(tick);
+  })();
+
+  const el = h("div", { class: "cut" },
+    h("p", { class: "dim" }, "Leave parts out of the output: ads, intros, mistakes. Mark start / Mark end at the playhead (keys I and O; , and . step frames), or type the times (1:23.5, or \"end\")."),
+    stage, status, bar,
+    h("div", { class: "row" },
+      h("button", { class: "small", title: "Previous frame (,)", onclick: () => step(-1) }, "◀ frame"),
+      h("button", { class: "small", title: "Next frame (.)", onclick: () => step(1) }, "frame ▶"),
+      timeEl, h("span", { class: "spacer" }), markStartBtn, markEndBtn, clipBtn),
+    rows,
+    h("div", { class: "row" },
+      h("button", { class: "small", onclick: () => addRow(null, null, true) }, "+ Section"),
+      h("label", { class: "check", title: "While playing here, jump over the sections marked for removal" }, skip, "Skip removed parts while playing")),
+    summary);
+  return { el, get: () => readRows(true).sort((x, y) => x[0] - y[0]), stop: () => { cancelAnimationFrame(raf); document.removeEventListener("keydown", onKey); v.pause(); v.removeAttribute("src"); v.load(); } };
+}
+
 // One label / control / hint line of a .form-grid.
 function setting(label, control, hint) {
   return [h("label", { class: "k" }, label), h("div", { class: "ctl" }, control, hint ? h("span", { class: "dim hint" }, hint) : null)];
@@ -335,10 +545,19 @@ function encodeDialog(inputs, roots = []) {
     const force = h("input", { type: "checkbox", checked: o.force });
     const retry = h("input", { type: "checkbox", checked: o.retry_skipped });
     const meta = metaEditor(o, inputs);
+    const one = inputs.length === 1 && /\.[A-Za-z0-9]{2,5}$/.test(inputs[0]) ? inputs[0] : null;
+    // Only built when opened, so the dialog doesn't load the video for nothing.
+    let cuts = null;
+    const cutsBox = h("div");
+    const cutsBtn = one && h("button", { class: "small", onclick: () => {
+      cuts = sectionsEditor(one);
+      cutsBox.replaceChildren(cuts.el);
+      cutsBtn.remove();
+    } }, "Choose sections to remove…");
     const syncWorkers = () => { workers.disabled = !scenes.checked; };
     scenes.addEventListener("change", syncWorkers);
     syncWorkers();
-    const close = (v) => { bg.remove(); resolve(v); };
+    const close = (v) => { if (cuts) cuts.stop(); bg.remove(); resolve(v); };
     const go = h("button", { class: "primary", onclick: async () => {
       const options = {
         container: container.value, target_vmaf: Number(vmaf.value), preset: Number(preset.value), scenes: scenes.checked,
@@ -346,6 +565,8 @@ function encodeDialog(inputs, roots = []) {
         ...meta.get(),
       };
       prefs.set("encodeOptions", options);
+      // Sections belong to this one video, so they aren't remembered with the settings.
+      try { if (cuts) options.remove = cuts.get(); } catch (e) { toast(e.message, true); return; }
       prefs.set("outDir", outDir);
       go.disabled = true;
       try {
@@ -379,7 +600,8 @@ function encodeDialog(inputs, roots = []) {
             h("label", { class: "check" }, force, "Force: also re-encode AV1 files and low-gain ones"),
             h("label", { class: "check" }, retry, "Retry files skipped in earlier runs")),
           h("h3", {}, "Metadata"),
-          meta.el),
+          meta.el,
+          one ? [h("h3", {}, "Remove sections"), cutsBtn, cutsBox] : null),
         h("div", { class: "foot" }, h("button", { onclick: () => close(false) }, "Cancel"), go)));
     document.body.append(bg);
   });
@@ -824,11 +1046,17 @@ function comparePlayer(root, r) {
   const vo = h("video", { preload: "auto", playsinline: true });
   const vs = h("video", { preload: "auto", playsinline: true, muted: true });
   vs.muted = true;
-  let offset = 0, segEnd = Infinity, srcMode = "direct";
+  // In preview mode the source clip covers output times offset..segEnd and starts at
+  // source time srcOff.
+  let offset = 0, segEnd = Infinity, srcOff = 0, srcMode = "direct";
   // Extra source shift in seconds, found by auto-align or set by hand: variable-frame-rate
   // sources are retimed by the encode, so frame k of the source isn't always at k/fps.
   let nudge = 0;
-  const srcTime = (t) => Math.max(0, t - offset + nudge);
+  // Outputs with sections removed: output time t shows source time toSrc(t).
+  const removed = r.removed || [];
+  const keep = removed.length && ii.duration_s ? keptParts(removed, ii.duration_s) : null;
+  const toSrc = (t) => (keep ? outToSrc(keep, t) : t);
+  const srcTime = (t) => Math.max(0, toSrc(t) - srcOff + nudge);
   let split = 0.5, zoom = 1, origin = "50% 50%";
 
   const layerS = h("div", { class: "layer" }, vs);
@@ -924,7 +1152,7 @@ function comparePlayer(root, r) {
         await seekWait(vo, t);
         const o = grab(vo);
         for (let k = base - 3; k <= base + 3; k++) {
-          await seekWait(vs, Math.max(0, t - offset + k / fps));
+          await seekWait(vs, Math.max(0, toSrc(t) - srcOff + k / fps));
           score.set(k, (score.get(k) || 0) + pixDiff(o, grab(vs)));
         }
       }
@@ -973,6 +1201,19 @@ function comparePlayer(root, r) {
     c.dataset.tip = `verify spot check ${tc(st)}–${tc(st + secs)} · VMAF ${num(v)}`;
     tl.append(c);
   });
+  // Where removed sections were joined.
+  if (keep) {
+    let at = 0;
+    keep.forEach(([a, b], k) => {
+      const gapBefore = k === 0 ? a : a - keep[k - 1][1];
+      if (gapBefore > 0) {
+        const m = s("rect", { x: x(at) - 2, width: 4, y: 0, height: 100, fill: "#e06666", opacity: 0.8 });
+        m.dataset.tip = `cut at ${tc(at)}: source ${tc(a - gapBefore)}–${tc(a)} removed`;
+        tl.append(m);
+      }
+      at += b - a;
+    });
+  }
   const segRect = s("rect", { x: 0, width: 0, y: 0, height: 100, fill: "#6aa7e8", opacity: 0.12 });
   tl.append(segRect);
   const head = s("line", { x1: 0, x2: 0, y1: 0, y2: 100, stroke: "#fff", "stroke-width": 1.5, "vector-effect": "non-scaling-stroke" });
@@ -1003,6 +1244,7 @@ function comparePlayer(root, r) {
         kv("Source", h("span", { class: "mono", title: r.input_path }, basename(r.input_path))),
         kv("Output", h("span", { class: "mono", title: r.output_path }, basename(r.output_path))),
         kv("Size", `${bytes(r.source_bytes)} → ${bytes(r.output_bytes)}`),
+        removed.length ? kv("Removed", removed.map(([a, b]) => `${fmtTime(a)}–${fmtTime(b)}`).join(", ")) : null,
         kv("Saved", h("span", { class: "ok" }, pct(r.savings, 1))),
         kv("Mode", r.mode === "scenes" ? `per-scene CRF, ${chunks.length} chunks` : "one CRF"),
         kv("CRF", r.mode === "scenes" && chunks.length ? `${Math.min(...chunks.map((c) => c.crf))}–${Math.max(...chunks.map((c) => c.crf))} (start ${r.crf})` : r.crf),
@@ -1097,26 +1339,39 @@ function comparePlayer(root, r) {
   }
 
   async function makePreview(at) {
-    const start = Math.max(0, Math.min(at, Math.max(0, duration - 2)));
-    const secs = Math.min(20, Math.max(2, duration - start));
+    let start = Math.max(0, Math.min(at, Math.max(0, duration - 2)));
+    let secs = Math.min(20, Math.max(2, duration - start));
+    if (keep) {
+      // Keep the clip inside one kept part, where output and source run in step.
+      let base = 0;
+      for (const [a, b] of keep) {
+        const len = b - a;
+        if (start < base + len || b === keep[keep.length - 1][1]) {
+          secs = Math.min(20, len);
+          start = Math.max(base, Math.min(start, base + len - secs));
+          break;
+        }
+        base += len;
+      }
+    }
     vo.pause();
     busy(`Making a ${Math.round(secs)} s near-lossless H.264 preview of the source from ${tc(start)}…`);
     previewBtn.disabled = true;
-    const prev = { offset, segEnd, srcMode, src: vs.src };
+    const prev = { offset, segEnd, srcOff, srcMode, src: vs.src };
     srcMode = "loading";
     try {
-      const p = await api("/api/preview", { path: r.input_path, kind: "transcode", start, secs });
+      const p = await api("/api/preview", { path: r.input_path, kind: "transcode", start: toSrc(start), secs });
       await tryLoad(vs, p.url);
-      offset = p.start; segEnd = p.start + p.secs; srcMode = "preview";
+      offset = start; segEnd = start + p.secs; srcOff = p.start; srcMode = "preview";
       segRect.setAttribute("x", x(offset)); segRect.setAttribute("width", x(segEnd) - x(offset));
-      srcStatus.replaceChildren(h("span", { class: "warn" }, "Source: preview clip "), `${tc(offset)}–${tc(segEnd)}. The browser can't decode ${ii.codec || "this source"} directly, so this clip is re-encoded near-losslessly (H.264 CRF 12)${ii.hdr ? "; HDR shown without tone mapping" : ""}. Click the timeline outside the shaded part for a new clip.`);
+      srcStatus.replaceChildren(h("span", { class: "warn" }, "Source: preview clip "), `${tc(srcOff)}–${tc(srcOff + p.secs)}. The browser can't decode ${ii.codec || "this source"} directly, so this clip is re-encoded near-losslessly (H.264 CRF 12)${ii.hdr ? "; HDR shown without tone mapping" : ""}. Click the timeline outside the shaded part for a new clip.`);
       tagL.textContent = `Source preview · ${ii.codec || "?"} → H.264 near-lossless`;
       seekTo(offset);
       busy(null);
       await autoAlign();
       seekTo(offset);
     } catch (e) {
-      ({ offset, segEnd, srcMode } = prev);
+      ({ offset, segEnd, srcOff, srcMode } = prev);
       if (prev.src && srcMode !== "loading") { vs.src = prev.src; vs.currentTime = srcTime(vo.currentTime); }
       busy(null);
       overlay.hidden = false;

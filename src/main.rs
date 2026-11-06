@@ -10,6 +10,7 @@ mod report;
 mod scan;
 mod scenes;
 mod search;
+mod sections;
 mod tools;
 #[cfg(feature = "ui")]
 mod ui;
@@ -131,6 +132,11 @@ enum Cmd {
         /// Don't read yt-dlp .info.json files.
         #[arg(long)]
         no_info_json: bool,
+        /// Leave a section out of the output, e.g. --remove 1:20-2:05 or --remove 58:30-end.
+        /// Times are h:mm:ss, m:ss or seconds, with optional decimals; cuts are frame-accurate.
+        /// Repeatable; needs a single input file. Audio is re-encoded to Opus.
+        #[arg(long, value_name = "START-END", value_parser = sections::parse_range)]
+        remove: Vec<(f64, f64)>,
     },
     /// Local web app: scan folders, queue encodes with live progress, compare source and AV1
     /// output side by side, browse past encodes. Listens on 127.0.0.1 only.
@@ -169,7 +175,7 @@ fn main() -> Result<()> {
         Cmd::Encode {
             inputs, out_dir, container, target_vmaf, preset, min_crf, max_crf, samples, sample_secs,
             min_savings, force, overwrite, retry_skipped, keep_temp, allow_zfs, ffmpeg, ffprobe, scenes, workers, memory_limit, nice,
-            strip_metadata, keep_dates, meta_preset, meta, no_info_json,
+            strip_metadata, keep_dates, meta_preset, meta, no_info_json, remove,
         } => {
             let meta = metadata::MetaOptions {
                 keep: !strip_metadata,
@@ -190,11 +196,14 @@ fn main() -> Result<()> {
             let tools = tools::Tools::new(ffmpeg, ffprobe, memory_cap(&memory_limit, if scenes { workers } else { 1 }));
             let opts = encode::Options {
                 container, target_vmaf, preset, min_crf, max_crf, samples, sample_secs,
-                min_savings, force, overwrite, keep_temp, scenes, workers: workers.into(), meta,
+                min_savings, force, overwrite, keep_temp, scenes, workers: workers.into(), meta, remove,
             };
             let jobs = batch::expand(&inputs, &out_dir, is_video);
             if jobs.is_empty() {
                 anyhow::bail!("no video files found in the given inputs");
+            }
+            if !opts.remove.is_empty() && jobs.len() > 1 {
+                anyhow::bail!("--remove applies to one video; {} were given", jobs.len());
             }
             let s = batch::run(&tools, &jobs, &out_dir, &opts, retry_skipped)?;
             let saved = s.bytes_in.saturating_sub(s.bytes_out) as f64 / 1e9;

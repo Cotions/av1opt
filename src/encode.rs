@@ -5,6 +5,7 @@ use crate::probe::{self, MediaInfo};
 use crate::history;
 use crate::metadata::{self, MetaOptions, Resolved};
 use crate::scenes;
+use crate::sections::{self, Sections};
 use crate::search::{self, EncodeSettings, SearchParams, Trial};
 use crate::tools::{Tools, hms, path_arg};
 use anyhow::{Context, Result, bail};
@@ -30,6 +31,8 @@ pub struct Options {
     pub workers: usize,
     /// Source tags kept or dropped, tags added, file date.
     pub meta: MetaOptions,
+    /// Parts of the video to leave out, as (start, end) seconds of the source.
+    pub remove: Vec<(f64, f64)>,
 }
 
 /// Name prefix of scene-mode work folders. Unlike temp folders they survive crashes on purpose:
@@ -84,6 +87,9 @@ struct Report<'a> {
     search: &'a [Trial],
     chunks: Option<&'a [scenes::ChunkResult]>,
     verify_vmaf: &'a [f64],
+    /// Source sections left out of the output, (start, end) seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    removed: Option<&'a [(f64, f64)]>,
     /// Tags av1opt wrote on top of (or instead of) the source's.
     tags: std::collections::BTreeMap<&'a str, &'a str>,
     /// The yt-dlp info file the tags were filled from.
@@ -144,15 +150,19 @@ pub fn clean_stale_temp(out_dir: &Path) {
 pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Result<PathBuf> {
     let size = std::fs::metadata(input).with_context(|| format!("cannot read {}", input.display()))?.len();
     let info = probe::probe(&tools.ffprobe, input, size)?;
-    if info.codec == "av1" && !o.force {
-        skip!("already AV1 (use --force to re-encode anyway)");
-    }
     if info.dolby_vision {
         skip!("Dolby Vision is not supported: re-encoding would drop its dynamic metadata");
     }
     if info.duration_s < 1.0 {
         skip!("no usable duration");
     }
+    // Removing sections is an edit the user asked for, so the output is wanted even when the
+    // re-encode alone wouldn't be worth it.
+    let cut = if o.remove.is_empty() { None } else { Some(Sections::new(&o.remove, info.duration_s)?) };
+    if info.codec == "av1" && !o.force && cut.is_none() {
+        skip!("already AV1 (use --force to re-encode anyway)");
+    }
+    let out_duration = cut.as_ref().map_or(info.duration_s, Sections::kept);
 
     let stem = input.file_stem().context("input has no file name")?.to_string_lossy();
     let output = out_dir.join(format!("{stem}.{}", o.container.ext()));
@@ -196,8 +206,17 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     if !o.meta.keep {
         notes.push("metadata: source tags and chapters dropped".to_string());
     }
-    let scenes = o.scenes && !info.vfr;
-    if o.scenes && info.vfr {
+    if let Some(c) = &cut {
+        let list: Vec<String> = c.removed().iter().map(|&(a, b)| format!("{}-{}", sections::fmt_time(a), sections::fmt_time(b))).collect();
+        notes.push(format!(
+            "removed {} section{}: {}; {} of {} kept",
+            list.len(), if list.len() == 1 { "" } else { "s" }, list.join(", "), sections::fmt_time(c.kept()), sections::fmt_time(info.duration_s)
+        ));
+    }
+    let scenes = o.scenes && !info.vfr && cut.is_none();
+    if o.scenes && cut.is_some() {
+        notes.push("sections removed: encoded in one pass instead of per scene".to_string());
+    } else if o.scenes && info.vfr {
         notes.push("variable frame rate source: encoded in one pass instead of per scene".to_string());
     }
     let work = scenes.then(|| work_dir(input, out_dir, size, o)).transpose()?;
@@ -215,20 +234,31 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         None => {
             eprintln!("searching CRF for VMAF >= {} ({model}, preset {})", o.target_vmaf, o.preset);
             tools.emit(Event::Phase { phase: "sampling".into(), detail: format!("{} samples", o.samples) });
-            let samples = search::extract_samples(tools, input, &info, &tmp.path, o.samples, o.sample_secs)?;
+            let pos = match &cut {
+                Some(c) => c.sample_positions(o.samples, o.sample_secs),
+                None => search::sample_positions(info.duration_s, o.samples, o.sample_secs),
+            };
+            let samples = search::extract_samples(tools, input, &info, &tmp.path, pos)?;
             let params = SearchParams { target_vmaf: o.target_vmaf, min_crf: o.min_crf, max_crf: o.max_crf, vmaf_threads };
             tools.emit(Event::Phase { phase: "searching".into(), detail: format!("VMAF >= {} ({model}, preset {})", o.target_vmaf, o.preset) });
             let (best, trials) = search::search(tools, &info, &samples, &tmp.path, &enc, &params)?;
             (best, trials, samples)
         }
     };
-    let Some(best) = best else {
-        skip!("even CRF {} misses VMAF {}; source is too lean to re-encode at this target", o.min_crf, o.target_vmaf);
+    // With sections removed the output is wanted anyway: settle for the best quality tried.
+    let reached = best.is_some();
+    let best = match best {
+        Some(b) => b,
+        None if cut.is_some() && let Some(t) = trials.iter().min_by(|a, b| a.crf.total_cmp(&b.crf)) => {
+            notes.push(format!("VMAF {} is out of reach (CRF {} gives {:.2}); encoded at CRF {} for the cut", o.target_vmaf, t.crf, t.mean_vmaf, t.crf));
+            *t
+        }
+        None => skip!("even CRF {} misses VMAF {}; source is too lean to re-encode at this target", o.min_crf, o.target_vmaf),
     };
     let predicted_savings = 1.0 - best.size_ratio;
     tools.emit(Event::Chosen { crf: best.crf, vmaf: best.mean_vmaf, predicted_savings });
     eprintln!("chose crf {} (VMAF {:.2}), predicted video savings {:.0}%", best.crf, best.mean_vmaf, predicted_savings * 100.0);
-    if predicted_savings < o.min_savings && !o.force {
+    if predicted_savings < o.min_savings && !o.force && cut.is_none() {
         skip!("predicted savings {:.0}% below --min-savings {:.0}%", predicted_savings * 100.0, o.min_savings * 100.0);
     }
 
@@ -285,13 +315,14 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         let _ = std::fs::remove_file(&video);
         (streams, Some(chunks), Some(plan.total_frames))
     } else {
-        let (args, streams) = full_encode_args(input, &info, &enc, best.crf, o.container, &covers, &meta, &o.meta, &partial, &mut notes);
+        let cut = cut.as_ref().map(|c| prepare_cut(tools, input, &info, c, o.meta.keep, &tmp.path, &mut notes)).transpose()?;
+        let (args, streams) = full_encode_args(input, &info, &enc, best.crf, o.container, &covers, &meta, &o.meta, cut.as_ref(), &partial, &mut notes);
         for n in &notes {
             eprintln!("note: {n}");
             tools.emit(Event::Note { text: n.clone() });
         }
         tools.emit(Event::Phase { phase: "encoding".into(), detail: format!("crf {}, preset {}", best.crf, o.preset) });
-        tools.run_with_progress(&args, info.duration_s, "encoding")?;
+        tools.run_with_progress(&args, out_duration, "encoding")?;
         (streams, None, None)
     };
     let encode_secs = t1.elapsed().as_secs_f64();
@@ -304,7 +335,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
 
     eprintln!("verifying");
     tools.emit(Event::Phase { phase: "verifying".into(), detail: "streams, duration, VMAF spot checks".into() });
-    let (verify_vmaf, out_info) = verify(tools, input, &info, &partial, &streams, expect_frames, o, vmaf_threads, &tmp.path)?;
+    let (verify_vmaf, out_info) = verify(tools, input, &info, &partial, &streams, expect_frames, cut.as_ref(), o.target_vmaf.min(best.mean_vmaf), vmaf_threads, &tmp.path)?;
     let lost = metadata::missing(&meta, &out_info.tags);
     if !lost.is_empty() {
         let n = format!(
@@ -342,6 +373,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         search: &trials,
         chunks: chunks.as_deref(),
         verify_vmaf: &verify_vmaf,
+        removed: cut.as_ref().map(Sections::removed),
         tags: meta.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect(),
         info_json: meta.info_json.as_deref(),
         search_secs,
@@ -355,7 +387,8 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         None => out_info.video_bitrate,
     };
     let record = history::Record::new(&info, video_bitrate, o.target_vmaf, o.preset, report.mode);
-    if let Err(e) = history::append(&record) {
+    // A cut encoded below the target would teach the size model wrong sizes for it.
+    if let Err(e) = if reached { history::append(&record) } else { Ok(()) } {
         eprintln!("warning: could not record this encode in the history: {e:#}");
     }
     if let Some(w) = &work
@@ -415,20 +448,54 @@ fn full_encode_args(
     covers: &[CoverFile],
     tags: &Resolved,
     mo: &MetaOptions,
+    cut: Option<&Cut>,
     out: &Path,
     notes: &mut Vec<String>,
 ) -> (Vec<String>, Streams) {
-    let map = format!("0:{}", info.video_index);
-    let mut a: Vec<String> = ["-y", "-i", &path_arg(input), "-map", &map].map(String::from).to_vec();
+    let mut a: Vec<String> = ["-y", "-i", &path_arg(input)].map(String::from).to_vec();
     let vf = search::source_filters(info);
     if !vf.is_empty() {
-        a.extend(["-filter:v:0".into(), vf.join(",")]);
         notes.push(format!("video filters: {}", vf.join(",")));
+    }
+    let mut sub_inputs = Vec::new();
+    let mut chapters = 0;
+    if let Some(c) = cut {
+        // Retimed subtitles and chapters come from their own files, as inputs 1, 2, ...
+        let mut n = 1;
+        for s in &c.subs {
+            sub_inputs.push(s.as_ref().map(|p| {
+                a.extend(["-i".into(), path_arg(p)]);
+                n += 1;
+                n - 1
+            }));
+        }
+        if let Some(p) = &c.chapters {
+            a.extend(["-f".into(), "ffmetadata".into(), "-i".into(), path_arg(p)]);
+            chapters = n;
+        }
+        a.extend(["-filter_complex".into(), c.sections.filter_graph(info.video_index, info.audio.len(), &vf, info.duration_s)]);
+        a.extend(["-map".into(), "[vout]".into()]);
+    } else {
+        a.extend(["-map".into(), format!("0:{}", info.video_index)]);
+        if !vf.is_empty() {
+            a.extend(["-filter:v:0".into(), vf.join(",")]);
+        }
     }
     a.extend(enc.video_args(crf));
     a.extend(["-fps_mode:v:0", "passthrough"].map(String::from));
-    let streams = stream_args(info, 0, container, covers, notes);
-    a.extend(metadata::ffmpeg_args(mo, tags, 0));
+    let streams = stream_args(info, 0, container, covers, cut.map(|_| sub_inputs.as_slice()), notes);
+    let mut meta = metadata::ffmpeg_args(mo, tags, 0);
+    if cut.is_some() {
+        // Chapters at their new times, or none if the source had none.
+        if let Some(i) = meta.iter().position(|x| x == "-map_chapters") {
+            meta[i + 1] = if chapters > 0 { chapters.to_string() } else { "-1".into() };
+        }
+        // Filter outputs and the subtitle files carry no stream tags of their own, and naming
+        // any stream's source turns off ffmpeg's automatic copying for all of them.
+        meta.extend(["-map_metadata:s:v:0".into(), format!("0:s:{}", info.video_index)]);
+        meta.extend(streams.meta_from.iter().flat_map(|(o, i)| [format!("-map_metadata:s:{o}"), format!("0:s:{i}")]));
+    }
+    a.extend(meta);
     a.extend(streams.args.iter().cloned());
     a.push(path_arg(out));
     (a, streams)
@@ -455,7 +522,7 @@ fn mux_args(
     ]
     .map(String::from)
     .to_vec();
-    let streams = stream_args(info, 1, container, covers, notes);
+    let streams = stream_args(info, 1, container, covers, None, notes);
     a.extend(metadata::ffmpeg_args(mo, tags, 1));
     a.extend(streams.args.iter().cloned());
     a.push(path_arg(out));
@@ -465,6 +532,8 @@ fn mux_args(
 /// Audio, subtitle, cover and attachment arguments for source input number `src`.
 struct Streams {
     args: Vec<String>,
+    /// (output, source) stream specifiers whose tags must be copied explicitly (cut mode).
+    meta_from: Vec<(String, String)>,
     audio: usize,
     subs: usize,
     covers: usize,
@@ -503,14 +572,30 @@ fn prepare_covers(tools: &Tools, input: &Path, info: &MediaInfo, container: Cont
     files
 }
 
-fn stream_args(info: &MediaInfo, src: usize, container: Container, cover_files: &[CoverFile], notes: &mut Vec<String>) -> Streams {
+/// `cut_subs` is set when sections are removed: audio then comes from the cut filter graph
+/// (`[ao0]`, ...) and subtitle `i` from input `cut_subs[i]` (None: dropped).
+fn stream_args(
+    info: &MediaInfo,
+    src: usize,
+    container: Container,
+    cover_files: &[CoverFile],
+    cut_subs: Option<&[Option<usize>]>,
+    notes: &mut Vec<String>,
+) -> Streams {
     let mut a = Vec::new();
+    let mut meta_from = Vec::new();
     for (i, s) in info.audio.iter().enumerate() {
-        a.extend(["-map".into(), format!("{src}:a:{i}")]);
-        if COPY_AUDIO.contains(&s.codec.as_str()) {
+        let kbps = (s.channels.max(1) * 64).clamp(64, 384);
+        if cut_subs.is_some() {
+            a.extend(["-map".into(), format!("[ao{i}]")]);
+            a.extend([format!("-c:a:{i}"), "libopus".into(), format!("-b:a:{i}"), format!("{kbps}k")]);
+            notes.push(format!("audio {i}: {} -> Opus {kbps} kbps (cut audio is re-encoded)", s.codec));
+            meta_from.push((format!("a:{i}"), format!("a:{i}")));
+        } else if COPY_AUDIO.contains(&s.codec.as_str()) {
+            a.extend(["-map".into(), format!("{src}:a:{i}")]);
             a.extend([format!("-c:a:{i}"), "copy".into()]);
         } else {
-            let kbps = (s.channels.max(1) * 64).clamp(64, 384);
+            a.extend(["-map".into(), format!("{src}:a:{i}")]);
             a.extend([format!("-c:a:{i}"), "libopus".into(), format!("-b:a:{i}"), format!("{kbps}k")]);
             notes.push(format!("audio {i}: {} -> Opus {kbps} kbps", s.codec));
         }
@@ -518,21 +603,28 @@ fn stream_args(info: &MediaInfo, src: usize, container: Container, cover_files: 
 
     let mut kept_subs = 0;
     for (i, codec) in info.subtitle_codecs.iter().enumerate() {
-        match container {
-            Container::Mkv => {
-                // MP4-style text subtitles can't be stored in Matroska; convert them to SRT.
-                let codec = if codec == "mov_text" { "srt" } else { "copy" };
-                a.extend(["-map".into(), format!("{src}:s:{i}")]);
-                a.extend([format!("-c:s:{kept_subs}"), codec.into()]);
-                kept_subs += 1;
-            }
-            Container::Mp4 if TEXT_SUBS.contains(&codec.as_str()) => {
-                a.extend(["-map".into(), format!("{src}:s:{i}")]);
-                a.extend([format!("-c:s:{kept_subs}"), "mov_text".into()]);
-                kept_subs += 1;
-            }
-            Container::Mp4 => notes.push(format!("subtitle {i} ({codec}) dropped: image subtitles don't fit in MP4; use --container mkv")),
+        let text = TEXT_SUBS.contains(&codec.as_str());
+        if container == Container::Mp4 && !text {
+            notes.push(format!("subtitle {i} ({codec}) dropped: image subtitles don't fit in MP4; use --container mkv"));
+            continue;
         }
+        let from = match cut_subs {
+            None => format!("{src}:s:{i}"),
+            Some(inputs) => match inputs.get(i).copied().flatten() {
+                Some(n) => format!("{n}:s:0"),
+                None => continue,
+            },
+        };
+        // MP4-style text subtitles can't be stored in Matroska; convert them to SRT.
+        let codec = match container {
+            Container::Mkv if codec == "mov_text" => "srt",
+            Container::Mkv => "copy",
+            Container::Mp4 => "mov_text",
+        };
+        a.extend(["-map".into(), from]);
+        a.extend([format!("-c:s:{kept_subs}"), codec.into()]);
+        meta_from.push((format!("s:{kept_subs}"), format!("s:{i}")));
+        kept_subs += 1;
     }
 
     let mut covers = 0;
@@ -545,12 +637,15 @@ fn stream_args(info: &MediaInfo, src: usize, container: Container, cover_files: 
                 }
                 covers += 1;
                 a.extend(["-map".into(), format!("{src}:{}", c.index), format!("-c:v:{covers}"), "copy".into()]);
+                meta_from.push((format!("v:{covers}"), c.index.to_string()));
                 a.extend([format!("-disposition:v:{covers}"), "attached_pic".into()]);
             }
         }
         Container::Mkv => {
             // Fonts used by ASS subtitles live in attachments; covers are re-attached after them.
             a.extend(["-map".into(), format!("{src}:t?"), "-c:t".into(), "copy".into()]);
+            // Matroska needs each attachment's file name and type.
+            meta_from.extend((0..info.attachments).map(|t| (format!("t:{t}"), format!("t:{t}"))));
             for (k, f) in cover_files.iter().enumerate() {
                 let t = info.attachments as usize + k;
                 a.extend(["-attach".into(), path_arg(&f.path)]);
@@ -563,7 +658,69 @@ fn stream_args(info: &MediaInfo, src: usize, container: Container, cover_files: 
     if container == Container::Mp4 {
         a.extend(["-movflags", "+faststart"].map(String::from));
     }
-    Streams { args: a, audio: info.audio.len(), subs: kept_subs, covers }
+    Streams { args: a, meta_from, audio: info.audio.len(), subs: kept_subs, covers }
+}
+
+/// Inputs for an encode that leaves sections out: retimed copies of the text subtitles and
+/// chapters (the filter graph cuts the picture and sound).
+struct Cut<'a> {
+    sections: &'a Sections,
+    /// Per source subtitle stream; None if it is dropped.
+    subs: Vec<Option<PathBuf>>,
+    /// FFMETADATA file with the chapters at their new times.
+    chapters: Option<PathBuf>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_cut<'a>(
+    tools: &Tools,
+    input: &Path,
+    info: &MediaInfo,
+    sections: &'a Sections,
+    keep_meta: bool,
+    tmp: &Path,
+    notes: &mut Vec<String>,
+) -> Result<Cut<'a>> {
+    let mut subs = Vec::new();
+    for (i, codec) in info.subtitle_codecs.iter().enumerate() {
+        if !TEXT_SUBS.contains(&codec.as_str()) {
+            // MP4 drops these anyway (stream_args says so).
+            notes.push(format!("subtitle {i} ({codec}) dropped: image subtitles can't be cut"));
+            subs.push(None);
+            continue;
+        }
+        let ass = matches!(codec.as_str(), "ass" | "ssa");
+        let ext = if ass { "ass" } else { "srt" };
+        let raw = tmp.join(format!("sub{i}.source.{ext}"));
+        let args: Vec<String> = ["-y", "-v", "error", "-i", &path_arg(input), "-map", &format!("0:s:{i}"), "-c:s", if ass { "ass" } else { "srt" }, &path_arg(&raw)]
+            .map(String::from)
+            .to_vec();
+        if let Err(e) = tools.run(&args) {
+            notes.push(format!("subtitle {i} dropped: could not read it ({})", e.to_string().lines().last().unwrap_or("")));
+            subs.push(None);
+            continue;
+        }
+        let text = String::from_utf8_lossy(&std::fs::read(&raw)?).into_owned();
+        let retimed = if ass { sections.retime_ass(&text) } else { sections.retime_srt(&text) };
+        if !retimed.contains(if ass { "Dialogue:" } else { "-->" }) {
+            notes.push(format!("subtitle {i} dropped: all of its lines are in removed sections"));
+            subs.push(None);
+            continue;
+        }
+        let path = tmp.join(format!("sub{i}.{ext}"));
+        std::fs::write(&path, retimed)?;
+        subs.push(Some(path));
+    }
+    let mut chapters = None;
+    if keep_meta {
+        let list = sections::read_chapters(&tools.ffprobe, input)?;
+        if !list.is_empty() {
+            let path = tmp.join("chapters.ffmeta");
+            std::fs::write(&path, sections.chapters(&list))?;
+            chapters = Some(path);
+        }
+    }
+    Ok(Cut { sections, subs, chapters })
 }
 
 /// Checks the encode before it replaces anything: stream layout, duration, and VMAF spot checks
@@ -576,17 +733,19 @@ fn verify(
     out: &Path,
     streams: &Streams,
     expect_frames: Option<u64>,
-    o: &Options,
+    cut: Option<&Sections>,
+    target_vmaf: f64,
     threads: usize,
     tmp: &Path,
 ) -> Result<(Vec<f64>, MediaInfo)> {
+    let duration = cut.map_or(info.duration_s, Sections::kept);
     let out_info = probe::probe(&tools.ffprobe, out, std::fs::metadata(out)?.len())?;
     if out_info.codec != "av1" {
         bail!("verify: output video is {}, expected av1", out_info.codec);
     }
-    let tolerance = (info.duration_s * 0.005).max(1.0);
-    if (out_info.duration_s - info.duration_s).abs() > tolerance {
-        bail!("verify: duration {:.1}s vs source {:.1}s", out_info.duration_s, info.duration_s);
+    let tolerance = (duration * 0.005).max(1.0);
+    if (out_info.duration_s - duration).abs() > tolerance {
+        bail!("verify: duration {:.1}s, expected {:.1}s", out_info.duration_s, duration);
     }
     if out_info.audio_streams as usize != streams.audio || out_info.subtitle_streams as usize != streams.subs {
         bail!(
@@ -607,20 +766,22 @@ fn verify(
         }
     }
 
-    let secs = 5.0_f64.min(info.duration_s);
     let model = search::vmaf_model(info);
     let pix = search::reference_pix_fmt(info);
     let mut scores = Vec::new();
     for (i, frac) in [0.3, 0.7].into_iter().enumerate() {
-        let start = ((info.duration_s - secs) * frac).max(0.0);
+        let secs = 5.0_f64.min(duration);
+        let start = ((duration - secs) * frac).max(0.0);
+        // The same picture sits at different times in the source when sections were removed.
+        let (start, src_start, secs) = cut.map_or((start, start, secs), |c| c.window(start, secs));
         let r = tmp.join(format!("verify{i}.ref.mkv"));
         let d = tmp.join(format!("verify{i}.out.mkv"));
-        search::extract_reference(tools, input, info, true, start, secs, &r)?;
+        search::extract_reference(tools, input, info, true, src_start, secs, &r)?;
         search::extract_reference(tools, out, info, false, start, secs, &d)?;
         let mut v = tools.vmaf(&d, &r, model, pix, threads, 0, 1)?;
         // Seeking two different files can land a frame or two apart; retry nearby alignments
         // before calling the encode bad.
-        if v < o.target_vmaf - 4.0 {
+        if v < target_vmaf - 4.0 {
             for off in [-2, -1, 1, 2] {
                 v = v.max(tools.vmaf(&d, &r, model, pix, threads, off, 1)?);
             }
@@ -632,7 +793,7 @@ fn verify(
         let _ = std::fs::remove_file(&d);
     }
     // Short spot checks are noisier than the multi-sample search, so allow some slack.
-    let floor = o.target_vmaf - 4.0;
+    let floor = target_vmaf - 4.0;
     if let Some(bad) = scores.iter().find(|&&v| v < floor) {
         bail!("verify: spot check VMAF {bad:.2} below {floor:.1}; keeping nothing");
     }

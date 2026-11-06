@@ -46,6 +46,9 @@ pub struct JobOptions {
     /// Tag name and template pairs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub meta_tags: Vec<(String, String)>,
+    /// Sections left out of the output, (start, end) seconds. Only for single-file jobs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remove: Vec<(f64, f64)>,
 }
 
 fn d_true() -> bool {
@@ -78,6 +81,11 @@ impl JobOptions {
         if !(1..=8).contains(&self.workers) {
             bail!("workers must be 1-8");
         }
+        for &(a, b) in &self.remove {
+            if !(a.is_finite() && b.is_finite() && a >= 0.0 && b > a) {
+                bail!("section {a}-{b} is not a valid range");
+            }
+        }
         let container = match self.container.as_str() {
             "mp4" => Container::Mp4,
             "mkv" => Container::Mkv,
@@ -98,6 +106,7 @@ impl JobOptions {
             scenes: self.scenes,
             workers: self.workers as usize,
             meta: self.meta()?,
+            remove: self.remove.clone(),
         })
     }
 
@@ -307,6 +316,9 @@ fn add_unchecked(app: &App, body: &Value) -> Result<Value> {
     }
     if batch_jobs.is_empty() {
         bail!("no video files in the selection");
+    }
+    if !opts.remove.is_empty() && batch_jobs.len() > 1 {
+        bail!("sections can only be removed when encoding a single video");
     }
     for j in &batch_jobs {
         if !j.out_dir.starts_with(&r.out_dir) {

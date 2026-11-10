@@ -479,7 +479,7 @@ pub fn preview(app: &App, body: &Value) -> Result<Value> {
     let meta = std::fs::metadata(&src)?;
     let mtime = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
     let start = r.start.max(0.0);
-    let secs = r.secs.clamp(2.0, 120.0);
+    let secs = r.secs.clamp(0.5, 120.0);
     let key = format!("{}|{}|{}|{mtime}|{start:.3}|{secs:.3}", r.kind, src.display(), meta.len());
     let out = app.preview_dir.join(format!("{:016x}.mp4", crate::scenes::fnv1a(&key)));
     let url = |p: &Path| format!("/media?path={}", percent_encode(&p.to_string_lossy()));

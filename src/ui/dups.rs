@@ -2,13 +2,14 @@
 //! results, serves frame thumbnails and describes a pair of files for the comparison player.
 
 use super::{App, library, now};
-use crate::dups::{self, Progress, Report, matching::Prefs};
+use crate::dups::{self, File, Progress, Report, matching::Prefs};
 use crate::events::Hooks;
 use crate::scan::is_video;
 use crate::tools::path_arg;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, UNIX_EPOCH};
@@ -25,6 +26,8 @@ pub struct Run {
     total: usize,
     started: u64,
     report: Option<Arc<Report>>,
+    /// Files of the result moved to the trash since, in that order.
+    trashed: Vec<PathBuf>,
     hooks: Arc<Hooks>,
 }
 
@@ -80,7 +83,7 @@ pub fn start(app: &Arc<App>, body: &Value) -> Result<Value> {
         while runs.len() >= 3 {
             runs.remove(0);
         }
-        runs.push(Run { id, paths: paths.clone(), status: "running".into(), error: None, phase: "probing", done: 0, total: 0, started: now(), report: None, hooks: hooks.clone() });
+        runs.push(Run { id, paths: paths.clone(), status: "running".into(), error: None, phase: "probing", done: 0, total: 0, started: now(), report: None, trashed: Vec::new(), hooks: hooks.clone() });
         id
     };
     {
@@ -149,14 +152,88 @@ pub fn list(app: &App) -> Value {
 }
 
 pub fn get(app: &App, id: u64) -> Result<Value> {
-    let (mut v, report) = {
+    let (mut v, report, trashed) = {
         let runs = app.dups.lock().unwrap();
         let r = runs.iter().find(|x| x.id == id).ok_or_else(|| anyhow!("not found: duplicate search {id}"))?;
-        (head(r), r.report.clone())
+        (head(r), r.report.clone(), r.trashed.clone())
     };
     // Serialized without the lock held: the result of a big library is large.
     v["report"] = json!(report.as_deref());
+    v["trashed"] = json!(trashed);
     Ok(v)
+}
+
+#[derive(Deserialize)]
+struct TrashRequest {
+    paths: Vec<PathBuf>,
+}
+
+/// Whether `paths` may go to the trash: only files of the result that are still as the search
+/// saw them, and never the last copy of a video. `gone` are the files trashed earlier;
+/// `present` says whether a file is still there unchanged.
+fn check_trash(report: &Report, gone: &HashSet<PathBuf>, paths: &[PathBuf], present: &dyn Fn(&File) -> bool) -> Result<()> {
+    if paths.is_empty() {
+        bail!("nothing is marked");
+    }
+    let marked: HashSet<&Path> = paths.iter().map(|p| p.as_path()).collect();
+    for p in paths {
+        let Some(f) = report.files.iter().find(|f| f.path == *p) else {
+            bail!("{} is not a file of this result", p.display());
+        };
+        if gone.contains(p) {
+            bail!("{} is in the trash already", p.display());
+        }
+        if !present(f) {
+            bail!("{} is gone or has changed since the search; search again", p.display());
+        }
+    }
+    for g in &report.groups {
+        let members: Vec<&File> = g.members.iter().filter_map(|&i| report.files.get(i)).collect();
+        let Some(one) = members.iter().find(|f| marked.contains(f.path.as_path())) else { continue };
+        let left: Vec<&&File> = members.iter().filter(|f| !marked.contains(f.path.as_path()) && !gone.contains(&f.path)).collect();
+        if left.is_empty() {
+            bail!("every copy of {} is marked: nothing would be left of that video. Untick one", one.path.display());
+        }
+        if !left.iter().any(|f| present(f)) {
+            bail!("the copy to keep of {} ({}) is gone or has changed since the search; search again", one.path.display(), left[0].path.display());
+        }
+    }
+    Ok(())
+}
+
+/// Moves marked files of a result to the trash of the drive each is on. Nothing is deleted:
+/// the file manager can put them back until the trash is emptied.
+pub fn trash(app: &App, id: u64, body: &Value) -> Result<Value> {
+    let r: TrashRequest = serde_json::from_value(body.clone())?;
+    // One at a time, so two requests can't each take "the other" copy of a video.
+    static ONE: Mutex<()> = Mutex::new(());
+    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    let (report, gone) = {
+        let runs = app.dups.lock().unwrap();
+        let run = runs.iter().find(|x| x.id == id).ok_or_else(|| anyhow!("not found: duplicate search {id}"))?;
+        let report = run.report.clone().ok_or_else(|| anyhow!("that search has no result"))?;
+        (report, run.trashed.iter().cloned().collect::<HashSet<PathBuf>>())
+    };
+    let mut paths = r.paths;
+    paths.sort();
+    paths.dedup();
+    let present = |f: &File| std::fs::symlink_metadata(&f.path).is_ok_and(|m| m.is_file() && m.len() == f.size);
+    check_trash(&report, &gone, &paths, &present)?;
+
+    let (mut trashed, mut failed, mut bytes) = (Vec::new(), Vec::new(), 0u64);
+    for p in &paths {
+        match crate::trash::trash(p) {
+            Ok(_) => {
+                bytes += report.files.iter().find(|f| f.path == *p).map_or(0, |f| f.size);
+                trashed.push(p.clone());
+            }
+            Err(e) => failed.push(json!({ "path": p, "error": format!("{e:#}") })),
+        }
+    }
+    if let Some(run) = app.dups.lock().unwrap().iter_mut().find(|x| x.id == id) {
+        run.trashed.extend(trashed.iter().cloned());
+    }
+    Ok(json!({ "trashed": trashed, "failed": failed, "bytes": bytes }))
 }
 
 pub fn cancel(app: &App, id: u64) -> Result<Value> {
@@ -249,4 +326,49 @@ pub fn thumb(app: &App, path: &Path, t: f64) -> Result<Vec<u8>> {
         std::fs::rename(&part, &out)?;
     }
     Ok(std::fs::read(&out)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dups::matching::{Group, Kind};
+
+    fn file(name: &str) -> File {
+        File { path: PathBuf::from(name), root: PathBuf::from("/"), size: 10, codec: "h264".into(), width: 1280, height: 720, fps: 30.0, duration_s: 60.0, video_mbps: 2.0, identical: None }
+    }
+
+    #[test]
+    fn the_last_copy_of_a_video_never_goes() {
+        let report = Report {
+            files: vec![file("/a/1.mkv"), file("/b/1.mp4"), file("/c/1.webm"), file("/a/2.mkv"), file("/b/2.mkv")],
+            groups: vec![
+                Group { kind: Kind::Same, score: 1.0, members: vec![0, 1, 2], reason: String::new() },
+                Group { kind: Kind::SameStart, score: 1.0, members: vec![3, 4], reason: String::new() },
+            ],
+            ..Default::default()
+        };
+        let paths = |names: &[&str]| names.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let all = |_: &File| true;
+        let none = HashSet::new();
+        let check = |gone: &HashSet<PathBuf>, names: &[&str], present: &dyn Fn(&File) -> bool| check_trash(&report, gone, &paths(names), present).map_err(|e| e.to_string());
+
+        assert!(check(&none, &["/b/1.mp4", "/c/1.webm", "/b/2.mkv"], &all).is_ok());
+        assert!(check(&none, &[], &all).unwrap_err().contains("nothing is marked"));
+        assert!(check(&none, &["/etc/passwd"], &all).unwrap_err().contains("not a file of this result"));
+        assert!(check(&none, &["/a/1.mkv", "/b/1.mp4", "/c/1.webm"], &all).unwrap_err().contains("every copy"));
+        assert!(check(&none, &["/a/2.mkv", "/b/2.mkv"], &all).unwrap_err().contains("every copy"));
+
+        // Copies trashed earlier don't count as kept, and can't be trashed twice.
+        let gone: HashSet<PathBuf> = paths(&["/a/1.mkv"]).into_iter().collect();
+        assert!(check(&gone, &["/b/1.mp4"], &all).is_ok());
+        assert!(check(&gone, &["/b/1.mp4", "/c/1.webm"], &all).unwrap_err().contains("every copy"));
+        assert!(check(&gone, &["/a/1.mkv"], &all).unwrap_err().contains("in the trash already"));
+
+        // A marked file that changed, or a keeper that is no longer there, stops everything.
+        let without = |missing: &'static str| move |f: &File| f.path != Path::new(missing);
+        assert!(check(&none, &["/b/1.mp4"], &without("/b/1.mp4")).unwrap_err().contains("gone or has changed"));
+        assert!(check(&none, &["/b/2.mkv"], &without("/a/2.mkv")).unwrap_err().contains("copy to keep"));
+        // One keeper missing is fine while another is there.
+        assert!(check(&none, &["/b/1.mp4"], &without("/a/1.mkv")).is_ok());
+    }
 }

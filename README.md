@@ -42,7 +42,8 @@ av1opt dups /videos /more/videos [--prefer /videos/keep] [--avoid trash] [--csv 
 
 Finds videos that show the same thing: the same video at another resolution, bitrate, codec or
 container, inside black bars, and copies with the start or the end cut off. Nothing is moved or
-deleted; the result is a list of groups with the copy worth keeping first.
+deleted by the command; the result is a list of groups with the copy worth keeping first. (The
+UI can move the copies you tick to the trash.)
 
 How it works:
 
@@ -243,7 +244,12 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
 - **Scan**: pick folders, see per-file and total savings estimates, select candidates and queue them.
 - **Duplicates**: the `dups` search with progress and a Stop button. Each group shows a frame
   of every copy, the suggested keep and why; **Compare** opens two copies in the split player.
-  Tick the copies you don't want and copy or save the list of paths: av1opt deletes nothing.
+  Tick the copies you don't want, then **Move to trash** (after a confirmation), or copy or save
+  the list of paths. Nothing is deleted: each file is renamed into the trash of the drive it is
+  on (`~/.local/share/Trash`, or `.Trash-<uid>` at the top of another drive, as file managers
+  do), so it can be put back until you empty the trash, and no space is freed before that.
+  The last copy of a video is never trashed, files that changed since the search are refused,
+  and a drive without a usable trash gives an error instead of a copy to another disk.
 - **Queue**: encodes run one at a time with live progress: CRF search trials, chosen CRF,
   per-chunk results in scene mode, percent, fps and ETA. Cancel stops ffmpeg at once; finished
   scene chunks are kept, so queueing the same files again resumes. Unfinished jobs are
@@ -324,8 +330,8 @@ a scene-mode file over rather than resuming a work folder of another format.
 
 `AV1OPT_DEBUG=1` prints every ffmpeg command. `--keep-temp` keeps samples and the partial encode.
 `cargo test --features ui` also runs `tests/ui_api.rs`, which starts the real `av1opt ui` and
-checks sign-in, request checks, media access, the job queue, the duplicate search and the
-benchmark's requests and tuned settings over HTTP (no ffmpeg needed).
+checks sign-in, request checks, media access, the job queue, the duplicate search (and what its
+trash action refuses) and the benchmark's requests and tuned settings over HTTP (no ffmpeg needed).
 
 ## Lessons baked in
 

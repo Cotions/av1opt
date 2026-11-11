@@ -258,3 +258,5 @@ h3.flat { margin: 0; }
 tr.hi td { background: var(--panel2); }
 td .pill { margin-left: 6px; }
 td .pill:first-child { margin-left: 0; }
+.modal.narrow { width: min(560px, 94vw); }
+.trash-list { white-space: pre-wrap; word-break: break-all; max-height: 220px; overflow: auto; background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius); padding: 6px 8px; }

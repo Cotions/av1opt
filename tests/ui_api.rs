@@ -424,6 +424,18 @@ fn duplicate_search_runs_and_guards_its_files() {
     assert_eq!(s.get(&format!("/thumb?path={}&t=1", a.display())).status, 404);
     assert_eq!(s.get("/thumb").status, 400);
     assert_eq!(s.post("/api/dups/pair", &json!({ "left": a, "right": "/etc/passwd" })).status, 400);
+
+    // Only files that are in a group of the result can go to the trash.
+    assert_eq!(run["trashed"], json!([]));
+    assert_eq!(s.post("/api/dups/99/trash", &json!({ "paths": [a] })).status, 404);
+    assert_eq!(s.post(&format!("/api/dups/{id}/trash"), &json!({ "paths": [] })).status, 400);
+    for p in [a.clone(), PathBuf::from("/etc/passwd")] {
+        let r = s.post(&format!("/api/dups/{id}/trash"), &json!({ "paths": [p] }));
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("not a file of this result"), "{}", r.body);
+    }
+    assert!(a.exists());
+    assert!(!s.dir.join("data/Trash/files/a.mkv").exists());
 }
 
 #[test]

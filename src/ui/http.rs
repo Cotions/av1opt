@@ -161,6 +161,7 @@ fn api(app: &Arc<App>, m: &Method, path: &str, q: &[(String, String)], body: &Va
         (Method::Post, ["dups", "pair"]) => dups::pair(app, body),
         (Method::Get, ["dups", id]) => dups::get(app, id.parse()?),
         (Method::Post, ["dups", id, "cancel"]) => dups::cancel(app, id.parse()?),
+        (Method::Post, ["dups", id, "trash"]) => dups::trash(app, id.parse()?, body),
         (Method::Get, ["bench"]) => bench::get(app),
         (Method::Post, ["bench"]) => bench::start(app, body),
         (Method::Post, ["bench", "cancel"]) => bench::cancel(app),

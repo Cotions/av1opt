@@ -1,0 +1,246 @@
+//! Moves files to the desktop's trash (freedesktop.org Trash specification 1.0), where the
+//! file manager shows them and can put them back. A file is only ever renamed within its own
+//! filesystem, never copied: trashing 50 GB takes a moment and can't half-finish.
+
+use anyhow::{Context, Result, bail};
+use std::io::Write;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+
+/// The user's own trash: `$XDG_DATA_HOME/Trash`.
+fn home_trash() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
+    Some(base.join("Trash"))
+}
+
+/// Moves `path` to the trash of the filesystem it is on. Returns where it is now.
+pub fn trash(path: &Path) -> Result<PathBuf> {
+    // SAFETY: getuid has no failure mode and touches no memory.
+    let uid = unsafe { libc::getuid() };
+    trash_with(path, home_trash().as_deref(), uid, now_local())
+}
+
+/// A trash folder and what `Path=` in its info files is relative to (None: absolute paths).
+struct Bin {
+    dir: PathBuf,
+    relative_to: Option<PathBuf>,
+}
+
+fn make_private(dir: &Path) -> std::io::Result<()> {
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
+}
+
+/// The trash for a file on device `dev`: the home trash when that is on the same filesystem,
+/// else the one at the top of the file's filesystem (`.Trash/<uid>` when an administrator set
+/// one up, `.Trash-<uid>` otherwise).
+fn bin_for(path: &Path, dev: u64, home: Option<&Path>, uid: u32) -> Result<Bin> {
+    if let Some(home) = home
+        && make_private(home).is_ok()
+        && std::fs::metadata(home).is_ok_and(|m| m.dev() == dev)
+    {
+        return Ok(Bin { dir: home.to_path_buf(), relative_to: None });
+    }
+    // The top of the filesystem: the last parent still on the same device.
+    let mut top: Option<&Path> = None;
+    for dir in path.ancestors().skip(1) {
+        match std::fs::metadata(dir) {
+            Ok(m) if m.dev() == dev => top = Some(dir),
+            _ => break,
+        }
+    }
+    let top = top.with_context(|| format!("cannot tell which drive {} is on", path.display()))?;
+    // A shared `.Trash` counts only as a real folder with the sticky bit, as the specification
+    // asks: anything else could be another user's trap.
+    let shared = top.join(".Trash");
+    let shared_ok = std::fs::symlink_metadata(&shared).is_ok_and(|m| m.is_dir() && m.mode() & 0o1000 != 0);
+    let candidates = [shared_ok.then(|| shared.join(uid.to_string())), Some(top.join(format!(".Trash-{uid}")))];
+    let mut last = None;
+    for dir in candidates.into_iter().flatten() {
+        match make_private(&dir) {
+            Ok(()) => return Ok(Bin { dir, relative_to: Some(top.to_path_buf()) }),
+            Err(e) => last = Some(e),
+        }
+    }
+    bail!("no trash on the drive of {} ({}): {}", path.display(), top.display(), last.map_or("cannot make one".to_string(), |e| e.to_string()))
+}
+
+/// Percent-encoding of the info file's `Path=`: everything but unreserved characters and `/`.
+fn encode_path(p: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let mut out = String::new();
+    for &b in p.as_os_str().as_bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.~/".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Local time as the specification writes it: `2026-11-10T22:15:03`.
+fn now_local() -> String {
+    // SAFETY: time() with a null pointer only returns the time; localtime_r fills the tm we
+    // own and is the thread-safe variant.
+    let tm = unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&t, &mut tm);
+        tm
+    };
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec)
+}
+
+fn trash_with(path: &Path, home: Option<&Path>, uid: u32, when: String) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        bail!("{} is not an absolute path", path.display());
+    }
+    // The link itself, not what it points to.
+    let meta = std::fs::symlink_metadata(path).with_context(|| format!("{} is not there", path.display()))?;
+    let name = path.file_name().with_context(|| format!("{} has no name", path.display()))?;
+    let bin = bin_for(path, meta.dev(), home, uid)?;
+    let (files, info) = (bin.dir.join("files"), bin.dir.join("info"));
+    make_private(&files).and_then(|_| make_private(&info)).with_context(|| format!("cannot use the trash at {}", bin.dir.display()))?;
+    let recorded = match &bin.relative_to {
+        Some(top) => path.strip_prefix(top).unwrap_or(path),
+        None => path,
+    };
+    let text = format!("[Trash Info]\nPath={}\nDeletionDate={when}\n", encode_path(recorded));
+
+    // The info file is made first and exclusively: that is what reserves the name.
+    for n in 1..10_000u32 {
+        let mut unique = name.to_os_string();
+        if n > 1 {
+            unique.push(format!(".{n}"));
+        }
+        let mut info_name = unique.clone();
+        info_name.push(".trashinfo");
+        let info_path = info.join(&info_name);
+        let mut f = match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&info_path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e).with_context(|| format!("cannot write to the trash at {}", bin.dir.display())),
+        };
+        let dest = files.join(&unique);
+        // A leftover file without its info file: don't replace it.
+        let moved = f.write_all(text.as_bytes()).and_then(|_| f.sync_all()).and_then(|_| {
+            if std::fs::symlink_metadata(&dest).is_ok() {
+                return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
+            }
+            std::fs::rename(path, &dest)
+        });
+        match moved {
+            Ok(()) => return Ok(dest),
+            Err(e) => {
+                let _ = std::fs::remove_file(&info_path);
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    continue;
+                }
+                return Err(e).with_context(|| format!("cannot move {} to the trash at {}", path.display(), bin.dir.display()));
+            }
+        }
+    }
+    bail!("the trash at {} is full of files named like {}", bin.dir.display(), path.display())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("av1opt-trash-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn files_go_to_the_home_trash_with_an_info_file() {
+        let dir = scratch("home");
+        let home = dir.join("data/Trash");
+        std::fs::create_dir_all(dir.join("lib/sub dir")).unwrap();
+        let a = dir.join("lib/sub dir/vidéo #1.mkv");
+        std::fs::write(&a, b"first").unwrap();
+        let dest = trash_with(&a, Some(&home), 1000, "2026-11-10T22:15:03".into()).unwrap();
+        assert!(!a.exists());
+        assert_eq!(dest, home.join("files/vidéo #1.mkv"));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"first");
+        let info = std::fs::read_to_string(home.join("info/vidéo #1.mkv.trashinfo")).unwrap();
+        let want = format!("[Trash Info]\nPath={}\nDeletionDate=2026-11-10T22:15:03\n", encode_path(&a));
+        assert_eq!(info, want);
+        assert!(info.contains("/lib/sub%20dir/vid%C3%A9o%20%231.mkv"), "{info}");
+
+        // The same name again gets its own slot; nothing in the trash is replaced.
+        std::fs::write(&a, b"second").unwrap();
+        let dest2 = trash_with(&a, Some(&home), 1000, "2026-11-10T22:15:04".into()).unwrap();
+        assert_eq!(dest2, home.join("files/vidéo #1.mkv.2"));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"first");
+        assert_eq!(std::fs::read(&dest2).unwrap(), b"second");
+        assert!(home.join("info/vidéo #1.mkv.2.trashinfo").exists());
+
+        // Missing files and relative paths are errors, and leave no info file behind.
+        assert!(trash_with(&a, Some(&home), 1000, "x".into()).is_err());
+        assert!(trash_with(Path::new("relative.mkv"), Some(&home), 1000, "x".into()).is_err());
+        assert_eq!(std::fs::read_dir(home.join("info")).unwrap().count(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_link_is_trashed_not_its_target() {
+        let dir = scratch("link");
+        let home = dir.join("Trash");
+        let target = dir.join("real.mkv");
+        std::fs::write(&target, b"keep me").unwrap();
+        let link = dir.join("link.mkv");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let dest = trash_with(&link, Some(&home), 1000, "x".into()).unwrap();
+        assert!(std::fs::symlink_metadata(&dest).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep me");
+        assert!(std::fs::symlink_metadata(&link).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Files on another filesystem than the home trash stay on theirs. `/dev/shm` is the one
+    /// other filesystem a test can count on; where it isn't one, there is nothing to check.
+    #[test]
+    fn other_drives_use_their_own_trash() {
+        let home_dir = scratch("drive");
+        let home = home_dir.join("Trash");
+        let shm = Path::new("/dev/shm");
+        let (Ok(a), Ok(b)) = (std::fs::metadata(shm), std::fs::metadata(&home_dir)) else { return };
+        if a.dev() == b.dev() {
+            return;
+        }
+        // A made-up user number keeps the test's trash apart from a real one.
+        let uid = 3_000_000_000 + std::process::id() % 1_000_000;
+        let dir = shm.join(format!("av1opt-trash-test-{}", std::process::id()));
+        if std::fs::create_dir_all(dir.join("sub")).is_err() {
+            return;
+        }
+        let f = dir.join("sub/clip.mp4");
+        std::fs::write(&f, b"x").unwrap();
+        let dest = trash_with(&f, Some(&home), uid, "2026-11-10T22:15:03".into()).unwrap();
+        let bin = shm.join(format!(".Trash-{uid}"));
+        assert_eq!(dest, bin.join("files/clip.mp4"));
+        assert!(!f.exists());
+        // Recorded relative to the top of that drive, so it survives another mount point.
+        let info = std::fs::read_to_string(bin.join("info/clip.mp4.trashinfo")).unwrap();
+        assert!(info.contains(&format!("Path=av1opt-trash-test-{}/sub/clip.mp4\n", std::process::id())), "{info}");
+        assert!(!home.join("files/clip.mp4").exists());
+        for d in [&bin, &dir, &home_dir] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn the_date_looks_like_the_specification() {
+        let d = now_local();
+        let b = d.as_bytes();
+        assert_eq!(d.len(), 19, "{d}");
+        assert!(b[4] == b'-' && b[7] == b'-' && b[10] == b'T' && b[13] == b':' && b[16] == b':', "{d}");
+        assert!(d[..4].parse::<u32>().unwrap() >= 2026);
+    }
+}

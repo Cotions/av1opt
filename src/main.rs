@@ -14,6 +14,8 @@ mod scenes;
 mod search;
 mod sections;
 mod tools;
+#[cfg(feature = "ui")]
+mod trash;
 mod tuning;
 #[cfg(feature = "ui")]
 mod ui;

@@ -776,6 +776,8 @@ function renderScan(out, r) {
 let lastDupId = null;
 // Paths ticked for removal. Kept while moving between views; a new search starts empty.
 const dupMarks = new Set();
+// Files a trash request could not move, shown once with the next drawing of the result.
+let pendingTrashFailures = null;
 const DUP_KIND = { same: ["Same video", "ok"], same_start: ["Same start", "warn"], same_end: ["Same ending", "warn"] };
 
 views.dups = (root) => {
@@ -877,7 +879,7 @@ views.dups = (root) => {
     if (r.status === "cancelled") { progText.textContent = "stopped (frames read so far are remembered)"; out.replaceChildren(); return; }
     const s = r.report.stats;
     progText.textContent = `${s.compared} of ${s.videos} videos compared · ${s.fresh} read now, the rest remembered`;
-    renderDups(out, r);
+    renderDups(out, r, () => showResult(id));
   }
 
   const off = onEvent((m) => {
@@ -898,11 +900,36 @@ views.dups = (root) => {
 // (master) file playable, so the likelier one goes there.
 function playRank(codec) { return { av1: 0, h264: 1, vp9: 1, vp8: 1, hevc: 3 }[codec] ?? 4; }
 
-function renderDups(out, run) {
-  const rep = run.report, files = rep.files, s = rep.stats;
+// Asks before something that can't be taken back with one click. Resolves true on "yes".
+function confirmDialog({ title, body, action }) {
+  return new Promise((resolve) => {
+    const close = (v) => { bg.remove(); document.removeEventListener("keydown", onKey); resolve(v); };
+    const onKey = (e) => { if (e.key === "Escape") close(false); };
+    const bg = h("div", { class: "modal-bg", onclick: (e) => { if (e.target === bg) close(false); } },
+      h("div", { class: "modal narrow" },
+        h("div", { class: "head" }, h("strong", {}, title)),
+        h("div", { class: "body" }, body),
+        h("div", { class: "foot" }, h("button", { onclick: () => close(false) }, "Cancel"), h("button", { class: "danger", onclick: () => close(true) }, action))));
+    document.body.append(bg);
+    document.addEventListener("keydown", onKey);
+  });
+}
+
+function renderDups(out, run, reload) {
+  const rep = run.report, files = rep.files;
   let filter = prefs.get("dupFilter", "same");
   let limit = 60;
-  const sizeOf = new Map(files.map((f) => [f.path, f.size]));
+  // Files moved to the trash since the search are out of the picture; a group needs two copies.
+  const gone = new Set(run.trashed || []);
+  for (const p of gone) dupMarks.delete(p);
+  const groups = rep.groups.map((g) => ({ ...g, members: g.members.filter((i) => !gone.has(files[i].path)), keepGone: gone.has(files[g.members[0]].path) }))
+    .filter((g) => g.members.length > 1);
+  const spares = groups.filter((g) => g.kind === "same").flatMap((g) => g.members.slice(1));
+  const s = gone.size ? {
+    same_groups: groups.filter((g) => g.kind === "same").length, partial_groups: groups.filter((g) => g.kind !== "same").length,
+    spare_files: spares.length, spare_bytes: spares.reduce((a, i) => a + files[i].size, 0),
+  } : rep.stats;
+  const sizeOf = new Map(files.filter((f) => !gone.has(f.path)).map((f) => [f.path, f.size]));
   const list = h("div");
   const markInfo = h("span", { class: "dim" });
   const marked = () => [...dupMarks].filter((p) => sizeOf.has(p)).sort();
@@ -917,11 +944,42 @@ function renderDups(out, run) {
     setTimeout(() => URL.revokeObjectURL(url), 10000);
   } }, "Save list…");
   const clearBtn = h("button", { onclick: () => { dupMarks.clear(); draw(); } }, "Clear marks");
-  const shown = () => rep.groups.filter((g) => filter === "all" || (filter === "same" ? g.kind === "same" : g.kind !== "same"));
+  // Groups where every copy left is marked: the server refuses those too.
+  const emptied = () => groups.filter((g) => g.members.every((i) => dupMarks.has(files[i].path)));
+  const failures = h("div");
+  const trashBtn = h("button", { class: "danger", onclick: async () => {
+    const m = marked(), total = m.reduce((a, p) => a + sizeOf.get(p), 0);
+    const ok = await confirmDialog({
+      title: `Move ${plural(m.length, "file")} to the trash?`,
+      action: "Move to trash",
+      body: [
+        h("p", {}, `${bytes(total)} in ${plural(m.length, "file")}. Each goes to the trash of the drive it is on, where your file manager can put it back; the space is freed when you empty the trash. Another copy of every video stays where it is.`),
+        h("div", { class: "mono trash-list" }, m.slice(0, 12).join("\n")),
+        m.length > 12 ? h("p", { class: "dim" }, `… and ${m.length - 12} more`) : null],
+    });
+    if (!ok) return;
+    trashBtn.disabled = true;
+    try {
+      const r = await api(`/api/dups/${run.id}/trash`, { paths: m });
+      for (const p of r.trashed) dupMarks.delete(p);
+      toast(`${plural(r.trashed.length, "file")} moved to the trash (${bytes(r.bytes)})`, r.failed.length > 0);
+      if (r.failed.length) pendingTrashFailures = r.failed;
+      reload();
+    } catch (e) { toast(e.message, true); trashBtn.disabled = false; }
+  } }, "Move to trash…");
+  if (pendingTrashFailures) {
+    failures.append(h("div", { class: "panel" }, h("strong", { class: "bad" }, `${plural(pendingTrashFailures.length, "file")} could not be moved to the trash and are still where they were`),
+      pendingTrashFailures.slice(0, 50).map((f) => h("div", { class: "dim mono" }, `${f.path}: ${f.error}`))));
+    pendingTrashFailures = null;
+  }
+  const shown = () => groups.filter((g) => filter === "all" || (filter === "same" ? g.kind === "same" : g.kind !== "same"));
   const updateMarks = () => {
     const m = marked();
+    const e = emptied().length;
     markInfo.textContent = m.length ? `${m.length} file${m.length === 1 ? "" : "s"} marked · ${bytes(m.reduce((a, p) => a + sizeOf.get(p), 0))}` : "Nothing marked";
     copyBtn.disabled = saveBtn.disabled = clearBtn.disabled = !m.length;
+    trashBtn.disabled = !m.length || e > 0;
+    trashBtn.title = e ? `${plural(e, "video")} would have no copy left: untick one copy first` : "";
   };
 
   const card = (g) => {
@@ -951,7 +1009,7 @@ function renderDups(out, run) {
         h("div", { class: "dup-info" },
           h("div", { class: "name", title: m.path }, h("span", { class: "dim" }, dirname(m.path) + "/"), basename(m.path)),
           h("div", { class: "dim" }, `${m.codec} · ${m.width}×${m.height} · ${num(m.video_mbps, 1)} Mbps · ${hms(m.duration_s)} · ${bytes(m.size)}`)),
-        k === 0 ? h("span", { class: "pill ok", title: g.reason }, g.kind === "same" ? "Suggested keep" : "Longer") : null,
+        k === 0 && !g.keepGone ? h("span", { class: "pill ok", title: g.reason }, g.kind === "same" ? "Suggested keep" : "Longer") : null,
         m.identical != null ? h("span", { class: "pill", title: "Same size and the same bytes at the start, middle and end" }, "Identical bytes") : null,
         compare].filter(Boolean));
       return row;
@@ -959,7 +1017,7 @@ function renderDups(out, run) {
     sync();
     return h("div", { class: "dup-group" },
       h("div", { class: "head" }, h("span", { class: "pill " + cls }, label), h("span", {}, `${pct(g.score)} of the compared frames match`),
-        g.kind === "same" && g.reason ? h("span", { class: "dim" }, `keep: ${g.reason}`) : null, allMarked,
+        g.kind === "same" && g.reason && !g.keepGone ? h("span", { class: "dim" }, `keep: ${g.reason}`) : null, allMarked,
         h("span", { class: "spacer" }), spare ? h("span", { class: "ok" }, `frees ${bytes(spare)}`) : null),
       rows);
   };
@@ -967,14 +1025,14 @@ function renderDups(out, run) {
     const v = shown();
     list.replaceChildren(...v.slice(0, limit).map(card));
     if (v.length > limit) list.append(h("div", { class: "panel dim" }, `${v.length - limit} more groups not shown. `, h("button", { class: "small", onclick: () => { limit += 200; draw(); } }, "Show more")));
-    if (!v.length) list.append(h("div", { class: "panel empty" }, rep.groups.length ? "Nothing in this view." : "No duplicates found."));
+    if (!v.length) list.append(h("div", { class: "panel empty" }, groups.length ? "Nothing in this view." : gone.size ? "No duplicates left." : "No duplicates found."));
     updateMarks();
   };
   const filt = h("select", { onchange: (e) => { filter = e.target.value; prefs.set("dupFilter", filter); limit = 60; draw(); } },
     h("option", { value: "same" }, `Same video (${s.same_groups})`), h("option", { value: "partial" }, `Same start or ending (${s.partial_groups})`), h("option", { value: "all" }, "All groups"));
   filt.value = filter;
   const markSpares = h("button", { title: "Marks every copy except the suggested one, in the groups of the same video", onclick: () => {
-    for (const g of rep.groups) if (g.kind === "same") for (const i of g.members.slice(1)) dupMarks.add(files[i].path);
+    for (const g of groups) if (g.kind === "same") for (const i of g.members.slice(1)) dupMarks.add(files[i].path);
     draw();
   } }, "Mark all spare copies");
 
@@ -985,8 +1043,10 @@ function renderDups(out, run) {
       h("div", { class: "stat" }, h("div", { class: "v ok" }, bytes(s.spare_bytes)), h("div", { class: "l" }, "freed by removing the spares")),
       h("div", { class: "stat" }, h("div", { class: "v" }, s.partial_groups), h("div", { class: "l" }, "pairs sharing only a start or an ending"))),
     h("div", { class: "panel" },
-      h("div", { class: "row" }, filt, markSpares, h("span", { class: "spacer" }), markInfo, clearBtn, copyBtn, saveBtn),
-      h("p", { class: "dim" }, "Tick the files you want gone, then copy or save the list of their paths. av1opt never deletes anything itself. “Same start / ending” pairs have different lengths: one is cut, or two videos share an intro or credits, so look before you tick.")),
+      h("div", { class: "row" }, filt, markSpares, h("span", { class: "spacer" }), markInfo, clearBtn, copyBtn, saveBtn, trashBtn),
+      h("p", { class: "dim" }, "Tick the files you want gone, then move them to the trash, or copy or save the list of their paths. av1opt deletes nothing: trashed files can be put back from your file manager until you empty the trash, and the last copy of a video is never trashed. “Same start / ending” pairs have different lengths: one is cut, or two videos share an intro or credits, so look before you tick."),
+      gone.size ? h("p", {}, `${plural(gone.size, "file")} of this result ${gone.size === 1 ? "is" : "are"} in the trash now (${bytes(files.filter((f) => gone.has(f.path)).reduce((a, f) => a + f.size, 0))}).`) : null),
+    failures,
     list,
     rep.unreadable.length ? h("details", { class: "panel more" }, h("summary", {}, `${rep.unreadable.length} video${rep.unreadable.length === 1 ? "" : "s"} could not be compared`),
       h("div", { class: "tablewrap" }, h("table", {}, h("tbody", {}, rep.unreadable.slice(0, 500).map((u) => h("tr", {}, h("td", { class: "path" }, u.path), h("td", { class: "dim" }, u.error))))))) : null].filter(Boolean));

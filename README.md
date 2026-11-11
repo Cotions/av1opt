@@ -3,12 +3,14 @@
 Shrink video libraries by re-encoding to AV1 at a target perceptual quality (VMAF),
 instead of one fixed setting for everything. Built on stock FFmpeg with SVT-AV1 and libvmaf.
 
-Four commands:
+Five commands:
 
 - `scan` — read-only survey of a library: what each file is, what re-encoding would roughly save.
 - `dups` — read-only search for videos that are kept more than once.
 - `encode` — per-file CRF search against a VMAF target, full encode, verification, report.
 - `bench` — which preset and SVT-AV1 parameters pay off on your own videos, measured.
+- `replace` — once you are happy with the outputs: each takes its original's place, the
+  original goes to the trash.
 
 ## Requirements
 
@@ -254,6 +256,43 @@ Read the result with these in mind:
 - Parameter names SVT-AV1 doesn't know are refused up front: ffmpeg would only warn and encode
   without them.
 
+## replace
+
+```
+av1opt replace ~/av1opt-out                # lists what would happen, changes nothing
+av1opt replace ~/av1opt-out --apply        # does it
+av1opt replace ~/av1opt-out --undo [--apply]
+```
+
+`encode` leaves the library as it was: outputs go to their own folder, so no space is saved
+yet. `replace` is the second half, for when you have looked at the
+results: each original is moved to the trash and its AV1 file gets its name (with the
+output's extension) in its folder. Name output folders, single reports (`.av1opt.json`) or
+single output files.
+
+- Without `--apply` it only lists: what can be replaced with sizes, what stays and why, and what
+  was replaced earlier.
+- An output is only used while its report still matches both files: the original and the
+  output must be there with the sizes the encode recorded, and the output must be the smaller
+  one. Originals that are links, reports without full paths (very old ones) and a new name
+  that is already taken in the original's folder are refused too.
+- Nothing is deleted and no file is written over. The original goes to the trash of the drive
+  it is on (as in the duplicates view), and the space is freed when you empty the trash. If the
+  output can't be put in place after that, the original is taken back out of the trash.
+- An output on another drive than the original is copied next to it under a hidden name
+  first (after a look at the free space), so a copy that fails leaves the original alone; the
+  file in the output folder is removed once the copy has its final name. On the same drive it
+  is a rename and takes no time.
+- The new file gets the original's permissions and keeps the output's date. Subtitles, covers
+  and other files next to the original are not touched: they still match by name, unless a
+  player wants the extension to be the same.
+- The report stays in the output folder and records where both files went (`replaced`: the
+  time, the output's old path, the place in the trash). `--undo` uses that to put things back
+  while the original is still in the trash: the AV1 file returns to the output folder, the
+  original to its place. After the trash is emptied there is nothing to undo.
+- Originals on ZFS are left alone unless `--allow-zfs` is given.
+- A later `encode` or `scan` over the library sees the replaced files as AV1 and skips them.
+
 ## ui (optional)
 
 ```
@@ -286,7 +325,10 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
   frame stepping and zoom, plus the per-chunk VMAF timeline from the `.av1opt.json` report
   (click to seek). Sources the browser can't decode (HEVC in some browsers, MPEG-2, ...) are shown as a
   20 s near-lossless H.264 preview made on demand in `~/.cache/av1opt/previews`, never next to
-  the source; MKV outputs the browser won't open are remuxed to MP4 there too.
+  the source; MKV outputs the browser won't open are remuxed to MP4 there too. The **Original**
+  panel replaces this one original by its output (after a confirmation that shows the new
+  path), and puts it back afterwards for as long as it is in the trash; the comparison then
+  plays the copy in the trash.
 - **Benchmark**: the `bench` comparison with progress and a Stop button, results while it
   runs, and a chart of size against encode time per size class (hover a dot for its numbers;
   the table below has them all). "Use for…" on a row makes that setting the tuned one for the
@@ -294,10 +336,15 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
   Encodes wait while a benchmark runs and a benchmark won't start during an encode, so the
   timings mean something. The last result is kept in `~/.local/share/av1opt/bench-last.json`.
 - **History**: every report found in the output folders used so far (and folders you add).
+  **Replace originals…** lists the outputs that can take their original's place (the rules of
+  `replace` above), all ticked; it works through the ticked ones one by one and keeps the ones
+  that failed on screen with the reason. Replaced encodes carry a "replaced" mark. An original
+  that is still in the encode queue is refused.
 
 The server listens on 127.0.0.1 only and prints a sign-in link with a random token (the browser
 gets it as a cookie). Requests with a foreign Host or Origin are refused, and media are only
-served for files you picked in the app. Output folders on ZFS are refused (no override in the UI).
+served for files you picked in the app. Output folders on ZFS are refused (no override in the UI);
+replacing an original that is on ZFS needs a tick in the dialog, or the confirmation in Compare, which says so.
 `AV1OPT_UI_TOKEN` sets the token (for a desktop wrapper loading the same page);
 `AV1OPT_UI_DEV=<repo>/ui` serves the page files from disk while working on them.
 
@@ -339,7 +386,8 @@ environment, so set the ffmpeg path once in Settings.
 
 ### Safety
 
-- Inputs are never modified, moved or deleted.
+- `encode` never modifies, moves or deletes an input. Only `replace` (and the two buttons for
+  it in the UI) moves originals, and only to the trash.
 - Refuses to write to ZFS unless `--allow-zfs` is passed.
 - Each ffmpeg run gets a memory cap (`--memory-limit`, default 40% of RAM) and low CPU priority
   (`--nice 10`), so a 4K encode can't freeze the desktop.
@@ -359,7 +407,8 @@ a scene-mode file over rather than resuming a work folder of another format.
 `AV1OPT_DEBUG=1` prints every ffmpeg command. `--keep-temp` keeps samples and the partial encode.
 `cargo test --features ui` also runs `tests/ui_api.rs`, which starts the real `av1opt ui` and
 checks sign-in, request checks, media access, the job queue, the duplicate search (and what its
-trash action refuses) and the benchmark's requests and tuned settings over HTTP (no ffmpeg needed).
+trash action refuses), replacing an original and putting it back (and which reports may do that)
+and the benchmark's requests and tuned settings over HTTP (no ffmpeg needed).
 
 ## Lessons baked in
 
@@ -393,4 +442,7 @@ or shrunk, chunk CRF
 estimation, scene chunk planning, sample placement, frame-rate snapping and source filters, plus
 the duplicate finder's hashes (scaling, noise, black bars, flat frames), pair rules and keep
 suggestions, and the benchmark's arithmetic (size and time at the target, comparison across
-videos, picks, spreading the test videos).
+videos, picks, spreading the test videos), and `replace`: the round trip with `--undo`, an
+output with the original's own extension, an output on another drive, every refusal (and that a
+refusal moves nothing), a trash that fails, a name taken at the last moment, two runs on one
+report at once.

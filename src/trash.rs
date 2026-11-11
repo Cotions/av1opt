@@ -1,6 +1,7 @@
 //! Moves files to the desktop's trash (freedesktop.org Trash specification 1.0), where the
 //! file manager shows them and can put them back. A file is only ever renamed within its own
 //! filesystem, never copied: trashing 50 GB takes a moment and can't half-finish.
+//! `restore` puts a trashed file back, as the file manager's "Restore" would.
 
 use anyhow::{Context, Result, bail};
 use std::io::Write;
@@ -94,7 +95,7 @@ fn now_local() -> String {
     format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec)
 }
 
-fn trash_with(path: &Path, home: Option<&Path>, uid: u32, when: String) -> Result<PathBuf> {
+pub(crate) fn trash_with(path: &Path, home: Option<&Path>, uid: u32, when: String) -> Result<PathBuf> {
     if !path.is_absolute() {
         bail!("{} is not an absolute path", path.display());
     }
@@ -144,6 +145,44 @@ fn trash_with(path: &Path, home: Option<&Path>, uid: u32, when: String) -> Resul
         }
     }
     bail!("the trash at {} is full of files named like {}", bin.dir.display(), path.display())
+}
+
+/// Renames `from` to `to` unless something is already at `to` (then: `AlreadyExists`, and
+/// nothing has moved). One step where the filesystem can do that, else a look followed by
+/// the rename.
+pub fn rename_new(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    let (cf, ct) = (c(from)?, c(to)?);
+    // SAFETY: both are valid NUL-terminated paths that outlive the call.
+    if unsafe { libc::renameat2(libc::AT_FDCWD, cf.as_ptr(), libc::AT_FDCWD, ct.as_ptr(), libc::RENAME_NOREPLACE) } == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    match e.raw_os_error() {
+        // Old kernels and some filesystems (FUSE ones like ntfs-3g) don't know the flag.
+        Some(libc::EINVAL | libc::ENOSYS | libc::ENOTSUP) => {
+            if std::fs::symlink_metadata(to).is_ok() {
+                return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
+            }
+            std::fs::rename(from, to)
+        }
+        _ => Err(e),
+    }
+}
+
+/// Puts a file `trash` moved away back at `to` and drops its info file. Nothing at `to` is
+/// replaced.
+pub fn restore(trashed: &Path, to: &Path) -> Result<()> {
+    let files = trashed.parent().filter(|d| d.file_name().is_some_and(|n| n == "files"));
+    let (Some(files), Some(name)) = (files, trashed.file_name()) else { bail!("{} is not in a trash folder", trashed.display()) };
+    rename_new(trashed, to).with_context(|| format!("cannot move {} back to {}", trashed.display(), to.display()))?;
+    let mut info_name = name.to_os_string();
+    info_name.push(".trashinfo");
+    if let Some(bin) = files.parent() {
+        let _ = std::fs::remove_file(bin.join("info").join(info_name));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -233,6 +272,29 @@ mod tests {
         for d in [&bin, &dir, &home_dir] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    #[test]
+    fn restoring_puts_the_file_back_and_replaces_nothing() {
+        let dir = scratch("restore");
+        let home = dir.join("Trash");
+        let a = dir.join("clip.mp4");
+        std::fs::write(&a, b"original").unwrap();
+        let dest = trash_with(&a, Some(&home), 1000, "x".into()).unwrap();
+        // Something else took the place: the trashed file stays where it is.
+        std::fs::write(&a, b"newcomer").unwrap();
+        assert!(restore(&dest, &a).is_err());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"original");
+        assert_eq!(std::fs::read(&a).unwrap(), b"newcomer");
+        assert!(home.join("info/clip.mp4.trashinfo").exists());
+        std::fs::remove_file(&a).unwrap();
+        restore(&dest, &a).unwrap();
+        assert_eq!(std::fs::read(&a).unwrap(), b"original");
+        assert!(!dest.exists() && !home.join("info/clip.mp4.trashinfo").exists());
+        // Only files in a trash folder are "restored".
+        assert!(restore(&a, &dir.join("b.mp4")).is_err());
+        assert!(a.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

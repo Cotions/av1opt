@@ -3,6 +3,7 @@
 use super::{App, now};
 use crate::estimate::{Model, TimeModel, Verdict};
 use crate::history;
+use crate::replace::{self, Check};
 use crate::scan::{self, FileResult, is_video};
 use crate::search;
 use crate::tools::path_arg;
@@ -348,28 +349,32 @@ fn allow_video(app: &App, p: &Path) {
     }
 }
 
-fn report_files(dirs: &[PathBuf]) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for d in dirs {
-        let walk = walkdir::WalkDir::new(d)
-            .max_depth(8)
-            .into_iter()
-            .filter_entry(|e| !e.file_name().to_string_lossy().starts_with(".av1opt-"))
-            .flatten();
-        for e in walk {
-            if e.file_type().is_file() && e.file_name().to_string_lossy().ends_with(".av1opt.json") {
-                out.push(e.into_path());
-            }
-        }
+/// What `replace` would do with a report, for the history table and the compare view.
+fn replace_state(report: &Path) -> Value {
+    match replace::check(report) {
+        Check::Ready(p) => json!({ "state": "ready", "dest": p.dest, "copy": p.copy, "zfs": p.zfs, "removed": p.removed }),
+        Check::Replaced(d) => json!({ "state": "replaced", "trash": d.trash, "from": d.from, "can_undo": d.can_undo }),
+        Check::No(why) => json!({ "state": "no", "why": why }),
     }
-    out.sort();
-    out.dedup();
-    out
+}
+
+/// The file to show as the source of a report: the original, or its copy in the trash once
+/// the output has taken its place. Trash names can carry a counter after the extension.
+fn source_of(app: &App, report: &Path, r: &Value) -> PathBuf {
+    let input = resolve(report, r["input"].as_str().unwrap_or(""), false);
+    let Some(trash) = r["replaced"]["trash"].as_str().map(PathBuf::from) else {
+        allow_video(app, &input);
+        return input;
+    };
+    if is_video(&input) && trash.is_file() && std::fs::metadata(&trash).is_ok_and(|m| Some(m.len()) == r["source_bytes"].as_u64()) {
+        app.allow(&trash);
+    }
+    trash
 }
 
 pub fn history(app: &App) -> Value {
     let dirs = app.settings.lock().unwrap().history_dirs.clone();
-    let mut rows: Vec<Value> = report_files(&dirs)
+    let mut rows: Vec<Value> = replace::report_files(&dirs)
         .into_iter()
         .filter_map(|p| {
             let r: Value = serde_json::from_slice(&std::fs::read(&p).ok()?).ok()?;
@@ -380,13 +385,14 @@ pub fn history(app: &App) -> Value {
             let input = resolve(&p, r["input"].as_str()?, false);
             let output = resolve(&p, r["output"].as_str()?, true);
             let mtime = std::fs::metadata(&p).ok()?.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_secs();
-            allow_video(app, &input);
+            let source = source_of(app, &p, &r);
             allow_video(app, &output);
             Some(json!({
                 "report": p,
                 "input": input,
                 "output": output,
-                "input_exists": input.exists(),
+                "replace": replace_state(&p),
+                "input_exists": source.exists(),
                 "output_exists": output.exists(),
                 "source_bytes": r["source_bytes"],
                 "output_bytes": r["output_bytes"],
@@ -450,6 +456,36 @@ fn known_report(app: &App, p: &Path) -> Result<PathBuf> {
     Ok(c)
 }
 
+#[derive(Deserialize)]
+struct ReplaceRequest {
+    report: PathBuf,
+    /// Also replace an original stored on ZFS (asked for in the dialog, per run).
+    #[serde(default)]
+    allow_zfs: bool,
+}
+
+/// Moves the original of one report to the trash and its output into its place. One file
+/// per request: the page shows progress and failures file by file.
+pub fn replace_original(app: &App, body: &Value) -> Result<Value> {
+    let r: ReplaceRequest = serde_json::from_value(body.clone())?;
+    let report = known_report(app, &r.report)?;
+    if let Check::Ready(p) = replace::check(&report)
+        && crate::ui::jobs::waiting_on(app, &p.source)
+    {
+        bail!("the original is in the encode queue");
+    }
+    let done = replace::apply(&report, r.allow_zfs)?;
+    Ok(json!({ "dest": done.dest, "trash": done.trash, "source_bytes": done.source_bytes, "warnings": done.warnings }))
+}
+
+/// Takes a replaced original back out of the trash and returns the AV1 file to where it was.
+pub fn restore_original(app: &App, body: &Value) -> Result<Value> {
+    let r: ReplaceRequest = serde_json::from_value(body.clone())?;
+    let report = known_report(app, &r.report)?;
+    let d = replace::undo(&report, r.allow_zfs)?;
+    Ok(json!({ "source": d.source, "output": d.from }))
+}
+
 pub fn media_info(app: &App, p: &Path) -> Value {
     let size = std::fs::metadata(p).map_or(0, |m| m.len());
     match crate::probe::probe(&app.ffprobe(), p, size) {
@@ -465,10 +501,10 @@ pub fn media_info(app: &App, p: &Path) -> Value {
 pub fn report(app: &App, path: &str) -> Result<Value> {
     let p = known_report(app, Path::new(path))?;
     let mut r: Value = serde_json::from_slice(&std::fs::read(&p)?).context("unreadable report")?;
-    let input = resolve(&p, r["input"].as_str().unwrap_or(""), false);
+    let input = source_of(app, &p, &r);
     let output = resolve(&p, r["output"].as_str().unwrap_or(""), true);
-    allow_video(app, &input);
     allow_video(app, &output);
+    r["replace"] = replace_state(&p);
     r["report_path"] = json!(p);
     r["input_path"] = json!(input);
     r["output_path"] = json!(output);

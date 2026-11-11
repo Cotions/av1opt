@@ -212,6 +212,14 @@ pub fn encoding(app: &App) -> bool {
     app.jobs.jobs.lock().unwrap().iter().any(|j| j.status == "running")
 }
 
+/// True while a queued or running job still has `input` to encode.
+pub fn waiting_on(app: &App, input: &Path) -> bool {
+    let jobs = app.jobs.jobs.lock().unwrap();
+    jobs.iter()
+        .filter(|j| matches!(j.status.as_str(), "queued" | "running"))
+        .any(|j| j.files.iter().any(|f| matches!(f.status.as_str(), "pending" | "running") && f.input == input))
+}
+
 /// True once the server is stopping: no new work may start.
 pub fn shutting_down(app: &App) -> bool {
     app.jobs.shutting_down.load(Ordering::SeqCst)

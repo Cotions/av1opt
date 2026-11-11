@@ -541,3 +541,70 @@ fn benchmark_requests_and_tuned_settings() {
     assert_eq!(o["shrink_audio"], true, "{o}");
     assert_eq!(o["svt_params"], "tune=2");
 }
+
+#[test]
+fn originals_are_replaced_and_put_back_through_reports_in_history() {
+    let s = Server::start("replace", |d| {
+        std::fs::write(d.join("videos/film.mp4"), vec![b's'; 3000]).unwrap();
+        for dir in ["out", "elsewhere"] {
+            std::fs::create_dir_all(d.join(dir)).unwrap();
+            let r = json!({
+                "format": 1, "input": d.join("videos/film.mp4"), "output": d.join("out/film.mkv"), "source_bytes": 3000, "output_bytes": 1000,
+                "savings": 0.667, "mode": "whole", "crf": 30.0, "preset": 6, "target_vmaf": 93.0,
+            });
+            std::fs::write(d.join(dir).join("film.av1opt.json"), r.to_string()).unwrap();
+        }
+        std::fs::write(d.join("out/film.mkv"), vec![b'o'; 1000]).unwrap();
+    });
+    let (original, output, new) = (s.dir.join("videos/film.mp4"), s.dir.join("out/film.mkv"), s.dir.join("videos/film.mkv"));
+    let report = s.dir.join("out/film.av1opt.json");
+    let sizes = || [&original, &output, &new].map(|p| std::fs::metadata(p).map(|m| m.len()).ok());
+    let state = |s: &Server| s.get("/api/history").json()["reports"][0]["replace"].clone();
+
+    // Only reports in a history folder can move files.
+    let r = s.post("/api/replace", &json!({ "report": report }));
+    assert_eq!(r.status, 400);
+    assert!(r.body.contains("outside the history folders"), "{}", r.body);
+    assert_eq!(s.post("/api/history/dirs", &json!({ "path": s.dir.join("out") })).status, 200);
+    assert_eq!(s.post("/api/replace", &json!({ "report": s.dir.join("elsewhere/film.av1opt.json") })).status, 400);
+    let r = s.post("/api/replace", &json!({ "report": original }));
+    assert!(r.status == 400 && r.body.contains("not a report"), "{}", r.body);
+    assert_eq!(s.post("/api/replace/undo", &json!({ "report": report })).status, 400);
+    assert_eq!(sizes(), [Some(3000), Some(1000), None]);
+    let st = state(&s);
+    assert_eq!(st["state"], "ready");
+    assert_eq!(st["dest"], json!(new));
+    assert_eq!(st["copy"], false);
+
+    // The output takes the original's place; the original is in the (scratch) trash.
+    let r = s.post("/api/replace", &json!({ "report": report }));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let trashed = s.dir.join("data/Trash/files/film.mp4");
+    assert_eq!(r.json()["trash"], json!(trashed));
+    assert_eq!(r.json()["dest"], json!(new));
+    assert_eq!(sizes(), [None, None, Some(1000)]);
+    assert_eq!(std::fs::metadata(&trashed).unwrap().len(), 3000);
+    let r = s.post("/api/replace", &json!({ "report": report }));
+    assert!(r.status == 400 && r.body.contains("already replaced"), "{}", r.body);
+    let row = s.get("/api/history").json()["reports"][0].clone();
+    assert_eq!(row["replace"]["state"], "replaced");
+    assert_eq!(row["replace"]["can_undo"], true);
+    assert_eq!(row["output"], json!(new));
+    assert_eq!(row["input_exists"], true);
+    // Compare still has a source to show: the copy in the trash.
+    assert_eq!(s.get(&format!("/media?path={}", trashed.display())).status, 200);
+
+    // And back.
+    let r = s.post("/api/replace/undo", &json!({ "report": report }));
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(sizes(), [Some(3000), Some(1000), None]);
+    assert!(!trashed.exists() && !s.dir.join("data/Trash/info/film.mp4.trashinfo").exists());
+    assert_eq!(state(&s)["state"], "ready");
+
+    // A file that no longer matches its report stays where it is.
+    std::fs::write(&original, b"edited").unwrap();
+    assert_eq!(state(&s)["why"], "the original changed since the encode");
+    let r = s.post("/api/replace", &json!({ "report": report }));
+    assert!(r.status == 400 && r.body.contains("changed since the encode"), "{}", r.body);
+    assert_eq!(sizes(), [Some(6), Some(1000), None]);
+}

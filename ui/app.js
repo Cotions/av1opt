@@ -1739,13 +1739,20 @@ views.queue = (root) => {
 
 views.history = (root) => {
   const out = h("div", { class: "empty" }, h("span", { class: "spin" }));
-  root.append(h("div", { class: "row" }, h("h1", { class: "grow" }, "History"),
+  let ready = [];
+  const replaceBtn = h("button", { disabled: true, onclick: () => replaceDialog(ready, load) }, "Replace originals…");
+  root.append(h("div", { class: "row" }, h("h1", { class: "grow" }, "History"), replaceBtn,
     h("button", { onclick: async () => { const p = await pick({ title: "Folder with av1opt outputs" }); if (p) { try { await api("/api/history/dirs", { path: p[0] }); load(); } catch (e) { toast(e.message, true); } } } }, "Add folder…")), out);
 
   async function load() {
     let r;
     try { r = await api("/api/history"); } catch (e) { toast(e.message, true); return; }
     const reps = r.reports;
+    const stateOf = (x) => (x.replace || {}).state;
+    ready = reps.filter((x) => stateOf(x) === "ready");
+    const replaced = reps.filter((x) => stateOf(x) === "replaced").length;
+    replaceBtn.disabled = !ready.length;
+    replaceBtn.title = ready.length ? `${plural(ready.length, "output")} can take the place of their original` : "No output here can take its original's place (already replaced, or a file is gone or changed)";
     const tin = reps.reduce((a, x) => a + (x.source_bytes || 0), 0), tout = reps.reduce((a, x) => a + (x.output_bytes || 0), 0);
     const dirs = h("div", { class: "chips" }, r.dirs.map((d) => h("span", { class: "chip" }, h("code", {}, d), h("button", { title: "Forget folder", onclick: async () => { await api("/api/history/dirs/remove", { path: d }); load(); } }, "×"))));
     if (!r.dirs.length) dirs.append(h("span", { class: "dim" }, "No folders yet. Output folders of queued encodes are added automatically."));
@@ -1753,7 +1760,10 @@ views.history = (root) => {
     const LIMIT = 500;
     const row = (x) => h("tr", { class: "click", onclick: () => (location.hash = "#/compare?report=" + encodeURIComponent(x.report)) },
       h("td", { class: "dim" }, when(x.time)),
-      h("td", { class: "path", title: x.input }, basename(x.input), x.input_exists ? null : h("span", { class: "pill warn", title: "source no longer at this path" }, "source gone"), x.output_exists ? null : h("span", { class: "pill bad" }, "output gone")),
+      h("td", { class: "path", title: x.input }, h("span", {}, basename(x.input)),
+        stateOf(x) === "replaced" ? h("span", { class: "pill ok", title: `The AV1 file is where the original was: ${x.output}\n${x.input_exists ? "The original is in the trash" : "The original is no longer in the trash"}` }, "replaced")
+          : x.input_exists ? null : h("span", { class: "pill warn", title: "source no longer at this path" }, "source gone"),
+        x.output_exists ? null : h("span", { class: "pill bad" }, "output gone")),
       h("td", {}, x.mode === "scenes" ? `scenes (${x.chunks})` : "whole"),
       h("td", { class: "num" }, x.crf),
       h("td", { class: "num" }, x.target_vmaf),
@@ -1772,7 +1782,7 @@ views.history = (root) => {
     out.replaceChildren(
       h("div", { class: "panel" }, h("h3", {}, "Folders searched for reports"), dirs),
       h("div", { class: "stats" },
-        h("div", { class: "stat" }, h("div", { class: "v" }, reps.length), h("div", { class: "l" }, "encodes")),
+        h("div", { class: "stat" }, h("div", { class: "v" }, reps.length), h("div", { class: "l" }, replaced ? `encodes · ${replaced} in place of their original` : "encodes")),
         h("div", { class: "stat" }, h("div", { class: "v" }, `${bytes(tin)} → ${bytes(tout)}`), h("div", { class: "l" }, "source → AV1")),
         h("div", { class: "stat" }, h("div", { class: "v ok" }, bytes(tin - tout)), h("div", { class: "l" }, `saved (${pct(tin ? 1 - tout / tin : 0)})`)),
         h("div", { class: "stat" }, h("div", { class: "v" }, STATE ? STATE.history_encodes : "–"), h("div", { class: "l" }, "encodes calibrating scan estimates"))),
@@ -1782,6 +1792,83 @@ views.history = (root) => {
   }
   load();
 };
+
+// Outputs take the place of their originals: one request per file, so the dialog can say
+// which one it is on and which ones failed.
+function replaceDialog(rows, reload) {
+  const picked = new Set(rows.map((x) => x.report));
+  const anyZfs = rows.some((x) => x.replace.zfs);
+  let allowZfs = false, busy = false, finished = false;
+  const usable = (x) => !x.replace.zfs || allowZfs;
+  const chosen = () => rows.filter((x) => picked.has(x.report) && usable(x));
+  const list = h("div", { class: "replace-list" });
+  const total = h("span", { class: "dim grow" });
+  const cancel = h("button", { onclick: () => close() }, "Cancel");
+  const go = h("button", { class: "danger" });
+  const close = () => { if (busy) return; bg.remove(); document.removeEventListener("keydown", onKey); };
+  const onKey = (e) => { if (e.key === "Escape") close(); };
+  const sum = () => {
+    const c = chosen();
+    go.textContent = c.length ? `Replace ${plural(c.length, "original")}` : "Replace";
+    go.disabled = !c.length || busy;
+    total.textContent = c.length ? `${bytes(c.reduce((a, x) => a + x.source_bytes, 0))} to the trash · ${bytes(c.reduce((a, x) => a + x.output_bytes, 0))} in their place` : "Nothing picked";
+  };
+  const draw = () => {
+    list.replaceChildren(...rows.map((x) => {
+      const cb = h("input", { type: "checkbox", onchange: () => { if (cb.checked) picked.add(x.report); else picked.delete(x.report); sum(); } });
+      cb.checked = picked.has(x.report) && usable(x);
+      cb.disabled = !usable(x) || busy;
+      const notes = [x.replace.copy ? "copied from another drive" : null, x.replace.removed ? `${plural(x.replace.removed, "section")} left out` : null, x.replace.zfs ? "on ZFS" : null].filter(Boolean);
+      const newName = basename(x.replace.dest);
+      return h("label", { class: "replace-row" + (usable(x) ? "" : " off") }, cb,
+        h("span", { class: "grow path", title: `${x.input}\n→ ${x.replace.dest}` }, basename(x.input),
+          newName !== basename(x.input) ? h("span", { class: "dim" }, ` → ${newName}`) : null, notes.map((n) => h("span", { class: "pill" }, n))),
+        h("span", { class: "num dim" }, `${bytes(x.source_bytes)} → ${bytes(x.output_bytes)}`));
+    }));
+    sum();
+  };
+  const all = h("button", { class: "small", onclick: () => { const on = chosen().length < rows.filter(usable).length; for (const x of rows) { if (on) picked.add(x.report); else picked.delete(x.report); } draw(); } }, "All / none");
+  const zfs = h("input", { type: "checkbox", onchange: () => { allowZfs = zfs.checked; draw(); } });
+  go.onclick = async () => {
+    const c = chosen();
+    busy = true; cancel.disabled = true; all.disabled = true; zfs.disabled = true;
+    draw();
+    let done = 0, moved = 0;
+    const problems = [];
+    for (const [i, x] of c.entries()) {
+      total.textContent = `Replacing ${i + 1} of ${c.length}: ${basename(x.input)}`;
+      try {
+        const r = await api("/api/replace", { report: x.report, allow_zfs: allowZfs });
+        done++; moved += r.source_bytes;
+        for (const w of r.warnings || []) problems.push({ path: x.input, text: w, warn: true });
+      } catch (e) { problems.push({ path: x.input, text: e.message }); }
+    }
+    busy = false; finished = true; cancel.disabled = false;
+    const failed = problems.filter((q) => !q.warn).length;
+    toast(`${plural(done, "original")} replaced; ${bytes(moved)} in the trash until it is emptied`, failed > 0);
+    reload();
+    if (!problems.length) { close(); return; }
+    // What went wrong stays on screen; the files concerned are where they were.
+    go.remove(); all.remove();
+    cancel.textContent = "Close";
+    total.textContent = `${plural(done, "original")} replaced`;
+    list.replaceChildren(
+      failed ? h("p", {}, h("strong", { class: "bad" }, `${plural(failed, "original")} not replaced; ${failed === 1 ? "it is" : "they are"} still where ${failed === 1 ? "it was" : "they were"}`)) : null,
+      ...problems.map((q) => h("div", { class: "dim mono" }, `${q.path}: ${q.text}`)));
+  };
+  const bg = h("div", { class: "modal-bg", onclick: (e) => { if (e.target === bg && !finished) close(); } },
+    h("div", { class: "modal" },
+      h("div", { class: "head" }, h("strong", { class: "grow" }, "Replace originals"), all),
+      h("div", { class: "body" },
+        h("p", {}, "Each original moves to the trash of the drive it is on, and its AV1 file takes its name in its folder. Nothing is deleted or written over: the space is freed when you empty the trash, and until then an original can be put back from its page in Compare (or with ", h("code", {}, "av1opt replace --undo"), ")."),
+        h("p", { class: "dim" }, "Listed are the outputs whose report still matches both files. Subtitles, covers and other files next to an original stay where they are."),
+        anyZfs ? h("label", { class: "check" }, zfs, "Also replace originals stored on ZFS") : null,
+        list),
+      h("div", { class: "foot" }, total, cancel, go)));
+  document.body.append(bg);
+  document.addEventListener("keydown", onKey);
+  draw();
+}
 
 // ----- compare -----
 
@@ -2023,6 +2110,33 @@ function comparePlayer(root, r) {
     kv(name, h("span", { class: "mono", title: path }, basename(path))),
     kv("", h("span", { class: "dim" }, dirname(path))),
     kv("", i.codec ? `${desc(i)} · ${num(i.fps, 2)} fps${i.hdr ? " HDR" : ""} · ${hms(i.duration_s)} · ${bytes(size)}` : (i.error || "–"))];
+  // ---- the original's place ----
+  const rp = r.replace || {};
+  const act = async (path, body, said) => {
+    try { await api(path, body); toast(said); route(); } catch (e) { toast(e.message, true); }
+  };
+  const replacePanel = r.pair || !rp.state ? null : h("div", { class: "panel" }, h("h3", {}, "Original"),
+    rp.state === "ready" ? [
+      h("p", { class: "dim" }, "Happy with it? The AV1 file can take the original's place: the original moves to the trash, the AV1 file gets its name in its folder."),
+      h("div", { class: "row" }, h("button", { class: "danger", onclick: async () => {
+        const ok = await confirmDialog({
+          title: "Replace the original?",
+          action: "Replace original",
+          body: [
+            h("p", {}, `The original (${bytes(r.source_bytes)}) moves to the trash of its drive and the AV1 file (${bytes(r.output_bytes)}) becomes:`),
+            h("div", { class: "mono trash-list" }, rp.dest),
+            rp.copy ? h("p", { class: "dim" }, "The AV1 file is on another drive: it is copied there first, then removed from the output folder.") : null,
+            rp.removed ? h("p", { class: "dim" }, `The AV1 file leaves out ${plural(rp.removed, "section")} of the original.`) : null,
+            rp.zfs ? h("p", { class: "warn" }, "The original is on ZFS, which av1opt writes to only when asked. Replacing it here is asking.") : null,
+            h("p", { class: "dim" }, "The space is freed when you empty the trash. Until then this page can put the original back.")],
+        });
+        if (ok) act("/api/replace", { report: r.report_path, allow_zfs: !!rp.zfs }, "Original replaced; it is in the trash");
+      } }, "Replace original…"))]
+    : rp.state === "replaced" ? [
+      h("p", { class: "dim" }, "The AV1 file is where the original was. ", rp.can_undo ? "The original is in the trash." : "The original is no longer in the trash (or one of the two files changed), so this can't be undone here."),
+      rp.can_undo ? h("div", { class: "row" }, h("button", { title: `Original back to ${r.input}\nAV1 file back to ${rp.from}`, onclick: () => act("/api/replace/undo", { report: r.report_path }, "Original back in its place") }, "Put original back")) : null]
+    : h("p", { class: "dim" }, `The AV1 file can't take the original's place: ${rp.why}.`));
+
   const side = h("div", {},
     r.pair ? h("div", { class: "panel" },
       h("h3", {}, "Copies"),
@@ -2031,7 +2145,7 @@ function comparePlayer(root, r) {
     h("div", { class: "panel" },
       h("h3", {}, "Encode"),
       h("div", { class: "kv" },
-        kv("Source", h("span", { class: "mono", title: r.input_path }, basename(r.input_path))),
+        kv("Source", [h("span", { class: "mono", title: r.input_path }, basename(r.input || r.input_path)), rp.state === "replaced" && rp.can_undo ? h("span", { class: "pill" }, "in the trash") : null]),
         kv("Output", h("span", { class: "mono", title: r.output_path }, basename(r.output_path))),
         kv("Size", `${bytes(r.source_bytes)} → ${bytes(r.output_bytes)}`),
         removed.length ? kv("Removed", removed.map(([a, b]) => `${fmtTime(a)}–${fmtTime(b)}`).join(", ")) : null,
@@ -2044,6 +2158,7 @@ function comparePlayer(root, r) {
         kv("Spot checks", (r.verify_vmaf || []).map((v) => num(v)).join(", ") || "–"),
         kv("Time", `search ${hms(r.search_secs)}, encode ${hms(r.encode_secs)}`),
         kv("Source video", ii.codec ? `${ii.codec} ${ii.width}×${ii.height} ${num(ii.fps, 2)} fps${ii.hdr ? " HDR" : ""}` : (ii.error || "–")))),
+    replacePanel,
     r.search && r.search.length ? h("div", { class: "panel" }, h("h3", {}, "CRF search (samples)"), h("table", { class: "trials" },
       h("tr", {}, h("th", {}, "CRF"), h("th", { class: "num" }, "VMAF"), h("th", { class: "num" }, "worst"), h("th", { class: "num" }, "size")),
       r.search.map((t) => h("tr", {}, h("td", {}, t.crf), h("td", { class: "num " + (t.mean_vmaf >= target ? "ok" : "bad") }, num(t.mean_vmaf)), h("td", { class: "num dim" }, num(t.min_vmaf)), h("td", { class: "num" }, pct(t.size_ratio)))))) : null,
@@ -2058,7 +2173,7 @@ function comparePlayer(root, r) {
         h("button", { class: "small", onclick: () => autoAlign() }, "Auto")),
       h("p", { class: "dim" }, "Drag on the picture to move the split. Double-click zooms in at that point (4× → back to 1×); shift-click moves the zoom centre. Keys: space play, , and . step frames.")));
 
-  root.append(h("div", { class: "row" }, h("h1", { class: "grow" }, basename(r.input_path)), r.pair ? h("a", { href: "#/dups" }, "← Duplicates") : h("a", { href: "#/history" }, "← History")),
+  root.append(h("div", { class: "row" }, h("h1", { class: "grow" }, basename(r.pair ? r.input_path : (r.input || r.input_path))), r.pair ? h("a", { href: "#/dups" }, "← Duplicates") : h("a", { href: "#/history" }, "← History")),
     h("div", { class: "cmp-grid" }, h("div", {}, stage, controls, timeline, tlLabel), side));
 
   // ---- sync ----

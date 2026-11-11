@@ -8,13 +8,13 @@ mod fsguard;
 mod history;
 mod metadata;
 mod probe;
+mod replace;
 mod report;
 mod scan;
 mod scenes;
 mod search;
 mod sections;
 mod tools;
-#[cfg(feature = "ui")]
 mod trash;
 mod tuning;
 #[cfg(feature = "ui")]
@@ -107,6 +107,25 @@ enum Cmd {
         /// CPU priority (0-19, higher = more polite to the desktop).
         #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(i32).range(0..=19))]
         nice: i32,
+    },
+    /// Put finished AV1 outputs where their originals were: the original goes to the trash,
+    /// the output takes its name in its folder. Lists what would happen and changes nothing
+    /// until --apply is given. Only outputs whose report (`.av1opt.json`) still matches both
+    /// files are touched, and no existing file is ever written over.
+    Replace {
+        /// Output folders, reports (`.av1opt.json`) or output files.
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// Do it. Without this the command only lists.
+        #[arg(long)]
+        apply: bool,
+        /// The other way round: take replaced originals back out of the trash and return the
+        /// AV1 files to where they were (also needs --apply to act).
+        #[arg(long)]
+        undo: bool,
+        /// Also replace originals stored on ZFS.
+        #[arg(long)]
+        allow_zfs: bool,
     },
     /// Compare encoder settings on your own videos: for every preset and SVT-AV1 parameter set,
     /// find the CRF that reaches the target VMAF on sample clips, then rank the settings by
@@ -373,6 +392,10 @@ fn main() -> Result<()> {
                 eprintln!("wrote {}", json.display());
             }
             Ok(())
+        }
+        Cmd::Replace { paths, apply, undo, allow_zfs } => {
+            let paths: Vec<PathBuf> = paths.iter().map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone())).collect();
+            replace::run(&paths, apply, undo, allow_zfs)
         }
         Cmd::Bench {
             paths, presets, param_sets, target_vmaf, max_videos, samples, sample_secs, min_crf, max_crf, refresh, work_dir, save, csv, json,

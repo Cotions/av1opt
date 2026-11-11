@@ -180,6 +180,8 @@ fn api(app: &Arc<App>, m: &Method, path: &str, q: &[(String, String)], body: &Va
         (Method::Post, ["settings", "tools"]) => library::set_tools(app, body),
         (Method::Post, ["history", "dirs"]) => library::add_history_dir(app, body),
         (Method::Post, ["history", "dirs", "remove"]) => library::remove_history_dir(app, body),
+        (Method::Post, ["replace"]) => library::replace_original(app, body),
+        (Method::Post, ["replace", "undo"]) => library::restore_original(app, body),
         (Method::Get, ["report"]) => library::report(app, param(q, "path").ok_or_else(|| anyhow!("missing path"))?),
         (Method::Post, ["preview"]) => library::preview(app, body),
         (Method::Post, ["meta", "preview"]) => library::meta_preview(app, body),

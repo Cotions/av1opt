@@ -564,7 +564,13 @@ pub fn search(lab: &mut Lab, enc: &EncodeSettings, p: &SearchParams) -> Result<(
         );
         tools.emit(crate::events::Event::Trial { crf: t.crf, mean_vmaf: t.mean_vmaf, min_vmaf: t.min_vmaf, size_ratio: t.size_ratio });
     };
-    let too_large = |t: &Trial| t.mean_vmaf < p.target_vmaf && p.max_size_ratio.is_some_and(|max| t.size_ratio > max);
+    // A trial that misses the target while already too large settles the matter, unless a
+    // higher CRF is known to pass: then its miss was noise.
+    let too_large = |t: &Trial, all: &BTreeMap<u8, Trial>| {
+        t.mean_vmaf < p.target_vmaf
+            && p.max_size_ratio.is_some_and(|max| t.size_ratio > max)
+            && !all.values().any(|u| u.crf > t.crf && u.mean_vmaf >= p.target_vmaf)
+    };
     // Trials from earlier runs count as if they had just been measured.
     let mut trials: BTreeMap<u8, Trial> = BTreeMap::new();
     for t in lab.cache.whole(enc) {
@@ -575,13 +581,13 @@ pub fn search(lab: &mut Lab, enc: &EncodeSettings, p: &SearchParams) -> Result<(
         }
     }
     let known: Vec<(u8, f64)> = trials.iter().map(|(c, t)| (*c, t.mean_vmaf)).collect();
-    let found = match trials.values().find(|t| too_large(t)) {
+    let found = match trials.values().find(|t| too_large(t, &trials)) {
         Some(_) => Err(TooLarge.into()),
         None => find_crossing(&known, p.start_crf, p.min_crf, p.max_crf, p.target_vmaf, |crf| {
             let (t, known) = lab.trial(enc, crf as f64)?;
             show(&t, known);
             trials.insert(crf, t);
-            if too_large(&t) {
+            if too_large(&t, &trials) {
                 return Err(TooLarge.into());
             }
             Ok(t.mean_vmaf)

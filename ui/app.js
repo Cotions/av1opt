@@ -1929,9 +1929,123 @@ function hoursDialog(sch) {
 
 // ----- history -----
 
+// The encodes of each day, oldest first, with the space saved up to and including that day.
+function savedByDay(reps) {
+  const rows = reps.filter((x) => x.time && x.source_bytes > 0 && x.output_bytes > 0).sort((a, b) => a.time - b.time);
+  const days = [];
+  let total = 0;
+  for (const x of rows) {
+    const d = new Date(x.time * 1000);
+    d.setHours(0, 0, 0, 0);
+    let last = days[days.length - 1];
+    if (!last || last.day !== d.getTime()) days.push(last = { day: d.getTime(), n: 0, saved: 0, total });
+    last.n++;
+    last.saved += x.source_bytes - x.output_bytes;
+    total += x.source_bytes - x.output_bytes;
+    last.total = total;
+  }
+  return days;
+}
+
+// Space saved so far, as it grew: one line that steps up on the days something was encoded
+// and stays level in between. Hover, or the arrow keys, read a day; the table below has
+// every encode.
+function savedChart(days) {
+  const wrap = h("div", { class: "saved-chart" });
+  const tip = h("div", { class: "tooltip", hidden: true });
+  const DAY = 86400000;
+  const date = (t, year) => new Date(t).toLocaleDateString([], year ? { day: "numeric", month: "short", year: "numeric" } : { day: "numeric", month: "short" });
+  let width = 0;
+
+  const draw = () => {
+    const W = width = Math.max(320, Math.floor(wrap.clientWidth) || 900), H = 210;
+    const m = { l: 58, r: 18, t: 22, b: 26 };
+    const pw = W - m.l - m.r, ph = H - m.t - m.b;
+    const t0 = days[0].day, t1 = Math.max(Date.now(), days[days.length - 1].day + DAY);
+    const top = Math.max(...days.map((d) => d.total), 1), low = Math.min(0, ...days.map((d) => d.total));
+    // Lines at round amounts, four at most.
+    const mag = Math.pow(10, Math.floor(Math.log10(top / 4)));
+    const step = [1, 2, 5, 10].map((k) => k * mag).find((v) => top / v <= 4);
+    const y1 = Math.ceil(top / step) * step, y0 = low < 0 ? Math.floor(low / step) * step : 0;
+    const x = (t) => m.l + (t - t0) / (t1 - t0) * pw;
+    const y = (v) => m.t + (y1 - v) / (y1 - y0) * ph;
+    // A day's encodes are drawn at its middle.
+    const at = (d) => x(Math.min(d.day + DAY / 2, t1));
+    const last = days[days.length - 1];
+    const svg = s("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: "img", tabindex: 0,
+      "aria-label": `Space saved over time: ${bytes(last.total)} in all since ${date(t0, true)}, over ${plural(days.length, "day")} with encodes. Left and right arrows read a day; the table below lists every encode.` });
+    const text = (str, attrs) => { const t = s("text", attrs); t.textContent = str; svg.append(t); return t; };
+
+    for (let v = y0; v <= y1 + step / 2; v += step) {
+      svg.append(s("line", { class: "grid", x1: m.l, x2: m.l + pw, y1: y(v), y2: y(v) }));
+      text(v === 0 ? "0" : bytes(v).replace(/\.0 /, " "), { x: m.l - 8, y: y(v) + 4, "text-anchor": "end" });
+    }
+    // Dates: a few, at the start of days (of months, over a long stretch), none on top of another.
+    const long = t1 - t0 > 100 * DAY, years = new Date(t0).getFullYear() !== new Date(t1).getFullYear();
+    let lastX = -Infinity;
+    for (const d = new Date(t0); d.getTime() <= t1; long ? d.setMonth(d.getMonth() + 1, 1) : d.setDate(d.getDate() + 1)) {
+      const px = x(d.getTime());
+      if (px - lastX < (years ? 86 : 64) || px > m.l + pw - 20) continue;
+      lastX = px;
+      svg.append(s("line", { class: "tick", x1: px, x2: px, y1: m.t + ph, y2: m.t + ph + 4 }));
+      text(long ? d.toLocaleDateString([], years ? { month: "short", year: "numeric" } : { month: "short" }) : date(d.getTime(), years), { x: px, y: m.t + ph + 17, "text-anchor": "middle" });
+    }
+
+    let line = `M${x(t0)},${y(0)}`;
+    for (const d of days) line += `H${at(d)}V${y(d.total)}`;
+    line += `H${x(t1)}`;
+    svg.append(s("path", { class: "area", d: `${line}V${y(0)}Z` }), s("path", { class: "line", d: line }));
+    // The amount it stands at, by the end of the line.
+    svg.append(s("circle", { class: "dot", cx: x(t1), cy: y(last.total), r: 4 }));
+    text(bytes(last.total), { class: "lbl", x: x(t1) - 8, y: Math.max(y(last.total) - 8, 12), "text-anchor": "end" });
+
+    const cross = s("line", { class: "cross", y1: m.t, y2: m.t + ph, visibility: "hidden" });
+    const mark = s("circle", { class: "dot", r: 4, visibility: "hidden" });
+    svg.append(cross, mark);
+    let cur = -1;
+    const show = (i) => {
+      cur = i;
+      const d = days[i], px = at(d), py = y(d.total);
+      cross.setAttribute("x1", px); cross.setAttribute("x2", px);
+      mark.setAttribute("cx", px); mark.setAttribute("cy", py);
+      cross.setAttribute("visibility", "visible"); mark.setAttribute("visibility", "visible");
+      tip.replaceChildren(
+        h("div", {}, h("strong", {}, bytes(d.total)), ` saved by ${date(d.day, true)}`),
+        h("div", { class: "dim" }, `${d.saved < 0 ? "−" : "+"}${bytes(Math.abs(d.saved))} that day, ${plural(d.n, "encode")}`));
+      tip.hidden = false;
+      const half = tip.offsetWidth / 2;
+      tip.style.left = Math.min(Math.max(px, half + 2), Math.max(half + 2, width - half - 2)) + "px";
+      tip.style.top = py + "px";
+      tip.style.transform = py < 70 ? "translate(-50%, 14px)" : "translate(-50%, calc(-100% - 12px))";
+    };
+    const hide = () => { cur = -1; tip.hidden = true; cross.setAttribute("visibility", "hidden"); mark.setAttribute("visibility", "hidden"); };
+    // The pointer only has to be nearest to a day, anywhere over the plot.
+    svg.addEventListener("pointermove", (e) => {
+      const px = e.clientX - svg.getBoundingClientRect().left;
+      let best = 0;
+      for (let i = 1; i < days.length; i++) if (Math.abs(at(days[i]) - px) < Math.abs(at(days[best]) - px)) best = i;
+      if (best !== cur) show(best);
+    });
+    svg.addEventListener("pointerleave", hide);
+    svg.addEventListener("focus", () => { if (cur < 0) show(days.length - 1); });
+    svg.addEventListener("blur", hide);
+    svg.addEventListener("keydown", (e) => {
+      const to = { ArrowLeft: cur - 1, ArrowRight: cur + 1, Home: 0, End: days.length - 1 }[e.key];
+      if (to == null) return;
+      e.preventDefault();
+      show(Math.min(Math.max(to, 0), days.length - 1));
+    });
+    wrap.replaceChildren(svg, tip);
+  };
+
+  const ro = new ResizeObserver(() => { const w = Math.floor(wrap.clientWidth); if (w && Math.max(320, w) !== width) draw(); });
+  ro.observe(wrap);
+  return { el: wrap, stop: () => ro.disconnect() };
+}
+
 views.history = (root) => {
   const out = h("div", { class: "empty" }, h("span", { class: "spin" }));
-  let ready = [];
+  let ready = [], chart = null;
   const replaceBtn = h("button", { disabled: true, onclick: () => replaceDialog(ready, load) }, "Replace originals…");
   root.append(h("div", { class: "row" }, h("h1", { class: "grow" }, "History"), replaceBtn,
     h("button", { onclick: async () => { const p = await pick({ title: "Folder with av1opt outputs" }); if (p) { try { await api("/api/history/dirs", { path: p[0] }); load(); } catch (e) { toast(e.message, true); } } } }, "Add folder…")), out);
@@ -1970,6 +2084,10 @@ views.history = (root) => {
         h("button", { class: "small", onclick: () => { more.remove(); tbody.append(...reps.slice(LIMIT).map(row)); } }, "Show all")));
       tbody.append(more);
     }
+    // A line needs somewhere to go: with the encodes of one day only, the numbers say it all.
+    const days = savedByDay(reps);
+    if (chart) chart.stop();
+    chart = days.length >= 2 ? savedChart(days) : null;
     out.className = "";
     out.replaceChildren(
       h("div", { class: "panel" }, h("h3", {}, "Folders searched for reports"), dirs),
@@ -1978,11 +2096,13 @@ views.history = (root) => {
         h("div", { class: "stat" }, h("div", { class: "v" }, `${bytes(tin)} → ${bytes(tout)}`), h("div", { class: "l" }, "source → AV1")),
         h("div", { class: "stat" }, h("div", { class: "v ok" }, bytes(tin - tout)), h("div", { class: "l" }, `saved (${pct(tin ? 1 - tout / tin : 0)})`)),
         h("div", { class: "stat" }, h("div", { class: "v" }, STATE ? STATE.history_encodes : "–"), h("div", { class: "l" }, "encodes calibrating scan estimates"))),
+      chart ? h("div", { class: "panel" }, h("h3", {}, "Space saved over time"), chart.el) : null,
       h("div", { class: "panel" }, reps.length
         ? h("div", { class: "tablewrap" }, h("table", {}, h("thead", {}, h("tr", {}, ["When", "File", "Mode", "CRF", "Target", "VMAF", "Source", "AV1", "Saved", "Time"].map((t, k) => h("th", { class: k >= 3 ? "num" : "" }, t)))), tbody))
         : h("div", { class: "empty" }, "No reports found in these folders.")));
   }
   load();
+  return () => { if (chart) chart.stop(); };
 };
 
 // Outputs take the place of their originals: one request per file, so the dialog can say

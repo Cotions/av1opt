@@ -393,6 +393,9 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
   Encodes wait while a benchmark runs and a benchmark won't start during an encode, so the
   timings mean something. The last result is kept in `~/.local/share/av1opt/bench-last.json`.
 - **History**: every report found in the output folders used so far (and folders you add).
+  **Space saved over time** shows the total as it grew, a line that steps up on the days
+  something was encoded (hover it, or use the arrow keys, for a day's numbers); it appears
+  once there are encodes from two different days.
   **Replace originals…** lists the outputs that can take their original's place (the rules of
   `replace` above), all ticked; it works through the ticked ones one by one and keeps the ones
   that failed on screen with the reason. Replaced encodes carry a "replaced" mark. An original

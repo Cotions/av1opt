@@ -165,6 +165,8 @@ pub struct FileState {
     output_bytes: u64,
     started: Option<u64>,
     ended: Option<u64>,
+    /// Estimated seconds to search and encode it; unknown until the file was scanned or probed.
+    est_secs: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -181,6 +183,9 @@ pub struct Job {
     error: Option<String>,
     current: Option<usize>,
     files: Vec<FileState>,
+    /// How long encodes take here at the job's preset.
+    #[serde(skip)]
+    time: crate::estimate::TimeModel,
     #[serde(skip)]
     batch: Vec<batch::Job>,
     #[serde(skip)]
@@ -245,10 +250,24 @@ fn head(j: &Job) -> Value {
             saved += f.input_bytes.saturating_sub(f.output_bytes);
         }
     }
+    // Time left: files still waiting, plus what the running one has left of its estimate
+    // (a tenth at least: an estimate that ran out doesn't mean the file is done).
+    let (mut left, mut unknown) = (0.0, 0usize);
+    if matches!(j.status.as_str(), "queued" | "running") {
+        for f in &j.files {
+            match (f.status.as_str(), f.est_secs) {
+                ("pending", Some(s)) => left += s,
+                ("running", Some(s)) => left += (s - f.started.map_or(0.0, |t| now().saturating_sub(t) as f64)).max(s * 0.1),
+                ("pending" | "running", None) => unknown += 1,
+                _ => {}
+            }
+        }
+    }
     json!({
         "id": j.id, "created": j.created, "out_dir": j.out_dir, "options": j.options,
         "status": j.status, "error": j.error, "current": j.current,
         "total": j.files.len(), "counts": counts, "saved": saved,
+        "left_secs": left, "left_unknown": unknown,
     })
 }
 
@@ -363,15 +382,20 @@ fn add_unchecked(app: &App, body: &Value) -> Result<Value> {
         }
         crate::fsguard::ensure_writable_location(&j.out_dir, false)?;
     }
+    // Time estimates for files a scan has seen; the others get theirs when they are probed.
+    let time = crate::estimate::TimeModel::fit(&crate::history::load(), opts.preset);
+    let abs_inputs: Vec<PathBuf> = batch_jobs.iter().map(|j| std::fs::canonicalize(&j.input).unwrap_or_else(|_| j.input.clone())).collect();
+    let known = crate::scan::cached_info(&abs_inputs);
     let files: Vec<FileState> = batch_jobs
         .iter()
-        .map(|j| {
+        .zip(abs_inputs)
+        .map(|(j, abs)| {
             let stem = j.input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             let output = j.out_dir.join(format!("{stem}.{}", opts.container.ext()));
-            let abs = std::fs::canonicalize(&j.input).unwrap_or_else(|_| j.input.clone());
             app.allow(&abs);
             FileState {
                 report: output.with_extension("av1opt.json"),
+                est_secs: known.get(&abs).map(|i| time.secs(i)).filter(|s| *s > 0.0),
                 input: abs,
                 output,
                 status: "pending".into(),
@@ -397,6 +421,7 @@ fn add_unchecked(app: &App, body: &Value) -> Result<Value> {
         error: None,
         current: None,
         files,
+        time,
         batch: batch_jobs,
         hooks: None,
         cancel_requested: false,
@@ -564,7 +589,13 @@ fn apply(job: &mut Job, e: &Event) -> Option<usize> {
             f.started = Some(now());
             f.phase = "probing".into();
         }
-        Event::Source { .. } => f.source = Some(v),
+        Event::Source { width, height, fps, duration_s, .. } => {
+            f.source = Some(v);
+            if f.est_secs.is_none() {
+                let info = crate::probe::MediaInfo { width: *width, height: *height, fps: *fps, duration_s: *duration_s, ..Default::default() };
+                f.est_secs = Some(job.time.secs(&info)).filter(|s| *s > 0.0);
+            }
+        }
         Event::Phase { phase, detail } => {
             f.phase = phase.clone();
             f.phase_detail = detail.clone();

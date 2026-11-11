@@ -277,6 +277,8 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
 - **Encode dialog**: target VMAF, preset, container, encoder parameters, metadata, sections
   to remove, and **Shrink heavy sound tracks to Opus** (`--audio shrink`, off by default).
 - **Queue**: encodes run one at a time with live progress: CRF search trials, chosen CRF,
+  the estimated time left per job and for the whole queue (files no scan has seen are
+  estimated once they are probed),
   per-chunk results in scene mode, percent, fps and ETA. Cancel stops ffmpeg at once; finished
   scene chunks are kept, so queueing the same files again resumes. Unfinished jobs are
   re-queued automatically the next time `av1opt ui` starts.

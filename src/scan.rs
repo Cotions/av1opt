@@ -132,6 +132,24 @@ pub fn collect(
     Ok((results, Stats { fresh, cached: total - fresh, dropped }))
 }
 
+/// What earlier scans learned about these files, without running ffprobe: only files whose
+/// size and date still match their cache entry.
+#[cfg(feature = "ui")]
+pub fn cached_info(paths: &[PathBuf]) -> HashMap<PathBuf, MediaInfo> {
+    let Some(cache) = cache_file().ok().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice::<HashMap<PathBuf, CacheEntry>>(&b).ok()) else {
+        return HashMap::new();
+    };
+    paths
+        .iter()
+        .filter_map(|p| {
+            let e = cache.get(p)?;
+            let meta = std::fs::metadata(p).ok()?;
+            let mtime = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+            (e.size == meta.len() && e.mtime == mtime).then(|| Some((p.clone(), e.info.clone()?)))?
+        })
+        .collect()
+}
+
 pub fn is_video(p: &Path) -> bool {
     p.extension().and_then(|e| e.to_str()).is_some_and(|e| VIDEO_EXTS.contains(&e.to_ascii_lowercase().as_str()))
 }

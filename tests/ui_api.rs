@@ -255,6 +255,8 @@ fn jobs_wait_while_tools_are_missing_and_survive_a_restart() {
     assert_eq!(jobs.len(), 1, "{heads}");
     assert_eq!(jobs[0]["status"], "queued");
     assert_eq!(jobs[0]["total"], 2);
+    // Never scanned or probed: no time estimate yet, and the header says for how many files.
+    assert_eq!((jobs[0]["left_secs"].as_f64(), jobs[0]["left_unknown"].as_u64()), (Some(0.0), Some(2)), "{heads}");
     let id = jobs[0]["id"].as_u64().unwrap();
     let full = s2.get(&format!("/api/jobs/{id}")).json();
     assert_eq!(full["files"].as_array().unwrap().len(), 2);

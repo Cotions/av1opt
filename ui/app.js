@@ -1533,10 +1533,17 @@ function vmafColor(v, target) {
 
 views.queue = (root) => {
   const list = h("div");
+  // Estimated time left: files not yet probed have no estimate and are counted apart.
+  const leftText = (secs, unknown) => !secs ? "" : `${secs < 60 ? "under a minute" : "about " + span(secs)} left${unknown ? ` + ${plural(unknown, "file")} not estimated yet` : ""}`;
+  const leftAll = h("span", { class: "dim", title: "Estimated from frame sizes and lengths, and from how long past encodes took on this machine" });
+  const drawLeft = () => {
+    const live = jobs.filter((j) => j.status === "queued" || j.status === "running");
+    leftAll.textContent = leftText(live.reduce((a, j) => a + (j.left_secs || 0), 0), live.reduce((a, j) => a + (j.left_unknown || 0), 0));
+  };
   const missing = h("div"); // saved jobs whose files were not there at start
   const held = h("div", { class: "panel warn", hidden: true }, "A benchmark is running: encodes wait until it ends, so that its timings mean something. ", h("a", { href: "#/bench" }, "Benchmark"));
   root.append(
-    h("div", { class: "row" }, h("h1", { class: "grow" }, "Encode queue"),
+    h("div", { class: "row" }, h("h1", {}, "Encode queue"), leftAll, h("span", { class: "spacer" }),
       h("button", { onclick: async () => { await api("/api/jobs/clear", {}); load(); } }, "Clear finished"),
       h("button", { class: "primary", onclick: async () => { const p = await pick({ title: "Videos or folders to encode", mode: "multi" }); if (p) encodeDialog(p); } }, "New encode…")),
     held, missing, list);
@@ -1580,6 +1587,7 @@ views.queue = (root) => {
     if (!j || !e || !e.nodes[i]) return load();
     Object.assign(j, r.head);
     j.files[i] = r.file;
+    drawLeft();
     patchHead(e, j);
     patchFile(e, j, r.file, i);
   }
@@ -1593,12 +1601,13 @@ views.queue = (root) => {
   function draw() {
     const ids = new Set(jobs.map((j) => j.id));
     for (const [id, e] of jobEls) if (!ids.has(id)) { e.box.remove(); jobEls.delete(id); }
-    if (!jobs.length) { list.replaceChildren(empty); return; }
+    if (!jobs.length) { list.replaceChildren(empty); drawLeft(); return; }
     empty.remove();
     for (const j of [...jobs].reverse()) list.append(patchJob(j)); // append moves nodes into order
+    drawLeft();
   }
 
-  const headSig = (j) => JSON.stringify([j.status, j.error, j.counts, j.saved]);
+  const headSig = (j) => JSON.stringify([j.status, j.error, j.counts, j.saved, leftText(j.left_secs, j.left_unknown)]);
   const fileSig = (f) => JSON.stringify({ ...f, progress: null });
 
   function patchJob(j) {
@@ -1643,6 +1652,7 @@ views.queue = (root) => {
       h("span", { class: "dim" }, `VMAF ${o.target_vmaf} · preset ${o.preset}${o.svt_params && o.svt_params !== "tune=0" ? " · " + o.svt_params : ""}${o.tuned ? " · tuned by size" : ""} · ${o.container}${o.scenes ? " · scenes×" + o.workers : ""}${metaLabel(o)}`),
       h("span", { class: "spacer" }),
       saved > 0 ? h("span", { class: "ok" }, `${bytes(saved)} saved`) : null,
+      j.left_secs ? h("span", {}, leftText(j.left_secs, j.left_unknown)) : null,
       h("span", { class: "dim" }, Object.entries(counts).map(([k, v]) => `${v} ${(STATUS[k] || [k])[0].toLowerCase()}`).join(" · ")),
       j.status === "running" || j.status === "queued"
         ? h("button", { class: "danger small", onclick: async (e) => { e.target.disabled = true; try { await api(`/api/jobs/${j.id}/cancel`, {}); toast("Cancelling… (finished chunks are kept; re-queue to resume)"); } catch (er) { toast(er.message, true); } } }, "Cancel")

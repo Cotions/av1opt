@@ -860,8 +860,8 @@ fn verify(
         let (start, src_start, secs) = cut.map_or((start, start, secs), |c| c.window(start, secs));
         let r = tmp.join(format!("verify{i}.ref.mkv"));
         let d = tmp.join(format!("verify{i}.out.mkv"));
-        search::extract_reference(tools, input, info, true, src_start, secs, &r)?;
-        search::extract_reference(tools, out, info, false, start, secs, &d)?;
+        search::extract_reference(tools, input, info, true, search::first_frame(info), src_start, secs, &r)?;
+        search::extract_reference(tools, out, info, false, search::first_frame(&out_info), start, secs, &d)?;
         let mut v = tools.vmaf(&d, &r, model, pix, threads, 0, 1)?;
         // Seeking two different files can land a frame or two apart; retry nearby alignments
         // before calling the encode bad.

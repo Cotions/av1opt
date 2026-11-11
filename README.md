@@ -418,6 +418,13 @@ and the benchmark's requests and tuned settings over HTTP (no ffmpeg needed).
   and misaligns comparisons.
 - **Pre-roll before cutting.** Seeking straight into MPEG-2/TS or open-GOP H.264 can return frames
   from the wrong place; seek 2 s early and discard the warm-up after decoding.
+- **Don't cut on a frame, or half-way between two.** Matroska stores timestamps in
+  milliseconds, so a frame at 2.2 s in an MP4 source is at 2.200 or 2.199 s in its MKV output. A
+  cut exactly between two frames then put every output frame on the edge between two slots of
+  the constant-rate grid: every third frame came out doubled and the next one dropped, in the
+  output only, and a good encode failed its spot check with VMAF 70 (3 of 40 cut points tried
+  on one clip; 0 of 40 since). Cuts are now made a quarter of a frame before a frame, and time
+  is counted from the first frame kept.
 - **Score every 3rd frame, not every 2nd.** SVT-AV1's hierarchical GOP alternates better and
   worse frames; an even VMAF stride measures only one kind (+0.2 VMAF bias).
 - **CRF has quarter steps.** `-svtav1-params crf=35.25` works; integer CRF alone left every
@@ -435,7 +442,7 @@ and the benchmark's requests and tuned settings over HTTP (no ffmpeg needed).
 ## Tests
 
 `cargo test` covers the CRF search (exactness against brute force, trial count, starting
-from scores known beforehand), the first-CRF guess and what it learns from past encodes, the
+from scores known beforehand), where clips are cut relative to frames, the first-CRF guess and what it learns from past encodes, the
 encode time estimate (the first guess, learning a faster machine, other presets), the
 trial cache (what counts as the same file, clips and settings), which sound tracks are copied
 or shrunk, chunk CRF

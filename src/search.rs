@@ -147,26 +147,51 @@ pub const VMAF_STRIDE: u32 = 3;
 
 pub const PREROLL_SECS: f64 = 2.0;
 
-/// Lossless, constant-frame-rate cut of `input` starting at `start` seconds.
-/// `is_source` applies [`source_filters`]; pass false when cutting from an already-encoded output.
+/// Moves a seek point to a quarter of a frame before the nearest frame. A seek that lands on
+/// a frame (or half-way between two) is decided by the last digit of a timestamp, and
+/// containers round those differently: Matroska keeps milliseconds, so the same frame is at
+/// 2.2 s in an MP4 source and at 2.200 or 2.199 s in its MKV output. A quarter frame is
+/// further from both edges than any such rounding.
+/// `first_frame` is the time of the video's first frame after the start of the file.
+pub fn snap_seek(t: f64, fps: f64, first_frame: f64) -> f64 {
+    if !(fps > 0.0 && t > 0.0) {
+        return t.max(0.0);
+    }
+    let frame = ((t - first_frame) * fps + 0.25).round();
+    (first_frame + (frame - 0.25) / fps).max(0.0)
+}
+
+/// Lossless, constant-frame-rate cut of `input` starting at `start` seconds (moved by less
+/// than a frame, see [`snap_seek`]). `is_source` applies [`source_filters`]; pass false when
+/// cutting from an already-encoded output. `first_frame` is the time of this file's first
+/// video frame after the start of the file.
+#[allow(clippy::too_many_arguments)]
 pub fn extract_reference(
     tools: &Tools,
     input: &Path,
     info: &MediaInfo,
     is_source: bool,
+    first_frame: f64,
     start: f64,
     secs: f64,
     out: &Path,
 ) -> Result<()> {
     let mut vf = if is_source { source_filters(info) } else { Vec::new() };
-    vf.push(format!("fps={}", cfr(info)));
+    // Time counts from the first frame kept before frames are put on the constant-rate grid:
+    // every frame is then at a whole number of frame times, give or take the container's
+    // rounding, and lands in its own slot. Counted from the seek point instead, a cut half-way
+    // between two frames puts every frame on the edge between two slots, where millisecond
+    // rounding decides: an MKV output then came out with every third frame doubled and the
+    // next one dropped, while its MP4 source did not (seen as a spot check of VMAF 70).
     vf.push("setpts=PTS-STARTPTS".into());
+    vf.push(format!("fps={}", cfr(info)));
     // Seeking straight to `start` can begin decoding mid-GOP (MPEG-2/TS, open-GOP H.264) and
     // return frames from the wrong place. Seek a little earlier and discard the warm-up after
     // decoding (output-side -ss), so the decoder has a clean run-in.
     let preroll = start.min(PREROLL_SECS);
+    let seek = snap_seek(start - preroll, cfr_value(info), first_frame);
     let args: Vec<String> = [
-        "-y", "-v", "error", "-ss", &format!("{:.3}", start - preroll), "-i", &path_arg(input),
+        "-y", "-v", "error", "-ss", &format!("{seek:.4}"), "-i", &path_arg(input),
         "-ss", &format!("{preroll:.3}"), "-t", &format!("{secs:.3}"),
         "-map", &format!("0:{}", if is_source { info.video_index } else { 0 }), "-an", "-sn",
         "-vf", &vf.join(","), "-c:v", "ffv1", "-pix_fmt", reference_pix_fmt(info), &path_arg(out),
@@ -174,6 +199,12 @@ pub fn extract_reference(
     .map(String::from)
     .to_vec();
     tools.run(&args).map(|_| ())
+}
+
+/// When a file's first video frame is shown, counted from the start of the file (other
+/// streams can start earlier).
+pub fn first_frame(info: &MediaInfo) -> f64 {
+    (info.video_start - info.start_time).max(0.0)
 }
 
 /// Sample start times: up to `count` clips of `secs` seconds, spread over the video and
@@ -202,7 +233,7 @@ pub fn extract_samples(tools: &Tools, input: &Path, info: &MediaInfo, tmp: &Path
             let reference = tmp.join(format!("sample{i}.ref.mkv"));
             eprintln!("  sample {}/{n} at {} ({secs:.0}s)", i + 1, crate::tools::hms(start));
             tools.emit(crate::events::Event::Phase { phase: "sampling".into(), detail: format!("sample {}/{n} at {}", i + 1, crate::tools::hms(start)) });
-            extract_reference(tools, input, info, true, start, secs, &reference)?;
+            extract_reference(tools, input, info, true, first_frame(info), start, secs, &reference)?;
             Ok(Sample { reference, secs })
         })
         .collect()
@@ -941,6 +972,31 @@ mod tests {
             start_time: 0.0, video_start: 0.0, covers: vec![], attachments: 0, tags: Default::default(),
             audio_streams: 0, subtitle_streams: 0, audio: vec![], subtitle_codecs: vec![],
         }
+    }
+
+    #[test]
+    fn seeks_stay_clear_of_frame_edges() {
+        for fps in [23.976, 25.0, 30.0, 59.94] {
+            for first in [0.0, 0.021, 0.5] {
+                for i in 0..400 {
+                    let t = i as f64 * 0.0137;
+                    let s = snap_seek(t, fps, first);
+                    assert!(s >= 0.0 && (s - t).abs() <= 0.75 / fps + 1e-9, "{t} -> {s} at {fps}");
+                    if s > 0.0 {
+                        // A quarter of a frame before a frame: nowhere near a frame or the
+                        // middle between two, where a millisecond decides.
+                        let phase = ((s - first) * fps).rem_euclid(1.0);
+                        assert!((phase - 0.75).abs() < 1e-6, "{t} -> {s} at {fps}: phase {phase}");
+                    }
+                }
+            }
+        }
+        // The very start stays the very start, and nonsense rates change nothing.
+        assert_eq!(snap_seek(0.0, 30.0, 0.0), 0.0);
+        assert_eq!(snap_seek(0.004, 30.0, 0.0), 0.0);
+        assert_eq!(snap_seek(3.21, 0.0, 0.0), 3.21);
+        // 2.2167 s is frame 66.5 at 30 fps: moved to a quarter before frame 67.
+        assert!((snap_seek(2.2167 - 2.0, 30.0, 0.0) - 6.75 / 30.0).abs() < 1e-9);
     }
 
     #[test]

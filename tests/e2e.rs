@@ -124,7 +124,11 @@ impl Case {
     }
 
     fn report(&self, stem: &str) -> Value {
-        let p = self.out().join(format!("{stem}.av1opt.json"));
+        self.report_in(&self.out(), stem)
+    }
+
+    fn report_in(&self, out: &Path, stem: &str) -> Value {
+        let p = out.join(format!("{stem}.av1opt.json"));
         serde_json::from_slice(&std::fs::read(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))).unwrap()
     }
 
@@ -899,6 +903,38 @@ fn scenes_get_their_own_crf_and_a_killed_run_goes_on_where_it_stopped() {
     }
     assert_eq!(chunks.iter().map(|ch| ch["frames"].as_u64().unwrap()).sum::<u64>(), 576);
     assert_eq!(c.outputs(), ["av1opt-log.tsv", "s.av1opt.json", "s.mp4"]);
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn scenes_are_encoded_apart_only_where_the_samples_disagree() {
+    let c = Case::new("auto");
+    let uneven = c.scenes_clip("uneven.mp4");
+    let even = c.clip("even.mp4", "320x180", 12);
+    let r = c.encode(&[&uneven, &even], &["--scenes=auto"]);
+    r.ok().has("encoded 2, skipped 0, failed 0");
+    let rep = c.report("uneven");
+    assert_eq!(rep["mode"], "scenes", "{}", r.err);
+    let notes = |rep: &Value| rep["notes"].as_array().unwrap().iter().map(|n| n.as_str().unwrap().to_string()).collect::<Vec<_>>().join("\n");
+    assert!(notes(&rep).contains("quality differs along the video") && notes(&rep).contains("each scene gets its own CRF"), "{rep}");
+    assert_in_step(&c.out().join("uneven.mp4"), &uneven, "1");
+    let rep = c.report("even");
+    assert_eq!(rep["mode"], "whole");
+    assert!(!notes(&rep).contains("quality differs"), "{rep}");
+    assert!(entries(&c.out(), ".av1opt-").is_empty());
+
+    // Without the setting the same video gets one CRF: one low enough for its worst sample,
+    // which verification would otherwise have thrown the finished encode away for.
+    let whole = c.dir.join("whole");
+    let r = c.encode_into(&whole, &[&uneven], &[]);
+    r.ok().has("looking for the CRF that keeps it at 89 or above");
+    let rep = c.report_in(&whole, "uneven");
+    assert_eq!(rep["mode"], "whole");
+    assert!(notes(&rep).contains("a CRF per scene (--scenes) would even it out") && notes(&rep).contains("to keep the worst sample at VMAF 89"), "{rep}");
+    let chosen = rep["crf"].as_f64().unwrap();
+    let mean_only = rep["search"].as_array().unwrap().iter().filter(|t| t["mean_vmaf"].as_f64().unwrap() >= 93.0).map(|t| t["crf"].as_f64().unwrap()).fold(0.0, f64::max);
+    assert!(chosen <= mean_only - 2.0, "CRF {chosen}, the mean alone allowed {mean_only}");
+    assert!(rep["verify_vmaf"].as_array().unwrap().iter().all(|v| v.as_f64().unwrap() >= 89.0), "{rep}");
 }
 
 #[test]

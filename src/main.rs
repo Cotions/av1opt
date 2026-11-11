@@ -255,8 +255,9 @@ enum Cmd {
         ffprobe: String,
         /// Choose the CRF per scene: split at scene changes, target VMAF for each chunk, then join.
         /// Evens out quality across the video; slower than one CRF for the whole file.
-        #[arg(long)]
-        scenes: bool,
+        /// `--scenes=auto` does it only for videos whose samples differ in quality at one CRF.
+        #[arg(long, value_enum, value_name = "WHEN", num_args = 0..=1, require_equals = true, default_value_t, default_missing_value = "always")]
+        scenes: encode::Scenes,
         /// Chunks encoded in parallel with --scenes. Each ffmpeg gets its share of --memory-limit.
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=8))]
         workers: u8,
@@ -511,7 +512,7 @@ fn main() -> Result<()> {
             std::fs::create_dir_all(&out_dir)?;
             // SAFETY: plain syscall on our own process; children inherit the priority.
             unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) };
-            let tools = tools::Tools::new(ffmpeg, ffprobe, memory_cap(&memory_limit, if scenes { workers } else { 1 }));
+            let tools = tools::Tools::new(ffmpeg, ffprobe, memory_cap(&memory_limit, if scenes.possible() { workers } else { 1 }));
             let tuning = if tuned {
                 let t = tuning::Tuning::load()?;
                 if t.classes.is_empty() {

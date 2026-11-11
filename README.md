@@ -105,7 +105,11 @@ For each file:
    within 3 CRF of the answer, never more than 4, and the CRF chosen is never more than 0.05
    VMAF short of the target. A trial encodes the samples end to end as one clip and scores
    them in one pass. The answer is in SVT-AV1's quarter-step CRF. 4K uses the
-   `vmaf_4k` model.
+   `vmaf_4k` model. One CRF has to carry the video's worst stretch: if the worst sample at
+   the chosen CRF scores more than 4 VMAF below the target (what verification allows a spot
+   check), the search goes on to the CRF that brings it up to that mark, and the report says
+   so. A sample more than 2 below the samples' mean gets a note that quality differs along
+   the video (see [per-scene CRF](#per-scene-crf---scenes)).
 3. **Decide** – skips files that are already AV1, Dolby Vision, can't reach the target, or would
    save less than `--min-savings` (15%). The search stops at the first trial that misses the
    target while already larger than that: the CRF the target needs would be larger still.
@@ -121,7 +125,8 @@ For each file:
    `--container mkv` to keep image subtitles too. Cover art is kept (MP4: attached picture,
    MKV: attachment with its original file name).
 5. **Verify** – codec, duration, stream and cover counts, HDR transfer, plus VMAF spot checks at positions the search
-   did not sample. Nothing is written unless all checks pass.
+   did not sample (five seconds at 30% and at 70% of the way; all of a video of ten seconds
+   or less, once). Nothing is written unless all checks pass.
 6. **Report** – the output plus `<name>.av1opt.json` with every CRF tried, scores, sizes and timings.
 
 ### Metadata
@@ -193,6 +198,19 @@ On a 60 s test clip mixing six kinds of footage, `--scenes` gave a 6% smaller fi
 full-length VMAF (93.07), with per-segment VMAF between 91.9 and 94.1 instead of 90.8 to 95.9.
 On a single continuous shot it gives no gain. It takes about 1.5-2x as long; `--workers 2`
 encodes two chunks at once (each ffmpeg then gets half of `--memory-limit`).
+
+`--scenes=auto` spends that time only where it buys something: on videos whose samples score
+far apart at one CRF (the worst one 2 VMAF or more below their mean), and one CRF for the
+rest. Whole encodes of eight test clips, every frame scored against the source: on the six
+whose worst sample was 0.3 to 1.6 below the mean, no five seconds of the encode fell more
+than 3 VMAF below the target. On the two where it was 2.9 and 4.1 below, stretches fell 8.5
+and 5.5 below the target (3-4% of all five-second windows were under what verification
+accepts, so now and then a finished encode would have been thrown away), while other
+stretches sat at 97. Encoded per scene, the worst five seconds of those two came out at 89.6
+and 89.8 instead of 84.6 and 87.5 and the best at 96 instead of 97.5, for 15% and 7% more
+bytes: the one-CRF encode of the first was 0.9 VMAF short of the target over the whole
+video, which its four samples had not shown. Without `--scenes`, the report of such a video
+says that quality differs along it.
 
 Finished chunks are kept in `.av1opt-work-*` in the output folder, so an interrupted run resumes
 where it stopped (including the search). Variable-frame-rate sources are encoded in one pass,
@@ -474,6 +492,14 @@ and the benchmark's requests and tuned settings over HTTP (no ffmpeg needed).
   measures the place. A step along that shape instead of a
   straight 0.4 per CRF took the search from 2.4 to 2.2 trials, and `bench`'s search (which
   goes on until two neighbouring CRFs are measured) from 3.6 to 3.1.
+- **A mean hides the stretches below it.** A CRF that brings the samples' mean to the target
+  leaves a video's hard stretches below it: 8.5 VMAF below on one of eight test clips, whose
+  samples averaged the target. The search knew, since one of its four samples scored 3
+  below their mean, and did nothing with it; a generated clip with one hard scene was encoded
+  in full and then refused by verification, again on every run, because the remembered
+  trials led to the same CRF. The worst sample now counts: past what verification allows,
+  the CRF comes down before the encode, and a video with samples far apart can be encoded
+  per scene (`--scenes=auto`).
 - **A Matroska header names a frame rate whatever the frames do.** ffprobe reports 24 fps as
   both the nominal and the average rate of an MKV whose frames come at 12, so comparing the
   two finds variable frame rates in MP4 only. Scene mode then cut such a file into
@@ -496,7 +522,8 @@ rotated, odd-sized, 4:4:4, wide-pixel and full-range sources, cover art in every
 can be, sound and picture offsets, AVI, WebM, MOV, MPEG and transport streams at six frame
 rates, very short videos, awkward file and folder names, skips, failures and name
 collisions, a scene-mode run killed half-way and resumed, an encode stopped half-way (nothing
-left behind, no ffmpeg left running, trials remembered), `replace` with `--undo` on a
+left behind, no ffmpeg left running, trials remembered), `--scenes=auto` on an even and an
+uneven video and the lower CRF an uneven one gets without it, `replace` with `--undo` on a
 real output, `scan` on a folder with a candidate, an AV1 file and a broken one (nothing in
 the folder touched), `dups` on a smaller copy, a byte-identical copy and two cut copies, and
 `bench` with its remembered sample encodes and `--save` feeding `encode --tuned`. With `--features ui` it also drives a real server: a paused queue (ffmpeg

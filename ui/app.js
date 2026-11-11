@@ -251,9 +251,14 @@ function metaLabel(o) {
   return parts.length ? " · " + parts.join(" · ") : "";
 }
 
+// Settings and jobs saved before "auto" existed hold true or false.
+function scenesMode(v) {
+  return v === true ? "always" : v === "auto" || v === "always" ? v : "off";
+}
+
 function defaultOptions() {
   return Object.assign({
-    container: "mp4", target_vmaf: 93, preset: 6, svt_params: "", tuned: false, scenes: false, workers: 1, min_savings: 0.15, force: false, retry_skipped: false,
+    container: "mp4", target_vmaf: 93, preset: 6, svt_params: "", tuned: false, scenes: "off", workers: 1, min_savings: 0.15, force: false, retry_skipped: false,
     keep_metadata: true, keep_dates: false, info_json: true, meta_preset: "", meta_tags: [], shrink_audio: false,
   }, prefs.get("encodeOptions", {}));
 }
@@ -554,7 +559,8 @@ function encodeDialog(inputs, roots = []) {
     const tuned = h("input", { type: "checkbox", checked: o.tuned });
     const container = h("select", {}, h("option", { value: "mp4" }, "MP4 (plays in browsers)"), h("option", { value: "mkv" }, "MKV (keeps image subtitles)"));
     container.value = o.container;
-    const scenes = h("input", { type: "checkbox", checked: o.scenes });
+    const scenes = h("select", {}, h("option", { value: "off" }, "Off: one CRF for the whole video"), h("option", { value: "auto" }, "Where quality is uneven"), h("option", { value: "always" }, "Always"));
+    scenes.value = scenesMode(o.scenes);
     const workers = h("input", { type: "number", min: "1", max: "8", value: o.workers });
     const minSav = h("input", { type: "number", min: "0", max: "95", step: "1", value: Math.round(o.min_savings * 100) });
     const force = h("input", { type: "checkbox", checked: o.force });
@@ -570,14 +576,14 @@ function encodeDialog(inputs, roots = []) {
       cutsBox.replaceChildren(cuts.el);
       cutsBtn.remove();
     } }, "Choose sections to remove…");
-    const syncWorkers = () => { workers.disabled = !scenes.checked; };
+    const syncWorkers = () => { workers.disabled = scenes.value === "off"; };
     scenes.addEventListener("change", syncWorkers);
     syncWorkers();
     const close = (v) => { if (cuts) cuts.stop(); bg.remove(); resolve(v); };
     const go = h("button", { class: "primary", onclick: async () => {
       const options = {
         container: container.value, target_vmaf: Number(vmaf.value), preset: Number(preset.value), svt_params: svtParams.value.trim(),
-        tuned: tuning.length > 0 && tuned.checked, scenes: scenes.checked,
+        tuned: tuning.length > 0 && tuned.checked, scenes: scenes.value,
         workers: Number(workers.value), min_savings: Number(minSav.value) / 100, force: force.checked, retry_skipped: retry.checked,
         shrink_audio: shrinkAudio.checked,
         ...meta.get(),
@@ -615,10 +621,10 @@ function encodeDialog(inputs, roots = []) {
             tuning.length ? setting("Tuned settings", h("label", { class: "check" }, tuned, "Use the benchmark's settings by video size"),
               tuning.map((x) => `${x.label}: ${configLabel(x.choice)}`).join("; ") + ". Other sizes use the preset and parameters above") : null,
             setting("Container", container, null),
+            setting("Per-scene CRF", h("span", { class: "unit" }, scenes, workers, "at once"),
+              "Splits at scene changes and picks a CRF for each: even quality, about twice the time. “Where quality is uneven” does it only for videos whose samples score far apart at one CRF"),
             setting("Skip if saving under", h("span", { class: "unit" }, minSav, "%"), "Files that wouldn't shrink this much are left alone")),
           h("div", { class: "checks-col" },
-            h("label", { class: "check", title: "Splits at scene cuts and picks a CRF per scene; slower but smaller on mixed content" }, scenes, "Per-scene CRF (slower, smaller on mixed content)"),
-            h("label", { class: "check sub" }, workers, "scenes encoded at once"),
             h("label", { class: "check", title: "AAC, Opus and MP3 sound is normally copied untouched. With this, a track far above what Opus needs (stereo above 144 kbps) is re-encoded to Opus (stereo at 96 kbps): smaller, but lossy a second time" }, shrinkAudio, "Shrink heavy sound tracks to Opus (stereo above 144 kbps becomes 96 kbps)"),
             h("label", { class: "check" }, force, "Force: also re-encode AV1 files and low-gain ones"),
             h("label", { class: "check" }, retry, "Retry files skipped in earlier runs")),
@@ -1683,7 +1689,7 @@ views.queue = (root) => {
       j.paused ? pausedPill(j) : statusPill(j.status),
       h("strong", {}, `${j.total} file${j.total === 1 ? "" : "s"}`),
       h("span", { class: "dim" }, `→ ${j.out_dir}`),
-      h("span", { class: "dim" }, `VMAF ${o.target_vmaf} · preset ${o.preset}${o.svt_params && o.svt_params !== "tune=0" ? " · " + o.svt_params : ""}${o.tuned ? " · tuned by size" : ""} · ${o.container}${o.scenes ? " · scenes×" + o.workers : ""}${metaLabel(o)}`),
+      h("span", { class: "dim" }, `VMAF ${o.target_vmaf} · preset ${o.preset}${o.svt_params && o.svt_params !== "tune=0" ? " · " + o.svt_params : ""}${o.tuned ? " · tuned by size" : ""} · ${o.container}${scenesMode(o.scenes) === "off" ? "" : (scenesMode(o.scenes) === "auto" ? " · scenes where uneven×" : " · scenes×") + o.workers}${metaLabel(o)}`),
       h("span", { class: "spacer" }),
       saved > 0 ? h("span", { class: "ok" }, `${bytes(saved)} saved`) : null,
       j.left_secs ? h("span", {}, leftText(j.left_secs, j.left_unknown)) : null,
@@ -2139,9 +2145,10 @@ function comparePlayer(root, r) {
     rect.dataset.tip = `chunk ${c.index + 1} · ${tc(c.start_secs)}–${tc(c.end)} · CRF ${c.crf}${c.corrected ? " (corrected)" : ""} · VMAF ${num(c.vmaf)} · ${bytes(c.bytes)} · ${num(c.bytes * 8 / (c.end - c.start_secs) / 1e6, 2)} Mbps`;
     tl.append(rect);
   }
-  // Verification spot checks: 5 s windows at 30% and 70% of (duration − 5 s).
-  (r.verify_vmaf || []).forEach((v, k) => {
-    const secs = Math.min(5, duration), st = (duration - secs) * [0.3, 0.7][k];
+  // Verification spot checks: 5 s windows at 30% and 70% of (duration − 5 s), or one check
+  // of all of a video of 10 s or less.
+  (r.verify_vmaf || []).forEach((v, k, all) => {
+    const secs = all.length === 1 ? duration : Math.min(5, duration), st = all.length === 1 ? 0 : (duration - secs) * [0.3, 0.7][k];
     const c = s("circle", { cx: x(st + secs / 2), cy: y(v), r: 4, fill: "#6aa7e8", stroke: "#111", "vector-effect": "non-scaling-stroke" });
     c.dataset.tip = `verify spot check ${tc(st)}–${tc(st + secs)} · VMAF ${num(v)}`;
     tl.append(c);

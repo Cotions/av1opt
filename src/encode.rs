@@ -30,7 +30,7 @@ pub struct Options {
     pub overwrite: bool,
     pub keep_temp: bool,
     /// Per-scene CRF (chunked encode) instead of one CRF for the whole file.
-    pub scenes: bool,
+    pub scenes: Scenes,
     /// Chunks encoded at the same time in scene mode.
     pub workers: usize,
     /// Source tags kept or dropped, tags added, file date.
@@ -40,6 +40,70 @@ pub struct Options {
     pub audio: Audio,
     /// Measure every CRF trial again instead of reusing trials from earlier runs.
     pub fresh_search: bool,
+}
+
+/// Whether each scene gets its own CRF.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug, clap::ValueEnum, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Scenes {
+    /// One CRF for the whole video.
+    #[default]
+    Off,
+    /// A CRF per scene where the search's samples differ in quality at one CRF, one CRF
+    /// for the whole video where they agree.
+    Auto,
+    /// A CRF per scene.
+    Always,
+}
+
+impl Scenes {
+    pub fn possible(self) -> bool {
+        self != Scenes::Off
+    }
+}
+
+// Queues and settings saved before `auto` existed hold true or false.
+impl<'de> serde::Deserialize<'de> for Scenes {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Old {
+            Flag(bool),
+            Name(String),
+        }
+        match Old::deserialize(d)? {
+            Old::Flag(true) => Ok(Scenes::Always),
+            Old::Flag(false) => Ok(Scenes::Off),
+            Old::Name(n) => match n.as_str() {
+                "off" => Ok(Scenes::Off),
+                "auto" => Ok(Scenes::Auto),
+                "always" => Ok(Scenes::Always),
+                other => Err(serde::de::Error::custom(format!("scenes: off, auto or always, not {other}"))),
+            },
+        }
+    }
+}
+
+/// How far below the samples' mean the worst sample may score before a video counts as
+/// uneven. Whole encodes of eight clips, every frame scored: where the gap at the chosen CRF
+/// was 0.3 to 1.6 VMAF, no five seconds of the encode fell more than 3 below the target;
+/// where it was 2.9 and 4.1, stretches fell 8.5 and 5.5 below, and 3-4% of five-second
+/// windows would have failed verification. Encoded per scene, the worst five seconds of
+/// those two came out 3.4 and 3.2 below the target.
+pub const UNEVEN_GAP: f64 = 2.0;
+
+/// How far below the target a spot check of the finished encode may score.
+pub const VERIFY_SLACK: f64 = 4.0;
+
+/// Where the finished encode is compared with the source, as (start, length) in seconds of
+/// the output: five seconds at 30% and at 70% of the way, or all of a video too short for
+/// the two to be different stretches.
+pub fn spot_checks(duration: f64) -> Vec<(f64, f64)> {
+    const SECS: f64 = 5.0;
+    if duration <= 2.0 * SECS {
+        return vec![(0.0, duration.max(0.0))];
+    }
+    [0.3, 0.7].map(|at| ((duration - SECS) * at, SECS)).to_vec()
 }
 
 /// What happens to sound tracks that could be copied as they are.
@@ -263,23 +327,28 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
             list.len(), if list.len() == 1 { "" } else { "s" }, list.join(", "), sections::fmt_time(c.kept()), sections::fmt_time(info.duration_s)
         ));
     }
-    let scenes = o.scenes && !info.vfr && cut.is_none();
-    if o.scenes && cut.is_some() {
-        notes.push("sections removed: encoded in one pass instead of per scene".to_string());
-    } else if o.scenes && info.vfr {
-        notes.push("variable frame rate source: encoded in one pass instead of per scene".to_string());
+    // Why scenes can't be encoded apart here, if they can't.
+    let one_pass = if cut.is_some() {
+        Some("sections removed")
+    } else if info.vfr {
+        Some("variable frame rate source")
+    } else {
+        None
+    };
+    if o.scenes == Scenes::Always && let Some(why) = one_pass {
+        notes.push(format!("{why}: encoded in one pass instead of per scene"));
     }
-    let work = scenes.then(|| work_dir(input, out_dir, size, o, preset, svt_params)).transpose()?;
+    let work = (o.scenes.possible() && one_pass.is_none()).then(|| work_dir(input, out_dir, size, o, preset, svt_params)).transpose()?;
     let saved: Option<scenes::Plan> = work.as_ref().and_then(|w| {
         let p: scenes::Plan = serde_json::from_slice(&std::fs::read(w.path.join("plan.json")).ok()?).ok()?;
         (p.key == w.key).then_some(p)
     });
 
     let t0 = tools.stopwatch();
-    let (best, trials, mut lab) = match &saved {
+    let (best, mut trials, mut lab, params) = match &saved {
         Some(p) => {
             eprintln!("resuming earlier run: crf {} from the saved search", p.best.crf);
-            (search::Outcome::Found(p.best), p.trials.clone(), None)
+            (search::Outcome::Found(p.best), p.trials.clone(), None, None)
         }
         None => {
             // A trial that misses the target while already too large to be worth it settles
@@ -295,15 +364,15 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
             };
             let cache = search::TrialCache::open(input, size, &pos, tools.encoder_version(), !o.fresh_search);
             let mut lab = search::Lab::new(tools, input, &info, &tmp.path, pos, vmaf_threads, cache);
-            let params = SearchParams { target_vmaf: o.target_vmaf, min_crf: o.min_crf, max_crf: o.max_crf, start_crf, max_size_ratio };
+            let params = SearchParams { target_vmaf: o.target_vmaf, min_crf: o.min_crf, max_crf: o.max_crf, start_crf, max_size_ratio, worst_sample: None };
             tools.emit(Event::Phase { phase: "searching".into(), detail: format!("VMAF >= {} ({model}, preset {preset}), from CRF {start_crf}", o.target_vmaf) });
             let (best, trials) = search::search(&mut lab, &enc, &params)?;
-            (best, trials, Some(lab))
+            (best, trials, Some(lab), Some(params))
         }
     };
     // With sections removed the output is wanted anyway: settle for the best quality tried.
     let reached = matches!(best, search::Outcome::Found(_));
-    let best = match best {
+    let mut best = match best {
         search::Outcome::Found(b) => b,
         search::Outcome::TooLarge(t) => skip!(
             "CRF {} misses VMAF {} ({:.2}) at {:.0}% of the source's size already: savings would be below --min-savings {:.0}%",
@@ -315,6 +384,51 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         }
         search::Outcome::OutOfReach => skip!("even CRF {} misses VMAF {}; source is too lean to re-encode at this target", o.min_crf, o.target_vmaf),
     };
+    // Samples far apart at one CRF: stretches of a one-CRF encode fall well below the target
+    // while others are better than they need to be.
+    let gap = best.mean_vmaf - best.min_vmaf;
+    let uneven = gap >= UNEVEN_GAP;
+    let differs = format!("quality differs along the video (worst sample VMAF {:.1}, {:.1} below the samples' mean, at CRF {})", best.min_vmaf, gap, best.crf);
+    // A run that had got to its chunks goes on with them.
+    let scenes = match o.scenes {
+        Scenes::Off => false,
+        Scenes::Always => one_pass.is_none(),
+        Scenes::Auto => one_pass.is_none() && (uneven || saved.is_some()),
+    };
+    if uneven {
+        match (o.scenes, one_pass) {
+            (Scenes::Off, _) => notes.push(format!("{differs}; a CRF per scene (--scenes) would even it out")),
+            (Scenes::Auto, None) => notes.push(format!("{differs}: each scene gets its own CRF")),
+            (Scenes::Auto, Some(why)) => notes.push(format!("{differs}; {why}, so encoded in one pass all the same")),
+            (Scenes::Always, _) => {}
+        }
+    }
+    let work = work.filter(|_| scenes);
+    // One CRF has to carry the video's worst stretch: verification wants every spot check
+    // within `VERIFY_SLACK` of the target, and a sample below that says some would not be.
+    // Found here, it costs a trial or two; found by verification, the whole encode.
+    let floor = o.target_vmaf - VERIFY_SLACK;
+    if !scenes
+        && reached
+        && best.min_vmaf < floor
+        && let (Some(lab), Some(params)) = (lab.as_mut(), params)
+    {
+        eprintln!("worst sample VMAF {:.2} at CRF {}: looking for the CRF that keeps it at {floor} or above", best.min_vmaf, best.crf);
+        let (held, all) = search::search(lab, &enc, &SearchParams { worst_sample: Some(floor), start_crf: best.crf.floor() as u8, ..params })?;
+        trials = all;
+        match held {
+            search::Outcome::Found(b) => {
+                notes.push(format!("CRF {} instead of {} to keep the worst sample at VMAF {floor} (it was {:.1})", b.crf, best.crf, best.min_vmaf));
+                best = b;
+            }
+            search::Outcome::TooLarge(t) => skip!(
+                "CRF {} leaves the worst sample at VMAF {:.2} (wanted: {floor}) at {:.0}% of the source's size already: savings would be below --min-savings {:.0}%",
+                t.crf, t.min_vmaf, t.size_ratio * 100.0, o.min_savings * 100.0
+            ),
+            // Nothing to gain from a lower CRF that still misses: verification decides.
+            search::Outcome::OutOfReach => notes.push(format!("the worst sample stays below VMAF {floor} down to CRF {}", o.min_crf)),
+        }
+    }
     let predicted_savings = 1.0 - best.size_ratio;
     tools.emit(Event::Chosen { crf: best.crf, vmaf: best.mean_vmaf, predicted_savings });
     eprintln!("chose crf {} (VMAF {:.2}), predicted video savings {:.0}%", best.crf, best.mean_vmaf, predicted_savings * 100.0);
@@ -869,9 +983,7 @@ fn verify(
     let model = search::vmaf_model(info);
     let pix = search::reference_pix_fmt(info);
     let mut scores = Vec::new();
-    for (i, frac) in [0.3, 0.7].into_iter().enumerate() {
-        let secs = 5.0_f64.min(duration);
-        let start = ((duration - secs) * frac).max(0.0);
+    for (i, (start, secs)) in spot_checks(duration).into_iter().enumerate() {
         // The same picture sits at different times in the source when sections were removed.
         let (start, src_start, secs) = cut.map_or((start, start, secs), |c| c.window(start, secs));
         let r = tmp.join(format!("verify{i}.ref.mkv"));
@@ -881,7 +993,7 @@ fn verify(
         let mut v = tools.vmaf(&d, &r, model, pix, threads, 0, 1)?;
         // Seeking two different files can land a frame or two apart; retry nearby alignments
         // before calling the encode bad.
-        if v < target_vmaf - 4.0 {
+        if v < target_vmaf - VERIFY_SLACK {
             for off in [-2, -1, 1, 2] {
                 v = v.max(tools.vmaf(&d, &r, model, pix, threads, off, 1)?);
             }
@@ -893,9 +1005,12 @@ fn verify(
         let _ = std::fs::remove_file(&d);
     }
     // Short spot checks are noisier than the multi-sample search, so allow some slack.
-    let floor = target_vmaf - 4.0;
+    let floor = target_vmaf - VERIFY_SLACK;
     if let Some(bad) = scores.iter().find(|&&v| v < floor) {
-        bail!("verify: spot check VMAF {bad:.2} below {floor:.1}; keeping nothing");
+        // One CRF for a video whose stretches need different ones; the same run would end
+        // the same way.
+        let hint = if expect_frames.is_none() && cut.is_none() { " (a CRF per scene, --scenes, evens quality out)" } else { "" };
+        bail!("verify: spot check VMAF {bad:.2} below {floor:.1}; keeping nothing{hint}");
     }
     Ok((scores, out_info))
 }
@@ -911,6 +1026,25 @@ fn free_bytes(dir: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spot_checks_do_not_look_at_the_same_stretch_twice() {
+        assert_eq!(spot_checks(100.0), [(28.5, 5.0), (66.5, 5.0)]);
+        assert_eq!(spot_checks(15.0), [(3.0, 5.0), (7.0, 5.0)]);
+        // Six seconds used to be checked from 0.3 s and again from 0.7 s.
+        assert_eq!(spot_checks(6.0), [(0.0, 6.0)]);
+        assert_eq!(spot_checks(10.0), [(0.0, 10.0)]);
+        assert_eq!(spot_checks(0.4), [(0.0, 0.4)]);
+    }
+
+    #[test]
+    fn scenes_setting_reads_what_older_queues_saved() {
+        let read = |j: &str| serde_json::from_str::<Scenes>(j).unwrap();
+        assert_eq!((read("true"), read("false")), (Scenes::Always, Scenes::Off));
+        assert_eq!((read("\"off\""), read("\"auto\""), read("\"always\"")), (Scenes::Off, Scenes::Auto, Scenes::Always));
+        assert!(serde_json::from_str::<Scenes>("\"sometimes\"").is_err());
+        assert_eq!(serde_json::to_string(&Scenes::Auto).unwrap(), "\"auto\"");
+    }
     use crate::probe::AudioInfo;
 
     fn info(audio: &[(&str, u32, f64)]) -> MediaInfo {

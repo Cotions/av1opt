@@ -136,7 +136,9 @@ impl Tools {
     pub fn new(ffmpeg: String, ffprobe: String, memory_limit: Option<String>) -> Self {
         let prefix = match memory_limit {
             Some(limit) if systemd_scope_works() => [
-                "systemd-run", "--user", "--scope", "-q", "-p", &format!("MemoryMax={limit}"), "-p", "MemorySwapMax=0",
+                // --collect: an ffmpeg killed before systemd had put it in its scope (a cancel
+                // at the wrong moment) leaves a failed unit, which would otherwise stay listed.
+                "systemd-run", "--user", "--scope", "--collect", "-q", "-p", &format!("MemoryMax={limit}"), "-p", "MemorySwapMax=0",
             ]
             .map(String::from)
             .to_vec(),

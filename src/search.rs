@@ -362,11 +362,13 @@ pub struct Lab<'a> {
     samples: Vec<Sample>,
     vmaf_threads: usize,
     cache: TrialCache,
+    /// CRFs (in quarter steps) of the trials a search has listed.
+    shown: std::collections::HashSet<u32>,
 }
 
 impl<'a> Lab<'a> {
     pub fn new(tools: &'a Tools, input: &'a Path, info: &'a MediaInfo, tmp: &'a Path, positions: Vec<(f64, f64)>, vmaf_threads: usize, cache: TrialCache) -> Self {
-        Lab { tools, info, input, tmp, positions, samples: Vec::new(), vmaf_threads, cache }
+        Lab { tools, info, input, tmp, positions, samples: Vec::new(), vmaf_threads, cache, shown: Default::default() }
     }
 
     /// The trial at `crf`, and whether it was known from an earlier run.
@@ -399,6 +401,19 @@ pub struct SearchParams {
     /// Give up once the answer is known to come out larger than this share of the source
     /// video (None: search to the end whatever the size).
     pub max_size_ratio: Option<f64>,
+    /// VMAF the worst sample has to reach as well (None: only the mean counts).
+    pub worst_sample: Option<f64>,
+}
+
+impl SearchParams {
+    /// What a trial is worth to the search: its mean, lowered by what its worst sample
+    /// lacks. It reaches the target when the mean does and the worst sample its own mark.
+    pub fn score(&self, t: &Trial) -> f64 {
+        match self.worst_sample {
+            Some(floor) => t.mean_vmaf.min(t.min_vmaf + (self.target_vmaf - floor)),
+            None => t.mean_vmaf,
+        }
+    }
 }
 
 /// What the CRF search concluded.
@@ -623,7 +638,12 @@ pub fn find_crossing(
 /// Runs [`find_crossing`] with real sample encodes. Returns the outcome and all trials.
 pub fn search(lab: &mut Lab, enc: &EncodeSettings, p: &SearchParams) -> Result<(Outcome, Vec<Trial>)> {
     let tools = lab.tools;
-    let show = |t: &Trial, known: bool| {
+    // A second search of the same video (see `SearchParams::worst_sample`) does not list
+    // the first one's trials again.
+    let show = |t: &Trial, known: bool, shown: &mut std::collections::HashSet<u32>| {
+        if !shown.insert(quarters(t.crf)) {
+            return;
+        }
         eprintln!(
             "  crf {:2}: VMAF {:.2} (worst sample {:.2}), size ~{:.0}% of source{}",
             t.crf, t.mean_vmaf, t.min_vmaf, t.size_ratio * 100.0, if known { " (measured earlier)" } else { "" }
@@ -633,37 +653,37 @@ pub fn search(lab: &mut Lab, enc: &EncodeSettings, p: &SearchParams) -> Result<(
     // A trial that misses the target while already too large settles the matter, unless a
     // higher CRF is known to pass: then its miss was noise.
     let too_large = |t: &Trial, all: &BTreeMap<u8, Trial>| {
-        t.mean_vmaf < p.target_vmaf
+        p.score(t) < p.target_vmaf
             && p.max_size_ratio.is_some_and(|max| t.size_ratio > max)
-            && !all.values().any(|u| u.crf > t.crf && u.mean_vmaf >= p.target_vmaf)
+            && !all.values().any(|u| u.crf > t.crf && p.score(u) >= p.target_vmaf)
     };
     // Trials from earlier runs count as if they had just been measured.
     let mut trials: BTreeMap<u8, Trial> = BTreeMap::new();
     for t in lab.cache.whole(enc) {
         let crf = t.crf as u8;
         if (p.min_crf..=p.max_crf).contains(&crf) {
-            show(&t, true);
+            show(&t, true, &mut lab.shown);
             trials.insert(crf, t);
         }
     }
-    let known: Vec<(u8, f64)> = trials.iter().map(|(c, t)| (*c, t.mean_vmaf)).collect();
+    let known: Vec<(u8, f64)> = trials.iter().map(|(c, t)| (*c, p.score(t))).collect();
     let found = match trials.values().find(|t| too_large(t, &trials)) {
         Some(_) => Err(TooLarge.into()),
         None => find_crossing(&known, p.start_crf, p.min_crf, p.max_crf, p.target_vmaf, |crf| {
             let (t, known) = lab.trial(enc, crf as f64)?;
-            show(&t, known);
+            show(&t, known, &mut lab.shown);
             trials.insert(crf, t);
             if too_large(&t, &trials) {
                 return Err(TooLarge.into());
             }
-            Ok(t.mean_vmaf)
+            Ok(p.score(&t))
         }),
     };
     let outcome = match found {
         Ok((Some(c), _)) => Outcome::Found(expected(&trials[&c.from.0], &trials[&c.from.1], c.crf)),
         Ok((None, _)) => Outcome::OutOfReach,
         // The trial that ended the search is the lowest failing one so far or below it.
-        Err(e) if e.is::<TooLarge>() => match trials.values().filter(|t| t.mean_vmaf < p.target_vmaf).min_by(|a, b| a.crf.total_cmp(&b.crf)) {
+        Err(e) if e.is::<TooLarge>() => match trials.values().filter(|t| p.score(t) < p.target_vmaf).min_by(|a, b| a.crf.total_cmp(&b.crf)) {
             Some(t) => Outcome::TooLarge(*t),
             None => return Err(e),
         },
@@ -1043,6 +1063,21 @@ mod tests {
         let mean = counts.iter().sum::<usize>() as f64 / counts.len() as f64;
         eprintln!("trials: {mean:.2} ({} cases), at most {}", counts.len(), counts.iter().max().unwrap());
         assert!(mean <= 3.2 && counts.iter().all(|n| *n <= 5));
+    }
+
+    #[test]
+    fn the_worst_sample_can_hold_the_crf_down() {
+        // Mean 93 at CRF 40; the worst sample is 7 below the mean there and gains 0.9 a step.
+        let trial = |crf: u8| Trial { crf: crf as f64, mean_vmaf: 93.0 + (40.0 - crf as f64) * 0.45, min_vmaf: 86.0 + (40.0 - crf as f64) * 0.9, size_ratio: 0.1 };
+        let p = |worst_sample| SearchParams { target_vmaf: 93.0, min_crf: 20, max_crf: 55, start_crf: 41, max_size_ratio: None, worst_sample };
+        let find = |p: &SearchParams| find_crossing(&[], p.start_crf, p.min_crf, p.max_crf, p.target_vmaf, |c| Ok(p.score(&trial(c)))).unwrap().0.unwrap().crf;
+        assert_eq!(find(&p(None)), 40.0);
+        // 89 for the worst sample is reached at CRF 36.67: a quarter step on the safe side.
+        assert_eq!(find(&p(Some(89.0))), 36.5);
+        // A mark the worst sample already meets changes nothing.
+        assert_eq!(find(&p(Some(86.0))), 40.0);
+        assert_eq!(p(Some(89.0)).score(&trial(40)), 90.0);
+        assert_eq!(p(Some(89.0)).score(&trial(30)), 97.5);
     }
 
     #[test]

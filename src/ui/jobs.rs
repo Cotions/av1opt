@@ -29,7 +29,7 @@ pub struct JobOptions {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tuned: bool,
     #[serde(default)]
-    pub scenes: bool,
+    pub scenes: crate::encode::Scenes,
     #[serde(default = "d_workers")]
     pub workers: u8,
     #[serde(default = "d_savings")]
@@ -781,7 +781,7 @@ fn run_job(app: &Arc<App>, id: u64, opts: Result<Options>, retry: bool, out_dir:
         };
         sink_app.broadcast(json!({ "kind": "job", "id": id, "file": file, "event": e }));
     }));
-    let mut tools = app.tools(if opts.scenes { workers } else { 1 });
+    let mut tools = app.tools(if opts.scenes.possible() { workers } else { 1 });
     tools.hooks = Some(hooks.clone());
     // A hold that arrived since the worker looked. One that arrives after this is put into
     // effect through the job's hooks, which exist from here on.

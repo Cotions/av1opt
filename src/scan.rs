@@ -32,6 +32,9 @@ pub struct FileResult {
     pub path: PathBuf,
     pub root: PathBuf,
     pub size: u64,
+    /// Modification time (seconds since 1970), with `size` the key of the caches.
+    #[serde(skip)]
+    pub mtime: u64,
     pub info: Option<MediaInfo>,
     pub error: Option<String>,
     pub verdict: Verdict,
@@ -120,7 +123,7 @@ pub fn collect(
                     Some(i) => estimate::judge(i, *size, min_savings, model),
                     None => (Verdict::Unreadable, SizeRange { low: *size as f64, likely: *size as f64, high: *size as f64 }),
                 };
-                FileResult { path: path.clone(), root: root.clone(), size: *size, info: entry.info, error: entry.error, verdict, estimate }
+                FileResult { path: path.clone(), root: root.clone(), size: *size, mtime: *mtime, info: entry.info, error: entry.error, verdict, estimate }
             })
             .collect()
     });

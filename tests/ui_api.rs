@@ -373,3 +373,55 @@ fn metadata_presets_and_options() {
     assert_eq!(r.status, 400);
     assert!(r.body.contains("not a video"), "{}", r.body);
 }
+
+#[test]
+fn duplicate_search_runs_and_guards_its_files() {
+    let s = Server::start("dups", |d| {
+        std::fs::write(d.join("videos/a.mkv"), b"not really a video").unwrap();
+        std::fs::write(d.join("videos/b.mp4"), b"not really a video").unwrap();
+        std::fs::write(d.join("videos/notes.txt"), b"x").unwrap();
+    });
+    let videos = s.dir.join("videos");
+    assert!(s.get("/api/dups").json()["runs"].as_array().unwrap().is_empty());
+
+    // Bad requests.
+    assert_eq!(s.post("/api/dups", &json!({ "paths": [] })).status, 400);
+    assert_eq!(s.post("/api/dups", &json!({ "paths": [videos], "tolerance": 21 })).status, 400);
+    assert_eq!(s.post("/api/dups", &json!({ "paths": [s.dir.join("nowhere")] })).status, 400);
+    assert_eq!(s.get("/api/dups/1").status, 404);
+
+    let r = s.post("/api/dups", &json!({ "paths": [videos], "prefer": [videos], "avoid": [" old ", ""] }));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let id = r.json()["id"].as_u64().unwrap();
+    let t = Instant::now();
+    let run = loop {
+        let run = s.get(&format!("/api/dups/{id}")).json();
+        if run["status"] != "running" {
+            break run;
+        }
+        assert!(t.elapsed() < Duration::from_secs(20), "still running: {run}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // `false` is no ffprobe: both videos are listed as unreadable, the text file is not a video.
+    assert_eq!(run["status"], "done", "{run}");
+    assert_eq!(run["report"]["unreadable"].as_array().unwrap().len(), 2, "{run}");
+    assert_eq!(run["report"]["stats"]["videos"], 2, "{run}");
+    assert_eq!(run["report"]["stats"]["compared"], 0, "{run}");
+    assert!(run["report"]["groups"].as_array().unwrap().is_empty());
+    let runs = s.get("/api/dups").json();
+    assert_eq!(runs["runs"][0]["id"], id);
+    assert!(runs["runs"][0].get("report").is_none(), "the list carries no results");
+    assert_eq!(s.post(&format!("/api/dups/{id}/cancel"), &json!({})).status, 200);
+
+    // The folders are remembered for the next visit, with blank avoid entries dropped.
+    let st: Value = serde_json::from_slice(&std::fs::read(s.data("ui.json")).unwrap()).unwrap();
+    assert_eq!(st["dup_paths"][0], json!(videos));
+    assert_eq!(st["dup_avoid"], json!(["old"]));
+
+    // Thumbnails and pairs are only for files of a result; these two weren't in any group.
+    let a = s.dir.join("videos/a.mkv");
+    assert_eq!(s.get("/thumb?path=/etc/passwd&t=1").status, 404);
+    assert_eq!(s.get(&format!("/thumb?path={}&t=1", a.display())).status, 404);
+    assert_eq!(s.get("/thumb").status, 400);
+    assert_eq!(s.post("/api/dups/pair", &json!({ "left": a, "right": "/etc/passwd" })).status, 400);
+}

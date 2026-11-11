@@ -1,4 +1,5 @@
 mod batch;
+mod dups;
 mod encode;
 mod estimate;
 mod events;
@@ -53,6 +54,49 @@ enum Cmd {
         /// VMAF target the estimates assume (past encodes for nearby targets calibrate them).
         #[arg(long, default_value_t = 93.0)]
         target_vmaf: f64,
+    },
+    /// Find videos that show the same thing: the same video at another resolution, bitrate,
+    /// codec or container, and copies cut at the start or the end. Read-only: decodes a few
+    /// frames of every video (cached) and lists the groups with the copy worth keeping first.
+    Dups {
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// Videos read at once. Keep low on slow or FUSE-mounted drives.
+        #[arg(short, long, default_value_t = 6)]
+        jobs: usize,
+        /// Between equally good copies, keep the one under this folder. Repeatable; first wins.
+        #[arg(long, value_name = "DIR")]
+        prefer: Vec<PathBuf>,
+        /// Never suggest keeping a copy whose path contains this text (e.g. trash) if another
+        /// copy exists. Repeatable; upper and lower case count as the same.
+        #[arg(long, value_name = "TEXT")]
+        avoid: Vec<String>,
+        /// How different two frames may be and still count as the same picture (0-20 of 63 bits).
+        /// Lower finds fewer, surer matches.
+        #[arg(long, default_value_t = dups::DEFAULT_MAX_DIST, value_parser = clap::value_parser!(u32).range(0..=20))]
+        tolerance: u32,
+        /// Fingerprint every video again instead of using the cache.
+        #[arg(long)]
+        refresh: bool,
+        /// Number of groups to list.
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+        /// Write one row per file of every group to this CSV.
+        #[arg(long)]
+        csv: Option<PathBuf>,
+        /// Write the full result to this JSON file.
+        #[arg(long)]
+        json: Option<PathBuf>,
+        #[arg(long, env = "AV1OPT_FFMPEG", default_value = "ffmpeg")]
+        ffmpeg: String,
+        #[arg(long, env = "AV1OPT_FFPROBE", default_value = "ffprobe")]
+        ffprobe: String,
+        /// Memory cap shared by the ffmpeg runs, as for `encode`.
+        #[arg(long, default_value = "auto")]
+        memory_limit: String,
+        /// CPU priority (0-19, higher = more polite to the desktop).
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(i32).range(0..=19))]
+        nice: i32,
     },
     /// Re-encode videos to AV1 at a target quality. Inputs are never modified; results go to --out-dir.
     /// Folders are processed recursively and their layout is mirrored. Re-running resumes.
@@ -171,6 +215,38 @@ fn main() -> Result<()> {
             // Absolute roots keep cache keys stable however the folder was typed.
             let paths: Vec<PathBuf> = paths.iter().map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone())).collect();
             scan(&paths, &ffprobe, jobs, min_savings, csv.as_deref(), top, &model)
+        }
+        Cmd::Dups { paths, jobs, prefer, avoid, tolerance, refresh, top, csv, json, ffmpeg, ffprobe, memory_limit, nice } => {
+            let abs = |p: &PathBuf| std::path::absolute(p).unwrap_or_else(|_| p.clone());
+            let paths: Vec<PathBuf> = paths.iter().map(abs).collect();
+            // SAFETY: plain syscall on our own process; children inherit the priority.
+            unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) };
+            let jobs = jobs.clamp(1, 64);
+            let tools = tools::Tools::new(ffmpeg, ffprobe, memory_cap(&memory_limit, jobs as u8));
+            let opts = dups::Options { jobs, max_dist: tolerance, prefs: dups::matching::Prefs { prefer: prefer.iter().map(abs).collect(), avoid }, refresh };
+            let start = std::time::Instant::now();
+            let progress = |p: dups::Progress| match p {
+                dups::Progress::Probing { done: 0, total } => eprintln!("found {total} video files"),
+                dups::Progress::Probing { done, total } if done.is_multiple_of(250) || done == total => eprint!("\rprobed {done}/{total}"),
+                dups::Progress::Fingerprinting { done: 0, total } => eprintln!("\nreading frames of {total} videos (cached ones are instant)"),
+                dups::Progress::Fingerprinting { done, total } if done.is_multiple_of(10) || done == total => {
+                    let el = start.elapsed().as_secs_f64();
+                    eprint!("\rfingerprinted {done}/{total}  ETA {}   ", tools::hms(el / done as f64 * (total - done) as f64));
+                }
+                dups::Progress::Comparing { videos } => eprintln!("\ncomparing {videos} videos"),
+                _ => {}
+            };
+            let report = dups::find(&paths, &tools, &opts, &progress)?;
+            dups::print(&report, top);
+            if let Some(csv) = csv {
+                dups::write_csv(&report, &csv)?;
+                eprintln!("wrote {}", csv.display());
+            }
+            if let Some(json) = json {
+                std::fs::write(&json, serde_json::to_vec_pretty(&report)?)?;
+                eprintln!("wrote {}", json.display());
+            }
+            Ok(())
         }
         Cmd::Encode {
             inputs, out_dir, container, target_vmaf, preset, min_crf, max_crf, samples, sample_secs,

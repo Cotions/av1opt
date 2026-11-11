@@ -762,6 +762,228 @@ function renderScan(out, r) {
   updateSel();
 }
 
+// ----- duplicates -----
+
+let lastDupId = null;
+// Paths ticked for removal. Kept while moving between views; a new search starts empty.
+const dupMarks = new Set();
+const DUP_KIND = { same: ["Same video", "ok"], same_start: ["Same start", "warn"], same_end: ["Same ending", "warn"] };
+
+views.dups = (root) => {
+  const st = (STATE && STATE.settings) || {};
+  const roots = new Set(prefs.get("dupRoots", st.dup_paths && st.dup_paths.length ? st.dup_paths : st.scan_paths || []));
+  let prefer = prefs.get("dupPrefer", st.dup_prefer || []);
+  const chips = h("div", { class: "chips" });
+  const preferChips = h("div", { class: "chips" });
+  const avoid = h("input", { type: "text", class: "grow", value: prefs.get("dupAvoid", (st.dup_avoid || []).join(", ")), placeholder: "e.g. trash, tmp", spellcheck: "false" });
+  const tol = h("input", { type: "number", min: "0", max: "20", value: prefs.get("dupTolerance", 10) });
+  const refresh = h("input", { type: "checkbox" });
+  const start = h("button", { class: "primary" }, "Find duplicates");
+  const cancel = h("button", { hidden: true }, "Stop");
+  const progress = h("div", { class: "bar grow" }, h("div"));
+  const progText = h("span", { class: "dim" });
+  const out = h("div");
+  let runId = null;
+  // For the time-left estimate of the slow step.
+  let fpStart = null;
+
+  const drawChips = () => {
+    chips.replaceChildren(...[...roots].map((r) => h("span", { class: "chip" }, h("code", {}, r), h("button", { title: "Remove", onclick: () => { roots.delete(r); prefs.set("dupRoots", [...roots]); drawChips(); } }, "×"))));
+    if (!roots.size) chips.append(h("span", { class: "dim" }, "No folders yet."));
+    start.disabled = !roots.size || runId != null;
+  };
+  const drawPrefer = () => {
+    preferChips.replaceChildren(...prefer.map((p, i) => h("span", { class: "chip" }, h("span", { class: "dim" }, `${i + 1}.`), h("code", {}, p),
+      h("button", { title: "Remove", onclick: () => { prefer = prefer.filter((x) => x !== p); prefs.set("dupPrefer", prefer); drawPrefer(); } }, "×"))));
+    if (!prefer.length) preferChips.append(h("span", { class: "dim" }, "None: quality alone decides."));
+  };
+  drawChips();
+  drawPrefer();
+
+  const setRunning = (on) => {
+    cancel.hidden = !on;
+    start.disabled = on || !roots.size;
+  };
+  const showProgress = (m) => {
+    const frac = m.total ? m.done / m.total : 0;
+    progress.firstChild.style.width = (m.phase === "comparing" ? 100 : frac * 100) + "%";
+    if (m.phase === "probing") progText.textContent = m.total ? `probing ${m.done} / ${m.total}` : "listing files…";
+    else if (m.phase === "fingerprinting") {
+      if (!fpStart || m.done < fpStart.done) fpStart = { t: performance.now(), done: m.done };
+      const el = (performance.now() - fpStart.t) / 1000, n = m.done - fpStart.done;
+      const eta = n >= 5 && el > 3 ? ` · about ${hms((m.total - m.done) * el / n)} left` : "";
+      progText.textContent = `reading frames ${m.done} / ${m.total}${eta}`;
+    } else progText.textContent = `comparing ${m.total} videos…`;
+  };
+
+  start.onclick = async () => {
+    const avoidList = avoid.value.split(",").map((x) => x.trim()).filter(Boolean);
+    prefs.set("dupAvoid", avoid.value);
+    prefs.set("dupTolerance", Number(tol.value));
+    start.disabled = true;
+    try {
+      const r = await api("/api/dups", { paths: [...roots], prefer, avoid: avoidList, tolerance: Number(tol.value), refresh: refresh.checked });
+      runId = lastDupId = r.id;
+      dupMarks.clear();
+      fpStart = null;
+      refresh.checked = false;
+      progText.textContent = "listing files…";
+      progress.firstChild.style.width = "0%";
+      out.replaceChildren();
+      setRunning(true);
+    } catch (e) { toast(e.message, true); start.disabled = !roots.size; }
+  };
+  cancel.onclick = async () => {
+    if (runId == null) return;
+    cancel.disabled = true;
+    try { await api(`/api/dups/${runId}/cancel`, {}); } catch (e) { toast(e.message, true); }
+    cancel.disabled = false;
+  };
+
+  root.append(
+    h("h1", {}, "Find duplicate videos"),
+    h("div", { class: "panel" },
+      h("div", { class: "row" }, chips, h("span", { class: "spacer" }),
+        h("button", { onclick: async () => { const p = await pick({ title: "Folder to search" }); if (p) { roots.add(p[0]); prefs.set("dupRoots", [...roots]); drawChips(); } } }, "Add folder…")),
+      h("p", { class: "dim" }, "Finds the same video stored more than once: another resolution, bitrate, codec or container, with or without black bars, and copies cut at the start or the end. Read-only: a few frames of every video are decoded and compared; nothing is written to these folders and nothing is deleted. The first search of a big library takes hours; the frames are remembered, so later searches only read new files."),
+      h("details", { class: "more" }, h("summary", {}, "Which copy to keep, and how strict"),
+        h("div", { class: "form-grid" },
+          setting("Prefer copies in", h("div", { class: "row grow" }, preferChips, h("span", { class: "spacer" }),
+            h("button", { class: "small", onclick: async () => { const p = await pick({ title: "Folder to prefer" }); if (p && !prefer.includes(p[0])) { prefer = [...prefer, p[0]]; prefs.set("dupPrefer", prefer); drawPrefer(); } } }, "Add folder…")),
+            "Between equally good copies, the one under the first folder listed is suggested"),
+          setting("Never keep paths with", avoid, "Comma-separated texts; a copy whose path contains one is never the suggestion while another copy exists"),
+          setting("Tolerance", tol, "0–20: how different two frames may be and still count as the same picture. Lower finds fewer, surer matches"),
+          setting("Read again", h("label", { class: "check" }, refresh, "Ignore the remembered frames and read every video again"), null))),
+      h("div", { class: "row" }, progress, progText, cancel, start)),
+    out);
+
+  async function showResult(id) {
+    let r;
+    try { r = await api("/api/dups/" + id); } catch (e) { runId = null; setRunning(false); return; }
+    if (r.status === "running") { runId = id; setRunning(true); showProgress(r); return; }
+    runId = null;
+    setRunning(false);
+    progress.firstChild.style.width = r.status === "done" ? "100%" : "0%";
+    if (r.status === "failed") { progText.textContent = "failed"; out.replaceChildren(h("div", { class: "panel bad" }, r.error)); return; }
+    if (r.status === "cancelled") { progText.textContent = "stopped (frames read so far are remembered)"; out.replaceChildren(); return; }
+    const s = r.report.stats;
+    progText.textContent = `${s.compared} of ${s.videos} videos compared · ${s.fresh} read now, the rest remembered`;
+    renderDups(out, r);
+  }
+
+  const off = onEvent((m) => {
+    if (m.kind === "dups" && m.id === runId) showProgress(m);
+    else if (m.kind === "dups_done" && (m.id === runId || m.id === lastDupId)) showResult(m.id);
+  });
+  (async () => {
+    // After a reload the page has forgotten the run; the server hasn't.
+    if (lastDupId == null) {
+      try { const { runs } = await api("/api/dups"); if (runs.length) lastDupId = runs[runs.length - 1].id; } catch { /* offline */ }
+    }
+    if (lastDupId != null) showResult(lastDupId);
+  })();
+  return off;
+};
+
+// Browsers play some codecs and not others; the comparison player needs its right-hand
+// (master) file playable, so the likelier one goes there.
+function playRank(codec) { return { av1: 0, h264: 1, vp9: 1, vp8: 1, hevc: 3 }[codec] ?? 4; }
+
+function renderDups(out, run) {
+  const rep = run.report, files = rep.files, s = rep.stats;
+  let filter = prefs.get("dupFilter", "same");
+  let limit = 60;
+  const sizeOf = new Map(files.map((f) => [f.path, f.size]));
+  const list = h("div");
+  const markInfo = h("span", { class: "dim" });
+  const marked = () => [...dupMarks].filter((p) => sizeOf.has(p)).sort();
+  const copyBtn = h("button", { onclick: async () => {
+    try { await navigator.clipboard.writeText(marked().join("\n") + "\n"); toast(`Copied ${marked().length} paths`); }
+    catch (e) { toast("Could not copy: " + e.message, true); }
+  } }, "Copy paths");
+  const saveBtn = h("button", { onclick: () => {
+    const url = URL.createObjectURL(new Blob([marked().join("\n") + "\n"], { type: "text/plain" }));
+    const a = h("a", { href: url, download: "av1opt-duplicates.txt" });
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  } }, "Save list…");
+  const clearBtn = h("button", { onclick: () => { dupMarks.clear(); draw(); } }, "Clear marks");
+  const shown = () => rep.groups.filter((g) => filter === "all" || (filter === "same" ? g.kind === "same" : g.kind !== "same"));
+  const updateMarks = () => {
+    const m = marked();
+    markInfo.textContent = m.length ? `${m.length} file${m.length === 1 ? "" : "s"} marked · ${bytes(m.reduce((a, p) => a + sizeOf.get(p), 0))}` : "Nothing marked";
+    copyBtn.disabled = saveBtn.disabled = clearBtn.disabled = !m.length;
+  };
+
+  const card = (g) => {
+    const members = g.members.map((i) => files[i]);
+    const [label, cls] = DUP_KIND[g.kind] || [g.kind, ""];
+    // The same moment in every copy, so the thumbnails can be compared at a glance.
+    const at = Math.min(30, Math.min(...members.map((m) => m.duration_s)) * 0.4);
+    const thumbAt = (m) => (g.kind === "same_end" ? Math.max(0, m.duration_s - at) : at);
+    const spare = g.kind === "same" ? members.slice(1).reduce((a, m) => a + m.size, 0) : 0;
+    const allMarked = h("span", { class: "bad", hidden: true }, "Every copy is marked: nothing would be left");
+    const sync = () => { allMarked.hidden = !members.every((m) => dupMarks.has(m.path)); };
+    const rows = members.map((m, k) => {
+      const row = h("div", { class: "dup-file" + (dupMarks.has(m.path) ? " marked" : "") });
+      const cb = h("input", { type: "checkbox", checked: dupMarks.has(m.path), title: "Mark this file for removal", onchange: () => {
+        if (cb.checked) dupMarks.add(m.path); else dupMarks.delete(m.path);
+        row.classList.toggle("marked", cb.checked); sync(); updateMarks();
+      } });
+      let compare = null;
+      if (k > 0) {
+        const keep = members[0];
+        const [left, right] = playRank(keep.codec) <= playRank(m.codec) ? [m, keep] : [keep, m];
+        compare = h("a", { class: "btn small", href: `#/compare?left=${encodeURIComponent(left.path)}&right=${encodeURIComponent(right.path)}&kind=${g.kind}` }, "Compare");
+      }
+      const img = h("img", { class: "dup-thumb", loading: "lazy", alt: "", src: `/thumb?path=${encodeURIComponent(m.path)}&t=${thumbAt(m).toFixed(2)}` });
+      img.addEventListener("error", () => img.classList.add("missing"));
+      row.append(...[cb, img,
+        h("div", { class: "dup-info" },
+          h("div", { class: "name", title: m.path }, h("span", { class: "dim" }, dirname(m.path) + "/"), basename(m.path)),
+          h("div", { class: "dim" }, `${m.codec} · ${m.width}×${m.height} · ${num(m.video_mbps, 1)} Mbps · ${hms(m.duration_s)} · ${bytes(m.size)}`)),
+        k === 0 ? h("span", { class: "pill ok", title: g.reason }, g.kind === "same" ? "Suggested keep" : "Longer") : null,
+        m.identical != null ? h("span", { class: "pill", title: "Same size and the same bytes at the start, middle and end" }, "Identical bytes") : null,
+        compare].filter(Boolean));
+      return row;
+    });
+    sync();
+    return h("div", { class: "dup-group" },
+      h("div", { class: "head" }, h("span", { class: "pill " + cls }, label), h("span", {}, `${pct(g.score)} of the compared frames match`),
+        g.kind === "same" && g.reason ? h("span", { class: "dim" }, `keep: ${g.reason}`) : null, allMarked,
+        h("span", { class: "spacer" }), spare ? h("span", { class: "ok" }, `frees ${bytes(spare)}`) : null),
+      rows);
+  };
+  const draw = () => {
+    const v = shown();
+    list.replaceChildren(...v.slice(0, limit).map(card));
+    if (v.length > limit) list.append(h("div", { class: "panel dim" }, `${v.length - limit} more groups not shown. `, h("button", { class: "small", onclick: () => { limit += 200; draw(); } }, "Show more")));
+    if (!v.length) list.append(h("div", { class: "panel empty" }, rep.groups.length ? "Nothing in this view." : "No duplicates found."));
+    updateMarks();
+  };
+  const filt = h("select", { onchange: (e) => { filter = e.target.value; prefs.set("dupFilter", filter); limit = 60; draw(); } },
+    h("option", { value: "same" }, `Same video (${s.same_groups})`), h("option", { value: "partial" }, `Same start or ending (${s.partial_groups})`), h("option", { value: "all" }, "All groups"));
+  filt.value = filter;
+  const markSpares = h("button", { title: "Marks every copy except the suggested one, in the groups of the same video", onclick: () => {
+    for (const g of rep.groups) if (g.kind === "same") for (const i of g.members.slice(1)) dupMarks.add(files[i].path);
+    draw();
+  } }, "Mark all spare copies");
+
+  out.replaceChildren(...[
+    h("div", { class: "stats" },
+      h("div", { class: "stat" }, h("div", { class: "v" }, s.same_groups), h("div", { class: "l" }, "videos stored more than once")),
+      h("div", { class: "stat" }, h("div", { class: "v" }, s.spare_files), h("div", { class: "l" }, "spare copies")),
+      h("div", { class: "stat" }, h("div", { class: "v ok" }, bytes(s.spare_bytes)), h("div", { class: "l" }, "freed by removing the spares")),
+      h("div", { class: "stat" }, h("div", { class: "v" }, s.partial_groups), h("div", { class: "l" }, "pairs sharing only a start or an ending"))),
+    h("div", { class: "panel" },
+      h("div", { class: "row" }, filt, markSpares, h("span", { class: "spacer" }), markInfo, clearBtn, copyBtn, saveBtn),
+      h("p", { class: "dim" }, "Tick the files you want gone, then copy or save the list of their paths. av1opt never deletes anything itself. “Same start / ending” pairs have different lengths: one is cut, or two videos share an intro or credits, so look before you tick.")),
+    list,
+    rep.unreadable.length ? h("details", { class: "panel more" }, h("summary", {}, `${rep.unreadable.length} video${rep.unreadable.length === 1 ? "" : "s"} could not be compared`),
+      h("div", { class: "tablewrap" }, h("table", {}, h("tbody", {}, rep.unreadable.slice(0, 500).map((u) => h("tr", {}, h("td", { class: "path" }, u.path), h("td", { class: "dim" }, u.error))))))) : null].filter(Boolean));
+  draw();
+}
+
 // ----- queue -----
 
 const PHASES = { probing: "Probing", sampling: "Cutting samples", searching: "Searching CRF", scenes: "Finding scenes", chunks: "Encoding chunks", encoding: "Encoding", muxing: "Muxing", verifying: "Verifying" };
@@ -1019,15 +1241,23 @@ views.history = (root) => {
 
 views.compare = (root, params) => {
   const reportPath = params.get("report");
-  if (!reportPath) {
-    root.append(h("h1", {}, "Compare"), h("div", { class: "panel empty" }, "Pick an encode in ", h("a", { href: "#/history" }, "History"), " or the ", h("a", { href: "#/queue" }, "Queue"), "."));
+  const left = params.get("left"), right = params.get("right");
+  if (!reportPath && !(left && right)) {
+    root.append(h("h1", {}, "Compare"), h("div", { class: "panel empty" }, "Pick an encode in ", h("a", { href: "#/history" }, "History"), " or the ", h("a", { href: "#/queue" }, "Queue"), ", or two copies in ", h("a", { href: "#/dups" }, "Duplicates"), "."));
     return;
   }
-  const wrap = h("div", { class: "empty" }, h("span", { class: "spin" }), " loading report…");
+  const wrap = h("div", { class: "empty" }, h("span", { class: "spin" }), reportPath ? " loading report…" : " loading…");
   root.append(wrap);
   let destroy = () => {};
   let closed = false;
-  api("/api/report?path=" + encodeURIComponent(reportPath))
+  // Two copies from a duplicate search stand in for source (left) and output (right).
+  const load = reportPath ? api("/api/report?path=" + encodeURIComponent(reportPath)) : api("/api/dups/pair", { left, right }).then((r) => {
+    // Copies that share only their ending line up from the end.
+    const dl = (r.input_info || {}).duration_s, dr = (r.output_info || {}).duration_s;
+    if (params.get("kind") === "same_end" && dl && dr) r.shift = dl - dr;
+    return r;
+  });
+  load
     .then((r) => { if (closed) return; wrap.remove(); destroy = comparePlayer(root, r); })
     .catch((e) => { wrap.className = "panel bad"; wrap.textContent = e.message; });
   return () => { closed = true; destroy(); };
@@ -1051,7 +1281,10 @@ function comparePlayer(root, r) {
   let offset = 0, segEnd = Infinity, srcOff = 0, srcMode = "direct";
   // Extra source shift in seconds, found by auto-align or set by hand: variable-frame-rate
   // sources are retimed by the encode, so frame k of the source isn't always at k/fps.
-  let nudge = 0;
+  let nudge = r.shift || 0;
+  // What the two sides are called: source and AV1 output of an encode, or two copies.
+  const leftName = r.pair ? "Left" : "Source";
+  const desc = (i) => `${i.codec || "?"} ${i.width || "?"}×${i.height || "?"}`;
   // Outputs with sections removed: output time t shows source time toSrc(t).
   const removed = r.removed || [];
   const keep = removed.length && ii.duration_s ? keptParts(removed, ii.duration_s) : null;
@@ -1062,8 +1295,8 @@ function comparePlayer(root, r) {
   const layerS = h("div", { class: "layer" }, vs);
   const layerO = h("div", { class: "layer" }, vo);
   const divider = h("div", { class: "divider" });
-  const tagL = h("div", { class: "tag l" }, `Source · ${ii.codec || "?"} · ${bytes(r.source_bytes)}`);
-  const tagR = h("div", { class: "tag r" }, `AV1 · ${bytes(r.output_bytes)} (−${pct(r.savings)})`);
+  const tagL = h("div", { class: "tag l" }, r.pair ? `Left · ${desc(ii)} · ${bytes(r.source_bytes)}` : `Source · ${ii.codec || "?"} · ${bytes(r.source_bytes)}`);
+  const tagR = h("div", { class: "tag r" }, r.pair ? `Right · ${desc(oi)} · ${bytes(r.output_bytes)}` : `AV1 · ${bytes(r.output_bytes)} (−${pct(r.savings)})`);
   const overlay = h("div", { class: "overlay", hidden: true });
   const stage = h("div", { class: "stage" }, layerS, layerO, divider, tagL, tagR, overlay);
   if (oi.width && oi.height) stage.style.aspectRatio = `${oi.width} / ${oi.height}`;
@@ -1112,7 +1345,7 @@ function comparePlayer(root, r) {
   const mute = h("button", { onclick: () => { vo.muted = !vo.muted; mute.textContent = vo.muted ? "Unmute" : "Mute"; } }, "Mute");
   const step = (n) => { vo.pause(); seekTo(vo.currentTime + n / fps); };
   const srcStatus = h("span", { class: "dim" });
-  const previewBtn = h("button", { class: "small", onclick: () => makePreview(vo.currentTime) }, "Preview source from here");
+  const previewBtn = h("button", { class: "small", onclick: () => makePreview(vo.currentTime) }, `Preview ${leftName.toLowerCase()} from here`);
   const alignEl = h("span", { class: "mono" }, "0 frames");
   function setNudge(v, how) {
     nudge = v;
@@ -1120,6 +1353,7 @@ function comparePlayer(root, r) {
     alignEl.textContent = `${k > 0 ? "+" : ""}${k} frame${Math.abs(k) === 1 ? "" : "s"}${how ? " (" + how + ")" : ""}`;
     vs.currentTime = srcTime(vo.currentTime);
   }
+  if (nudge) setNudge(nudge, "from the lengths");
   // Picks the source shift (−3..+3 frames) whose picture differs least from the output at a
   // few paused positions. Ties keep the current shift, so static scenes change nothing.
   const seekWait = (v, t) => new Promise((res) => {
@@ -1184,11 +1418,13 @@ function comparePlayer(root, r) {
   const lo = Math.floor(Math.min(...vs_, target - 2) - 0.5), hi = Math.ceil(Math.max(...vs_, target + 2) + 0.5);
   const y = (v) => 92 - (v - lo) / (hi - lo) * 84;
   const x = (t) => (duration ? t / duration * 1000 : 0);
+  // Two copies have no scores to draw: the timeline is just a seek bar.
+  if (r.pair) tl.classList.add("plain");
   // grid
-  for (let v = Math.ceil(lo); v <= hi; v += Math.max(1, Math.round((hi - lo) / 5))) {
+  if (!r.pair) for (let v = Math.ceil(lo); v <= hi; v += Math.max(1, Math.round((hi - lo) / 5))) {
     tl.append(s("line", { x1: 0, x2: 1000, y1: y(v), y2: y(v), stroke: "#2c3136", "stroke-width": 1, "vector-effect": "non-scaling-stroke" }));
   }
-  tl.append(s("line", { x1: 0, x2: 1000, y1: y(target), y2: y(target), stroke: "#8b939b", "stroke-dasharray": "4 4", "stroke-width": 1, "vector-effect": "non-scaling-stroke" }));
+  if (!r.pair) tl.append(s("line", { x1: 0, x2: 1000, y1: y(target), y2: y(target), stroke: "#8b939b", "stroke-dasharray": "4 4", "stroke-width": 1, "vector-effect": "non-scaling-stroke" }));
   for (const c of segs) {
     const rect = s("rect", { x: x(c.start_secs), width: Math.max(0.5, x(c.end) - x(c.start_secs) - 0.6), y: y(c.vmaf), height: Math.max(1, 96 - y(c.vmaf)), fill: vmafColor(c.vmaf, target), opacity: 0.85 });
     rect.dataset.tip = `chunk ${c.index + 1} · ${tc(c.start_secs)}–${tc(c.end)} · CRF ${c.crf}${c.corrected ? " (corrected)" : ""} · VMAF ${num(c.vmaf)} · ${bytes(c.bytes)} · ${num(c.bytes * 8 / (c.end - c.start_secs) / 1e6, 2)} Mbps`;
@@ -1218,7 +1454,7 @@ function comparePlayer(root, r) {
   tl.append(segRect);
   const head = s("line", { x1: 0, x2: 0, y1: 0, y2: 100, stroke: "#fff", "stroke-width": 1.5, "vector-effect": "non-scaling-stroke" });
   tl.append(head);
-  const tlLabel = h("div", { class: "row dim" },
+  const tlLabel = r.pair ? h("div", { class: "row dim" }, "Click the bar to seek.") : h("div", { class: "row dim" },
     h("span", {}, chunks.length ? `Per-chunk VMAF (${chunks.length} chunks, ${lo}–${hi}); dashed line = target ${target}. Click to seek.` : "Whole-file encode: one CRF, no per-chunk scores (use per-scene CRF for a timeline). Dots = verification spot checks."),
     h("span", { class: "spacer" }), h("span", { class: "ok" }, "■ ≥ target"), h("span", { class: "warn" }, "■ within 1"), h("span", { class: "bad" }, "■ below"));
   tl.addEventListener("mousemove", (e) => {
@@ -1237,7 +1473,15 @@ function comparePlayer(root, r) {
 
   // ---- side panel ----
   const kv = (k, v) => [h("div", { class: "k" }, k), h("div", {}, v)];
+  const fileKv = (name, path, i, size) => [
+    kv(name, h("span", { class: "mono", title: path }, basename(path))),
+    kv("", h("span", { class: "dim" }, dirname(path))),
+    kv("", i.codec ? `${desc(i)} · ${num(i.fps, 2)} fps${i.hdr ? " HDR" : ""} · ${hms(i.duration_s)} · ${bytes(size)}` : (i.error || "–"))];
   const side = h("div", {},
+    r.pair ? h("div", { class: "panel" },
+      h("h3", {}, "Copies"),
+      h("div", { class: "kv" }, fileKv("Left", r.input_path, ii, r.source_bytes), fileKv("Right", r.output_path, oi, r.output_bytes)),
+      h("p", { class: "dim" }, "Sound comes from the right-hand file.")) :
     h("div", { class: "panel" },
       h("h3", {}, "Encode"),
       h("div", { class: "kv" },
@@ -1268,7 +1512,7 @@ function comparePlayer(root, r) {
         h("button", { class: "small", onclick: () => autoAlign() }, "Auto")),
       h("p", { class: "dim" }, "Drag on the picture to move the split. Double-click zooms in at that point (4× → back to 1×); shift-click moves the zoom centre. Keys: space play, , and . step frames.")));
 
-  root.append(h("div", { class: "row" }, h("h1", { class: "grow" }, basename(r.input_path)), h("a", { href: "#/history" }, "← History")),
+  root.append(h("div", { class: "row" }, h("h1", { class: "grow" }, basename(r.input_path)), r.pair ? h("a", { href: "#/dups" }, "← Duplicates") : h("a", { href: "#/history" }, "← History")),
     h("div", { class: "cmp-grid" }, h("div", {}, stage, controls, timeline, tlLabel), side));
 
   // ---- sync ----
@@ -1364,8 +1608,8 @@ function comparePlayer(root, r) {
       await tryLoad(vs, p.url);
       offset = start; segEnd = start + p.secs; srcOff = p.start; srcMode = "preview";
       segRect.setAttribute("x", x(offset)); segRect.setAttribute("width", x(segEnd) - x(offset));
-      srcStatus.replaceChildren(h("span", { class: "warn" }, "Source: preview clip "), `${tc(srcOff)}–${tc(srcOff + p.secs)}. The browser can't decode ${ii.codec || "this source"} directly, so this clip is re-encoded near-losslessly (H.264 CRF 12)${ii.hdr ? "; HDR shown without tone mapping" : ""}. Click the timeline outside the shaded part for a new clip.`);
-      tagL.textContent = `Source preview · ${ii.codec || "?"} → H.264 near-lossless`;
+      srcStatus.replaceChildren(h("span", { class: "warn" }, `${leftName}: preview clip `), `${tc(srcOff)}–${tc(srcOff + p.secs)}. The browser can't decode ${ii.codec || "this file"} directly, so this clip is re-encoded near-losslessly (H.264 CRF 12)${ii.hdr ? "; HDR shown without tone mapping" : ""}. Click the timeline outside the shaded part for a new clip.`);
+      tagL.textContent = `${leftName} preview · ${ii.codec || "?"} → H.264 near-lossless`;
       seekTo(offset);
       busy(null);
       await autoAlign();
@@ -1389,19 +1633,19 @@ function comparePlayer(root, r) {
     try {
       await tryLoad(vo, mediaUrl(r.output_path));
     } catch {
-      busy("Your browser can't open this container; copying the AV1 stream into MP4…");
+      busy("Your browser can't open this container; copying the video stream into MP4…");
       try {
         const p = await api("/api/preview", { path: r.output_path, kind: "remux" });
         await tryLoad(vo, p.url);
       } catch (e) {
-        overlay.replaceChildren(h("div", { class: "bad" }, "Cannot play the AV1 output here: " + e.message));
+        overlay.replaceChildren(h("div", { class: "bad" }, (r.pair ? `Cannot play the right-hand file (${oi.codec || "?"}) in this browser: ` : "Cannot play the AV1 output here: ") + e.message));
         return;
       }
     }
     if (ii.error) { busy(null); overlay.hidden = false; overlay.replaceChildren(h("div", { class: "bad" }, ii.error)); return; }
     try {
       await tryLoad(vs, mediaUrl(r.input_path));
-      srcStatus.replaceChildren(h("span", { class: "ok" }, "Source: original file"), " played directly.");
+      srcStatus.replaceChildren(h("span", { class: "ok" }, `${leftName}: original file`), " played directly.");
       previewBtn.hidden = false;
       busy(null);
       autoAlign();

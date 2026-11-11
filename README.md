@@ -3,9 +3,10 @@
 Shrink video libraries by re-encoding to AV1 at a target perceptual quality (VMAF),
 instead of one fixed setting for everything. Built on stock FFmpeg with SVT-AV1 and libvmaf.
 
-Two commands:
+Three commands:
 
 - `scan` — read-only survey of a library: what each file is, what re-encoding would roughly save.
+- `dups` — read-only search for videos that are kept more than once.
 - `encode` — per-file CRF search against a VMAF target, full encode, verification, report.
 
 ## Requirements
@@ -31,6 +32,46 @@ Every successful `encode` appends its source and output bitrates to
 fit of AV1 bits per pixel against source bits per pixel and resolution, pulled toward the
 built-in pilot model while there are few encodes), so estimates and their ranges tighten as
 you encode more.
+
+## dups
+
+```
+av1opt dups /videos /more/videos [--prefer /videos/keep] [--avoid trash] [--csv dups.csv]
+```
+
+Finds videos that show the same thing: the same video at another resolution, bitrate, codec or
+container, inside black bars, and copies with the start or the end cut off. Nothing is moved or
+deleted; the result is a list of groups with the copy worth keeping first.
+
+How it works:
+
+1. **Fingerprint** – a handful of frames are decoded at fixed times counted from the start
+   (1.5 s, 4 s, 10 s, 20 s, 45 s, ... up to half the length) and the same times counted back
+   from the end. Each frame is shrunk to a small grayscale picture, black bars shared by the
+   video's frames are cut away, and a 63-bit perceptual hash is taken. Black and plain frames
+   are left out. Fingerprints are cached in `~/.cache/av1opt/`, so only new or changed files
+   are decoded on later runs (`--refresh` reads everything again).
+2. **Compare** – every video against every other. Two frames are the same picture when their
+   hashes differ in at most `--tolerance` bits (default 10 of 63; re-encodes of one video
+   measure 0-6, unrelated videos 20 and more).
+   - *Same video*: lengths within 2% (or 1.5 s) and at least three quarters of the frames
+     from both ends agree.
+   - *Same start* / *same end*: lengths differ, but the frames counted from that end agree
+     (at least 3 in common, 80% of them matching). The longer file is listed first.
+3. **Suggest** – within a group, the copy to keep is the one that is not under an `--avoid`
+   text, then the longest (for cut copies), the highest resolution, the best bitrate for its
+   codec (AV1 counts double H.264, HEVC and VP9 one and a half), a `--prefer` folder, the bigger
+   file. The reason is printed next to it. Files with the same size and the same bytes at the
+   start, middle and end are marked as identical.
+
+The first run decodes about a dozen frames per video with accurate seeking: a few seconds of
+one core each, so a large library takes hours once (`-j` sets how many are read at once).
+`--csv` writes one row per file of every group, `--json` the full result.
+
+Limits: a clip cut out of the middle of a video, a copy cut at both ends, and cuts of very
+short clips (fewer than three frames in common) are not found. Videos that share a long
+identical intro or credits can show up as *same start* or *same end*; that is why these are
+listed apart and Compare is one click away.
 
 ## encode
 
@@ -147,6 +188,9 @@ av1opt ui [--port 8765] [--no-open] [--memory-limit 12G]
 A local web app in the browser (Chrome or Firefox), built from the same scan and encode code:
 
 - **Scan**: pick folders, see per-file and total savings estimates, select candidates and queue them.
+- **Duplicates**: the `dups` search with progress and a Stop button. Each group shows a frame
+  of every copy, the suggested keep and why; **Compare** opens two copies in the split player.
+  Tick the copies you don't want and copy or save the list of paths: av1opt deletes nothing.
 - **Queue**: encodes run one at a time with live progress: CRF search trials, chosen CRF,
   per-chunk results in scene mode, percent, fps and ETA. Cancel stops ffmpeg at once; finished
   scene chunks are kept, so queueing the same files again resumes. Unfinished jobs are
@@ -221,7 +265,8 @@ a scene-mode file over rather than resuming a work folder of another format.
 
 `AV1OPT_DEBUG=1` prints every ffmpeg command. `--keep-temp` keeps samples and the partial encode.
 `cargo test --features ui` also runs `tests/ui_api.rs`, which starts the real `av1opt ui` and
-checks sign-in, request checks, media access and the job queue over HTTP (no ffmpeg needed).
+checks sign-in, request checks, media access, the job queue and the duplicate search over HTTP
+(no ffmpeg needed).
 
 ## Lessons baked in
 
@@ -240,4 +285,6 @@ checks sign-in, request checks, media access and the job queue over HTTP (no ffm
 ## Tests
 
 `cargo test` covers the CRF search (exactness against brute force, trial count), chunk CRF
-estimation, scene chunk planning, sample placement, frame-rate snapping and source filters.
+estimation, scene chunk planning, sample placement, frame-rate snapping and source filters, plus
+the duplicate finder's hashes (scaling, noise, black bars, flat frames), pair rules and keep
+suggestions.

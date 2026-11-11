@@ -429,7 +429,7 @@ fn known_report(app: &App, p: &Path) -> Result<PathBuf> {
     Ok(c)
 }
 
-fn media_info(app: &App, p: &Path) -> Value {
+pub fn media_info(app: &App, p: &Path) -> Value {
     let size = std::fs::metadata(p).map_or(0, |m| m.len());
     match crate::probe::probe(&app.ffprobe(), p, size) {
         Ok(i) => json!({

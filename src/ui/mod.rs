@@ -1,12 +1,14 @@
-//! `av1opt ui`: a local web app on 127.0.0.1 for scanning, a live encode queue, a before/after
-//! comparison player and the history of past encodes.
+//! `av1opt ui`: a local web app on 127.0.0.1 for scanning, finding duplicates, a live encode
+//! queue, a before/after comparison player and the history of past encodes.
 //!
 //! The page is static files embedded in the binary; it talks to this server only through a JSON
 //! API and one Server-Sent-Events stream, so a desktop wrapper (Electron-style) can load the same
 //! URL later. Every request must carry the session token (as a cookie set on first visit), a
 //! localhost Host header and, if present, a localhost Origin. Media are only served for files the
-//! user picked (scan results, queued encodes, reports in history folders) and previews.
+//! user picked (scan and duplicate results, queued encodes, reports in history folders) and
+//! previews.
 
+mod dups;
 mod http;
 mod jobs;
 mod library;
@@ -49,6 +51,13 @@ pub struct Settings {
     pub out_dir: Option<PathBuf>,
     #[serde(default)]
     pub scan_paths: Vec<PathBuf>,
+    /// Folders, preferred folders and avoided path texts of the last duplicate search.
+    #[serde(default)]
+    pub dup_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub dup_prefer: Vec<PathBuf>,
+    #[serde(default)]
+    pub dup_avoid: Vec<String>,
     /// Chosen in the page; wins over --ffmpeg / AV1OPT_FFMPEG. A desktop launcher has no shell
     /// environment, so this is how the desktop app finds an ffmpeg with libvmaf.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -68,6 +77,7 @@ pub struct App {
     subscribers: Mutex<Vec<Sender<String>>>,
     pub jobs: jobs::Queue,
     pub scans: Mutex<Vec<library::Scan>>,
+    pub dups: Mutex<Vec<dups::Run>>,
     pub preview_dir: PathBuf,
     pub preview_lock: Mutex<()>,
     /// Shared by preview transcodes so shutdown can stop them.
@@ -168,6 +178,7 @@ pub fn run(cfg: Config) -> Result<()> {
         subscribers: Mutex::new(Vec::new()),
         jobs: jobs::Queue::default(),
         scans: Mutex::new(Vec::new()),
+        dups: Mutex::new(Vec::new()),
         preview_dir,
         preview_lock: Mutex::new(()),
         preview_hooks: Arc::new(crate::events::Hooks::new(|_| {})),

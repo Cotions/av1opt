@@ -186,11 +186,17 @@ pub struct Queue {
     unrestored: Mutex<Vec<(Value, String)>>,
 }
 
-/// Stops running encodes and previews so no ffmpeg outlives the server. Interrupted jobs stay
+/// True once the server is stopping: no new work may start.
+pub fn shutting_down(app: &App) -> bool {
+    app.jobs.shutting_down.load(Ordering::SeqCst)
+}
+
+/// Stops running encodes, previews and duplicate searches so no ffmpeg outlives the server. Interrupted jobs stay
 /// in the saved queue and resume on the next start.
 pub fn shutdown(app: &App) {
     app.jobs.shutting_down.store(true, Ordering::SeqCst);
     app.preview_hooks.cancel();
+    super::dups::shutdown(app);
     for j in app.jobs.jobs.lock().unwrap().iter_mut() {
         j.cancel_requested = true;
         if let Some(h) = &j.hooks {

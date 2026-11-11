@@ -175,6 +175,48 @@ impl Tools {
         Ok(stderr)
     }
 
+    /// Runs ffmpeg and returns what it wrote to stdout. A run still going after `timeout` (a
+    /// damaged file, a stalled network drive) is stopped and counts as failed.
+    pub fn run_capture(&self, args: &[String], timeout: std::time::Duration) -> Result<Vec<u8>> {
+        let mut cmd = self.command_for(args);
+        cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = self.spawn(&mut cmd)?;
+        let id = child.id();
+        let (mut stdout, mut stderr) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
+        let out_reader = std::thread::spawn(move || {
+            let mut b = Vec::new();
+            let _ = stdout.read_to_end(&mut b);
+            b
+        });
+        let err_reader = std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = stderr.read_to_string(&mut s);
+            s
+        });
+        let start = Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(st)) => break Some(st),
+                Ok(None) if start.elapsed() < timeout => std::thread::sleep(std::time::Duration::from_millis(5)),
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+            }
+        };
+        if let Some(h) = &self.hooks {
+            h.untrack(id);
+        }
+        let (out, stderr) = (out_reader.join().unwrap_or_default(), err_reader.join().unwrap_or_default());
+        self.check_cancel()?;
+        match status {
+            Some(st) if st.success() => Ok(out),
+            Some(st) => bail!("ffmpeg failed ({st}):\n{}", tail(&stderr, 5)),
+            None => bail!("ffmpeg gave no answer within {} s", timeout.as_secs()),
+        }
+    }
+
     /// Runs a long ffmpeg job, printing percent done, encode fps and ETA on one line.
     /// Returns the number of frames ffmpeg output.
     pub fn run_with_progress(&self, args: &[String], total_secs: f64, label: &str) -> Result<u64> {

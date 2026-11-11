@@ -1,6 +1,6 @@
 //! Request handling: session check, routing, static files, the event stream and media ranges.
 
-use super::{App, err_json, jobs, library};
+use super::{App, dups, err_json, jobs, library};
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -123,6 +123,14 @@ pub fn handle(app: &Arc<App>, mut req: Request) {
             Some((_, p)) => media(app, req, PathBuf::from(p)),
             None => reply(req, 400, "text/plain", "missing path"),
         },
+        (Method::Get, "/thumb") => {
+            let t = param(&q, "t").and_then(|t| t.parse().ok()).unwrap_or(0.0);
+            match param(&q, "path").map(|p| dups::thumb(app, std::path::Path::new(p), t)) {
+                Some(Ok(jpeg)) => reply(req, 200, "image/jpeg", jpeg),
+                Some(Err(e)) => reply(req, 404, "text/plain", format!("{e:#}")),
+                None => reply(req, 400, "text/plain", "missing path"),
+            }
+        }
         (m, p) if p.starts_with("/api/") => {
             let r = api(app, &m, p, &q, &body);
             match r {
@@ -148,6 +156,11 @@ fn api(app: &Arc<App>, m: &Method, path: &str, q: &[(String, String)], body: &Va
         (Method::Get, ["browse"]) => library::browse(param(q, "path"), param(q, "hidden") == Some("1")),
         (Method::Post, ["scans"]) => library::start_scan(app, body),
         (Method::Get, ["scans", id]) => library::scan_result(app, id.parse()?),
+        (Method::Get, ["dups"]) => Ok(dups::list(app)),
+        (Method::Post, ["dups"]) => dups::start(app, body),
+        (Method::Post, ["dups", "pair"]) => dups::pair(app, body),
+        (Method::Get, ["dups", id]) => dups::get(app, id.parse()?),
+        (Method::Post, ["dups", id, "cancel"]) => dups::cancel(app, id.parse()?),
         (Method::Get, ["jobs"]) => Ok(jobs::list(app)),
         (Method::Get, ["jobs", "heads"]) => Ok(jobs::heads(app)),
         (Method::Post, ["jobs", "unrestored", "retry"]) => jobs::unrestored_action(app, true),

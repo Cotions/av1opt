@@ -135,19 +135,47 @@ pub fn print(results: &[FileResult], top: usize, time: &TimeModel, by: TopBy) {
     let what = if by == TopBy::PerHour { "estimated savings per hour of encoding" } else { "estimated savings" };
     println!("\n== Top {top} candidates by {what} ==");
     for r in cands.iter().take(top) {
-        let i = r.info.as_ref().unwrap();
-        println!(
-            "{:>9} -> ~{:>9}  {:>8}  {:>11}  {:5} {:>4}x{:<4} {:>5.1} Mbps  {}",
-            gb(r.size as f64),
-            gb(r.estimate.likely),
-            span(secs_of(r)),
-            format!("{}/h", gb(rate_of(r) * 3600.0)),
-            i.codec,
-            i.width,
-            i.height,
-            i.video_bitrate / 1e6,
-            r.path.display()
-        );
+        line(r, time);
+    }
+}
+
+/// One candidate: size now and after, time to encode, saving per hour, what it is.
+fn line(r: &FileResult, time: &TimeModel) {
+    let Some(i) = r.info.as_ref() else { return };
+    let secs = time.secs(i);
+    let rate = if secs > 0.0 { (r.size as f64 - r.estimate.likely) / secs } else { 0.0 };
+    println!(
+        "{:>9} -> ~{:>9}  {:>8}  {:>11}  {:5} {:>4}x{:<4} {:>5.1} Mbps  {}",
+        gb(r.size as f64),
+        gb(r.estimate.likely),
+        span(secs),
+        format!("{}/h", gb(rate * 3600.0)),
+        i.codec,
+        i.width,
+        i.height,
+        i.video_bitrate / 1e6,
+        r.path.display()
+    );
+}
+
+/// The candidates picked for a number of hours of encoding (`scan --hours`).
+pub fn print_pick(picked: &[&FileResult], hours: f64, results: &[FileResult], time: &TimeModel) {
+    println!("\n== Most saved in {} of encoding ==", span(hours * 3600.0));
+    let secs_of = |r: &FileResult| r.info.as_ref().map_or(0.0, |i| time.secs(i));
+    if picked.is_empty() {
+        let shortest = results.iter().filter(|r| r.verdict == Verdict::Candidate).map(secs_of).filter(|s| *s > 0.0).fold(f64::INFINITY, f64::min);
+        match shortest.is_finite() {
+            true => println!("no candidate fits: the shortest takes about {}", span(shortest)),
+            false => println!("no candidates"),
+        }
+        return;
+    }
+    let secs: f64 = picked.iter().map(|r| secs_of(r)).sum();
+    let saved: f64 = picked.iter().map(|r| r.size as f64 - r.estimate.likely).sum();
+    let videos = if picked.len() == 1 { "video" } else { "videos" };
+    println!("{} {videos}, about {} to encode, estimated savings {}", picked.len(), span(secs), gb(saved));
+    for r in picked {
+        line(r, time);
     }
 }
 

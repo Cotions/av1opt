@@ -283,3 +283,4 @@ td .pill:first-child { margin-left: 0; }
 .watch code.path { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; }
 .watch .sub { margin-top: 4px; font-size: 12px; }
 .watch .sub span[title] { border-bottom: 1px dotted var(--line); cursor: help; }
+.unit.pick input { width: 64px; }

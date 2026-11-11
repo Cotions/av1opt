@@ -156,6 +156,7 @@ fn api(app: &Arc<App>, m: &Method, path: &str, q: &[(String, String)], body: &Va
         (Method::Get, ["browse"]) => library::browse(param(q, "path"), param(q, "hidden") == Some("1")),
         (Method::Post, ["scans"]) => library::start_scan(app, body),
         (Method::Get, ["scans", id]) => library::scan_result(app, id.parse()?),
+        (Method::Post, ["scans", id, "pick"]) => library::scan_pick(app, id.parse()?, body),
         (Method::Get, ["dups"]) => Ok(dups::list(app)),
         (Method::Post, ["dups"]) => dups::start(app, body),
         (Method::Post, ["dups", "pair"]) => dups::pair(app, body),

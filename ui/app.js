@@ -776,6 +776,34 @@ function renderScan(out, r) {
     selInfo.textContent = sel.length ? `${sel.length} selected · ${bytes(sel.reduce((a, x) => a + savedOf(x), 0))} est. saved${secs ? " · about " + span(secs) + " to encode" : ""}` : "";
     encodeBtn.disabled = !selected.size;
   };
+  // "What is worth encoding tonight": the candidates that save the most in so many hours.
+  const hoursIn = h("input", { type: "number", min: "0.5", max: "999", step: "0.5", value: prefs.get("pickHours", 8), title: "Hours of encoding to fill" });
+  const pickBtn = h("button", { title: "Selects the candidates that save the most together in this many hours of encoding. Not simply the best per hour first: a long video can leave a gap that shorter ones fill better", onclick: async () => {
+    const hours = Number(hoursIn.value);
+    if (!(hours > 0)) { toast("Give a number of hours", true); return; }
+    pickBtn.disabled = true;
+    try {
+      const p = await api(`/api/scans/${r.id}/pick`, { hours });
+      prefs.set("pickHours", hours);
+      if (!p.paths.length) { toast("No candidate can be encoded in that time", true); return; }
+      selected.clear();
+      for (const x of p.paths) selected.add(x);
+      // Shown the way they will be queued: best value first.
+      filter = "candidate"; filt.value = filter; sortKey = "rate"; sortDir = -1;
+      draw(); updateSel();
+      toast(`${plural(p.paths.length, "video")} picked: about ${span(p.secs)} to encode, ${bytes(p.saved)} est. saved`);
+    } catch (e) { toast(e.message, true); } finally { pickBtn.disabled = false; }
+  } }, "Pick");
+  // With encoding hours set, a night is as long as they are.
+  if (prefs.get("pickHours", null) == null) {
+    api("/api/jobs/heads").then(({ queue }) => {
+      const sch = queue && queue.schedule;
+      if (!sch || !sch.on) return;
+      const mins = (t) => { const [a, b] = String(t).split(":").map(Number); return a * 60 + b; };
+      const len = ((mins(sch.to) - mins(sch.from) + 1440) % 1440) / 60;
+      if (len > 0) hoursIn.value = Math.round(len * 2) / 2;
+    }).catch(() => {});
+  }
   let limit = 500; // more rows make every sort and filter click slow
   const draw = () => {
     const v = shown();
@@ -815,7 +843,8 @@ function renderScan(out, r) {
       h("div", { class: "stat" }, h("div", { class: "v" }, pct(t.bytes ? t.saved_likely / t.bytes : 0)), h("div", { class: "l" }, "of the whole library")),
       h("div", { class: "stat", title: timeBasis }, h("div", { class: "v" }, t.encode_secs ? "≈ " + span(t.encode_secs) : "–"), h("div", { class: "l" }, `to encode the candidates${r.time_samples ? "" : " (rough guess)"}`))),
     h("div", { class: "panel" },
-      h("div", { class: "row" }, filt, selInfo, h("span", { class: "spacer" }), encodeBtn),
+      h("div", { class: "row" }, filt, selInfo, h("span", { class: "spacer" }),
+        t.candidates ? h("span", { class: "unit pick" }, "Most saved in", hoursIn, "h", pickBtn) : null, encodeBtn),
       h("div", { class: "tablewrap" }, h("table", {},
         h("thead", {}, h("tr", {}, h("th", {}, allBox), th("File", "name"), h("th", {}, "Codec"), h("th", { class: "num" }, "Size px"), th("Length", "dur", "num"), th("Mbps", "mbps", "num"), th("Size", "size", "num"), h("th", { class: "num" }, "AV1 est."), th("Saves", "saved", "num"), th("Time", "time", "num", timeBasis), th("Per hour", "rate", "num", "Estimated saving per hour of encoding: sort by this to start where the time pays most"), h("th", {}, "Verdict"))),
         body))));

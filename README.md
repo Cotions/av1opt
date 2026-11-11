@@ -43,6 +43,13 @@ is seconds per frame by frame size: a guess from one six-core machine at first, 
 the encode times in the history, so it becomes this machine's speed after a few encodes.
 The CSV has it as `est_encode_secs`.
 
+`--hours 8` adds the candidates that save the most together in eight hours of encoding, and
+`--list tonight.txt` writes their paths, one per line
+(`xargs -d '\n' -a tonight.txt av1opt encode -o /out`). This is not the per-hour order cut
+off at eight hours: a long video with the best rate can leave a gap that two shorter ones
+would have filled, so every way of filling the time is tried (a knapsack over the time cut
+in up to 10,000 slots; lengths are rounded up, so the choice never runs over).
+
 ## dups
 
 ```
@@ -331,6 +338,9 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
 - **Scan**: pick folders, see per-file and total savings estimates, select candidates and queue them.
   **Time** is the estimated search and encode time of a file and **Per hour** its saving per
   hour of encoding (click to sort); the selection line adds up both for the ticked files.
+  **Most saved in N h → Pick** ticks the candidates that save the most together in that many
+  hours of encoding (`scan --hours`); it starts at the length of the encoding hours when
+  those are set.
 - **Duplicates**: the `dups` search with progress and a Stop button. Each group shows a frame
   of every copy, the suggested keep and why; **Compare** opens two copies in the split player.
   Tick the copies you don't want, then **Move to trash** (after a confirmation), or copy or save
@@ -539,7 +549,7 @@ collisions, a scene-mode run killed half-way and resumed, an encode stopped half
 left behind, no ffmpeg left running, trials remembered), `--scenes=auto` on an even and an
 uneven video and the lower CRF an uneven one gets without it, `replace` with `--undo` on a
 real output, `scan` on a folder with a candidate, an AV1 file and a broken one (nothing in
-the folder touched), `dups` on a smaller copy, a byte-identical copy and two cut copies, and
+the folder touched) and its `--hours` pick, `dups` on a smaller copy, a byte-identical copy and two cut copies, and
 `bench` with its remembered sample encodes and `--save` feeding `encode --tuned`. With `--features ui` it also drives a real server: a paused queue (ffmpeg
 stopped in place, the wait left out of the timings), cancelling a running and a held job,
 queueing it again, closing the app in the middle of an encode and going on after the next
@@ -555,7 +565,8 @@ or shrunk, chunk CRF
 estimation, scene chunk planning, sample placement, frame-rate snapping and source filters, plus
 the duplicate finder's hashes (scaling, noise, black bars, flat frames), pair rules and keep
 suggestions, and the benchmark's arithmetic (size and time at the target, comparison across
-videos, picks, spreading the test videos), and `replace`: the round trip with `--undo`, an
+videos, picks, spreading the test videos), the pick for a number of hours (against trying
+every subset, and on 30,000 videos), what a watched folder makes of the videos it finds, and `replace`: the round trip with `--undo`, an
 output with the original's own extension, an output on another drive, every refusal (and that a
 refusal moves nothing), a trash that fails, a name taken at the last moment, two runs on one
 report at once.

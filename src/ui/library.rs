@@ -277,6 +277,17 @@ pub fn start_scan(app: &Arc<App>, body: &Value) -> Result<Value> {
     Ok(json!({ "id": id }))
 }
 
+/// The candidates of a scan that save the most in `hours` of encoding, best value first.
+pub fn scan_pick(app: &App, id: u64, body: &Value) -> Result<Value> {
+    let hours = body["hours"].as_f64().filter(|h| *h > 0.0 && *h <= 10_000.0).context("hours: a number above 0")?;
+    let scans = app.scans.lock().unwrap();
+    let s = scans.iter().find(|s| s.id == id).ok_or_else(|| anyhow!("not found: scan {id}"))?;
+    let picked = scan::pick_for_time(&s.results, &s.time, hours * 3600.0);
+    let secs: f64 = picked.iter().filter_map(|r| r.info.as_ref()).map(|i| s.time.secs(i)).sum();
+    let saved: f64 = picked.iter().map(|r| r.size as f64 - r.estimate.likely).sum();
+    Ok(json!({ "paths": picked.iter().map(|r| &r.path).collect::<Vec<_>>(), "secs": secs, "saved": saved }))
+}
+
 pub fn scan_result(app: &App, id: u64) -> Result<Value> {
     let scans = app.scans.lock().unwrap();
     let s = scans.iter().find(|s| s.id == id).ok_or_else(|| anyhow!("not found: scan {id}"))?;

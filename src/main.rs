@@ -64,6 +64,14 @@ enum Cmd {
         /// Order of the list of top candidates: most saved, or most saved per hour of encoding.
         #[arg(long, value_enum, default_value_t)]
         sort: report::TopBy,
+        /// Also list the candidates that save the most in this many hours of encoding
+        /// (for a night's worth: --hours 8).
+        #[arg(long, value_name = "HOURS", value_parser = positive_hours)]
+        hours: Option<f64>,
+        /// Write the paths picked by --hours to this file, one per line, best value first
+        /// (then: xargs -d '\n' -a FILE av1opt encode -o OUT).
+        #[arg(long, value_name = "FILE", requires = "hours")]
+        list: Option<PathBuf>,
     },
     /// Find videos that show the same thing: the same video at another resolution, bitrate,
     /// codec or container, and copies cut at the start or the end. Read-only: decodes a few
@@ -354,13 +362,13 @@ enum Cmd {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
-        Cmd::Scan { paths, ffprobe, jobs, min_savings, csv, top, target_vmaf, preset, sort } => {
+        Cmd::Scan { paths, ffprobe, jobs, min_savings, csv, top, target_vmaf, preset, sort, hours, list } => {
             let past = history::load();
             let model = estimate::Model::fit(&past, target_vmaf);
             let time = estimate::TimeModel::fit(&past, preset);
             // Absolute roots keep cache keys stable however the folder was typed.
             let paths: Vec<PathBuf> = paths.iter().map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone())).collect();
-            scan(&paths, &ffprobe, jobs, min_savings, csv.as_deref(), top, &model, &time, sort)
+            scan(&paths, &ffprobe, jobs, min_savings, csv.as_deref(), top, &model, &time, sort, hours.map(|h| (h, list)))
         }
         Cmd::Dups { paths, jobs, prefer, avoid, tolerance, refresh, top, csv, json, ffmpeg, ffprobe, memory_limit, nice } => {
             let abs = |p: &PathBuf| std::path::absolute(p).unwrap_or_else(|_| p.clone());
@@ -659,6 +667,13 @@ fn order_jobs(jobs: &mut [batch::Job], inputs: &[PathBuf], ffprobe: &str, o: &en
     Ok(())
 }
 
+fn positive_hours(s: &str) -> Result<f64, String> {
+    match s.parse::<f64>() {
+        Ok(h) if h > 0.0 && h <= 10_000.0 => Ok(h),
+        _ => Err("a number of hours above 0, like 8 or 2.5".into()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan(
     paths: &[PathBuf],
@@ -670,6 +685,7 @@ fn scan(
     model: &estimate::Model,
     time: &estimate::TimeModel,
     sort: report::TopBy,
+    pick: Option<(f64, Option<PathBuf>)>,
 ) -> Result<()> {
     let progress = |n: usize, total: usize| {
         if n == 0 {
@@ -691,6 +707,22 @@ fn scan(
         eprintln!("estimates: learned from {} past encodes (spread x{:.2})", model.samples, (1.28 * model.sigma).exp());
     }
     report::print(&results, top, time, sort);
+    if let Some((hours, list)) = pick {
+        let picked = scan::pick_for_time(&results, time, hours * 3600.0);
+        report::print_pick(&picked, hours, &results, time);
+        if let Some(list) = list {
+            let mut text = String::new();
+            for r in &picked {
+                // A line break in a name would make two paths of one.
+                match r.path.to_str().filter(|p| !p.contains('\n')) {
+                    Some(p) => text += &format!("{p}\n"),
+                    None => eprintln!("warning: left out of {}: {}", list.display(), r.path.display()),
+                }
+            }
+            std::fs::write(&list, text).map_err(|e| anyhow::anyhow!("writing {}: {e}", list.display()))?;
+            eprintln!("wrote {}", list.display());
+        }
+    }
     if let Some(csv) = csv {
         report::write_csv(&results, csv, time)?;
         eprintln!("wrote {}", csv.display());

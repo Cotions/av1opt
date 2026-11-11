@@ -1072,6 +1072,16 @@ fn scan_sorts_a_folder_into_candidates_and_touches_nothing() {
     assert_eq!(row("done.mp4")[col("verdict")], "skip: already AV1");
     // One line a spreadsheet can show, without the demuxer's detail or the path again.
     assert_eq!((row("broken.mkv")[col("verdict")], row("broken.mkv")[col("error")]), ("skip: unreadable", "ffprobe: Invalid data found when processing input"));
+
+    // What to encode in the hours there are: the candidate, and nothing when it cannot fit.
+    let list = c.dir.join("tonight.txt");
+    let r = c.av1opt(&["scan".as_ref(), c.videos().as_os_str(), "--hours".as_ref(), "8".as_ref(), "--list".as_ref(), list.as_os_str()]);
+    r.ok().has("== Most saved in 8.0 h of encoding ==").has("1 video, about");
+    assert_eq!(std::fs::read_to_string(&list).unwrap(), format!("{}\n", c.videos().join("big.mp4").display()));
+    let r = c.av1opt(&["scan".as_ref(), c.videos().as_os_str(), "--hours".as_ref(), "0.0001".as_ref(), "--list".as_ref(), list.as_os_str()]);
+    r.ok().has("no candidate fits: the shortest takes about");
+    assert_eq!(std::fs::read_to_string(&list).unwrap(), "");
+    assert_eq!(snapshot(&c.videos()), before);
 }
 
 #[test]
@@ -1352,6 +1362,20 @@ mod queue {
         let codec = |p: &Path| streams(&probe(p), "video")[0]["codec_name"].as_str().unwrap().to_string();
         assert_eq!((codec(&out.join("new/fresh.mp4")), codec(&dir.join("new/fresh.mp4"))), ("av1".into(), "h264".into()));
         assert!(!out.join("new/done.mkv").exists() && !out.join("there.mp4").exists());
+
+        // A scan of the folder and the pick for a night: the two H.264 videos not yet in
+        // AV1 that are long enough, best value first, and none when there is no time at all.
+        let scan = s.post("/api/scans", &json!({ "paths": [dir] })).json()["id"].as_u64().unwrap();
+        wait_until("the scan to end", 60, || s.get(&format!("/api/scans/{scan}")).json()["status"] == "done");
+        let pick = |hours: f64| s.post(&format!("/api/scans/{scan}/pick"), &json!({ "hours": hours }));
+        let p = pick(8.0).json();
+        let names: Vec<&str> = p["paths"].as_array().unwrap().iter().map(|p| p.as_str().unwrap().rsplit('/').next().unwrap()).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, ["arriving.mp4", "fresh.mp4", "there.mp4"], "{p}");
+        assert!(p["secs"].as_f64().unwrap() > 0.0 && p["saved"].as_f64().unwrap() > 0.0, "{p}");
+        assert_eq!(pick(1e-7).json()["paths"], json!([]));
+        assert_eq!((pick(0.0).status, s.post("/api/scans/999/pick", &json!({ "hours": 8 })).status), (400, 404));
 
         // Looked at again, nothing is queued twice; the one being written is still waited for.
         let w = look(&s);

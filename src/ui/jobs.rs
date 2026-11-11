@@ -1,7 +1,7 @@
 //! Encode queue: jobs run one at a time through the same `batch::run` as `av1opt encode`.
 //! Progress events update a per-file state (for page reloads) and go out on the event stream.
 
-use super::{App, now};
+use super::{App, hold, now};
 use crate::batch;
 use crate::encode::{Container, Options};
 use crate::events::{Event, Hooks};
@@ -167,6 +167,9 @@ pub struct FileState {
     ended: Option<u64>,
     /// Estimated seconds to search and encode it; unknown until the file was scanned or probed.
     est_secs: Option<f64>,
+    /// Seconds its job had spent paused when the file started.
+    #[serde(skip)]
+    paused_before: f64,
 }
 
 #[derive(Serialize)]
@@ -205,6 +208,15 @@ pub struct Queue {
     /// Saved jobs that could not be restored (say, a drive not mounted yet). Kept in the saved
     /// queue so they come back once their files are there again.
     unrestored: Mutex<Vec<(Value, String)>>,
+}
+
+/// Holds the running job where it is, or lets it go on, and wakes the worker: a queue that
+/// is held starts nothing new.
+pub fn set_held(app: &App, held: bool) {
+    for h in app.jobs.jobs.lock().unwrap().iter().filter_map(|j| j.hooks.as_ref()) {
+        if held { h.pause() } else { h.resume() }
+    }
+    app.jobs.wake.notify_all();
 }
 
 /// True while a job is encoding.
@@ -259,13 +271,18 @@ fn head(j: &Job) -> Value {
         }
     }
     // Time left: files still waiting, plus what the running one has left of its estimate
-    // (a tenth at least: an estimate that ran out doesn't mean the file is done).
+    // (a tenth at least: an estimate that ran out doesn't mean the file is done). Time spent
+    // paused is not time worked.
+    let paused = j.hooks.as_ref().map_or(0.0, |h| h.paused_time().as_secs_f64());
     let (mut left, mut unknown) = (0.0, 0usize);
     if matches!(j.status.as_str(), "queued" | "running") {
         for f in &j.files {
             match (f.status.as_str(), f.est_secs) {
                 ("pending", Some(s)) => left += s,
-                ("running", Some(s)) => left += (s - f.started.map_or(0.0, |t| now().saturating_sub(t) as f64)).max(s * 0.1),
+                ("running", Some(s)) => {
+                    let worked = f.started.map_or(0.0, |t| now().saturating_sub(t) as f64) - (paused - f.paused_before).max(0.0);
+                    left += (s - worked.max(0.0)).max(s * 0.1)
+                }
                 ("pending" | "running", None) => unknown += 1,
                 _ => {}
             }
@@ -276,6 +293,7 @@ fn head(j: &Job) -> Value {
         "status": j.status, "error": j.error, "current": j.current,
         "total": j.files.len(), "counts": counts, "saved": saved,
         "left_secs": left, "left_unknown": unknown,
+        "paused": j.hooks.as_ref().is_some_and(|h| h.is_paused()),
     })
 }
 
@@ -288,13 +306,13 @@ fn full(j: &Job) -> Value {
 pub fn list(app: &App) -> Value {
     let jobs: Vec<Value> = app.jobs.jobs.lock().unwrap().iter().map(full).collect();
     // Queued jobs wait while a benchmark measures; the page says so.
-    json!({ "jobs": jobs, "unrestored": unrestored_list(app), "benchmark": super::bench::running(app) })
+    json!({ "jobs": jobs, "unrestored": unrestored_list(app), "benchmark": super::bench::running(app), "queue": hold::json(app) })
 }
 
 /// Headers only, for the queue badge.
 pub fn heads(app: &App) -> Value {
     let jobs: Vec<Value> = app.jobs.jobs.lock().unwrap().iter().map(head).collect();
-    json!({ "jobs": jobs, "unrestored": unrestored_list(app) })
+    json!({ "jobs": jobs, "unrestored": unrestored_list(app), "queue": hold::json(app) })
 }
 
 fn find(jobs: &[Job], id: u64) -> Result<&Job> {
@@ -595,6 +613,7 @@ fn apply(job: &mut Job, e: &Event) -> Option<usize> {
             f.output = output.clone();
             f.report = output.with_extension("av1opt.json");
             f.started = Some(now());
+            f.paused_before = job.hooks.as_ref().map_or(0.0, |h| h.paused_time().as_secs_f64());
             f.phase = "probing".into();
         }
         Event::Source { width, height, fps, duration_s, .. } => {
@@ -653,9 +672,12 @@ pub fn start_worker(app: Arc<App>) {
                 let tools_ok = app.encode_problem().is_none();
                 // A benchmark measures encode times: jobs wait until it is done (it wakes us).
                 let benchmarking = super::bench::running(&app);
+                // Paused, or outside the hours encodes may run in.
+                let held = hold::current(&app).is_some();
                 let mut jobs = app.jobs.jobs.lock().unwrap();
                 if tools_ok
                     && !benchmarking
+                    && !held
                     && !app.jobs.shutting_down.load(Ordering::SeqCst)
                     && let Some(j) = jobs.iter_mut().find(|j| j.status == "queued")
                 {
@@ -725,12 +747,17 @@ fn run_job(app: &Arc<App>, id: u64, opts: Result<Options>, retry: bool, out_dir:
     }));
     let mut tools = app.tools(if opts.scenes { workers } else { 1 });
     tools.hooks = Some(hooks.clone());
+    // A hold that arrived since the worker looked. One that arrives after this is put into
+    // effect through the job's hooks, which exist from here on.
+    let held = hold::current(app).is_some();
     // Take the batch list out of the job so the lock isn't held while encoding.
     let batch_jobs = {
         let mut jobs = app.jobs.jobs.lock().unwrap();
         let Some(j) = jobs.iter_mut().find(|j| j.id == id) else { bail!("job vanished") };
         if j.cancel_requested {
             hooks.cancel();
+        } else if held {
+            hooks.pause();
         }
         j.hooks = Some(hooks);
         std::mem::take(&mut j.batch)

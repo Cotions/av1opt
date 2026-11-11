@@ -325,7 +325,13 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
   estimated once they are probed),
   per-chunk results in scene mode, percent, fps and ETA. Cancel stops ffmpeg at once; finished
   scene chunks are kept, so queueing the same files again resumes. Unfinished jobs are
-  re-queued automatically the next time `av1opt ui` starts.
+  re-queued automatically the next time `av1opt ui` starts. **Pause** holds the queue until
+  you resume, and **Hours…** sets the hours of the day encodes may run in (for example 23:00
+  to 07:00). Either way nothing new starts and the running encode is held where it is: its
+  ffmpeg processes are stopped, not ended, so they use no processor but keep their memory,
+  and they go on from the same frame afterwards. **Run now** lets the queue work outside the
+  hours until they next begin. The pause and the hours are kept across restarts, and the
+  time spent held is left out of the timings av1opt learns its estimates from.
 - **Compare**: source and AV1 output on top of each other with a split slider, synced playback,
   frame stepping and zoom, plus the per-chunk VMAF timeline from the `.av1opt.json` report
   (click to seek). Sources the browser can't decode (HEVC in some browsers, MPEG-2, ...) are shown as a
@@ -359,7 +365,8 @@ lack either, a banner says so and queued jobs wait instead of failing. `av1opt e
 same check before it starts.
 
 Stopping the server (Ctrl-C, SIGTERM) stops running ffmpeg processes and keeps unfinished jobs
-for the next start.
+for the next start. When av1opt is killed outright (`kill -9`, a crash) its ffmpeg processes
+are killed with it, held or not, so none is left writing a file nobody will finish.
 
 ### Desktop app (optional)
 
@@ -411,7 +418,7 @@ a scene-mode file over rather than resuming a work folder of another format.
 
 `AV1OPT_DEBUG=1` prints every ffmpeg command. `--keep-temp` keeps samples and the partial encode.
 `cargo test --features ui` also runs `tests/ui_api.rs`, which starts the real `av1opt ui` and
-checks sign-in, request checks, media access, the job queue, the duplicate search (and what its
+checks sign-in, request checks, media access, the job queue, its pause and hours, the duplicate search (and what its
 trash action refuses), replacing an original and putting it back (and which reports may do that)
 and the benchmark's requests and tuned settings over HTTP (no ffmpeg needed).
 

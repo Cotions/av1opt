@@ -15,7 +15,6 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::time::Instant;
 
 /// One chunk as timestamps of the constant-rate stream, in units of one frame (the time base of
 /// ffmpeg's `fps` filter). `None` means from the very start / to the very end.
@@ -344,7 +343,7 @@ pub fn encode_all(c: &Ctx, plan: &Plan) -> Result<Vec<ChunkResult>> {
     let todo_frames: u64 = todo.len() as u64 * plan.total_frames / n.max(1) as u64;
     let (next, stop, frames_done) = (AtomicUsize::new(0), AtomicBool::new(false), AtomicU64::new(0));
     let failure: Mutex<Option<anyhow::Error>> = Mutex::new(None);
-    let t0 = Instant::now();
+    let t0 = c.tools.stopwatch();
 
     std::thread::scope(|s| {
         for _ in 0..c.workers.clamp(1, todo.len().max(1)) {
@@ -355,7 +354,7 @@ pub fn encode_all(c: &Ctx, plan: &Plan) -> Result<Vec<ChunkResult>> {
                         Ok(r) => {
                             let done = frames_done.fetch_add(r.frames, Ordering::Relaxed) + r.frames;
                             let frac = (done as f64 / todo_frames.max(1) as f64).min(1.0);
-                            let el = t0.elapsed().as_secs_f64();
+                            let el = t0.secs(c.tools);
                             let eta = if frac > 0.0 { el / frac - el } else { 0.0 };
                             c.tools.emit(Event::Chunk {
                                 index: i, chunks: n, start_secs: r.start_secs, frames: r.frames, crf: r.crf, vmaf: r.vmaf,

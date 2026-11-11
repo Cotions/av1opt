@@ -106,11 +106,14 @@ function connect() {
 // Queue badge: number of queued + running jobs.
 async function refreshBadge() {
   try {
-    const { jobs } = await api("/api/jobs/heads");
+    const { jobs, queue } = await api("/api/jobs/heads");
     const n = jobs.filter((j) => j.status === "queued" || j.status === "running").length;
     const b = document.getElementById("queue-badge");
     b.textContent = n;
     b.hidden = n === 0;
+    // Amber while the queue is paused or outside its hours.
+    b.classList.toggle("held", !!queue.hold);
+    b.title = !queue.hold ? "" : queue.hold.why === "paused" ? "Paused" : "Outside encoding hours";
   } catch { /* offline */ }
 }
 onEvent((m) => { if (m.kind === "jobs") refreshBadge(); });
@@ -1542,11 +1545,35 @@ views.queue = (root) => {
   };
   const missing = h("div"); // saved jobs whose files were not there at start
   const held = h("div", { class: "panel warn", hidden: true }, "A benchmark is running: encodes wait until it ends, so that its timings mean something. ", h("a", { href: "#/bench" }, "Benchmark"));
+  // Pause switch and the hours encodes may run in: { hold, paused, schedule }.
+  let queue = null;
+  const holdBox = h("div");
+  const setQueue = async (path, body) => { try { queue = await api(path, body); drawHold(); } catch (e) { toast(e.message, true); } };
+  const pauseBtn = h("button", { hidden: true, onclick: () => setQueue("/api/queue/pause", { paused: !queue.paused }) });
+  const hoursBtn = h("button", { hidden: true, title: "Hours of the day encodes may run in", onclick: async () => { const q = await hoursDialog(queue.schedule); if (q) { queue = q; drawHold(); } } });
+  const clockTime = (t) => new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  function drawHold() {
+    if (!queue) return;
+    const sch = queue.schedule, hd = queue.hold;
+    pauseBtn.hidden = hoursBtn.hidden = false;
+    pauseBtn.textContent = queue.paused ? "Resume" : "Pause";
+    pauseBtn.title = queue.paused ? "Encodes go on from where they stopped" : "Holds the running encode where it is and starts no new one, until you resume";
+    hoursBtn.textContent = sch.on ? `Hours: ${sch.from}–${sch.to}` : "Hours…";
+    if (!hd) { holdBox.replaceChildren(); return; }
+    const working = jobs.some((j) => j.status === "running");
+    holdBox.replaceChildren(h("div", { class: "panel hold" },
+      hd.why === "paused"
+        ? [h("span", { class: "grow" }, h("strong", {}, "Paused. "), working ? "The running encode is held where it is (it keeps its memory) and goes on when you resume." : "Encodes wait until you resume."),
+          h("button", { class: "primary", onclick: () => setQueue("/api/queue/pause", { paused: false }) }, "Resume")]
+        : [h("span", { class: "grow" }, h("strong", {}, `Outside encoding hours (${sch.from}–${sch.to}). `), working ? `The running encode is held where it is and goes on at ${clockTime(hd.opens)}.` : `Encodes start at ${clockTime(hd.opens)}.`),
+          h("button", { title: `Encode now; the hours count again from ${sch.from}`, onclick: () => setQueue("/api/queue/run-now", {}) }, "Run now")]));
+  }
   root.append(
     h("div", { class: "row" }, h("h1", {}, "Encode queue"), leftAll, h("span", { class: "spacer" }),
+      pauseBtn, hoursBtn,
       h("button", { onclick: async () => { await api("/api/jobs/clear", {}); load(); } }, "Clear finished"),
       h("button", { class: "primary", onclick: async () => { const p = await pick({ title: "Videos or folders to encode", mode: "multi" }); if (p) encodeDialog(p); } }, "New encode…")),
-    held, missing, list);
+    held, holdBox, missing, list);
   const drawMissing = (un) => {
     if (!un || !un.length) { missing.replaceChildren(); return; }
     const act = (what) => async () => {
@@ -1575,6 +1602,8 @@ views.queue = (root) => {
     try { r = await api("/api/jobs"); } catch (e) { toast(e.message, true); return; }
     jobs = r.jobs;
     held.hidden = !r.benchmark;
+    queue = r.queue;
+    drawHold();
     drawMissing(r.unrestored);
     draw();
   }
@@ -1607,8 +1636,11 @@ views.queue = (root) => {
     drawLeft();
   }
 
-  const headSig = (j) => JSON.stringify([j.status, j.error, j.counts, j.saved, leftText(j.left_secs, j.left_unknown)]);
-  const fileSig = (f) => JSON.stringify({ ...f, progress: null });
+  // What holds a running job, if anything: the pause switch or the hours.
+  const heldBy = (j) => (j.paused ? queue?.hold?.why ?? "paused" : null);
+  const headSig = (j) => JSON.stringify([j.status, heldBy(j), j.error, j.counts, j.saved, leftText(j.left_secs, j.left_unknown)]);
+  const fileSig = (j, f) => JSON.stringify({ ...f, progress: null, held: f.status === "running" ? heldBy(j) : null });
+  const pausedPill = (j) => h("span", { class: "pill warn" }, heldBy(j) === "hours" ? "On hold" : "Paused");
 
   function patchJob(j) {
     let e = jobEls.get(j.id);
@@ -1633,7 +1665,7 @@ views.queue = (root) => {
   }
 
   function patchFile(e, j, f, i) {
-    const sg = fileSig(f);
+    const sg = fileSig(j, f);
     if (sg === e.sigs[i]) return;
     fileEls.delete(`${j.id}:${i}`);
     const n = drawFile(j, f, i);
@@ -1646,7 +1678,7 @@ views.queue = (root) => {
     const counts = j.counts || {};
     const saved = j.saved || 0;
     const head = h("div", { class: "head" },
-      statusPill(j.status),
+      j.paused ? pausedPill(j) : statusPill(j.status),
       h("strong", {}, `${j.total} file${j.total === 1 ? "" : "s"}`),
       h("span", { class: "dim" }, `→ ${j.out_dir}`),
       h("span", { class: "dim" }, `VMAF ${o.target_vmaf} · preset ${o.preset}${o.svt_params && o.svt_params !== "tune=0" ? " · " + o.svt_params : ""}${o.tuned ? " · tuned by size" : ""} · ${o.container}${o.scenes ? " · scenes×" + o.workers : ""}${metaLabel(o)}`),
@@ -1667,7 +1699,7 @@ views.queue = (root) => {
       if (f.input_bytes && f.output_bytes) right.append(h("span", {}, `${bytes(f.input_bytes)} → ${bytes(f.output_bytes)} `, h("span", { class: "ok" }, `−${pct(1 - f.output_bytes / f.input_bytes)}`)));
       right.append(h("a", { class: "btn", href: "#/compare?report=" + encodeURIComponent(f.report) }, "Compare"));
     }
-    const el = h("div", { class: "file" }, h("div", { class: "line1" }, statusPill(f.status), name, right));
+    const el = h("div", { class: "file" }, h("div", { class: "line1" }, j.paused && f.status === "running" ? pausedPill(j) : statusPill(f.status), name, right));
     if (f.detail && (f.status === "skip" || f.status === "error")) el.append(h("div", { class: f.status === "error" ? "bad mono" : "warn" }, f.detail));
     if (f.status === "running") {
       const live = drawLive(j, f);
@@ -1734,6 +1766,42 @@ views.queue = (root) => {
   load();
   return () => { off(); clearTimeout(timer); for (const t of pending.values()) clearTimeout(t); };
 };
+
+// Hours of the day encodes may run in. Resolves to the queue's new state, or null.
+function hoursDialog(sch) {
+  return new Promise((resolve) => {
+    const close = (v) => { bg.remove(); document.removeEventListener("keydown", onKey); resolve(v); };
+    const onKey = (e) => { if (e.key === "Escape") close(null); };
+    const on = h("input", { type: "checkbox" });
+    on.checked = sch.on;
+    const from = h("input", { type: "time", value: sch.from, required: true }), to = h("input", { type: "time", value: sch.to, required: true });
+    const note = h("p", { class: "dim" });
+    const sync = () => {
+      from.disabled = to.disabled = !on.checked;
+      const a = from.value, b = to.value;
+      note.textContent = !on.checked ? "Encodes run whenever there is something in the queue."
+        : !a || !b ? "Give both times."
+        : a === b ? "The hours begin and end at the same time."
+        : `Encodes run from ${a} to ${b}${b < a ? " the next day" : ""}. Outside these hours nothing new starts and a running encode is held where it is; it goes on when the hours begin again.`;
+      save.disabled = on.checked && (!a || !b || a === b);
+    };
+    const save = h("button", { class: "primary", onclick: async () => {
+      try { close(await api("/api/queue/schedule", { on: on.checked, from: from.value || sch.from, to: to.value || sch.to })); } catch (e) { toast(e.message, true); }
+    } }, "Save");
+    for (const el of [on, from, to]) el.addEventListener("input", sync);
+    const bg = h("div", { class: "modal-bg", onclick: (e) => { if (e.target === bg) close(null); } },
+      h("div", { class: "modal narrow" },
+        h("div", { class: "head" }, h("strong", {}, "Encoding hours")),
+        h("div", { class: "body" },
+          h("label", { class: "check" }, on, "Encode only during these hours"),
+          h("div", { class: "row hours" }, "from", from, "to", to),
+          note),
+        h("div", { class: "foot" }, h("button", { onclick: () => close(null) }, "Cancel"), save)));
+    sync();
+    document.body.append(bg);
+    document.addEventListener("keydown", onKey);
+  });
+}
 
 // ----- history -----
 

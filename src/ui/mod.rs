@@ -11,6 +11,7 @@
 
 mod bench;
 mod dups;
+mod hold;
 mod http;
 mod jobs;
 mod library;
@@ -69,6 +70,12 @@ pub struct Settings {
     pub ffmpeg: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ffprobe: Option<String>,
+    /// The queue's pause switch: a paused queue stays paused when the app is started again.
+    #[serde(default)]
+    pub queue_paused: bool,
+    /// Hours of the day encodes may run in.
+    #[serde(default)]
+    pub schedule: hold::Schedule,
 }
 
 pub struct App {
@@ -81,6 +88,7 @@ pub struct App {
     /// Open event streams; dead ones are dropped on the next send.
     subscribers: Mutex<Vec<Sender<String>>>,
     pub jobs: jobs::Queue,
+    pub hold: hold::State,
     pub scans: Mutex<Vec<library::Scan>>,
     pub dups: Mutex<Vec<dups::Run>>,
     /// The benchmark of this session, running or finished.
@@ -184,6 +192,7 @@ pub fn run(cfg: Config) -> Result<()> {
         allowed: Mutex::new(HashSet::new()),
         subscribers: Mutex::new(Vec::new()),
         jobs: jobs::Queue::default(),
+        hold: hold::State::default(),
         scans: Mutex::new(Vec::new()),
         dups: Mutex::new(Vec::new()),
         bench: Mutex::new(None),
@@ -198,6 +207,7 @@ pub fn run(cfg: Config) -> Result<()> {
     stop_on_signal(app.clone());
     jobs::restore(&app);
     jobs::start_worker(app.clone());
+    hold::start_clock(app.clone());
 
     let url = format!("http://127.0.0.1:{port}/?token={}", app.token);
     // A caller that chose the token knows it; keep it out of logs (a desktop launcher's output

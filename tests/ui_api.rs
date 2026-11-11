@@ -608,3 +608,56 @@ fn originals_are_replaced_and_put_back_through_reports_in_history() {
     assert!(r.status == 400 && r.body.contains("changed since the encode"), "{}", r.body);
     assert_eq!(sizes(), [Some(6), Some(1000), None]);
 }
+
+#[test]
+fn queue_pause_and_hours_are_kept_and_checked() {
+    let mut s = Server::start("hold", |_| {});
+    let q = s.get("/api/jobs").json()["queue"].clone();
+    assert_eq!(q, json!({ "hold": null, "paused": false, "schedule": { "on": false, "from": "23:00", "to": "07:00" } }));
+    assert_eq!(s.get("/api/jobs/heads").json()["queue"], q);
+
+    // The pause switch.
+    assert_eq!(s.post("/api/queue/pause", &json!({})).status, 400);
+    let r = s.post("/api/queue/pause", &json!({ "paused": true }));
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.json()["hold"], json!({ "why": "paused" }));
+    assert_eq!(s.get("/api/jobs/heads").json()["queue"]["paused"], true);
+
+    // Hours: times of day only, and not an empty span.
+    for bad in [json!({ "on": true, "from": "25:00", "to": "07:00" }), json!({ "on": true, "from": "10:00", "to": "10:00" }), json!({ "on": true, "from": "10:00" }), json!({ "from": "10:00", "to": "11:00" })] {
+        let r = s.post("/api/queue/schedule", &bad);
+        assert_eq!(r.status, 400, "{bad}: {}", r.body);
+    }
+    // Hours that leave out the present minute whenever the test runs: they begin in twelve hours.
+    let minute = {
+        let t = unsafe { libc::time(std::ptr::null_mut()) };
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        unsafe { libc::localtime_r(&t, &mut tm) };
+        (tm.tm_hour * 60 + tm.tm_min) as u32
+    };
+    let clock = |m: u32| format!("{:02}:{:02}", m / 60 % 24, m % 60);
+    let (from, to) = (clock(minute + 12 * 60), clock(minute + 13 * 60));
+    let r = s.post("/api/queue/schedule", &json!({ "on": true, "from": from, "to": to }));
+    assert_eq!(r.status, 200, "{}", r.body);
+    // The pause still counts first.
+    assert_eq!(r.json()["hold"]["why"], "paused");
+    assert_eq!(r.json()["schedule"], json!({ "on": true, "from": from, "to": to }));
+
+    // Both survive a restart.
+    assert!(s.terminate());
+    let s2 = Server::start_in(&s.dir);
+    let q = s2.get("/api/jobs").json()["queue"].clone();
+    assert_eq!((q["paused"].as_bool(), &q["schedule"]), (Some(true), &json!({ "on": true, "from": from, "to": to })), "{q}");
+
+    // Resumed: the hours hold it now, until they begin.
+    let r = s2.post("/api/queue/pause", &json!({ "paused": false })).json();
+    assert_eq!(r["hold"]["why"], "hours", "{r}");
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let wait = r["hold"]["opens"].as_u64().unwrap() - now;
+    assert!((12 * 3600 - 120..=12 * 3600).contains(&wait), "{wait}");
+    // "Run now" lifts it; saving the hours again brings it back; switching them off ends it.
+    assert_eq!(s2.post("/api/queue/run-now", &json!({})).json()["hold"], Value::Null);
+    assert_eq!(s2.get("/api/jobs/heads").json()["queue"]["hold"], Value::Null);
+    assert_eq!(s2.post("/api/queue/schedule", &json!({ "on": true, "from": from, "to": to })).json()["hold"]["why"], "hours");
+    assert_eq!(s2.post("/api/queue/schedule", &json!({ "on": false, "from": from, "to": to })).json()["hold"], Value::Null);
+}

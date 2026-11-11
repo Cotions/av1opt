@@ -82,6 +82,45 @@ impl Capabilities {
     }
 }
 
+/// The child is killed when av1opt goes away without stopping it (kill -9, a crash): an ffmpeg
+/// left behind would write a file nobody finishes, and one left behind paused would sit on
+/// its memory until someone found it. The signal follows the thread that started the child;
+/// every run here is started and waited for by the same thread.
+fn die_with_parent(c: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    let parent = std::process::id();
+    // SAFETY: the closure runs in the forked child before exec and only makes async-signal-safe
+    // calls (prctl, getppid).
+    unsafe {
+        c.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // The parent went away before the request was in place: nothing will signal us.
+            if libc::getppid() as u32 != parent {
+                return Err(std::io::Error::other("av1opt is gone"));
+            }
+            Ok(())
+        });
+    }
+}
+
+/// See [`Tools::stopwatch`].
+pub struct Stopwatch {
+    start: Instant,
+    /// Time the job had spent paused when the count began.
+    paused: std::time::Duration,
+}
+
+impl Stopwatch {
+    /// Seconds worked since the count began. A pause is not work: an encode held for the
+    /// night would otherwise teach the time estimates that this machine is slow, and time
+    /// out a probe that never got to run.
+    pub fn secs(&self, tools: &Tools) -> f64 {
+        self.start.elapsed().saturating_sub(tools.paused_time().saturating_sub(self.paused)).as_secs_f64()
+    }
+}
+
 pub struct Tools {
     pub ffmpeg: String,
     pub ffprobe: String,
@@ -141,6 +180,7 @@ impl Tools {
         };
         // SVT-AV1 prints its config banner to stderr on every run; errors only.
         c.env("SVT_LOG", "1").arg("-hide_banner").arg("-nostdin");
+        die_with_parent(&mut c);
         c
     }
 
@@ -149,6 +189,15 @@ impl Tools {
         if let Some(h) = &self.hooks {
             h.emit(e);
         }
+    }
+
+    /// Starts counting working time: the time that passes, less what the job spends paused.
+    pub fn stopwatch(&self) -> Stopwatch {
+        Stopwatch { start: Instant::now(), paused: self.paused_time() }
+    }
+
+    fn paused_time(&self) -> std::time::Duration {
+        self.hooks.as_ref().map_or(std::time::Duration::ZERO, |h| h.paused_time())
     }
 
     /// Fails with [`Cancelled`] once the user asked to stop.
@@ -210,11 +259,11 @@ impl Tools {
             let _ = stderr.read_to_string(&mut s);
             s
         });
-        let start = Instant::now();
+        let watch = self.stopwatch();
         let status = loop {
             match child.try_wait() {
                 Ok(Some(st)) => break Some(st),
-                Ok(None) if start.elapsed() < timeout => std::thread::sleep(std::time::Duration::from_millis(5)),
+                Ok(None) if watch.secs(self) < timeout.as_secs_f64() => std::thread::sleep(std::time::Duration::from_millis(5)),
                 _ => {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -256,7 +305,7 @@ impl Tools {
             s
         });
 
-        let start = Instant::now();
+        let watch = self.stopwatch();
         let (mut done_secs, mut fps, mut frames) = (0.0_f64, String::new(), 0u64);
         // Read errors end the loop instead of returning, so the child is always reaped
         // (and untracked) below.
@@ -269,7 +318,7 @@ impl Tools {
                 fps = f.to_string();
             } else if line.starts_with("progress=") && total_secs > 0.0 {
                 let frac = (done_secs / total_secs).clamp(0.0, 1.0);
-                let elapsed = start.elapsed().as_secs_f64();
+                let elapsed = watch.secs(self);
                 let eta = if frac > 0.01 { elapsed / frac - elapsed } else { 0.0 };
                 if self.hooks.is_some() {
                     self.emit(Event::Progress { label: label.to_string(), frac, fps: fps.trim().parse().unwrap_or(0.0), eta_secs: eta });

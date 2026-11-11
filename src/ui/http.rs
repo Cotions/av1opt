@@ -1,6 +1,6 @@
 //! Request handling: session check, routing, static files, the event stream and media ranges.
 
-use super::{App, bench, dups, err_json, jobs, library};
+use super::{App, bench, dups, err_json, hold, jobs, library};
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -176,6 +176,9 @@ fn api(app: &Arc<App>, m: &Method, path: &str, q: &[(String, String)], body: &Va
         (Method::Post, ["jobs", id, "cancel"]) => jobs::cancel(app, id.parse()?),
         (Method::Post, ["jobs", id, "remove"]) => jobs::remove(app, id.parse()?),
         (Method::Post, ["jobs", "clear"]) => jobs::clear_finished(app),
+        (Method::Post, ["queue", "pause"]) => hold::set_paused(app, body),
+        (Method::Post, ["queue", "schedule"]) => hold::set_schedule(app, body),
+        (Method::Post, ["queue", "run-now"]) => hold::run_now(app),
         (Method::Get, ["history"]) => Ok(library::history(app)),
         (Method::Post, ["settings", "tools"]) => library::set_tools(app, body),
         (Method::Post, ["history", "dirs"]) => library::add_history_dir(app, body),

@@ -11,7 +11,6 @@ use crate::tools::{Tools, hms, path_arg};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 pub struct Options {
     pub container: Container,
@@ -276,7 +275,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         (p.key == w.key).then_some(p)
     });
 
-    let t0 = Instant::now();
+    let t0 = tools.stopwatch();
     let (best, trials, mut lab) = match &saved {
         Some(p) => {
             eprintln!("resuming earlier run: crf {} from the saved search", p.best.crf);
@@ -341,8 +340,8 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     }
     let partial = tmp.path.join(format!("partial.{}", o.container.ext()));
     let covers = prepare_covers(tools, input, &info, o.container, &tmp.path, &mut notes);
-    let t1 = Instant::now();
-    let mut search_secs = t0.elapsed().as_secs_f64();
+    let t1 = tools.stopwatch();
+    let mut search_secs = t0.secs(tools);
     let (streams, chunks, expect_frames) = if let Some(work) = &work {
         let vf = search::source_filters(&info);
         if !vf.is_empty() {
@@ -368,7 +367,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
                 plan
             }
         };
-        search_secs = t0.elapsed().as_secs_f64();
+        search_secs = t0.secs(tools);
         let ctx = scenes::Ctx {
             tools, input, info: &info, work: &work.path, enc: &enc, probe: &probe, target: o.target_vmaf,
             min_crf: o.min_crf, max_crf: o.max_crf, vmaf_threads, workers: o.workers,
@@ -391,7 +390,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         tools.run_with_progress(&args, out_duration, "encoding")?;
         (streams, None, None)
     };
-    let encode_secs = t1.elapsed().as_secs_f64();
+    let encode_secs = t1.secs(tools);
     if chunks.is_some() {
         for n in &notes {
             eprintln!("note: {n}");

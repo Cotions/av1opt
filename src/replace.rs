@@ -234,8 +234,8 @@ fn write_report(report: &Path, r: &Value) -> Result<()> {
 }
 
 /// Held while the files of a report are moved, so that two runs (two clicks, or the command
-/// and the page at once) never work on the same pair. Gone when the returned file is dropped.
-fn lock(report: &Path) -> Result<std::fs::File> {
+/// and the page at once) never work on the same pair. Gone when the returned lock is dropped.
+fn lock(report: &Path) -> Result<Lock> {
     use std::os::fd::AsRawFd;
     let f = std::fs::File::open(report).with_context(|| format!("no report at {}", report.display()))?;
     // SAFETY: flock on a descriptor we own; no memory is involved.
@@ -245,7 +245,20 @@ fn lock(report: &Path) -> Result<std::fs::File> {
         bail!("this file is being replaced or put back right now");
     }
     // A filesystem without locks: carry on as a single run would.
-    Ok(f)
+    Ok(Lock(f))
+}
+
+struct Lock(std::fs::File);
+
+impl Drop for Lock {
+    /// Closing the file is not enough: a process another thread is starting at this moment
+    /// (an ffmpeg of the queue) holds a copy of the descriptor until it execs, and the lock
+    /// would outlive us by that long, refusing the next click.
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: flock on a descriptor we own; no memory is involved.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 /// Replaces the original named in `report` by its output, after checking both again.

@@ -184,7 +184,8 @@ pub fn write_csv(results: &[FileResult], path: &Path, time: &TimeModel) -> Resul
             ]),
             None => row.extend(std::iter::repeat_n(String::new(), 12)),
         }
-        row.push(r.error.clone().unwrap_or_default());
+        // One line: errors remembered from older scans can hold several.
+        row.push(r.error.as_deref().map(crate::probe::one_line).unwrap_or_default().to_string());
         // New columns go last so the ones before keep their place.
         row.push(r.info.as_ref().map(|i| time.secs(i)).filter(|s| *s > 0.0).map_or(String::new(), |s| format!("{s:.0}")));
         w.write_record(&row)?;

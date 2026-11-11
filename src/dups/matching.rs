@@ -242,8 +242,18 @@ pub fn groups(links: &[Link], media: &[Media], prefs: &Prefs) -> Vec<Group> {
         .filter(|(_, (m, _))| m.len() > 1)
         .map(|(_, (m, score))| ordered(m.clone(), Kind::Same, *score))
         .collect();
+    // The copy each whole-video group keeps (a video by itself is its own).
+    let mut kept: Vec<usize> = (0..media.len()).collect();
+    for g in &out {
+        for &m in &g.members {
+            kept[m] = g.members[0];
+        }
+    }
 
-    // One entry per pair of groups, from their best-matching pair of files.
+    // One entry per pair of groups. Shown with the copies that are kept where those match
+    // (a pair named by a spare copy sends the reader looking for a file about to go), else
+    // with the best-matching pair of files.
+    let worth = |l: &Link| ((kept[l.a] == l.a) as u8 + (kept[l.b] == l.b) as u8, l.score);
     let mut partial: HashMap<(usize, usize), Link> = HashMap::new();
     for l in links.iter().filter(|l| l.kind != Kind::Same) {
         let (a, b) = (find(&mut parent, l.a), find(&mut parent, l.b));
@@ -251,7 +261,7 @@ pub fn groups(links: &[Link], media: &[Media], prefs: &Prefs) -> Vec<Group> {
             continue;
         }
         let e = partial.entry((a.min(b), a.max(b))).or_insert(*l);
-        if l.score > e.score {
+        if worth(l) > worth(e) {
             *e = *l;
         }
     }
@@ -387,7 +397,12 @@ mod tests {
         let g = groups(&links, &m, &Prefs::default());
         assert_eq!(g.len(), 2);
         assert_eq!((g[0].kind, g[0].members.clone(), g[0].score), (Kind::Same, vec![0, 1, 2], 0.8));
-        assert_eq!((g[1].kind, g[1].members.clone(), g[1].score), (Kind::SameStart, vec![1, 3], 1.0));
+        // The pair is shown with the copy the group keeps (0), though 1 matched better.
+        assert_eq!((g[1].kind, g[1].members.clone(), g[1].score), (Kind::SameStart, vec![0, 3], 0.9));
+        // Where the kept copy does not match (its start differs), the best pair is shown.
+        let g = groups(&[l(0, 1, Kind::Same, 1.0), l(1, 3, Kind::SameStart, 0.7), l(2, 3, Kind::SameStart, 0.7)], &m, &Prefs::default());
+        let starts: Vec<Vec<usize>> = g.iter().filter(|g| g.kind == Kind::SameStart).map(|g| g.members.clone()).collect();
+        assert!(starts.contains(&vec![1, 3]) && starts.contains(&vec![2, 3]), "{starts:?}");
     }
 
     #[test]

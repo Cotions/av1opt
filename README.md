@@ -496,8 +496,10 @@ rotated, odd-sized, 4:4:4, wide-pixel and full-range sources, cover art in every
 can be, sound and picture offsets, AVI, WebM, MOV, MPEG and transport streams at six frame
 rates, very short videos, awkward file and folder names, skips, failures and name
 collisions, a scene-mode run killed half-way and resumed, an encode stopped half-way (nothing
-left behind, no ffmpeg left running, trials remembered), and `replace` with `--undo` on a
-real output. With `--features ui` it also drives a real server: a paused queue (ffmpeg
+left behind, no ffmpeg left running, trials remembered), `replace` with `--undo` on a
+real output, `scan` on a folder with a candidate, an AV1 file and a broken one (nothing in
+the folder touched), `dups` on a smaller copy, a byte-identical copy and two cut copies, and
+`bench` with its remembered sample encodes and `--save` feeding `encode --tuned`. With `--features ui` it also drives a real server: a paused queue (ffmpeg
 stopped in place, the wait left out of the timings), cancelling a running and a held job,
 queueing it again, closing the app in the middle of an encode and going on after the next
 start, and replacing an original from History. It needs an ffmpeg with libsvtav1, libvmaf, libx264 and libx265

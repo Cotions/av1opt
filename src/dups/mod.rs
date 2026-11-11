@@ -455,7 +455,7 @@ pub fn write_csv(r: &Report, path: &Path) -> Result<()> {
     for u in &r.unreadable {
         let mut row = vec![String::new(); 13];
         row[1] = "not compared".into();
-        row[4] = u.error.clone();
+        row[4] = crate::probe::one_line(&u.error).to_string();
         row[5] = u.path.display().to_string();
         w.write_record(&row)?;
     }

@@ -988,6 +988,149 @@ fn an_output_takes_its_originals_place_and_gives_it_back() {
     assert!(placed.exists() && !src.exists());
 }
 
+/// Every file below `dir` with its size and modification time.
+fn snapshot(dir: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
+    let mut all = Vec::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let m = e.metadata().unwrap();
+            if m.is_dir() {
+                todo.push(e.path());
+            }
+            all.push((e.path(), if m.is_dir() { 0 } else { m.len() }, m.modified().unwrap()));
+        }
+    }
+    all.sort();
+    all
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn scan_sorts_a_folder_into_candidates_and_touches_nothing() {
+    let c = Case::new("scan");
+    c.clip("big.mp4", "640x360", 12);
+    std::fs::create_dir_all(c.videos().join("sub")).unwrap();
+    c.ffmpeg(&["-i", "big.mp4", "-c:v", "libsvtav1", "-preset", "12", "-crf", "45", "-c:a", "copy", "sub/done.mp4"]);
+    std::fs::write(c.videos().join("sub/broken.mkv"), vec![7u8; 30_000]).unwrap();
+    std::fs::write(c.videos().join("notes.txt"), "not a video").unwrap();
+    let before = snapshot(&c.videos());
+
+    let csv = c.dir.join("scan.csv");
+    let r = c.av1opt(&["scan".as_ref(), c.videos().as_os_str(), "--csv".as_ref(), csv.as_os_str()]);
+    r.ok().has("1 candidates").has("skip: already AV1");
+    assert_eq!(snapshot(&c.videos()), before);
+
+    let text = std::fs::read_to_string(&csv).unwrap();
+    let mut rows = text.lines();
+    let header: Vec<&str> = rows.next().unwrap().split(',').collect();
+    let col = |name: &str| header.iter().position(|h| *h == name).unwrap_or_else(|| panic!("no column {name}"));
+    let rows: Vec<Vec<&str>> = rows.map(|l| l.split(',').collect()).collect();
+    let row = |file: &str| rows.iter().find(|r| r[col("path")].ends_with(file)).unwrap_or_else(|| panic!("{file} is not in:\n{text}"));
+    assert_eq!(rows.len(), 3, "{text}");
+    let big = row("big.mp4");
+    assert_eq!((big[col("verdict")], big[col("codec")], big[col("width")], big[col("audio_streams")]), ("candidate", "h264", "640", "1"));
+    let (size, likely, low, high): (u64, u64, u64, u64) =
+        (big[col("size_bytes")].parse().unwrap(), big[col("est_size_likely")].parse().unwrap(), big[col("est_size_low")].parse().unwrap(), big[col("est_size_high")].parse().unwrap());
+    assert!(low <= likely && likely <= high && high < size, "{big:?}");
+    assert_eq!(row("done.mp4")[col("verdict")], "skip: already AV1");
+    // One line a spreadsheet can show, without the demuxer's detail or the path again.
+    assert_eq!((row("broken.mkv")[col("verdict")], row("broken.mkv")[col("error")]), ("skip: unreadable", "ffprobe: Invalid data found when processing input"));
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn duplicates_are_grouped_with_the_copy_worth_keeping_first() {
+    let c = Case::new("dups");
+    std::fs::create_dir_all(c.videos().join("sub")).unwrap();
+    let x264 = ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"];
+    let make = |args: &[&str], out: &str| {
+        let mut a: Vec<&str> = args.to_vec();
+        a.extend(x264);
+        a.push(out);
+        c.ffmpeg(&a);
+    };
+    // A minute each, so the frames compared reach well into the video.
+    make(&["-f", "lavfi", "-i", "testsrc2=s=320x180:r=24:d=60", "-crf", "20"], "a.mp4");
+    make(&["-i", "a.mp4", "-vf", "scale=160:90", "-crf", "30"], "sub/a-small.mkv");
+    make(&["-i", "a.mp4", "-t", "30", "-crf", "22"], "sub/a-start.mp4");
+    make(&["-ss", "25", "-i", "a.mp4", "-crf", "22"], "sub/a-end.mp4");
+    make(&["-f", "lavfi", "-i", "mandelbrot=s=320x180:r=24,trim=duration=60", "-crf", "20"], "b.mp4");
+    std::fs::copy(c.videos().join("b.mp4"), c.videos().join("sub/b-copy.mp4")).unwrap();
+    make(&["-f", "lavfi", "-i", "sierpinski=s=320x180:r=24:seed=1,trim=duration=60", "-crf", "20"], "alone.mp4");
+    let before = snapshot(&c.videos());
+
+    let json = c.dir.join("dups.json");
+    let run = || c.av1opt(&["dups".as_ref(), c.videos().as_os_str(), "--json".as_ref(), json.as_os_str()]);
+    run().ok().has("2 groups of the same video: 2 spare copies").has("2 pairs sharing only a start or an ending");
+    assert_eq!(snapshot(&c.videos()), before);
+    let d: Value = serde_json::from_slice(&std::fs::read(&json).unwrap()).unwrap();
+    let name = |i: &Value| d["files"][i.as_u64().unwrap() as usize]["path"].as_str().unwrap().rsplit("/videos/").next().unwrap().to_string();
+    let mut groups: Vec<(String, Vec<String>, String)> = d["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| (g["kind"].as_str().unwrap().to_string(), g["members"].as_array().unwrap().iter().map(name).collect(), g["reason"].as_str().unwrap().to_string()))
+        .collect();
+    groups.sort();
+    let g = |kind: &str, members: &[&str], reason: &str| (kind.to_string(), members.iter().map(|m| m.to_string()).collect::<Vec<_>>(), reason.to_string());
+    assert_eq!(
+        groups,
+        [
+            // The copy to keep comes first; cut copies are paired with it, not with a spare.
+            g("same", &["a.mp4", "sub/a-small.mkv"], "highest resolution"),
+            g("same", &["b.mp4", "sub/b-copy.mp4"], "identical files, first by name"),
+            g("same_end", &["a.mp4", "sub/a-end.mp4"], "longest"),
+            g("same_start", &["a.mp4", "sub/a-start.mp4"], "longest"),
+        ]
+    );
+    assert!(d["files"].as_array().unwrap().iter().all(|f| !f["path"].as_str().unwrap().ends_with("alone.mp4")));
+    assert_eq!(d["stats"]["fresh"], 7);
+    // The second look reads no frame again.
+    run().ok().has("0 fingerprinted now");
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_benchmark_ranks_settings_remembers_its_encodes_and_tunes_the_encoder() {
+    let c = Case::new("bench");
+    c.clip("a.mp4", "320x180", 12);
+    c.ffmpeg(&["-f", "lavfi", "-i", "mandelbrot=s=320x180:r=24,trim=duration=12", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "16", "-pix_fmt", "yuv420p", "b.mp4"]);
+    let json = c.dir.join("bench.json");
+    let before = snapshot(&c.videos());
+    let run = |extra: &[&str]| {
+        let mut a: Vec<std::ffi::OsString> = vec!["bench".into(), c.videos().into()];
+        a.extend(["--presets", "8,10", "--params", "tune=0", "--samples", "1", "--sample-secs", "2", "--json"].iter().map(Into::into));
+        a.push(json.clone().into());
+        a.extend(extra.iter().map(Into::into));
+        c.av1opt(&a)
+    };
+    run(&[]).ok().has("3 settings on 2 videos at VMAF 93");
+    assert_eq!(snapshot(&c.videos()), before);
+    let b: Value = serde_json::from_slice(&std::fs::read(&json).unwrap()).unwrap();
+    // The default settings are measured too, as what the others are compared with.
+    let configs: Vec<(u64, &str)> = b["configs"].as_array().unwrap().iter().map(|k| (k["preset"].as_u64().unwrap(), k["params"].as_str().unwrap())).collect();
+    assert_eq!(configs, [(6, "tune=0"), (8, "tune=0"), (10, "tune=0")]);
+    assert_eq!(b["videos"].as_array().unwrap().len(), 2);
+    let rows = b["summaries"][0]["rows"].as_array().unwrap();
+    assert_eq!((rows[0]["size"].as_f64(), rows[0]["time"].as_f64()), (Some(1.0), Some(1.0)));
+    // A faster preset takes less time for the same quality, and every setting was measured.
+    assert!(rows[2]["time"].as_f64().unwrap() < 1.0, "{rows:?}");
+    assert!(rows.iter().all(|r| r["missing"] == 0), "{rows:?}");
+    let fresh = b["fresh"].as_u64().unwrap();
+    assert!(fresh >= 6 && b["cached"] == 0, "{fresh} fresh, {} cached", b["cached"]);
+
+    // A second run measures nothing again, and --save makes `encode --tuned` use the pick.
+    run(&["--save", "fastest"]).ok().has("from earlier runs").has("`av1opt encode --tuned` uses these");
+    let b: Value = serde_json::from_slice(&std::fs::read(&json).unwrap()).unwrap();
+    assert_eq!((b["fresh"].as_u64(), b["cached"].as_u64()), (Some(0), Some(fresh)));
+    let tuning: Value = serde_json::from_slice(&std::fs::read(c.dir.join("data/av1opt/tuning.json")).unwrap()).unwrap();
+    let pick = tuning["classes"]["sd"]["preset"].as_u64().unwrap();
+    let r = c.av1opt(&["encode".as_ref(), "-o".as_ref(), c.out().as_os_str(), "--tuned".as_ref(), "--samples".as_ref(), "2".as_ref(), "--sample-secs".as_ref(), "2".as_ref(), c.videos().join("a.mp4").as_os_str()]);
+    r.ok().has("encoded 1,");
+    assert_eq!(c.report("a")["preset"].as_u64(), Some(pick));
+}
+
 #[cfg(feature = "ui")]
 mod queue {
     use super::*;

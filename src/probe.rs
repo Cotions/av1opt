@@ -72,6 +72,19 @@ pub struct AudioInfo {
     pub bitrate: f64,
 }
 
+/// What ffprobe said in the end, on one line: the lines before it are the
+/// demuxer's detail, and the last one starts with the path the caller already has.
+fn reason(stderr: &str, path: &Path) -> String {
+    let last = one_line(stderr);
+    let last = last.strip_prefix(&*path.to_string_lossy()).map_or(last, |rest| rest.trim_start_matches(':').trim_start());
+    if last.is_empty() { "could not read the file".into() } else { last.to_string() }
+}
+
+/// The last line of a message that has something on it, for places with room for one line.
+pub fn one_line(message: &str) -> &str {
+    message.lines().rev().map(str::trim).find(|l| !l.is_empty()).unwrap_or("")
+}
+
 pub fn probe(ffprobe: &str, path: &Path, file_size: u64) -> Result<MediaInfo> {
     let out = Command::new(ffprobe)
         .args(["-v", "error", "-show_format", "-show_streams", "-of", "json"])
@@ -79,7 +92,7 @@ pub fn probe(ffprobe: &str, path: &Path, file_size: u64) -> Result<MediaInfo> {
         .output()
         .with_context(|| format!("failed to run {ffprobe}"))?;
     if !out.status.success() {
-        bail!("ffprobe: {}", String::from_utf8_lossy(&out.stderr).trim());
+        bail!("ffprobe: {}", reason(&String::from_utf8_lossy(&out.stderr), path));
     }
     let j: Value = serde_json::from_slice(&out.stdout).context("ffprobe returned invalid JSON")?;
     let streams = j["streams"].as_array().cloned().unwrap_or_default();
@@ -211,4 +224,19 @@ fn parse_rate(s: Option<&str>) -> Option<f64> {
     let (n, d) = s?.split_once('/')?;
     let (n, d): (f64, f64) = (n.parse().ok()?, d.parse().ok()?);
     (d > 0.0 && n > 0.0).then(|| n / d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unreadable_file_gets_a_one_line_reason() {
+        let path = Path::new("/v/a b.mkv");
+        let said = "[matroska,webm @ 0x55] EBML header parsing failed\n/v/a b.mkv: Invalid data found when processing input\n\n";
+        assert_eq!(reason(said, path), "Invalid data found when processing input");
+        assert_eq!(reason("moov atom not found\n", path), "moov atom not found");
+        assert_eq!(reason("", path), "could not read the file");
+        assert_eq!(one_line("first\nsecond\n  \n"), "second");
+    }
 }

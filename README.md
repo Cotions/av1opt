@@ -487,15 +487,20 @@ and the benchmark's requests and tuned settings over HTTP (no ffmpeg needed).
 ## Tests
 
 `cargo test --test e2e -- --ignored` runs the real program with a real ffmpeg on clips
-generated on the spot (a few seconds of test patterns, 320x180, so the whole set takes under
-a minute): a plain encode and its report, the frames of the output against the source's one by one
+generated on the spot (a few seconds of test patterns, mostly 320x180; the whole set takes
+a little over a minute): a plain encode and its report, the frames of the output against the source's one by one
 (so a frame dropped, doubled or out of place is seen), subtitles, chapters, languages and
 tags in both containers, 10-bit, HDR10 and HLG signalling, sound tracks copied, converted
 and shrunk, removed sections, metadata presets and info files, interlaced, variable-rate,
 rotated, odd-sized, 4:4:4, wide-pixel and full-range sources, cover art in every place it
 can be, sound and picture offsets, AVI, WebM, MOV, MPEG and transport streams at six frame
-rates, very short videos, awkward file and folder names, and skips, failures and name
-collisions. It needs an ffmpeg with libsvtav1, libvmaf, libx264 and libx265
+rates, very short videos, awkward file and folder names, skips, failures and name
+collisions, a scene-mode run killed half-way and resumed, an encode stopped half-way (nothing
+left behind, no ffmpeg left running, trials remembered), and `replace` with `--undo` on a
+real output. With `--features ui` it also drives a real server: a paused queue (ffmpeg
+stopped in place, the wait left out of the timings), cancelling a running and a held job,
+queueing it again, closing the app in the middle of an encode and going on after the next
+start, and replacing an original from History. It needs an ffmpeg with libsvtav1, libvmaf, libx264 and libx265
 (`AV1OPT_FFMPEG`, `AV1OPT_FFPROBE`), which is why a plain `cargo test` leaves it out.
 
 `cargo test` covers the CRF search (exactness against brute force, trial count and misses on

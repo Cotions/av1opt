@@ -340,7 +340,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     }
     let partial = tmp.path.join(format!("partial.{}", o.container.ext()));
     let covers = prepare_covers(tools, input, &info, o.container, &tmp.path, &mut notes);
-    let t1 = tools.stopwatch();
+    let mut t1 = tools.stopwatch();
     let mut search_secs = t0.secs(tools);
     let probe = EncodeSettings { preset: (preset + 4).clamp(preset, 12), pix_fmt_out: enc.pix_fmt_out, params: enc.params.clone() };
     let mut work = work;
@@ -381,7 +381,10 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         if !vf.is_empty() {
             notes.push(format!("video filters: {}", vf.join(",")));
         }
+        // Finding the scenes belongs to the search; the encode's clock starts here, so that
+        // stretch is not counted twice.
         search_secs = t0.secs(tools);
+        t1 = tools.stopwatch();
         let ctx = scenes::Ctx {
             tools, input, info: &info, work: &work.path, enc: &enc, probe: &probe, target: o.target_vmaf,
             min_crf: o.min_crf, max_crf: o.max_crf, vmaf_threads, workers: o.workers,

@@ -9,6 +9,9 @@
 //! Every test has its own folders for videos, outputs, history and caches below the target
 //! folder, so nothing of the user's is read or written.
 
+#[cfg(feature = "ui")]
+mod common;
+
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -84,6 +87,12 @@ impl Case {
         self.videos().join(name)
     }
 
+    /// 24 s of four very different scenes, 640x360: enough work to stop an encode midway.
+    fn scenes_clip(&self, name: &str) -> PathBuf {
+        scenes_clip(&self.videos(), name);
+        self.videos().join(name)
+    }
+
     fn command(&self) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_av1opt"));
         c.current_dir(&self.dir)
@@ -125,6 +134,60 @@ impl Case {
         names.sort();
         names
     }
+}
+
+fn scenes_clip(dir: &Path, name: &str) {
+    let o = Command::new(ffmpeg_bin())
+        .current_dir(dir)
+        .args(["-v", "error", "-nostdin", "-y"])
+        .args(["-f", "lavfi", "-i", "testsrc2=s=640x360:r=24:d=6", "-f", "lavfi", "-i", "mandelbrot=s=640x360:r=24,trim=duration=6"])
+        // Seeded: these two draw at random otherwise, and a test must see the same clip twice.
+        .args(["-f", "lavfi", "-i", "sierpinski=s=640x360:r=24:seed=1,trim=duration=6"])
+        .args(["-f", "lavfi", "-i", "life=s=640x360:r=24:mold=10:ratio=0.1:seed=1:death_color=#C83232:life_color=#00ff00,trim=duration=6"])
+        .args(["-f", "lavfi", "-i", "sine=f=440:d=24"])
+        .args(["-filter_complex", "[0:v]format=yuv420p[a];[1:v]format=yuv420p[b];[2:v]format=yuv420p[c];[3:v]format=yuv420p[d];[a][b][c][d]concat=n=4:v=1:a=0[v]"])
+        .args(["-map", "[v]", "-map", "4:a", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "16", "-c:a", "aac", "-b:a", "64k", "-bitexact", "-fflags", "+bitexact", name])
+        .output()
+        .expect("run ffmpeg");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+}
+
+/// Running ffmpeg processes whose command line names something under `dir`, each with its
+/// state letter (`R` running, `S` sleeping, `T` stopped).
+fn ffmpegs_under(dir: &Path) -> Vec<(u32, char)> {
+    let needle = dir.to_string_lossy().into_owned();
+    let mut found = Vec::new();
+    for e in std::fs::read_dir("/proc").unwrap().flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else { continue };
+        let Ok(comm) = std::fs::read_to_string(e.path().join("comm")) else { continue };
+        if comm.trim() != "ffmpeg" {
+            continue;
+        }
+        let cmdline = std::fs::read(e.path().join("cmdline")).unwrap_or_default();
+        if !String::from_utf8_lossy(&cmdline).contains(&needle) {
+            continue;
+        }
+        let stat = std::fs::read_to_string(e.path().join("stat")).unwrap_or_default();
+        if let Some(state) = stat.rsplit(')').next().and_then(|rest| rest.trim().chars().next()) {
+            found.push((pid, state));
+        }
+    }
+    found
+}
+
+/// Waits for `done` to hold, looking every 50 ms; fails after `secs`.
+fn wait_until(what: &str, secs: u64, mut done: impl FnMut() -> bool) {
+    let t = std::time::Instant::now();
+    while !done() {
+        assert!(t.elapsed().as_secs() < secs, "gave up waiting for {what} after {secs} s");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Entries of `dir` whose name starts with `prefix`.
+fn entries(dir: &Path, prefix: &str) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    rd.flatten().map(|e| e.path()).filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(prefix))).collect()
 }
 
 fn ffprobe(args: &[&str], path: &Path) -> String {
@@ -789,4 +852,260 @@ fn very_short_videos_are_encoded_or_refused_cleanly() {
     // As it stands: a second is enough, less is skipped with the reason.
     r.ok().has("encoded 1, skipped 3, failed 0");
     assert_eq!(r.err.matches("skipped: no usable duration").count(), 3, "{}", r.err);
+}
+
+/// Settings slow enough to catch an encode in the middle.
+const SLOW: [&str; 6] = ["--preset", "6", "--samples", "2", "--sample-secs", "2"];
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn scenes_get_their_own_crf_and_a_killed_run_goes_on_where_it_stopped() {
+    let c = Case::new("resume");
+    let src = c.scenes_clip("s.mp4");
+    let args = || {
+        let mut a: Vec<std::ffi::OsString> = vec!["encode".into(), "-o".into(), c.out().into(), "--scenes".into()];
+        a.extend(SLOW.iter().map(Into::into));
+        a.push(src.clone().into());
+        a
+    };
+    let mut child = c.command().args(args()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    wait_until("the first finished chunk", 180, || entries(&c.out(), ".av1opt-work-").iter().any(|w| w.join("chunk00000.obu").exists()));
+    // Killed outright, as by a power cut or the out-of-memory killer: its ffmpeg goes too.
+    child.kill().unwrap();
+    child.wait().unwrap();
+    wait_until("ffmpeg to end with av1opt", 5, || ffmpegs_under(&c.dir).is_empty());
+    assert!(!c.out().join("s.mp4").exists() && !c.out().join("s.av1opt.json").exists());
+
+    let r = c.av1opt(&args());
+    r.ok().has("resuming earlier run: crf").has("encoded 1, skipped 0, failed 0");
+    let kept: u32 = r.err.split("resuming: ").nth(1).and_then(|t| t.split_whitespace().next()?.parse().ok()).unwrap_or_else(|| panic!("no chunk kept:\n{}", r.err));
+    assert!((1..4).contains(&kept), "{kept} chunks kept");
+    // The search was not run again.
+    assert!(!r.err.contains("searching CRF"), "{}", r.err);
+
+    let out = c.out().join("s.mp4");
+    assert_eq!(frames(&out), 576);
+    assert_in_step(&out, &src, "1");
+    assert_eq!(packets_md5(&out, "0:a:0"), packets_md5(&src, "0:a:0"));
+    let rep = c.report("s");
+    assert_eq!(rep["mode"], "scenes");
+    let chunks = rep["chunks"].as_array().unwrap();
+    assert_eq!(chunks.len(), 4, "{rep}");
+    // Four kinds of picture do not all want the same CRF, and each chunk met the target.
+    let crfs: Vec<f64> = chunks.iter().map(|ch| ch["crf"].as_f64().unwrap()).collect();
+    assert!(crfs.iter().cloned().fold(0.0, f64::max) - crfs.iter().cloned().fold(99.0, f64::min) >= 3.0, "{crfs:?}");
+    for ch in chunks {
+        assert!(ch["vmaf"].as_f64().unwrap() > 92.0, "{ch}");
+    }
+    assert_eq!(chunks.iter().map(|ch| ch["frames"].as_u64().unwrap()).sum::<u64>(), 576);
+    assert_eq!(c.outputs(), ["av1opt-log.tsv", "s.av1opt.json", "s.mp4"]);
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_stopped_encode_leaves_nothing_half_done_and_its_trials_are_remembered() {
+    let c = Case::new("stopped");
+    let src = c.clip("s.mp4", "640x360", 24);
+    let args = |extra: &[&str]| {
+        let mut a: Vec<std::ffi::OsString> = vec!["encode".into(), "-o".into(), c.out().into()];
+        a.extend(SLOW.iter().map(Into::into));
+        a.extend(extra.iter().map(Into::into));
+        a.push(src.clone().into());
+        a
+    };
+    let mut child = c.command().args(args(&[])).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let tmp = c.out().join(format!(".av1opt-tmp-{}", child.id()));
+    wait_until("the encode to start writing", 180, || std::fs::metadata(tmp.join("partial.mp4")).is_ok_and(|m| m.len() > 0));
+    // Ctrl-C in a terminal reaches av1opt and ffmpeg alike; `kill` reaches av1opt only.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let status = child.wait().unwrap();
+    assert!(!status.success());
+    wait_until("ffmpeg to end with av1opt", 5, || ffmpegs_under(&c.dir).is_empty());
+    assert!(c.outputs().iter().all(|n| n.starts_with(".av1opt-tmp-")), "{:?}", c.outputs());
+
+    // The next run clears the leftovers away, reuses the trials and finishes.
+    let r = c.av1opt(&args(&[]));
+    r.ok().has("encoded 1, skipped 0, failed 0").has("(measured earlier)");
+    assert!(!r.err.lines().any(|l| l.trim_start().starts_with("crf ") && !l.contains("measured earlier")), "a trial was measured again:\n{}", r.err);
+    assert_eq!(c.outputs(), ["av1opt-log.tsv", "s.av1opt.json", "s.mp4"]);
+    assert_eq!(frames(&c.out().join("s.mp4")), 576);
+    assert_in_step(&c.out().join("s.mp4"), &src, "1");
+
+    // Asked to, every trial is measured again; the answer is the same or next to it.
+    let crf = c.report("s")["crf"].as_f64().unwrap();
+    let r = c.av1opt(&args(&["--overwrite", "--fresh-search"]));
+    r.ok().has("encoded 1, skipped 0, failed 0");
+    assert!(!r.err.contains("measured earlier"), "{}", r.err);
+    assert!((c.report("s")["crf"].as_f64().unwrap() - crf).abs() <= 1.0, "{} then {crf}", c.report("s")["crf"]);
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn an_output_takes_its_originals_place_and_gives_it_back() {
+    let c = Case::new("replace");
+    c.clip("plain.mp4", "320x180", 4);
+    std::fs::create_dir_all(c.videos().join("films")).unwrap();
+    c.ffmpeg(&["-i", "plain.mp4", "-c", "copy", "films/movie.mkv"]);
+    std::fs::remove_file(c.videos().join("plain.mp4")).unwrap();
+    let src = c.videos().join("films/movie.mkv");
+    let original = std::fs::read(&src).unwrap();
+    c.encode(&[&c.videos()], &[]).ok().has("encoded 1,");
+    let out = c.out().join("films/movie.mp4");
+    let encoded = std::fs::read(&out).unwrap();
+    let trash = c.dir.join("data/Trash/files");
+    let out_arg = c.out();
+    let replace = |extra: &[&str]| {
+        let mut a: Vec<std::ffi::OsString> = vec!["replace".into(), out_arg.clone().into()];
+        a.extend(extra.iter().map(Into::into));
+        c.av1opt(&a)
+    };
+
+    // Without --apply it only says what it would do.
+    replace(&[]).ok();
+    assert_eq!((std::fs::read(&src).unwrap(), std::fs::read(&out).unwrap()), (original.clone(), encoded.clone()));
+    assert!(entries(&trash, "").is_empty());
+
+    // Applied: the AV1 file sits where the original was, under its name with the new
+    // ending; the original is in the trash, whole.
+    replace(&["--apply"]).ok();
+    let placed = c.videos().join("films/movie.mp4");
+    assert_eq!(std::fs::read(&placed).unwrap(), encoded);
+    assert!(!src.exists() && !out.exists());
+    assert_eq!(std::fs::read(trash.join("movie.mkv")).unwrap(), original);
+    assert_eq!(video(&placed)["codec_name"], "av1");
+    // A second go has nothing left to do and changes nothing.
+    replace(&["--apply"]);
+    assert_eq!(std::fs::read(&placed).unwrap(), encoded);
+    assert_eq!(entries(&trash, "").len(), 1);
+
+    // And back: both files where they were, byte for byte, the trash empty.
+    replace(&["--undo", "--apply"]).ok();
+    assert_eq!((std::fs::read(&src).unwrap(), std::fs::read(&out).unwrap()), (original, encoded));
+    assert!(!placed.exists());
+    assert!(entries(&trash, "").is_empty(), "{:?}", entries(&trash, ""));
+    // After that it can be replaced again.
+    replace(&["--apply"]).ok();
+    assert!(placed.exists() && !src.exists());
+}
+
+#[cfg(feature = "ui")]
+mod queue {
+    use super::*;
+    use common::Server;
+    use serde_json::json;
+    use std::time::{Duration, Instant};
+
+    fn head(s: &Server, id: u64) -> Value {
+        let heads = s.get("/api/jobs/heads").json();
+        heads["jobs"].as_array().unwrap().iter().find(|j| j["id"] == id).cloned().unwrap_or_else(|| panic!("job {id} is not in {heads}"))
+    }
+
+    fn status(s: &Server, id: u64) -> String {
+        head(s, id)["status"].as_str().unwrap().to_string()
+    }
+
+    fn add(s: &Server, input: &Path, options: Value) -> u64 {
+        let r = s.post("/api/jobs", &json!({ "inputs": [input], "roots": [], "out_dir": s.dir.join("out"), "options": options }));
+        assert_eq!(r.status, 200, "{}", r.body);
+        r.json()["id"].as_u64().unwrap()
+    }
+
+    #[test]
+    #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+    fn a_paused_queue_holds_its_encode_in_place_and_leaves_the_wait_out_of_the_timings() {
+        let s = Server::start_with_tools("e2e-pause", &ffmpeg_bin(), &ffprobe_bin(), |d| scenes_clip(&d.join("videos"), "s.mp4"));
+        let src = s.dir.join("videos/s.mp4");
+        let began = Instant::now();
+        let id = add(&s, &src, json!({ "preset": 6, "scenes": true }));
+        wait_until("the encode to run ffmpeg", 60, || status(&s, id) == "running" && !ffmpegs_under(&s.dir).is_empty());
+
+        // Paused: every ffmpeg of the job is stopped, not ended, and stays so.
+        assert_eq!(s.post("/api/queue/pause", &json!({ "paused": true })).status, 200);
+        wait_until("ffmpeg to be held", 10, || {
+            let f = ffmpegs_under(&s.dir);
+            !f.is_empty() && f.iter().all(|(_, state)| *state == 'T')
+        });
+        let held = ffmpegs_under(&s.dir);
+        let heads = s.get("/api/jobs/heads").json();
+        assert_eq!(heads["queue"]["hold"]["why"], "paused", "{heads}");
+        assert_eq!(head(&s, id)["paused"], true);
+        std::thread::sleep(Duration::from_millis(2500));
+        assert_eq!(ffmpegs_under(&s.dir), held, "a held ffmpeg ended or another started");
+        assert_eq!(status(&s, id), "running");
+
+        assert_eq!(s.post("/api/queue/pause", &json!({ "paused": false })).status, 200);
+        wait_until("the encode to finish", 300, || status(&s, id) != "running");
+        let wall = began.elapsed().as_secs_f64();
+        let h = head(&s, id);
+        assert_eq!((h["status"].as_str(), h["counts"]["ok"].as_u64(), h["error"].as_str()), (Some("done"), Some(1), None), "{h}");
+        assert!(ffmpegs_under(&s.dir).is_empty());
+        let out = s.dir.join("out/s.mp4");
+        assert_eq!(frames(&out), 576);
+        assert_in_step(&out, &src, "1");
+        // The 2.5 s it was held are in neither timing.
+        let r: Value = serde_json::from_slice(&std::fs::read(out.with_extension("av1opt.json")).unwrap()).unwrap();
+        let worked = r["search_secs"].as_f64().unwrap() + r["encode_secs"].as_f64().unwrap();
+        assert!(worked < wall - 2.0, "worked {worked:.1} s of {wall:.1} s on the clock");
+
+        // The report is in History, and the output can take the original's place and give it back.
+        let report = out.with_extension("av1opt.json");
+        let state = |s: &Server| s.get("/api/history").json()["reports"][0]["replace"]["state"].as_str().unwrap_or("").to_string();
+        assert_eq!(state(&s), "ready");
+        let (original, encoded) = (std::fs::read(&src).unwrap(), std::fs::read(&out).unwrap());
+        let r = s.post("/api/replace", &json!({ "report": report }));
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(std::fs::read(&src).unwrap(), encoded);
+        assert_eq!(std::fs::read(s.dir.join("data/Trash/files/s.mp4")).unwrap(), original);
+        assert_eq!(state(&s), "replaced");
+        let r = s.post("/api/replace/undo", &json!({ "report": report }));
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!((std::fs::read(&src).unwrap(), std::fs::read(&out).unwrap()), (original, encoded));
+        assert_eq!(state(&s), "ready");
+    }
+
+    #[test]
+    #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+    fn cancelled_jobs_stop_at_once_come_back_when_asked_and_a_restart_goes_on() {
+        let mut s = Server::start_with_tools("e2e-cancel", &ffmpeg_bin(), &ffprobe_bin(), |d| scenes_clip(&d.join("videos"), "s.mp4"));
+        let src = s.dir.join("videos/s.mp4");
+        let id = add(&s, &src, json!({ "preset": 6, "scenes": true }));
+        wait_until("the encode to run ffmpeg", 60, || status(&s, id) == "running" && !ffmpegs_under(&s.dir).is_empty());
+        assert_eq!(s.post(&format!("/api/jobs/{id}/cancel"), &json!({})).status, 200);
+        wait_until("the job to stop", 20, || status(&s, id) == "cancelled");
+        wait_until("ffmpeg to end", 5, || ffmpegs_under(&s.dir).is_empty());
+        assert!(!s.dir.join("out/s.mp4").exists());
+
+        // Cancelled while held: it ends all the same, and the pause stays on.
+        let again = s.post(&format!("/api/jobs/{id}/again"), &json!({})).json()["id"].as_u64().unwrap();
+        wait_until("the encode to run ffmpeg", 60, || status(&s, again) == "running" && !ffmpegs_under(&s.dir).is_empty());
+        s.post("/api/queue/pause", &json!({ "paused": true }));
+        wait_until("ffmpeg to be held", 10, || ffmpegs_under(&s.dir).iter().all(|(_, state)| *state == 'T') && !ffmpegs_under(&s.dir).is_empty());
+        assert_eq!(s.post(&format!("/api/jobs/{again}/cancel"), &json!({})).status, 200);
+        wait_until("the held job to stop", 20, || status(&s, again) == "cancelled");
+        wait_until("ffmpeg to end", 5, || ffmpegs_under(&s.dir).is_empty());
+        assert_eq!(s.get("/api/jobs/heads").json()["queue"]["paused"], true);
+
+        // A paused queue starts nothing.
+        let third = s.post(&format!("/api/jobs/{again}/again"), &json!({})).json()["id"].as_u64().unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(status(&s, third), "queued");
+        assert!(ffmpegs_under(&s.dir).is_empty());
+        s.post("/api/queue/pause", &json!({ "paused": false }));
+        wait_until("chunks to be encoded", 180, || entries(&s.dir.join("out"), ".av1opt-work-").iter().any(|w| w.join("chunk00000.obu").exists()));
+
+        // The server is stopped in the middle (the app is closed): ffmpeg ends with it, and
+        // the next start takes the job up again, keeping the chunks that were done.
+        assert!(s.terminate(), "server did not stop on SIGTERM");
+        wait_until("ffmpeg to end with the server", 5, || ffmpegs_under(&s.dir).is_empty());
+        let s2 = Server::start_in(&s.dir, &ffmpeg_bin(), &ffprobe_bin());
+        let heads = s2.get("/api/jobs/heads").json();
+        let id = heads["jobs"][0]["id"].as_u64().unwrap_or_else(|| panic!("no job after the restart: {heads}"));
+        wait_until("the encode to finish", 300, || !matches!(status(&s2, id).as_str(), "queued" | "running"));
+        let h = head(&s2, id);
+        assert_eq!((h["status"].as_str(), h["counts"]["ok"].as_u64()), (Some("done"), Some(1)), "{h}");
+        let out = s2.dir.join("out/s.mp4");
+        assert_eq!(frames(&out), 576);
+        assert_in_step(&out, &s2.dir.join("videos/s.mp4"), "1");
+        assert!(entries(&s2.dir.join("out"), ".av1opt-").is_empty());
+    }
 }

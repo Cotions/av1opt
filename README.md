@@ -196,7 +196,9 @@ encodes two chunks at once (each ffmpeg then gets half of `--memory-limit`).
 
 Finished chunks are kept in `.av1opt-work-*` in the output folder, so an interrupted run resumes
 where it stopped (including the search). Variable-frame-rate sources are encoded in one pass,
-since chunking needs a constant frame rate.
+since chunking needs a constant frame rate. A file's header is not taken at its word for
+that: the scene pass counts how many frames a constant rate would drop or show twice, and
+past a handful (more than 1 in 200) the file is encoded in one pass, with a note in the report.
 
 Folders are walked recursively and their layout is mirrored under `--out-dir`. Every result is
 appended to `av1opt-log.tsv` there; re-running the same command resumes: finished files are
@@ -472,10 +474,29 @@ and the benchmark's requests and tuned settings over HTTP (no ffmpeg needed).
   measures the place. A step along that shape instead of a
   straight 0.4 per CRF took the search from 2.4 to 2.2 trials, and `bench`'s search (which
   goes on until two neighbouring CRFs are measured) from 3.6 to 3.1.
+- **A Matroska header names a frame rate whatever the frames do.** ffprobe reports 24 fps as
+  both the nominal and the average rate of an MKV whose frames come at 12, so comparing the
+  two finds variable frame rates in MP4 only. Scene mode then cut such a file into
+  constant-rate chunks: 96 frames became 190, every other one a repeat (a file with more
+  frames than its header says would have lost some), and the checks passed because they
+  compare at the same constant rate. ffmpeg's `fps` filter counts the frames it drops and
+  repeats; scene detection runs it over the whole file anyway, so that count now decides.
 - **ffmpeg ignores `-svtav1-params` names it can't parse.** A typo only prints a warning and the
   encode runs without the option, so parameters are tried on a few generated frames first.
 
 ## Tests
+
+`cargo test --test e2e -- --ignored` runs the real program with a real ffmpeg on clips
+generated on the spot (a few seconds of test patterns, 320x180, so the whole set takes under
+a minute): a plain encode and its report, the frames of the output against the source's one by one
+(so a frame dropped, doubled or out of place is seen), subtitles, chapters, languages and
+tags in both containers, 10-bit, HDR10 and HLG signalling, sound tracks copied, converted
+and shrunk, removed sections, metadata presets and info files, interlaced, variable-rate,
+rotated, odd-sized, 4:4:4, wide-pixel and full-range sources, cover art in every place it
+can be, sound and picture offsets, AVI, WebM, MOV, MPEG and transport streams at six frame
+rates, very short videos, awkward file and folder names, and skips, failures and name
+collisions. It needs an ffmpeg with libsvtav1, libvmaf, libx264 and libx265
+(`AV1OPT_FFMPEG`, `AV1OPT_FFPROBE`), which is why a plain `cargo test` leaves it out.
 
 `cargo test` covers the CRF search (exactness against brute force, trial count and misses on
 the measured curves of eight real clips, starting from scores known beforehand), where clips are cut relative to frames, the first-CRF guess and what it learns from past encodes, the

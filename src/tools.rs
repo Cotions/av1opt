@@ -300,6 +300,12 @@ impl Tools {
     /// Like [`Tools::run_with_progress`], with ffmpeg's working directory set to `dir` (lets
     /// filters write files by relative name, avoiding filter-graph path escaping).
     pub fn run_with_progress_in(&self, dir: Option<&Path>, args: &[String], total_secs: f64, label: &str) -> Result<u64> {
+        self.run_with_progress_log(dir, args, total_secs, label).map(|(frames, _)| frames)
+    }
+
+    /// Like [`Tools::run_with_progress_in`], also returning what ffmpeg wrote to its log
+    /// (errors only, unless `args` raise the level with `-v`).
+    pub fn run_with_progress_log(&self, dir: Option<&Path>, args: &[String], total_secs: f64, label: &str) -> Result<(u64, String)> {
         let mut cmd = self.command_for(args);
         if let Some(d) = dir {
             cmd.current_dir(d);
@@ -344,7 +350,7 @@ impl Tools {
         if !status.success() {
             bail!("ffmpeg failed ({status}):\n{}", tail(&stderr, 15));
         }
-        Ok(frames)
+        Ok((frames, stderr))
     }
 
     /// VMAF of `distorted` against `reference`, pairing frames by index rather than timestamp

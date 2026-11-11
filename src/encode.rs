@@ -342,31 +342,45 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     let covers = prepare_covers(tools, input, &info, o.container, &tmp.path, &mut notes);
     let t1 = tools.stopwatch();
     let mut search_secs = t0.secs(tools);
-    let (streams, chunks, expect_frames) = if let Some(work) = &work {
+    let probe = EncodeSettings { preset: (preset + 4).clamp(preset, 12), pix_fmt_out: enc.pix_fmt_out, params: enc.params.clone() };
+    let mut work = work;
+    let mut plan = saved;
+    if plan.is_none()
+        && let Some(w) = &work
+    {
+        // How much better the real preset scores than the fast probe preset at the
+        // same CRF; probe scores are shifted by this to predict the real encode.
+        let lab = lab.as_mut().expect("a search that wasn't resumed has its lab");
+        let (pt, _) = lab.trial(&probe, best.crf)?;
+        let bias = best.mean_vmaf - pt.mean_vmaf;
+        lab.discard_samples();
+        std::fs::create_dir_all(&w.path)?;
+        tools.emit(Event::Phase { phase: "scenes".into(), detail: "finding scene changes".into() });
+        let found = scenes::detect(tools, input, &info, &w.path)?;
+        match found.pace.filter(scenes::Pace::uneven) {
+            // The header named a constant rate the frames don't keep (see `Pace`).
+            Some(p) => {
+                notes.push(format!(
+                    "frames come at uneven times ({} frames; at a constant {} fps {} would be dropped and {} shown twice): encoded in one pass instead of per scene",
+                    p.source_frames, search::cfr(&info), p.dropped, p.repeated
+                ));
+                let _ = std::fs::remove_dir_all(&w.path);
+                work = None;
+            }
+            None => {
+                let (first_pts, chunks) = scenes::bounds(&info, &found.cuts, found.total);
+                eprintln!("{} scene cuts, {} frames, {} chunks", found.cuts.len(), found.total, chunks.len());
+                let p = scenes::Plan { key: w.key.clone(), best, trials: trials.clone(), bias, first_pts, total_frames: found.total, chunks };
+                std::fs::write(w.path.join("plan.json"), serde_json::to_vec_pretty(&p)?)?;
+                plan = Some(p);
+            }
+        }
+    }
+    let (streams, chunks, expect_frames) = if let (Some(work), Some(plan)) = (&work, plan) {
         let vf = search::source_filters(&info);
         if !vf.is_empty() {
             notes.push(format!("video filters: {}", vf.join(",")));
         }
-        let probe = EncodeSettings { preset: (preset + 4).clamp(preset, 12), pix_fmt_out: enc.pix_fmt_out, params: enc.params.clone() };
-        let plan = match saved {
-            Some(p) => p,
-            None => {
-                // How much better the real preset scores than the fast probe preset at the
-                // same CRF; probe scores are shifted by this to predict the real encode.
-                let lab = lab.as_mut().expect("a search that wasn't resumed has its lab");
-                let (pt, _) = lab.trial(&probe, best.crf)?;
-                let bias = best.mean_vmaf - pt.mean_vmaf;
-                lab.discard_samples();
-                std::fs::create_dir_all(&work.path)?;
-                tools.emit(Event::Phase { phase: "scenes".into(), detail: "finding scene changes".into() });
-                let (cuts, total_frames) = scenes::detect(tools, input, &info, &work.path)?;
-                let (first_pts, chunks) = scenes::bounds(&info, &cuts, total_frames);
-                eprintln!("{} scene cuts, {total_frames} frames, {} chunks", cuts.len(), chunks.len());
-                let plan = scenes::Plan { key: work.key.clone(), best, trials: trials.clone(), bias, first_pts, total_frames, chunks };
-                std::fs::write(work.path.join("plan.json"), serde_json::to_vec_pretty(&plan)?)?;
-                plan
-            }
-        };
         search_secs = t0.secs(tools);
         let ctx = scenes::Ctx {
             tools, input, info: &info, work: &work.path, enc: &enc, probe: &probe, target: o.target_vmaf,

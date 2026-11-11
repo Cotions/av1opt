@@ -159,8 +159,49 @@ fn score_at(probes: &[(u8, f64)], crf: u8) -> f64 {
     probes.iter().find(|p| p.0 == crf).map_or(0.0, |p| p.1)
 }
 
-/// Scene-cut timestamps (frame units, absolute) and total frame count of the constant-rate stream.
-pub fn detect(tools: &Tools, input: &Path, info: &MediaInfo, work: &Path) -> Result<(Vec<i64>, u64)> {
+/// What the scene pass found.
+pub struct Detected {
+    /// Scene-cut timestamps (frame units, absolute).
+    pub cuts: Vec<i64>,
+    /// Frames of the constant-rate stream.
+    pub total: u64,
+    /// Frames the source has, and how many of them the constant rate dropped or showed twice.
+    pub pace: Option<Pace>,
+}
+
+/// How the source's frames fit the constant frame rate chunks are cut at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pace {
+    pub source_frames: u64,
+    pub dropped: u64,
+    pub repeated: u64,
+}
+
+impl Pace {
+    /// The source's frames do not come at the constant rate its header names: a screen
+    /// recording, a phone video, a Matroska file whose header says 24 fps over frames that
+    /// come at 12. Cutting it into constant-rate chunks would drop frames or double them.
+    /// A few are let through: a broadcast with a damaged second is still constant-rate.
+    pub fn uneven(&self) -> bool {
+        self.dropped + self.repeated > (self.source_frames / 200).max(2)
+    }
+
+    /// From ffmpeg's log at `-v verbose`, where the `fps` filter sums up what it did:
+    /// `[Parsed_fps_0 @ 0x...] 96 frames in, 190 frames out; 0 frames dropped, 94 frames duplicated.`
+    /// The last such line counts (a filter graph set up twice logs an empty one first).
+    fn from_log(log: &str) -> Option<Pace> {
+        log.lines().rev().filter(|l| l.contains("Parsed_fps_")).find_map(|l| {
+            let nums: Vec<u64> = l.split("] ").nth(1)?.split(|c: char| !c.is_ascii_digit()).filter(|w| !w.is_empty()).filter_map(|w| w.parse().ok()).collect();
+            match nums[..] {
+                [source_frames, _out, dropped, repeated] => Some(Pace { source_frames, dropped, repeated }),
+                _ => None,
+            }
+        })
+    }
+}
+
+/// Finds the scene changes of the constant-rate stream, and counts its frames.
+pub fn detect(tools: &Tools, input: &Path, info: &MediaInfo, work: &Path) -> Result<Detected> {
     let mut vf = search::source_filters(info);
     vf.extend([
         format!("fps={}", search::cfr(info)),
@@ -170,19 +211,20 @@ pub fn detect(tools: &Tools, input: &Path, info: &MediaInfo, work: &Path) -> Res
         "metadata=mode=print:key=lavfi.scd.time:file=scenes.txt".into(),
     ]);
     let input = std::path::absolute(input)?;
+    // Verbose, for the fps filter's count of dropped and repeated frames (see `Pace`).
     let args: Vec<String> = [
-        "-y", "-copyts", "-i", &path_arg(&input), "-map", &format!("0:{}", info.video_index),
+        "-v", "verbose", "-y", "-copyts", "-i", &path_arg(&input), "-map", &format!("0:{}", info.video_index),
         "-an", "-sn", "-dn", "-vf", &vf.join(","), "-f", "null", "-",
     ]
     .map(String::from)
     .to_vec();
-    let total = tools.run_with_progress_in(Some(work), &args, info.duration_s, "finding scenes")?;
+    let (total, log) = tools.run_with_progress_log(Some(work), &args, info.duration_s, "finding scenes")?;
     let text = std::fs::read_to_string(work.join("scenes.txt")).unwrap_or_default();
     let cuts = text
         .lines()
         .filter_map(|l| l.split_whitespace().find_map(|w| w.strip_prefix("pts:"))?.parse().ok())
         .collect();
-    Ok((cuts, total))
+    Ok(Detected { cuts, total, pace: Pace::from_log(&log) })
 }
 
 /// Turns detected cuts into chunk bounds. Returns (first frame timestamp, bounds).
@@ -415,6 +457,28 @@ pub fn fnv1a(s: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_fps_filter_tells_whether_frames_keep_a_constant_rate() {
+        let log = "[Parsed_fps_0 @ 0x62ae] 0 frames in, 0 frames out; 0 frames dropped, 0 frames duplicated.\n\
+                   [h264 @ 0x1] Reinit context to 320x192, pix_fmt: yuv420p\n\
+                   [Parsed_fps_0 @ 0x7a52] 96 frames in, 190 frames out; 0 frames dropped, 94 frames duplicated.\n\
+                   [out#0/null @ 0x2] video:82KiB audio:0KiB\n";
+        let p = Pace::from_log(log).unwrap();
+        assert_eq!(p, Pace { source_frames: 96, dropped: 0, repeated: 94 });
+        assert!(p.uneven());
+        // A filter chain that starts with something else numbers the fps filter differently.
+        let p = Pace::from_log("[Parsed_fps_1 @ 0x5d] 172800 frames in, 172803 frames out; 2 frames dropped, 5 frames duplicated.").unwrap();
+        assert_eq!(p, Pace { source_frames: 172800, dropped: 2, repeated: 5 });
+        // A handful over two hours is a damaged broadcast, not a variable rate.
+        assert!(!p.uneven());
+        assert!(!Pace { source_frames: 100, dropped: 1, repeated: 1 }.uneven());
+        assert!(Pace { source_frames: 100, dropped: 3, repeated: 0 }.uneven());
+        assert!(Pace { source_frames: 172800, dropped: 900, repeated: 0 }.uneven());
+        // No such line (another ffmpeg, another wording): nothing is concluded.
+        assert_eq!(Pace::from_log("frame=  190 fps=0.0 q=-0.0 Lsize=N/A"), None);
+        assert_eq!(Pace::from_log("[Parsed_fps_0 @ 0x1] something else entirely"), None);
+    }
 
     fn lens(starts: &[u64], total: u64) -> Vec<u64> {
         starts.windows(2).map(|w| w[1] - w[0]).chain([total - starts.last().unwrap()]).collect()

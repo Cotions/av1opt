@@ -220,6 +220,10 @@ enum Cmd {
         /// Retry files an earlier run skipped (low savings, unreachable target, ...).
         #[arg(long)]
         retry_skipped: bool,
+        /// Which file goes first: as given, the largest estimated saving, or the largest
+        /// estimated saving per hour of encoding (so a run stopped early has saved the most).
+        #[arg(long, value_enum, default_value_t)]
+        order: batch::Order,
         /// Keep sample and partial files for debugging.
         #[arg(long)]
         keep_temp: bool,
@@ -466,7 +470,7 @@ fn main() -> Result<()> {
         Cmd::Encode {
             inputs, out_dir, container, target_vmaf, preset, svt_params, tuned, min_crf, max_crf, samples, sample_secs,
             min_savings, force, overwrite, retry_skipped, keep_temp, allow_zfs, ffmpeg, ffprobe, scenes, workers, memory_limit, nice,
-            strip_metadata, keep_dates, meta_preset, meta, no_info_json, remove, audio, fresh_search,
+            strip_metadata, keep_dates, meta_preset, meta, no_info_json, remove, audio, fresh_search, order,
         } => {
             let meta = metadata::MetaOptions {
                 keep: !strip_metadata,
@@ -505,9 +509,12 @@ fn main() -> Result<()> {
                 container, target_vmaf, preset, svt_params, tuning, min_crf, max_crf, samples, sample_secs,
                 min_savings, force, overwrite, keep_temp, scenes, workers: workers.into(), meta, remove, audio, fresh_search,
             };
-            let jobs = batch::expand(&inputs, &out_dir, is_video);
+            let mut jobs = batch::expand(&inputs, &out_dir, is_video);
             if jobs.is_empty() {
                 anyhow::bail!("no video files found in the given inputs");
+            }
+            if order != batch::Order::Given && jobs.len() > 1 {
+                order_jobs(&mut jobs, &inputs, &tools.ffprobe, &opts, order)?;
             }
             if !opts.remove.is_empty() && jobs.len() > 1 {
                 anyhow::bail!("--remove applies to one video; {} were given", jobs.len());
@@ -596,6 +603,36 @@ fn memory_cap(setting: &str, workers: u8) -> Option<String> {
         }
     };
     Some(format!("{}M", mb / workers.max(1) as u64))
+}
+
+/// Sorts a batch by what `scan` expects of each file (probe results come from its cache).
+fn order_jobs(jobs: &mut [batch::Job], inputs: &[PathBuf], ffprobe: &str, o: &encode::Options, order: batch::Order) -> Result<()> {
+    let abs = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    let past = history::load();
+    let model = estimate::Model::fit(&past, o.target_vmaf);
+    let time = estimate::TimeModel::fit(&past, o.preset);
+    let roots: Vec<PathBuf> = inputs.iter().map(|p| abs(p)).collect();
+    eprintln!("probing {} files to order them", jobs.len());
+    let (found, _) = scan::collect(&roots, ffprobe, 6, o.min_savings, &model, &|_, _| {})?;
+    // Files that would be skipped anyway are worth nothing and go last.
+    let worth: std::collections::HashMap<PathBuf, f64> = found
+        .iter()
+        .filter(|r| r.verdict == estimate::Verdict::Candidate)
+        .map(|r| {
+            let saved = r.size as f64 - r.estimate.likely;
+            let secs = r.info.as_ref().map_or(0.0, |i| time.secs(i));
+            let w = match order {
+                batch::Order::PerHour if secs > 0.0 => saved / secs,
+                batch::Order::PerHour => 0.0,
+                _ => saved,
+            };
+            (r.path.clone(), w)
+        })
+        .collect();
+    batch::order_by(jobs, |p| worth.get(&abs(p)).copied().unwrap_or(0.0));
+    let what = if order == batch::Order::PerHour { "largest estimated saving per hour of encoding" } else { "largest estimated saving" };
+    eprintln!("order: {what} first");
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

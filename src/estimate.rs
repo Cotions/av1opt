@@ -184,6 +184,9 @@ const SEARCH_ENCODES: f64 = 2.0;
 /// Seconds of video the search's sample clips add up to (4 clips of 8 s) unless the video is shorter.
 const SEARCH_CLIP_SECS: f64 = 32.0;
 
+/// Encodes shorter than this say little about seconds per frame.
+const MIN_TIMED_SECS: f64 = 10.0;
+
 fn preset_time(preset: u8) -> f64 {
     PRESET_TIME[(preset as usize).min(PRESET_TIME.len() - 1)]
 }
@@ -196,7 +199,8 @@ impl TimeModel {
             .filter(|r| r.mode == "whole")
             .filter_map(|r| {
                 let frames = r.fps * r.duration_s;
-                let secs = r.encode_secs.filter(|s| *s > 0.0)?;
+                // Very short encodes are mostly start-up and muxing, not frames.
+                let secs = r.encode_secs.filter(|s| *s >= MIN_TIMED_SECS)?;
                 let pixels = r.width as f64 * r.height as f64;
                 let per_frame = secs / frames * preset_time(preset) / preset_time(r.preset);
                 (frames >= 1.0 && pixels > 0.0).then(|| ((pixels / PIXELS_1080P).ln(), per_frame.ln()))
@@ -430,6 +434,7 @@ mod tests {
 
     fn timed(w: u32, h: u32, preset: u8, per_frame: f64) -> Record {
         let mut r = rec(0.1, 0.03, w, h);
+        r.duration_s = 600.0;
         (r.preset, r.encode_secs) = (preset, Some(per_frame * r.fps * r.duration_s));
         r
     }
@@ -476,6 +481,9 @@ mod tests {
         let mut scene = timed(1920, 1080, 6, 0.001);
         scene.mode = "scenes".into();
         assert_eq!(TimeModel::fit(&[scene, rec(0.1, 0.03, 1920, 1080)], 6).samples, 0);
+        let mut blink = timed(1920, 1080, 6, 0.2);
+        (blink.duration_s, blink.encode_secs) = (1.0, Some(6.0));
+        assert_eq!(TimeModel::fit(&[blink], 6).samples, 0);
         let one = TimeModel::fit(&[timed(1920, 1080, 6, SPF_1080P / 4.0)], 6).secs_per_frame(PIXELS_1080P);
         assert!(one < SPF_1080P && one > SPF_1080P / 2.0, "{one}");
     }

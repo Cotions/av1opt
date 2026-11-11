@@ -728,7 +728,9 @@ function renderScan(out, r) {
   const rows = r.rows;
   const body = h("tbody");
   const selInfo = h("span", { class: "dim" });
-  const encodeBtn = h("button", { class: "primary", disabled: true, onclick: () => encodeDialog([...selected], r.paths) }, "Encode selected…");
+  // Files are queued in the order of the table: sort by "Per hour" to encode the best value first.
+  const inOrder = () => { const seen = shown().map((x) => x.path).filter((p) => selected.has(p)); const s = new Set(seen); return seen.concat([...selected].filter((p) => !s.has(p))); };
+  const encodeBtn = h("button", { class: "primary", disabled: true, title: "Files are queued in the order of the table", onclick: () => encodeDialog(inOrder(), r.paths) }, "Encode selected…");
   const allBox = h("input", { type: "checkbox", title: "Select all shown" });
 
   const shown = () => {

@@ -47,6 +47,41 @@ pub fn expand(inputs: &[PathBuf], out_dir: &Path, is_video: impl Fn(&Path) -> bo
     jobs
 }
 
+/// Which file of a batch is encoded first.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum Order {
+    /// As given: files in the order named, folders by path.
+    #[default]
+    Given,
+    /// The file with the largest estimated saving first.
+    Savings,
+    /// The file with the largest estimated saving per hour of encoding first: stopping a
+    /// long run early then leaves the most space saved for the time spent.
+    PerHour,
+}
+
+/// Puts the jobs with the highest `worth` first. Jobs of equal worth (and the ones it knows
+/// nothing about, worth 0) keep their order.
+pub fn order_by(jobs: &mut [Job], worth: impl Fn(&Path) -> f64) {
+    jobs.sort_by_cached_key(|j| std::cmp::Reverse(Sortable(worth(&j.input))));
+}
+
+/// A float that sorts, with NaN counted as nothing.
+#[derive(PartialEq)]
+struct Sortable(f64);
+impl Eq for Sortable {}
+impl PartialOrd for Sortable {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Sortable {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let clean = |x: f64| if x.is_nan() { 0.0 } else { x };
+        clean(self.0).total_cmp(&clean(other.0))
+    }
+}
+
 /// The settings a skip decision depends on. A skip made with other settings (say a faster
 /// preset that can't reach the target) doesn't stop a run with these settings.
 fn settings_key(o: &Options) -> String {
@@ -215,6 +250,20 @@ pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jobs_are_ordered_by_worth_and_ties_keep_their_place() {
+        let job = |name: &str| Job { input: PathBuf::from(name), out_dir: PathBuf::from("/out") };
+        let mut jobs: Vec<Job> = ["a", "b", "c", "d", "e"].map(job).into();
+        order_by(&mut jobs, |p| match p.to_str().unwrap() {
+            "b" => 5.0,
+            "d" => 9.0,
+            "e" => f64::NAN,
+            _ => 0.0,
+        });
+        let names: Vec<&str> = jobs.iter().map(|j| j.input.to_str().unwrap()).collect();
+        assert_eq!(names, ["d", "b", "a", "c", "e"]);
+    }
 
     #[test]
     fn skips_only_count_for_the_same_settings() {

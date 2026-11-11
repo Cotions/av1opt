@@ -193,7 +193,10 @@ since chunking needs a constant frame rate.
 Folders are walked recursively and their layout is mirrored under `--out-dir`. Every result is
 appended to `av1opt-log.tsv` there; re-running the same command resumes: finished files are
 skipped, and files skipped for a reason (low savings, ...) are not searched again with the same settings (target, preset, CRF range, `--min-savings`, `--force`) unless
-`--retry-skipped` is given. Trial encodes are remembered in `~/.cache/av1opt/trials-v1.jsonl`
+`--retry-skipped` is given. `--order per-hour` encodes the files with the largest estimated
+saving per hour of encoding first (`--order savings`: the largest saving first), going by the
+same estimates as `scan`, so a long run stopped early has saved the most for its time; in the
+web UI files are queued in the order of the scan table. Trial encodes are remembered in `~/.cache/av1opt/trials-v1.jsonl`
 for the same file (path, size, date), sample clips, settings and ffmpeg build: an encode that
 was stopped or failed, or is run again with another target, container or `--min-savings`,
 starts from the scores it already has and often measures nothing new. `--fresh-search`

@@ -415,13 +415,30 @@ impl std::fmt::Display for TooLarge {
 
 impl std::error::Error for TooLarge {}
 
-/// First guess when nothing is known about the video, and the typical VMAF drop per CRF step
-/// for SVT-AV1 (pilot data: ~0.36 at 720p-1080p).
+/// First guess when nothing is known about the video: measured curves of eight clips of
+/// different kinds cross VMAF 93 at CRF 35 on average (28 to 39).
 pub const START_CRF: u8 = 35;
 
 /// Winning CRF (None if even the minimum fails) and every (crf, score) evaluated.
 pub type CrfSearch = (Option<u8>, Vec<(u8, f64)>);
-pub const VMAF_PER_CRF: f64 = 0.4;
+/// Usual VMAF drop per CRF step for SVT-AV1 around [`START_CRF`] (measured on the same clips:
+/// 0.3 to 0.6 there, 0.47 on average, and about 0.5 where the score passes 93).
+pub const VMAF_PER_CRF: f64 = 0.5;
+
+/// How much that drop grows with each CRF step: on the measured curves it went from about
+/// 0.15 VMAF per step at CRF 22 to 0.65 at CRF 44.
+const SLOPE_RISE: f64 = 0.02;
+
+/// CRF where a curve of the usual shape through one measured point reaches `target`. A
+/// straight line with the usual slope steps too far toward low CRFs, where the curve flattens,
+/// and not far enough toward high ones.
+fn usual_crossing(crf: f64, score: f64, target: f64) -> f64 {
+    let slope = (VMAF_PER_CRF + SLOPE_RISE * (crf - START_CRF as f64)).max(0.1);
+    // score - target = slope·x + SLOPE_RISE/2·x², x being the way to go. Past the flat top
+    // of that parabola no CRF reaches the target: the top is as far as the shape can tell.
+    let reach = (slope * slope + 2.0 * SLOPE_RISE * (score - target)).max(0.0);
+    crf + (reach.sqrt() - slope) / SLOPE_RISE
+}
 
 /// Finds the highest CRF in `min..=max` whose score is >= `target`, assuming the score falls
 /// as CRF rises. Instead of halving the range, it interpolates between the nearest passing
@@ -439,7 +456,15 @@ pub fn find_crf(start: u8, min: u8, max: u8, target: f64, mut eval: impl FnMut(u
         // Highest passing and lowest failing CRF seen so far.
         let pass = tried.iter().filter(|(_, v)| **v >= target).map(|(c, v)| (*c, *v)).max_by_key(|(c, _)| *c);
         let fail = tried.iter().filter(|(_, v)| **v < target).map(|(c, v)| (*c, *v)).min_by_key(|(c, _)| *c);
-        let step = |v: f64| ((v - target).abs() / VMAF_PER_CRF).round().max(2.0) as u8;
+        // With scores on one side of the target only: along the line through the two nearest
+        // of them, or along the usual shape of the curve when there is just one.
+        let step = |c: u8, v: f64, other: Option<(&u8, &f64)>| {
+            let to = match other {
+                Some((&b, &vb)) => (v - target).abs() / ((vb - v).abs() / c.abs_diff(b) as f64).clamp(0.1, 2.0),
+                None => (usual_crossing(c as f64, v, target) - c as f64).abs(),
+            };
+            to.round().max(1.0) as u8
+        };
         let next = match (pass, fail) {
             (Some((p, _)), Some((f, _))) if f <= p + 1 => None,
             (Some((p, vp)), Some((f, vf))) => {
@@ -448,9 +473,9 @@ pub fn find_crf(start: u8, min: u8, max: u8, target: f64, mut eval: impl FnMut(u
                 Some((c.round() as u8).clamp(p + 1, f - 1))
             }
             (Some((p, _)), None) if p >= max => None,
-            (Some((p, vp)), None) => Some(p.saturating_add(step(vp)).min(max)),
+            (Some((p, vp)), None) => Some(p.saturating_add(step(p, vp, tried.range(..p).next_back())).min(max)),
             (None, Some((f, _))) if f <= min => None,
-            (None, Some((f, vf))) => Some(f.saturating_sub(step(vf)).max(min)),
+            (None, Some((f, vf))) => Some(f.saturating_sub(step(f, vf, tried.range(f + 1..).next())).max(min)),
             (None, None) => unreachable!("just inserted a trial"),
         };
         match next {
@@ -482,7 +507,7 @@ const MAX_REACH: f64 = 6.0;
 /// Curvature assumed when an estimate lies outside its two measurements (VMAF per CRF step
 /// squared). Scores fall faster as the CRF rises, so outside the points the straight line
 /// promises more than the encoder gives; the estimate is moved toward quality by that much.
-const CURVATURE: f64 = 0.02;
+const CURVATURE: f64 = 0.03;
 
 enum Step {
     Try(u8),
@@ -505,29 +530,29 @@ fn next_step(tried: &BTreeMap<u8, f64>, min: u8, max: u8, target: f64) -> Step {
         }
         (Some((p, _)), None) if p >= max => Step::Done(Some(Crossing { crf: p as f64, from: (p, p) })),
         (Some((p, vp)), None) => {
-            let below = tried.range(..p).next_back();
-            let slope = below.map_or(VMAF_PER_CRF, |(b, vb)| ((vb - vp) / (p - b) as f64).clamp(0.1, 2.0));
+            let Some((&b, &vb)) = tried.range(..p).next_back() else {
+                return Step::Try((usual_crossing(p as f64, vp, target).round() as u8).clamp(p + 1, max));
+            };
+            let slope = ((vb - vp) / (p - b) as f64).clamp(0.1, 2.0);
             let x = p as f64 + (vp - target) / slope;
-            if let Some((&b, _)) = below {
-                let reach = (x - p as f64) * (x - b as f64);
-                if reach <= MAX_REACH && x <= max as f64 {
-                    let safe = x - CURVATURE * reach / (2.0 * slope);
-                    return Step::Done(Some(Crossing { crf: quarter(safe).max(p as f64), from: (b, p) }));
-                }
+            let reach = (x - p as f64) * (x - b as f64);
+            if reach <= MAX_REACH && x <= max as f64 {
+                let safe = x - CURVATURE * reach / (2.0 * slope);
+                return Step::Done(Some(Crossing { crf: quarter(safe).max(p as f64), from: (b, p) }));
             }
             Step::Try((x.round() as u8).clamp(p + 1, max))
         }
         (None, Some((f, _))) if f <= min => Step::Done(None),
         (None, Some((f, vf))) => {
-            let above = tried.range(f + 1..).next();
-            let slope = above.map_or(VMAF_PER_CRF, |(b, vb)| ((vf - vb) / (b - f) as f64).clamp(0.1, 2.0));
+            let Some((&b, &vb)) = tried.range(f + 1..).next() else {
+                return Step::Try((usual_crossing(f as f64, vf, target).round().max(0.0) as u8).clamp(min, f - 1));
+            };
+            let slope = ((vf - vb) / (b - f) as f64).clamp(0.1, 2.0);
             let x = f as f64 - (target - vf) / slope;
-            if let Some((&b, _)) = above {
-                let reach = (f as f64 - x) * (b as f64 - x);
-                let safe = quarter(x - CURVATURE * reach / (2.0 * slope));
-                if reach <= MAX_REACH && safe >= min as f64 {
-                    return Step::Done(Some(Crossing { crf: safe, from: (f, b) }));
-                }
+            let reach = (f as f64 - x) * (b as f64 - x);
+            let safe = quarter(x - CURVATURE * reach / (2.0 * slope));
+            if reach <= MAX_REACH && safe >= min as f64 {
+                return Step::Done(Some(Crossing { crf: safe, from: (f, b) }));
             }
             Step::Try((x.round().max(0.0) as u8).clamp(min, f - 1))
         }
@@ -842,6 +867,85 @@ mod tests {
         let (got, tried) = find_crossing(&[], START_CRF, 20, 55, 93.0, |c| Ok(if c < 41 { 96.0 } else { 80.0 })).unwrap();
         assert!(tried.len() <= 7, "{tried:?}");
         assert!(got.unwrap().crf < 41.0);
+    }
+
+    /// Mean VMAF at CRF 22..=46 of real clips of different kinds (SVT-AV1 preset 6, tune 0,
+    /// four 8-second samples), measured with `av1opt curve`. The searches are held to these as
+    /// well as to made-up shapes.
+    const MEASURED: [[f64; 25]; 8] = [
+        // 1080x1920 archive_W_h264_highbpp.mp4
+        [97.53, 97.45, 97.34, 97.16, 96.97, 96.78, 96.59, 96.36, 96.12, 95.79, 95.46, 95.09, 94.72,
+         94.27, 93.79, 93.31, 92.79, 92.23, 91.74, 91.12, 90.49, 89.81, 89.15, 88.44, 87.77],
+        // 576x1024 archive_feedvault_h264.mp4
+        [97.93, 97.79, 97.60, 97.31, 97.04, 96.78, 96.50, 96.22, 95.91, 95.51, 95.07, 94.65, 94.25,
+         93.74, 93.17, 92.66, 92.12, 91.54, 91.01, 90.40, 89.77, 89.09, 88.44, 87.76, 87.13],
+        // 1920x1080 h264_1080p_landscape.mp4
+        [96.79, 96.68, 96.54, 96.31, 96.11, 95.90, 95.70, 95.50, 95.29, 95.00, 94.71, 94.42, 94.15,
+         93.81, 93.45, 93.12, 92.77, 92.38, 92.05, 91.61, 91.21, 90.74, 90.30, 89.84, 89.43],
+        // 1284x720 h264_720p.mp4
+        [94.95, 94.76, 94.51, 94.11, 93.75, 93.39, 93.07, 92.75, 92.40, 91.93, 91.49, 91.06, 90.63,
+         90.10, 89.60, 89.13, 88.63, 88.03, 87.50, 86.87, 86.23, 85.57, 84.91, 84.19, 83.57],
+        // 1282x720 h264_high_bitrate.mp4
+        [95.06, 94.96, 94.82, 94.59, 94.42, 94.23, 94.03, 93.84, 93.65, 93.39, 93.17, 92.89, 92.65,
+         92.35, 92.02, 91.75, 91.41, 91.08, 90.74, 90.35, 89.97, 89.53, 89.13, 88.72, 88.30],
+        // 1080x1920 h264_vertical_1920.mp4
+        [99.06, 98.97, 98.87, 98.65, 98.45, 98.24, 98.04, 97.79, 97.55, 97.16, 96.70, 96.26, 95.86,
+         95.29, 94.74, 94.18, 93.55, 92.87, 92.26, 91.50, 90.75, 89.82, 88.96, 88.04, 87.35],
+        // 1920x1080 hevc.mov
+        [98.84, 98.71, 98.52, 98.22, 97.92, 97.61, 97.30, 96.97, 96.64, 96.16, 95.68, 95.21, 94.73,
+         94.13, 93.56, 92.99, 92.40, 91.71, 91.18, 90.46, 89.83, 89.04, 88.35, 87.59, 86.89],
+        // 1280x720 mixed.mp4
+        [96.23, 96.08, 95.89, 95.61, 95.30, 95.04, 94.77, 94.49, 94.19, 93.77, 93.42, 93.03, 92.65,
+         92.18, 91.71, 91.25, 90.78, 90.23, 89.81, 89.22, 88.66, 87.99, 87.33, 86.75, 86.18],
+    ];
+
+    fn measured(curve: &[f64; 25]) -> impl Fn(u8) -> f64 + Copy + '_ {
+        move |crf| curve[(crf - 22) as usize]
+    }
+
+    /// Targets a curve crosses well inside the measured range, with the exact crossing.
+    fn measured_targets(curve: &[f64; 25]) -> Vec<(f64, f64)> {
+        (0..=18)
+            .map(|i| 88.0 + i as f64 * 0.5)
+            .filter_map(|target| Some((target, crossing(22, 46, target, measured(curve))?)))
+            .filter(|(_, want)| (23.0..=45.0).contains(want))
+            .collect()
+    }
+
+    #[test]
+    fn measured_curves_take_two_or_three_trials() {
+        // From the fixed first guess, then from guesses near the answer, as history gives them.
+        let (mut far, mut near) = (Vec::new(), Vec::new());
+        for (i, curve) in MEASURED.iter().enumerate() {
+            for (target, want) in measured_targets(curve) {
+                let run = |start: u8| {
+                    let (n, off, miss) = cross(start, 22, 46, target, measured(curve));
+                    assert!(n <= if start == START_CRF { 4 } else { 3 }, "clip {i}, target {target}, start {start}: {n} trials");
+                    // Never more than a hair below the target, never far above it.
+                    assert!(miss > -0.05, "clip {i}, target {target}, start {start}: {miss:+.3} VMAF");
+                    assert!(off > -0.8 && off < 0.15, "clip {i}, target {target}, start {start}: {off:+.2} CRF from the crossing");
+                    n
+                };
+                far.push(run(START_CRF));
+                near.extend((-3..=3).map(|d| run((want.round() as i32 + d).clamp(22, 46) as u8)));
+            }
+        }
+        let mean = |n: &[usize]| n.iter().sum::<usize>() as f64 / n.len() as f64;
+        eprintln!("trials: {:.2} from CRF {START_CRF} ({} cases), {:.2} from near the answer ({} cases)", mean(&far), far.len(), mean(&near), near.len());
+        assert!(mean(&far) <= 2.3 && mean(&near) <= 2.05);
+    }
+
+    #[test]
+    fn measured_curves_take_three_trials_down_to_neighbouring_crfs() {
+        let mut counts = Vec::new();
+        for curve in &MEASURED {
+            for (target, _) in measured_targets(curve) {
+                counts.push(check(22, 46, target, measured(curve)));
+            }
+        }
+        let mean = counts.iter().sum::<usize>() as f64 / counts.len() as f64;
+        eprintln!("trials: {mean:.2} ({} cases), at most {}", counts.len(), counts.iter().max().unwrap());
+        assert!(mean <= 3.2 && counts.iter().all(|n| *n <= 5));
     }
 
     #[test]

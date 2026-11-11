@@ -105,8 +105,10 @@ pub struct CrfModel {
 }
 
 /// CRF for VMAF 93 at 1080p from a 0.1 bpp source, and how it moves with the source's bits
-/// per pixel and frame size. Flat until measured curves say otherwise: the search's old
-/// fixed starting point.
+/// per pixel and frame size. Flat: the measured curves of eight clips (see the tests of
+/// `search`) cross 93 between CRF 28 and 39, 35 on average, and neither bits per pixel nor
+/// frame size told one clip's crossing better than that average. Past encodes may still
+/// teach the model a lean.
 const CRF_PRIOR: [f64; 3] = [PRIOR_CRF_0, PRIOR_CRF_BPP, PRIOR_CRF_PIXELS];
 const PRIOR_CRF_0: f64 = 35.0;
 const PRIOR_CRF_BPP: f64 = 0.0;
@@ -390,7 +392,8 @@ mod tests {
         assert!((m.predict(SOURCE_BPP_REF, PIXELS_1080P) - PRIOR_CRF_0).abs() < 1e-9);
         // A stricter target starts lower, by the usual VMAF per CRF step.
         let strict = CrfModel::fit(&[], 95.0, "tune=0");
-        assert!((m.predict(0.1, PIXELS_1080P) - strict.predict(0.1, PIXELS_1080P) - 5.0).abs() < 1e-9);
+        let shift = 2.0 / crate::search::VMAF_PER_CRF;
+        assert!((m.predict(0.1, PIXELS_1080P) - strict.predict(0.1, PIXELS_1080P) - shift).abs() < 1e-9);
         // Unknown bitrate: the average video. Always inside the allowed range.
         assert!((m.predict(0.0, PIXELS_1080P) - PRIOR_CRF_0).abs() < 1e-9);
         let info = |bitrate: f64| MediaInfo { width: 1920, height: 1080, fps: 30.0, video_bitrate: bitrate, ..Default::default() };
@@ -420,7 +423,8 @@ mod tests {
         // Encodes for a nearby target count, moved by the usual slope; far ones don't.
         let near = CrfModel::fit(&recs, 95.0, "tune=0");
         assert_eq!(near.samples, 120);
-        assert!((m.predict(0.1, PIXELS_1080P) - near.predict(0.1, PIXELS_1080P) - 5.0).abs() < 0.5);
+        let shift = 2.0 / crate::search::VMAF_PER_CRF;
+        assert!((m.predict(0.1, PIXELS_1080P) - near.predict(0.1, PIXELS_1080P) - shift).abs() < 0.5);
         assert_eq!(CrfModel::fit(&recs, 97.0, "tune=0").samples, 0);
         // Other encoder parameters reach the score at other CRFs: not counted. Nor are
         // lines from before the CRF was recorded.

@@ -130,8 +130,9 @@ pub fn estimate_crf(
         };
         let (c0, v0) = near[0];
         let next = (c0 as f64 + (v0 - target) / slope).clamp(min as f64, max as f64);
-        // Toward quality: floor, not round, so misses tend to land above the target.
-        let next = next.floor() as u8;
+        // Toward quality: floor, not round, so misses tend to land above the target (a whole
+        // number that arithmetic left a hair short of itself is not rounded down a full step).
+        let next = (next + 1e-6).floor() as u8;
         if probes.iter().any(|p| p.0 == next) {
             break;
         }

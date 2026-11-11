@@ -95,11 +95,16 @@ For each file:
 1. **Sample** – cuts up to 4 clips spread through the video into lossless, constant-frame-rate
    references (deinterlaced and cropped to even size when needed).
 2. **Search** – finds the highest CRF whose mean VMAF over the samples meets the target. The
-   first CRF tried is a guess from the source's bits per pixel and frame size, corrected by
-   your own past encodes (the same history `scan` learns from). Every further trial goes where
-   the line through the two nearest measurements crosses the target, and the search stops as
-   soon as that crossing lies close enough to measured CRFs to be trusted: usually 2-3 trial
-   encodes. The answer is in SVT-AV1's quarter-step CRF. 4K uses the `vmaf_4k` model.
+   first CRF tried is a guess: 35 for VMAF 93, moved by what your own past encodes say about
+   bits per pixel and frame size (the same history `scan` learns from). The second goes where
+   a curve of the usual shape through the first score crosses the target (scores fall faster
+   the higher the CRF), every further one where the line through the two nearest measurements
+   does, and the search stops as soon as that crossing lies close enough to measured CRFs to
+   be trusted. On the measured curves of eight test clips (every CRF from 22 to 46, targets
+   88 to 97) that is 2.2 trial encodes on average from the fixed guess and 2.0 from a guess
+   within 3 CRF of the answer, never more than 4, and the CRF chosen is never more than 0.05
+   VMAF short of the target. The answer is in SVT-AV1's quarter-step CRF. 4K uses the
+   `vmaf_4k` model.
 3. **Decide** – skips files that are already AV1, Dolby Vision, can't reach the target, or would
    save less than `--min-savings` (15%). The search stops at the first trial that misses the
    target while already larger than that: the CRF the target needs would be larger still.
@@ -436,13 +441,21 @@ and the benchmark's requests and tuned settings over HTTP (no ffmpeg needed).
   time went to the search instead: 4-5 trials per file, 2-5 times the final encode on short
   videos. So trials are saved (a better first guess, stopping as soon as the crossing is
   pinned down, remembering trials) rather than run side by side.
+- **The score falls faster the higher the CRF, in much the same way on every clip.** On
+  eight clips measured at every CRF from 22 to 46 (preset 6) a CRF step cost 0.15 VMAF at
+  CRF 22, 0.45 at 35 (0.3 to 0.6 depending on the clip) and 0.65 at 44. Where the curve sits
+  differs more: VMAF 93 is crossed between CRF 28 and 39, and neither bits per pixel nor
+  frame size told where better than the average did. So the search knows the shape and
+  measures the place. A step along that shape instead of a
+  straight 0.4 per CRF took the search from 2.4 to 2.2 trials, and `bench`'s search (which
+  goes on until two neighbouring CRFs are measured) from 3.6 to 3.1.
 - **ffmpeg ignores `-svtav1-params` names it can't parse.** A typo only prints a warning and the
   encode runs without the option, so parameters are tried on a few generated frames first.
 
 ## Tests
 
-`cargo test` covers the CRF search (exactness against brute force, trial count, starting
-from scores known beforehand), where clips are cut relative to frames, the first-CRF guess and what it learns from past encodes, the
+`cargo test` covers the CRF search (exactness against brute force, trial count and misses on
+the measured curves of eight real clips, starting from scores known beforehand), where clips are cut relative to frames, the first-CRF guess and what it learns from past encodes, the
 encode time estimate (the first guess, learning a faster machine, other presets), the
 trial cache (what counts as the same file, clips and settings), which sound tracks are copied
 or shrunk, chunk CRF

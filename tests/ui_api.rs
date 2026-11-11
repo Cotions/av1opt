@@ -566,3 +566,95 @@ fn waiting_jobs_can_be_moved_first_and_stopped_ones_queued_again() {
     assert_eq!(ids(&s), [b, c, a]);
     assert_eq!(s.post("/api/jobs/999/again", &json!({})).status, 404);
 }
+
+/// Sets a file's modification time `secs` in the past.
+fn age(path: &Path, secs: u64) {
+    let f = std::fs::File::options().write(true).open(path).unwrap();
+    f.set_modified(std::time::SystemTime::now() - Duration::from_secs(secs)).unwrap();
+}
+
+#[test]
+fn watched_folders_are_kept_looked_at_and_never_queue_what_was_there() {
+    let mut s = Server::start("watch", |d| {
+        std::fs::create_dir_all(d.join("videos/in/sub")).unwrap();
+        std::fs::write(d.join("videos/in/old.mkv"), b"x").unwrap();
+        std::fs::write(d.join("videos/in/notes.txt"), b"x").unwrap();
+    });
+    let dir = s.dir.join("videos/in");
+    let add = |s: &Server, path: &Path, out: &Path| s.post("/api/watch", &json!({ "path": path, "out_dir": out, "options": { "preset": 8 } }));
+    let watches = |s: &Server| s.get("/api/watch").json()["watches"].as_array().unwrap().clone();
+
+    // What cannot be watched is said so, and nothing is kept of it.
+    for (path, out, why) in [
+        (s.dir.join("videos/nowhere"), s.dir.join("out"), "does not exist"),
+        (dir.join("old.mkv"), s.dir.join("out"), "not a folder"),
+        (dir.clone(), PathBuf::from("out"), "output folder"),
+        (dir.clone(), dir.clone(), "cannot be the watched folder"),
+    ] {
+        let r = add(&s, &path, &out);
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.json()["error"].as_str().unwrap_or("").contains(why), "{why}: {}", r.body);
+    }
+    let r = s.post("/api/watch", &json!({ "path": dir, "out_dir": s.dir.join("out"), "options": { "remove": [[0.0, 1.0]] } }));
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert!(watches(&s).is_empty());
+
+    let r = add(&s, &dir, &s.dir.join("out"));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let id = r.json()["id"].as_u64().unwrap();
+    let r = add(&s, &dir, &s.dir.join("elsewhere"));
+    assert!(r.status == 400 && r.body.contains("watched already"), "{}", r.body);
+    let look = |s: &Server| {
+        let r = s.post(&format!("/api/watch/{id}/look"), &json!({}));
+        assert_eq!(r.status, 200, "{}", r.body);
+        r.json()["watches"][0].clone()
+    };
+
+    // The video that was there is noted and left; the text file is not a video.
+    let w = look(&s);
+    assert_eq!((w["videos"].as_u64(), w["before"].as_u64(), w["fresh"].as_u64(), w["enabled"].as_bool()), (Some(1), Some(1), Some(0), Some(true)), "{w}");
+    assert_eq!(w["options"]["preset"], 8);
+
+    // A new one, in a sub-folder, is seen at the next look and due at the one after: with no
+    // usable ffmpeg here it cannot be judged, which is said, and it stays to be tried again.
+    std::fs::write(dir.join("sub/new.mp4"), b"xx").unwrap();
+    age(&dir.join("sub/new.mp4"), 600);
+    // Hidden folders and the output folder are not looked into.
+    std::fs::create_dir_all(dir.join(".av1opt-work-1")).unwrap();
+    std::fs::write(dir.join(".av1opt-work-1/chunk.mkv"), b"x").unwrap();
+    let w = look(&s);
+    assert_eq!((w["videos"].as_u64(), w["fresh"].as_u64(), w["error"].as_str()), (Some(2), Some(1), None), "{w}");
+    let w = look(&s);
+    assert_eq!((w["fresh"].as_u64(), w["queued"].as_u64(), w["left"].as_u64()), (Some(1), Some(0), Some(0)), "{w}");
+    assert!(w["error"].as_str().unwrap_or("").contains("Settings"), "{w}");
+    assert!(s.get("/api/jobs/heads").json()["jobs"].as_array().unwrap().is_empty());
+
+    // Switched off, and all of it still there after a restart.
+    let r = s.post(&format!("/api/watch/{id}/enabled"), &json!({ "enabled": false }));
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(s.post(&format!("/api/watch/{id}/enabled"), &json!({})).status, 400);
+    assert!(s.terminate());
+    let mut s = Server::start_in(&s.dir, "false", "false");
+    let w = watches(&s);
+    assert_eq!(w.len(), 1);
+    assert_eq!((w[0]["id"].as_u64(), w[0]["enabled"].as_bool(), w[0]["before"].as_u64(), w[0]["fresh"].as_u64()), (Some(id), Some(false), Some(1), Some(1)), "{}", w[0]);
+    assert_eq!(w[0]["path"].as_str(), std::fs::canonicalize(&dir).unwrap().to_str());
+
+    // What was seen is lost, or written by a newer av1opt: the videos in the folder are not
+    // so many new ones to encode, and the newer file is kept under another name.
+    assert!(s.terminate());
+    std::fs::write(s.data("ui-watch.json"), br#"{"format":99,"folders":{"1":{"files":{}}}}"#).unwrap();
+    let s = Server::start_in(&s.dir, "false", "false");
+    let w = look(&s);
+    assert_eq!((w["videos"].as_u64(), w["before"].as_u64(), w["fresh"].as_u64()), (Some(2), Some(2), Some(0)), "{w}");
+    assert!(s.data("ui-watch.format99.json").exists());
+
+    // Removed: gone from the settings and from what is remembered of its videos.
+    assert_eq!(s.post("/api/watch/99/remove", &json!({})).status, 404);
+    assert_eq!(s.post(&format!("/api/watch/{id}/remove"), &json!({})).status, 200);
+    assert!(watches(&s).is_empty());
+    let saved: Value = serde_json::from_slice(&std::fs::read(s.data("ui.json")).unwrap()).unwrap();
+    assert!(saved.get("watches").is_none(), "{saved}");
+    let state: Value = serde_json::from_slice(&std::fs::read(s.data("ui-watch.json")).unwrap()).unwrap();
+    assert_eq!(state["folders"], json!({}));
+}

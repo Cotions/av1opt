@@ -1,6 +1,6 @@
 //! Request handling: session check, routing, static files, the event stream and media ranges.
 
-use super::{App, bench, dups, err_json, hold, jobs, library};
+use super::{App, bench, dups, err_json, hold, jobs, library, watch};
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -181,6 +181,11 @@ fn api(app: &Arc<App>, m: &Method, path: &str, q: &[(String, String)], body: &Va
         (Method::Post, ["queue", "pause"]) => hold::set_paused(app, body),
         (Method::Post, ["queue", "schedule"]) => hold::set_schedule(app, body),
         (Method::Post, ["queue", "run-now"]) => hold::run_now(app),
+        (Method::Get, ["watch"]) => Ok(watch::list(app)),
+        (Method::Post, ["watch"]) => watch::add(app, body),
+        (Method::Post, ["watch", id, "remove"]) => watch::remove(app, id.parse()?),
+        (Method::Post, ["watch", id, "enabled"]) => watch::set_enabled(app, id.parse()?, body),
+        (Method::Post, ["watch", id, "look"]) => watch::look_now(app, id.parse()?),
         (Method::Get, ["history"]) => Ok(library::history(app)),
         (Method::Post, ["settings", "tools"]) => library::set_tools(app, body),
         (Method::Post, ["history", "dirs"]) => library::add_history_dir(app, body),

@@ -15,6 +15,7 @@ mod hold;
 mod http;
 mod jobs;
 mod library;
+mod watch;
 
 use crate::tools::{Capabilities, Tools};
 use anyhow::{Context, Result};
@@ -76,6 +77,9 @@ pub struct Settings {
     /// Hours of the day encodes may run in.
     #[serde(default)]
     pub schedule: hold::Schedule,
+    /// Folders whose new videos are queued by themselves.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub watches: Vec<watch::Watch>,
 }
 
 pub struct App {
@@ -89,6 +93,7 @@ pub struct App {
     subscribers: Mutex<Vec<Sender<String>>>,
     pub jobs: jobs::Queue,
     pub hold: hold::State,
+    pub watch: watch::State,
     pub scans: Mutex<Vec<library::Scan>>,
     pub dups: Mutex<Vec<dups::Run>>,
     /// The benchmark of this session, running or finished.
@@ -193,6 +198,7 @@ pub fn run(cfg: Config) -> Result<()> {
         subscribers: Mutex::new(Vec::new()),
         jobs: jobs::Queue::default(),
         hold: hold::State::default(),
+        watch: watch::State::default(),
         scans: Mutex::new(Vec::new()),
         dups: Mutex::new(Vec::new()),
         bench: Mutex::new(None),
@@ -208,6 +214,7 @@ pub fn run(cfg: Config) -> Result<()> {
     jobs::restore(&app);
     jobs::start_worker(app.clone());
     hold::start_clock(app.clone());
+    watch::start(app.clone());
 
     let url = format!("http://127.0.0.1:{port}/?token={}", app.token);
     // A caller that chose the token knows it; keep it out of logs (a desktop launcher's output

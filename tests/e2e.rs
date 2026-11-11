@@ -1287,4 +1287,78 @@ mod queue {
         assert_in_step(&out, &s2.dir.join("videos/s.mp4"), "1");
         assert!(entries(&s2.dir.join("out"), ".av1opt-").is_empty());
     }
+
+    /// A short H.264 clip under `dir`, last written `age` seconds ago.
+    fn small_clip(path: &Path, codec: &[&str], age: u64) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let o = Command::new(ffmpeg_bin())
+            .args(["-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i", "testsrc2=s=320x240:r=24:d=6"])
+            .args(codec)
+            .arg(path)
+            .output()
+            .expect("run ffmpeg");
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_modified(std::time::SystemTime::now() - Duration::from_secs(age)).unwrap();
+    }
+
+    const H264: [&str; 6] = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "16"];
+
+    #[test]
+    #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+    fn a_watched_folder_queues_the_new_videos_worth_encoding_and_only_those() {
+        let s = Server::start_with_tools("e2e-watch", &ffmpeg_bin(), &ffprobe_bin(), |d| small_clip(&d.join("videos/there.mp4"), &H264, 3600));
+        let (dir, out) = (s.dir.join("videos"), s.dir.join("out"));
+        let options = json!({ "preset": 10 });
+        let r = s.post("/api/watch", &json!({ "path": dir, "out_dir": out, "options": options }));
+        assert_eq!(r.status, 200, "{}", r.body);
+        let id = r.json()["id"].as_u64().unwrap();
+        let look = |s: &Server| {
+            let r = s.post(&format!("/api/watch/{id}/look"), &json!({}));
+            assert_eq!(r.status, 200, "{}", r.body);
+            r.json()["watches"][0].clone()
+        };
+        let counts = |w: &Value| [&w["fresh"], &w["queued"], &w["left"], &w["before"]].map(|n| n.as_u64().unwrap());
+        let jobs = |s: &Server| s.get("/api/jobs/heads").json()["jobs"].as_array().unwrap().clone();
+
+        // The video that was there is not asked for, however often the folder is looked at.
+        look(&s);
+        let w = look(&s);
+        assert_eq!((counts(&w), w["error"].as_str()), ([0, 0, 0, 1], None), "{w}");
+        assert!(jobs(&s).is_empty());
+
+        // Three turn up: one worth encoding, one in AV1 already, one still being written.
+        small_clip(&dir.join("new/fresh.mp4"), &H264, 600);
+        small_clip(&dir.join("new/done.mkv"), &["-c:v", "libsvtav1", "-preset", "12", "-crf", "40"], 600);
+        small_clip(&dir.join("new/arriving.mp4"), &H264, 0);
+        let w = look(&s);
+        assert_eq!(counts(&w), [3, 0, 0, 1], "{w}");
+        assert!(jobs(&s).is_empty(), "queued at first sight");
+        let w = look(&s);
+        assert_eq!((counts(&w), w["error"].as_str()), ([1, 1, 1, 1], None), "{w}");
+
+        // One job, said to come from the watched folder, with the folder's settings.
+        let all = jobs(&s);
+        assert_eq!(all.len(), 1, "{all:?}");
+        let job = all[0]["id"].as_u64().unwrap();
+        let h = head(&s, job);
+        assert_eq!(h["watch"].as_str(), std::fs::canonicalize(&dir).unwrap().to_str(), "{h}");
+        assert_eq!(h["total"], 1, "{h}");
+        wait_until("the encode to finish", 300, || !matches!(status(&s, job).as_str(), "queued" | "running"));
+        let h = head(&s, job);
+        assert_eq!((h["status"].as_str(), h["counts"]["ok"].as_u64(), h["error"].as_str()), (Some("done"), Some(1), None), "{h}");
+        // The output keeps its place under the watched folder; originals are as they were.
+        assert_eq!(frames(&out.join("new/fresh.mp4")), 144);
+        let codec = |p: &Path| streams(&probe(p), "video")[0]["codec_name"].as_str().unwrap().to_string();
+        assert_eq!((codec(&out.join("new/fresh.mp4")), codec(&dir.join("new/fresh.mp4"))), ("av1".into(), "h264".into()));
+        assert!(!out.join("new/done.mkv").exists() && !out.join("there.mp4").exists());
+
+        // Looked at again, nothing is queued twice; the one being written is still waited for.
+        let w = look(&s);
+        assert_eq!(counts(&w), [1, 1, 1, 1], "{w}");
+        assert_eq!(jobs(&s).len(), 1);
+        // The folder a job was queued from by hand is not replaced by the watched folder's.
+        let saved: Value = serde_json::from_slice(&std::fs::read(s.data("ui.json")).unwrap()).unwrap();
+        assert!(saved["out_dir"].is_null(), "{saved}");
+    }
 }

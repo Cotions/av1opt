@@ -355,6 +355,19 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
   and they go on from the same frame afterwards. **Run now** lets the queue work outside the
   hours until they next begin. The pause and the hours are kept across restarts, and the
   time spent held is left out of the timings av1opt learns its estimates from.
+- **Watched folders** (**Watch folder…** on the Queue page): videos that turn up in a folder,
+  or anywhere below it, are queued on their own while av1opt is open, with the settings and
+  the output folder the watch was given. The folder is looked at every five minutes (less
+  often when walking it takes long: a look never takes a tenth of the time), not through
+  file-change notifications, which network and FUSE mounts don't send. A video is queued
+  once two looks found it unchanged and it has not been written to for two minutes, so a
+  download still running is left alone, and only if a scan would call it a candidate: AV1,
+  too short, too little to gain and unreadable files are left. The videos in the folder
+  when it was added are not queued unless asked for. Queueing is all a watch does: the
+  pause and the hours decide when the encode runs, and originals are never replaced or
+  touched. What was seen is kept in `ui-watch.json`, and a video gone from the folder is
+  remembered for a month, so a drive that was not mounted does not come back as a folder
+  full of new videos.
 - **Compare**: source and AV1 output on top of each other with a split slider, synced playback,
   frame stepping and zoom, plus the per-chunk VMAF timeline from the `.av1opt.json` report
   (click to seek). Sources the browser can't decode (HEVC in some browsers, MPEG-2, ...) are shown as a
@@ -431,10 +444,11 @@ environment, so set the ffmpeg path once in Settings.
 
 ### Saved files and versions
 
-Reports, history lines, `ui.json`, `ui-queue.json`, `tuning.json`, benchmark results and the scene-mode work folders carry a
+Reports, history lines, `ui.json`, `ui-queue.json`, `ui-watch.json`, `tuning.json`, benchmark results and the scene-mode work folders carry a
 `format` number. Files from before versioning count as format 1. A newer av1opt keeps reading
 older files; an older one skips reports and history lines from a newer format, leaves a newer
-`ui.json` untouched, sets a newer `ui-queue.json` aside as `ui-queue.format<N>.json`, and starts
+`ui.json` untouched, sets a newer `ui-queue.json` or `ui-watch.json` aside as
+`ui-queue.format<N>.json` (the videos in a watched folder then count as there before), and starts
 a scene-mode file over rather than resuming a work folder of another format.
 
 ### Debugging
@@ -529,7 +543,8 @@ the folder touched), `dups` on a smaller copy, a byte-identical copy and two cut
 `bench` with its remembered sample encodes and `--save` feeding `encode --tuned`. With `--features ui` it also drives a real server: a paused queue (ffmpeg
 stopped in place, the wait left out of the timings), cancelling a running and a held job,
 queueing it again, closing the app in the middle of an encode and going on after the next
-start, and replacing an original from History. It needs an ffmpeg with libsvtav1, libvmaf, libx264 and libx265
+start, replacing an original from History, and a watched folder (a video there before, a
+new one worth encoding, one in AV1 and one still being written). It needs an ffmpeg with libsvtav1, libvmaf, libx264 and libx265
 (`AV1OPT_FFMPEG`, `AV1OPT_FFPROBE`), which is why a plain `cargo test` leaves it out.
 
 `cargo test` covers the CRF search (exactness against brute force, trial count and misses on

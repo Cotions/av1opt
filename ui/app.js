@@ -251,6 +251,12 @@ function metaLabel(o) {
   return parts.length ? " · " + parts.join(" · ") : "";
 }
 
+// The settings of a job or a watched folder, in one line.
+function optionsLabel(o) {
+  const sc = scenesMode(o.scenes);
+  return `VMAF ${o.target_vmaf} · preset ${o.preset}${o.svt_params && o.svt_params !== "tune=0" ? " · " + o.svt_params : ""}${o.tuned ? " · tuned by size" : ""} · ${o.container}${sc === "off" ? "" : (sc === "auto" ? " · scenes where uneven×" : " · scenes×") + o.workers}${metaLabel(o)}`;
+}
+
 // Settings and jobs saved before "auto" existed hold true or false.
 function scenesMode(v) {
   return v === true ? "always" : v === "auto" || v === "always" ? v : "off";
@@ -545,8 +551,9 @@ function setting(label, control, hint) {
   return [h("label", { class: "k" }, label), h("div", { class: "ctl" }, control, hint ? h("span", { class: "dim hint" }, hint) : null)];
 }
 
-// Shows the encode dialog for `inputs` (paths). Resolves true if queued.
-function encodeDialog(inputs, roots = []) {
+// Shows the encode dialog for `inputs` (paths). Resolves true if queued. With `watch`, the
+// one input is a folder to keep an eye on: its settings are asked for, and nothing is queued now.
+function encodeDialog(inputs, roots = [], watch = false) {
   return new Promise((resolve) => {
     const o = defaultOptions();
     let outDir = prefs.get("outDir", null) || (STATE && STATE.default_out_dir) || "";
@@ -565,9 +572,10 @@ function encodeDialog(inputs, roots = []) {
     const minSav = h("input", { type: "number", min: "0", max: "95", step: "1", value: Math.round(o.min_savings * 100) });
     const force = h("input", { type: "checkbox", checked: o.force });
     const retry = h("input", { type: "checkbox", checked: o.retry_skipped });
+    const existing = h("input", { type: "checkbox" });
     const shrinkAudio = h("input", { type: "checkbox", checked: o.shrink_audio });
     const meta = metaEditor(o, inputs);
-    const one = inputs.length === 1 && /\.[A-Za-z0-9]{2,5}$/.test(inputs[0]) ? inputs[0] : null;
+    const one = !watch && inputs.length === 1 && /\.[A-Za-z0-9]{2,5}$/.test(inputs[0]) ? inputs[0] : null;
     // Only built when opened, so the dialog doesn't load the video for nothing.
     let cuts = null;
     const cutsBox = h("div");
@@ -584,10 +592,20 @@ function encodeDialog(inputs, roots = []) {
       const options = {
         container: container.value, target_vmaf: Number(vmaf.value), preset: Number(preset.value), svt_params: svtParams.value.trim(),
         tuned: tuning.length > 0 && tuned.checked, scenes: scenes.value,
-        workers: Number(workers.value), min_savings: Number(minSav.value) / 100, force: force.checked, retry_skipped: retry.checked,
+        workers: Number(workers.value), min_savings: Number(minSav.value) / 100, force: force.checked, retry_skipped: !watch && retry.checked,
         shrink_audio: shrinkAudio.checked,
         ...meta.get(),
       };
+      if (watch) {
+        // Neither the settings nor the folder become the defaults of encodes queued by hand.
+        go.disabled = true;
+        try {
+          await api("/api/watch", { path: inputs[0], out_dir: outDir, options, existing: existing.checked });
+          toast(`Watching ${inputs[0]}`);
+          close(true);
+        } catch (e) { toast(e.message, true); go.disabled = false; }
+        return;
+      }
       // The tick is remembered also while there are no tuned settings to use.
       prefs.set("encodeOptions", { ...options, tuned: tuning.length ? tuned.checked : o.tuned });
       // Sections belong to this one video, so they aren't remembered with the settings.
@@ -600,19 +618,23 @@ function encodeDialog(inputs, roots = []) {
         close(true);
         location.hash = "#/queue";
       } catch (e) { toast(e.message, true); go.disabled = false; }
-    } }, "Add to queue");
+    } }, watch ? "Watch folder" : "Add to queue");
     const list = inputs.length <= 6 ? inputs.map((p) => h("div", { class: "mono" }, p)) : [h("div", { class: "mono" }, inputs.slice(0, 4).join("\n")), h("div", { class: "dim" }, `… and ${inputs.length - 4} more`)];
     const bg = h("div", { class: "modal-bg", onclick: (e) => { if (e.target === bg) close(false); } },
       h("div", { class: "modal" },
-        h("div", { class: "head" }, h("strong", {}, `Encode ${inputs.length} item${inputs.length === 1 ? "" : "s"}`)),
+        h("div", { class: "head" }, h("strong", {}, watch ? "Watch a folder" : `Encode ${inputs.length} item${inputs.length === 1 ? "" : "s"}`)),
         h("div", { class: "body" },
-          h("h3", {}, "Inputs"), list,
+          h("h3", {}, watch ? "Folder" : "Inputs"), list,
+          watch ? [
+            h("p", { class: "dim" }, "Videos that turn up in this folder, or anywhere below it, are added to the queue on their own while av1opt is open. The folder is looked at every few minutes; a video is queued once it has stopped changing (a download still running is left alone) and a scan would call it worth encoding. The queue’s pause and hours decide when it is encoded."),
+            h("label", { class: "check" }, existing, "Also queue the videos that are in it now"),
+          ] : null,
           h("h3", {}, "Output folder"),
           h("div", { class: "row" }, outEl, h("button", { class: "small", onclick: async () => {
             const p = await pick({ title: "Output folder (not on ZFS)", mode: "dir", start: outDir || undefined });
             if (p) { outDir = p[0]; outEl.textContent = outDir; }
           } }, "Change…")),
-          h("p", { class: "dim" }, "Folders are mirrored below it. Inputs are never modified. Re-adding the same files resumes."),
+          h("p", { class: "dim" }, watch ? "Folders are mirrored below it. The videos in the watched folder are never modified." : "Folders are mirrored below it. Inputs are never modified. Re-adding the same files resumes."),
           h("h3", {}, "Settings"),
           h("div", { class: "form-grid" },
             setting("Target VMAF", vmaf, "Quality to match: 93 looks like the source, higher keeps more and saves less"),
@@ -626,8 +648,8 @@ function encodeDialog(inputs, roots = []) {
             setting("Skip if saving under", h("span", { class: "unit" }, minSav, "%"), "Files that wouldn't shrink this much are left alone")),
           h("div", { class: "checks-col" },
             h("label", { class: "check", title: "AAC, Opus and MP3 sound is normally copied untouched. With this, a track far above what Opus needs (stereo above 144 kbps) is re-encoded to Opus (stereo at 96 kbps): smaller, but lossy a second time" }, shrinkAudio, "Shrink heavy sound tracks to Opus (stereo above 144 kbps becomes 96 kbps)"),
-            h("label", { class: "check" }, force, "Force: also re-encode AV1 files and low-gain ones"),
-            h("label", { class: "check" }, retry, "Retry files skipped in earlier runs")),
+            h("label", { class: "check" }, force, watch ? "Force: also queue videos with little to gain (AV1 files are left alone all the same)" : "Force: also re-encode AV1 files and low-gain ones"),
+            watch ? null : h("label", { class: "check" }, retry, "Retry files skipped in earlier runs")),
           h("h3", {}, "Metadata"),
           meta.el,
           one ? [h("h3", {}, "Remove sections"), cutsBtn, cutsBox] : null),
@@ -1574,12 +1596,66 @@ views.queue = (root) => {
         : [h("span", { class: "grow" }, h("strong", {}, `Outside encoding hours (${sch.from}–${sch.to}). `), working ? `The running encode is held where it is and goes on at ${clockTime(hd.opens)}.` : `Encodes start at ${clockTime(hd.opens)}.`),
           h("button", { title: `Encode now; the hours count again from ${sch.from}`, onclick: () => setQueue("/api/queue/run-now", {}) }, "Run now")]));
   }
+  // Watched folders: what turns up in them is queued without being asked for.
+  const watchBox = h("div");
+  let watched = null, watchTick = null;
+  // A path too long for its place loses its beginning, not its end: the mark keeps the
+  // slashes in order where the text runs right to left for that.
+  const lrm = "\u200e";
+  const ago = (t) => { const d = Date.now() / 1000 - t; return d < 90 ? "a moment ago" : span(d) + " ago"; };
+  const watchAct = (path, body) => async (e) => {
+    e.target.disabled = true;
+    try { watched = await api(path, body); } catch (er) { toast(er.message, true); }
+    drawWatched();
+  };
+  async function loadWatched() {
+    try { watched = await api("/api/watch"); } catch { return; }
+    drawWatched();
+  }
+  function drawWatched() {
+    const ws = (watched && watched.watches) || [];
+    if (!ws.length) { watchBox.replaceChildren(); return; }
+    const row = (w) => {
+      const counts = [
+        w.queued ? `${w.queued} queued` : null,
+        w.fresh ? { text: `${w.fresh} new`, title: `Seen, not queued yet: a video is left alone until it has not changed for ${span(watched.settled_secs)} and two looks` } : null,
+        w.left ? { text: `${w.left} left alone`, title: "AV1 already, too short, too little to gain, or unreadable" } : null,
+        w.before ? { text: `${w.before} there before`, title: "In the folder when it was added; only new videos were asked for" } : null,
+      ].filter(Boolean);
+      const state = !w.enabled ? h("span", { class: "pill warn" }, "Not watching") : w.error ? h("span", { class: "pill bad" }, "Problem") : h("span", { class: "pill ok" }, "Watching");
+      return h("div", { class: "watch" },
+        h("div", { class: "row" },
+          state,
+          h("code", { class: "path", title: w.path }, lrm + w.path), h("span", { class: "dim" }, "→"), h("code", { class: "path", title: w.out_dir }, lrm + w.out_dir),
+          h("span", { class: "spacer" }),
+          h("button", { class: "small", title: "Look at the folder now instead of waiting for the next look", onclick: watchAct(`/api/watch/${w.id}/look`, {}) }, "Look now"),
+          h("button", { class: "small", onclick: watchAct(`/api/watch/${w.id}/enabled`, { enabled: !w.enabled }) }, w.enabled ? "Stop watching" : "Watch again"),
+          h("button", { class: "small", title: "Forget this folder. Jobs it queued stay in the queue", onclick: async () => {
+            const sure = await confirmDialog({ title: "Forget this watched folder?", action: "Forget",
+              body: [h("p", { class: "mono" }, w.path), h("p", { class: "dim" }, "What it queued stays in the queue, and no file is touched. Watched again later, the videos in it then count as there before.")] });
+            if (!sure) return;
+            try { watched = await api(`/api/watch/${w.id}/remove`, {}); } catch (er) { toast(er.message, true); }
+            drawWatched();
+          } }, "Forget")),
+        h("div", { class: "dim sub" },
+          optionsLabel(w.options), " · ",
+          w.looked ? `looked ${ago(w.looked)}` : "not looked at yet",
+          w.enabled && w.next_secs != null ? `, again ${w.next_secs < 45 ? "in a moment" : "in " + span(w.next_secs)}` : "",
+          counts.map((c) => [" · ", typeof c === "string" ? c : h("span", { title: c.title }, c.text)])),
+        w.error ? h("div", { class: "bad sub" }, w.error) : null);
+    };
+    watchBox.replaceChildren(h("div", { class: "panel watched" }, h("h3", {}, "Watched folders"), ws.map(row)));
+  }
+  const watchBtn = h("button", { title: "Queue the videos that turn up in a folder, on their own", onclick: async () => {
+    const p = await pick({ title: "Folder to watch", mode: "dir" });
+    if (p && await encodeDialog([p[0]], [], true)) loadWatched();
+  } }, "Watch folder…");
   root.append(
     h("div", { class: "row" }, h("h1", {}, "Encode queue"), leftAll, h("span", { class: "spacer" }),
-      pauseBtn, hoursBtn,
+      pauseBtn, hoursBtn, watchBtn,
       h("button", { onclick: async () => { await api("/api/jobs/clear", {}); load(); } }, "Clear finished"),
       h("button", { class: "primary", onclick: async () => { const p = await pick({ title: "Videos or folders to encode", mode: "multi" }); if (p) encodeDialog(p); } }, "New encode…")),
-    held, holdBox, missing, list);
+    held, holdBox, watchBox, missing, list);
   const drawMissing = (un) => {
     if (!un || !un.length) { missing.replaceChildren(); return; }
     const act = (what) => async () => {
@@ -1689,7 +1765,8 @@ views.queue = (root) => {
       j.paused ? pausedPill(j) : statusPill(j.status),
       h("strong", {}, `${j.total} file${j.total === 1 ? "" : "s"}`),
       h("span", { class: "dim" }, `→ ${j.out_dir}`),
-      h("span", { class: "dim" }, `VMAF ${o.target_vmaf} · preset ${o.preset}${o.svt_params && o.svt_params !== "tune=0" ? " · " + o.svt_params : ""}${o.tuned ? " · tuned by size" : ""} · ${o.container}${scenesMode(o.scenes) === "off" ? "" : (scenesMode(o.scenes) === "auto" ? " · scenes where uneven×" : " · scenes×") + o.workers}${metaLabel(o)}`),
+      h("span", { class: "dim" }, optionsLabel(o)),
+      j.watch ? h("span", { class: "pill", title: `Queued on its own: these turned up in the watched folder ${j.watch}` }, "watched folder") : null,
       h("span", { class: "spacer" }),
       saved > 0 ? h("span", { class: "ok" }, `${bytes(saved)} saved`) : null,
       j.left_secs ? h("span", {}, leftText(j.left_secs, j.left_unknown)) : null,
@@ -1768,6 +1845,7 @@ views.queue = (root) => {
 
   const off = onEvent((m) => {
     if (m.kind === "jobs") return reload();
+    if (m.kind === "watch") return loadWatched();
     if (m.kind === "bench") { held.hidden = m.run.status !== "running"; return; }
     if (m.kind === "bench_done") { held.hidden = true; return; }
     if (m.kind !== "job") return;
@@ -1778,7 +1856,10 @@ views.queue = (root) => {
     if (m.file == null) reload(); else reloadFile(m.id, m.file);
   });
   load();
-  return () => { off(); clearTimeout(timer); for (const t of pending.values()) clearTimeout(t); };
+  loadWatched();
+  // "Looked 3 min ago" goes on counting between two looks.
+  watchTick = setInterval(() => { if (watched && watched.watches.length) loadWatched(); }, 30000);
+  return () => { off(); clearTimeout(timer); clearInterval(watchTick); for (const t of pending.values()) clearTimeout(t); };
 };
 
 // Hours of the day encodes may run in. Resolves to the queue's new state, or null.

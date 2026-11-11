@@ -181,6 +181,8 @@ pub struct Job {
     roots: Vec<PathBuf>,
     out_dir: PathBuf,
     options: JobOptions,
+    /// The watched folder that queued it, if one did.
+    watch: Option<PathBuf>,
     /// queued, running, done, cancelled, failed
     status: String,
     error: Option<String>,
@@ -289,7 +291,7 @@ fn head(j: &Job) -> Value {
         }
     }
     json!({
-        "id": j.id, "created": j.created, "out_dir": j.out_dir, "options": j.options,
+        "id": j.id, "created": j.created, "out_dir": j.out_dir, "options": j.options, "watch": j.watch,
         "status": j.status, "error": j.error, "current": j.current,
         "total": j.files.len(), "counts": counts, "saved": saved,
         "left_secs": left, "left_unknown": unknown,
@@ -341,6 +343,19 @@ struct AddRequest {
     roots: Vec<PathBuf>,
     #[serde(default)]
     options: Option<JobOptions>,
+    /// The watched folder that queued it, if one did.
+    #[serde(default)]
+    watch: Option<PathBuf>,
+}
+
+/// ffmpeg carries on without parameters SVT-AV1 doesn't know; better said when the settings
+/// are chosen than found in a finished encode.
+pub fn check_options(app: &App, options: &JobOptions) -> Result<()> {
+    let o = options.to_options()?;
+    if o.svt_params != crate::search::DEFAULT_PARAMS {
+        crate::search::check_params(&app.tools(1), o.preset, &o.svt_params)?;
+    }
+    Ok(())
 }
 
 pub fn add(app: &App, body: &Value) -> Result<Value> {
@@ -350,13 +365,9 @@ pub fn add(app: &App, body: &Value) -> Result<Value> {
     if let Some(p) = app.encode_problem() {
         bail!("{p} (see Settings)");
     }
-    // ffmpeg carries on without parameters SVT-AV1 doesn't know; better said now than found
-    // in a finished encode. (Jobs restored at startup were checked when they were added.)
+    // (Jobs restored at startup were checked when they were added.)
     if let Some(o) = body.get("options").filter(|o| !o.is_null()) {
-        let o = serde_json::from_value::<JobOptions>(o.clone())?.to_options()?;
-        if o.svt_params != crate::search::DEFAULT_PARAMS {
-            crate::search::check_params(&app.tools(1), o.preset, &o.svt_params)?;
-        }
+        check_options(app, &serde_json::from_value::<JobOptions>(o.clone())?)?;
     }
     add_unchecked(app, body)
 }
@@ -436,6 +447,7 @@ fn add_unchecked(app: &App, body: &Value) -> Result<Value> {
         *n
     };
     let count = files.len();
+    let by_hand = r.watch.is_none();
     app.jobs.jobs.lock().unwrap().push(Job {
         id,
         created: now(),
@@ -443,6 +455,7 @@ fn add_unchecked(app: &App, body: &Value) -> Result<Value> {
         roots,
         out_dir: r.out_dir.clone(),
         options,
+        watch: r.watch,
         status: "queued".into(),
         error: None,
         current: None,
@@ -454,7 +467,10 @@ fn add_unchecked(app: &App, body: &Value) -> Result<Value> {
     });
     {
         let mut s = app.settings.lock().unwrap();
-        s.out_dir = Some(r.out_dir.clone());
+        // The folder offered for the next encode is the one last chosen, not a watch's.
+        if by_hand {
+            s.out_dir = Some(r.out_dir.clone());
+        }
         if !s.history_dirs.contains(&r.out_dir) {
             s.history_dirs.push(r.out_dir.clone());
         }
@@ -486,7 +502,7 @@ fn persist(app: &App) {
         .unwrap()
         .iter()
         .filter(|j| matches!(j.status.as_str(), "queued" | "running"))
-        .map(|j| json!({ "inputs": j.inputs, "roots": j.roots, "out_dir": j.out_dir, "options": j.options }))
+        .map(|j| json!({ "inputs": j.inputs, "roots": j.roots, "out_dir": j.out_dir, "options": j.options, "watch": j.watch }))
         .chain(app.jobs.unrestored.lock().unwrap().iter().map(|(j, _)| j.clone()))
         .collect();
     if let Some(p) = queue_path() {
@@ -617,7 +633,7 @@ pub fn again(app: &App, id: u64) -> Result<Value> {
         if !matches!(j.status.as_str(), "cancelled" | "failed") {
             bail!("only a cancelled or failed job can be queued again");
         }
-        json!({ "inputs": j.inputs, "roots": j.roots, "out_dir": j.out_dir, "options": j.options })
+        json!({ "inputs": j.inputs, "roots": j.roots, "out_dir": j.out_dir, "options": j.options, "watch": j.watch })
     };
     let r = add(app, &body)?;
     // Only once the new job exists: a refused request leaves the old entry on screen.

@@ -276,3 +276,10 @@ td .pill:first-child { margin-left: 0; }
 .panel.hold { display: flex; align-items: center; gap: 12px; border-color: var(--warn); }
 .row.hours { margin: 10px 0; }
 .row.hours input:disabled { opacity: 0.5; }
+.panel.watched h3 { margin-top: 0; }
+.watch + .watch { border-top: 1px solid var(--line); margin-top: 10px; padding-top: 10px; }
+.watch > .row { flex-wrap: nowrap; }
+.watch > .row button, .watch > .row .pill { flex: none; }
+.watch code.path { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; }
+.watch .sub { margin-top: 4px; font-size: 12px; }
+.watch .sub span[title] { border-bottom: 1px dotted var(--line); cursor: help; }

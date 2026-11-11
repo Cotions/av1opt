@@ -590,6 +590,42 @@ pub fn remove(app: &App, id: u64) -> Result<Value> {
     Ok(json!({ "ok": true }))
 }
 
+/// Moves a waiting job ahead of the other waiting ones, so it is the next to start. The
+/// order is the saved one too.
+pub fn first(app: &App, id: u64) -> Result<Value> {
+    let mut jobs = app.jobs.jobs.lock().unwrap();
+    let Some(from) = jobs.iter().position(|j| j.id == id) else { bail!("not found: job {id}") };
+    if jobs[from].status != "queued" {
+        bail!("only a waiting job can be moved");
+    }
+    let to = jobs.iter().position(|j| j.status == "queued").unwrap_or(from);
+    let job = jobs.remove(from);
+    jobs.insert(to, job);
+    drop(jobs);
+    persist(app);
+    app.broadcast(json!({ "kind": "jobs" }));
+    Ok(json!({ "ok": true }))
+}
+
+/// Queues the files of a cancelled or failed job once more, with the same options, and
+/// drops the old entry. Files that were finished are recognised as done and scene chunks
+/// resume, as with any re-run.
+pub fn again(app: &App, id: u64) -> Result<Value> {
+    let body = {
+        let jobs = app.jobs.jobs.lock().unwrap();
+        let j = find(&jobs, id)?;
+        if !matches!(j.status.as_str(), "cancelled" | "failed") {
+            bail!("only a cancelled or failed job can be queued again");
+        }
+        json!({ "inputs": j.inputs, "roots": j.roots, "out_dir": j.out_dir, "options": j.options })
+    };
+    let r = add(app, &body)?;
+    // Only once the new job exists: a refused request leaves the old entry on screen.
+    app.jobs.jobs.lock().unwrap().retain(|j| j.id != id);
+    app.broadcast(json!({ "kind": "jobs" }));
+    Ok(r)
+}
+
 pub fn clear_finished(app: &App) -> Result<Value> {
     app.jobs.jobs.lock().unwrap().retain(|j| matches!(j.status.as_str(), "queued" | "running"));
     app.broadcast(json!({ "kind": "jobs" }));

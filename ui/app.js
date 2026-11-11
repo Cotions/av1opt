@@ -1638,7 +1638,9 @@ views.queue = (root) => {
 
   // What holds a running job, if anything: the pause switch or the hours.
   const heldBy = (j) => (j.paused ? queue?.hold?.why ?? "paused" : null);
-  const headSig = (j) => JSON.stringify([j.status, heldBy(j), j.error, j.counts, j.saved, leftText(j.left_secs, j.left_unknown)]);
+  // The waiting job that starts next: the oldest one, unless another was moved ahead of it.
+  const isNext = (j) => j.status === "queued" && jobs.find((x) => x.status === "queued") === j;
+  const headSig = (j) => JSON.stringify([j.status, isNext(j), heldBy(j), j.error, j.counts, j.saved, leftText(j.left_secs, j.left_unknown)]);
   const fileSig = (j, f) => JSON.stringify({ ...f, progress: null, held: f.status === "running" ? heldBy(j) : null });
   const pausedPill = (j) => h("span", { class: "pill warn" }, heldBy(j) === "hours" ? "On hold" : "Paused");
 
@@ -1686,6 +1688,12 @@ views.queue = (root) => {
       saved > 0 ? h("span", { class: "ok" }, `${bytes(saved)} saved`) : null,
       j.left_secs ? h("span", {}, leftText(j.left_secs, j.left_unknown)) : null,
       h("span", { class: "dim" }, Object.entries(counts).map(([k, v]) => `${v} ${(STATUS[k] || [k])[0].toLowerCase()}`).join(" · ")),
+      j.status === "queued" && !isNext(j)
+        ? h("button", { class: "small", title: "Start this job before the other waiting ones", onclick: async (e) => { e.target.disabled = true; try { await api(`/api/jobs/${j.id}/first`, {}); } catch (er) { toast(er.message, true); } load(); } }, "Do next")
+        : null,
+      j.status === "cancelled" || j.status === "failed"
+        ? h("button", { class: "small", title: "Queue these files again with the same settings. Finished files are skipped and scene chunks resume.", onclick: async (e) => { e.target.disabled = true; try { await api(`/api/jobs/${j.id}/again`, {}); toast("Queued again"); } catch (er) { toast(er.message, true); } load(); } }, "Queue again")
+        : null,
       j.status === "running" || j.status === "queued"
         ? h("button", { class: "danger small", onclick: async (e) => { e.target.disabled = true; try { await api(`/api/jobs/${j.id}/cancel`, {}); toast("Cancelling… (finished chunks are kept; re-queue to resume)"); } catch (er) { toast(er.message, true); } } }, "Cancel")
         : h("button", { class: "small", onclick: async () => { await api(`/api/jobs/${j.id}/remove`, {}); load(); } }, "Remove"));

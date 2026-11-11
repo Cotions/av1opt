@@ -661,3 +661,49 @@ fn queue_pause_and_hours_are_kept_and_checked() {
     assert_eq!(s2.post("/api/queue/schedule", &json!({ "on": true, "from": from, "to": to })).json()["hold"]["why"], "hours");
     assert_eq!(s2.post("/api/queue/schedule", &json!({ "on": false, "from": from, "to": to })).json()["hold"], Value::Null);
 }
+
+#[test]
+fn waiting_jobs_can_be_moved_first_and_stopped_ones_queued_again() {
+    // Three saved jobs; with no usable ffmpeg they all wait, so their order can be looked at.
+    let s = Server::start("order", |d| {
+        let job = |name: &str| {
+            std::fs::write(d.join("videos").join(name), b"x").unwrap();
+            json!({ "inputs": [d.join("videos").join(name)], "roots": [], "out_dir": d.join("out"), "options": {} })
+        };
+        let saved = json!({ "format": 1, "jobs": [job("a.mkv"), job("b.mkv"), job("c.mkv")] });
+        std::fs::write(d.join("data/av1opt/ui-queue.json"), saved.to_string()).unwrap();
+    });
+    let ids = |s: &Server| -> Vec<u64> { s.get("/api/jobs/heads").json()["jobs"].as_array().unwrap().iter().map(|j| j["id"].as_u64().unwrap()).collect() };
+    let order = ids(&s);
+    assert_eq!(order.len(), 3);
+    let (a, b, c) = (order[0], order[1], order[2]);
+
+    assert_eq!(s.post(&format!("/api/jobs/{c}/first"), &json!({})).status, 200);
+    assert_eq!(ids(&s), [c, a, b]);
+    // The first one stays where it is, and a job that is not there is said so.
+    assert_eq!(s.post(&format!("/api/jobs/{c}/first"), &json!({})).status, 200);
+    assert_eq!(ids(&s), [c, a, b]);
+    assert_eq!(s.post("/api/jobs/999/first", &json!({})).status, 404);
+
+    // The saved queue has the new order.
+    let q: Value = serde_json::from_slice(&std::fs::read(s.data("ui-queue.json")).unwrap()).unwrap();
+    let names: Vec<String> = q["jobs"].as_array().unwrap().iter().map(|j| j["inputs"][0].as_str().unwrap().rsplit('/').next().unwrap().to_string()).collect();
+    assert_eq!(names, ["c.mkv", "a.mkv", "b.mkv"]);
+
+    // A stopped job is not moved; a waiting one is ahead of the stopped ones only by status.
+    assert_eq!(s.post(&format!("/api/jobs/{a}/cancel"), &json!({})).status, 200);
+    let r = s.post(&format!("/api/jobs/{a}/first"), &json!({}));
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert_eq!(s.post(&format!("/api/jobs/{b}/first"), &json!({})).status, 200);
+    assert_eq!(ids(&s), [b, c, a]);
+
+    // Only stopped jobs are queued again, and a refusal (no ffmpeg here) keeps the entry.
+    let r = s.post(&format!("/api/jobs/{b}/again"), &json!({}));
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert!(r.json()["error"].as_str().unwrap_or("").contains("cancelled or failed"), "{}", r.body);
+    let r = s.post(&format!("/api/jobs/{a}/again"), &json!({}));
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert!(r.json()["error"].as_str().unwrap_or("").contains("Settings"), "{}", r.body);
+    assert_eq!(ids(&s), [b, c, a]);
+    assert_eq!(s.post("/api/jobs/999/again", &json!({})).status, 404);
+}

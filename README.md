@@ -326,7 +326,9 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
   estimated once they are probed),
   per-chunk results in scene mode, percent, fps and ETA. Cancel stops ffmpeg at once; finished
   scene chunks are kept, so queueing the same files again resumes. Unfinished jobs are
-  re-queued automatically the next time `av1opt ui` starts. **Pause** holds the queue until
+  re-queued automatically the next time `av1opt ui` starts. **Do next** on a waiting job
+  starts it before the other waiting ones, and **Queue again** on a cancelled or failed job
+  queues its files once more with the same settings. **Pause** holds the queue until
   you resume, and **Hours…** sets the hours of the day encodes may run in (for example 23:00
   to 07:00). Either way nothing new starts and the running encode is held where it is: its
   ffmpeg processes are stopped, not ended, so they use no processor but keep their memory,

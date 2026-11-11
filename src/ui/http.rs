@@ -175,6 +175,8 @@ fn api(app: &Arc<App>, m: &Method, path: &str, q: &[(String, String)], body: &Va
         (Method::Post, ["jobs"]) => jobs::add(app, body),
         (Method::Post, ["jobs", id, "cancel"]) => jobs::cancel(app, id.parse()?),
         (Method::Post, ["jobs", id, "remove"]) => jobs::remove(app, id.parse()?),
+        (Method::Post, ["jobs", id, "first"]) => jobs::first(app, id.parse()?),
+        (Method::Post, ["jobs", id, "again"]) => jobs::again(app, id.parse()?),
         (Method::Post, ["jobs", "clear"]) => jobs::clear_finished(app),
         (Method::Post, ["queue", "pause"]) => hold::set_paused(app, body),
         (Method::Post, ["queue", "schedule"]) => hold::set_schedule(app, body),

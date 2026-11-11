@@ -1,7 +1,7 @@
 //! Folder browsing, scans, encode history (the `.av1opt.json` reports) and playback previews.
 
 use super::{App, now};
-use crate::estimate::{Model, Verdict};
+use crate::estimate::{Model, TimeModel, Verdict};
 use crate::history;
 use crate::scan::{self, FileResult, is_video};
 use crate::search;
@@ -164,6 +164,8 @@ pub struct Scan {
     total: usize,
     started: u64,
     model_samples: usize,
+    /// How long encodes take here, for the preset the scan was asked about.
+    time: TimeModel,
     results: Vec<FileResult>,
 }
 
@@ -174,6 +176,13 @@ struct ScanRequest {
     min_savings: f64,
     #[serde(default = "d_vmaf")]
     target_vmaf: f64,
+    /// Preset the encode time estimates are for.
+    #[serde(default = "d_preset")]
+    preset: u8,
+}
+
+fn d_preset() -> u8 {
+    6
 }
 
 fn d_savings() -> f64 {
@@ -193,7 +202,12 @@ pub fn start_scan(app: &Arc<App>, body: &Value) -> Result<Value> {
         .iter()
         .map(|p| std::fs::canonicalize(p).with_context(|| format!("cannot open {}", p.display())))
         .collect::<Result<_>>()?;
-    let model = Model::fit(&history::load(), r.target_vmaf);
+    if r.preset > 13 {
+        bail!("preset must be 0-13");
+    }
+    let past = history::load();
+    let model = Model::fit(&past, r.target_vmaf);
+    let time = TimeModel::fit(&past, r.preset);
     let id = {
         let mut scans = app.scans.lock().unwrap();
         let id = scans.iter().map(|s| s.id).max().unwrap_or(0) + 1;
@@ -210,6 +224,7 @@ pub fn start_scan(app: &Arc<App>, body: &Value) -> Result<Value> {
             total: 0,
             started: now(),
             model_samples: model.samples,
+            time,
             results: Vec::new(),
         });
         id
@@ -266,14 +281,17 @@ pub fn scan_result(app: &App, id: u64) -> Result<Value> {
     let s = scans.iter().find(|s| s.id == id).ok_or_else(|| anyhow!("not found: scan {id}"))?;
     let mut totals = json!({ "files": 0, "bytes": 0.0, "candidates": 0, "candidate_bytes": 0.0, "saved_likely": 0.0, "saved_low": 0.0, "saved_high": 0.0 });
     let (mut files, mut bytes, mut cands, mut cbytes, mut lk, mut lo, mut hi) = (0, 0.0, 0, 0.0, 0.0, 0.0, 0.0);
+    let mut encode_secs = 0.0;
     let rows: Vec<Value> = s
         .results
         .iter()
         .map(|r| {
             files += 1;
             bytes += r.size as f64;
+            let est_secs = r.info.as_ref().map(|i| s.time.secs(i)).filter(|t| *t > 0.0);
             if r.verdict == Verdict::Candidate {
                 cands += 1;
+                encode_secs += est_secs.unwrap_or(0.0);
                 cbytes += r.size as f64;
                 lk += r.size as f64 - r.estimate.likely;
                 lo += r.size as f64 - r.estimate.high;
@@ -288,6 +306,7 @@ pub fn scan_result(app: &App, id: u64) -> Result<Value> {
                 "verdict": r.verdict,
                 "verdict_label": r.verdict.label(),
                 "estimate": r.estimate,
+                "est_secs": est_secs,
                 "codec": i.map(|i| i.codec.as_str()),
                 "width": i.map(|i| i.width),
                 "height": i.map(|i| i.height),
@@ -300,11 +319,11 @@ pub fn scan_result(app: &App, id: u64) -> Result<Value> {
         })
         .collect();
     if files > 0 {
-        totals = json!({ "files": files, "bytes": bytes, "candidates": cands, "candidate_bytes": cbytes, "saved_likely": lk, "saved_low": lo, "saved_high": hi });
+        totals = json!({ "files": files, "bytes": bytes, "candidates": cands, "candidate_bytes": cbytes, "saved_likely": lk, "saved_low": lo, "saved_high": hi, "encode_secs": encode_secs });
     }
     Ok(json!({
         "id": s.id, "paths": s.paths, "status": s.status, "error": s.error, "done": s.done, "total": s.total,
-        "started": s.started, "model_samples": s.model_samples, "totals": totals, "rows": rows,
+        "started": s.started, "model_samples": s.model_samples, "time_samples": s.time.samples, "preset": s.time.preset, "totals": totals, "rows": rows,
     }))
 }
 

@@ -458,7 +458,7 @@ fn benchmark_requests_and_tuned_settings() {
     let s = Server::start("bench", |d| {
         std::fs::write(d.join("videos/a.mkv"), b"x").unwrap();
         std::fs::write(d.join("data/av1opt/bench-last.json"), report.to_string()).unwrap();
-        let saved = json!({ "format": 1, "jobs": [{ "inputs": [d.join("videos/a.mkv")], "roots": [], "out_dir": d.join("out"), "options": { "tuned": true, "svt_params": "tune=2" } }] });
+        let saved = json!({ "format": 1, "jobs": [{ "inputs": [d.join("videos/a.mkv")], "roots": [], "out_dir": d.join("out"), "options": { "tuned": true, "svt_params": "tune=2", "shrink_audio": true } }] });
         std::fs::write(d.join("data/av1opt/ui-queue.json"), saved.to_string()).unwrap();
     });
     let videos = s.dir.join("videos");
@@ -536,5 +536,6 @@ fn benchmark_requests_and_tuned_settings() {
     // A saved job keeps its encoder options.
     let o = &s.get("/api/jobs/heads").json()["jobs"][0]["options"];
     assert_eq!(o["tuned"], true, "{o}");
+    assert_eq!(o["shrink_audio"], true, "{o}");
     assert_eq!(o["svt_params"], "tune=2");
 }

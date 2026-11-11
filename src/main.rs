@@ -58,6 +58,12 @@ enum Cmd {
         /// VMAF target the estimates assume (past encodes for nearby targets calibrate them).
         #[arg(long, default_value_t = 93.0)]
         target_vmaf: f64,
+        /// SVT-AV1 preset the encode time estimates assume.
+        #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u8).range(0..=13))]
+        preset: u8,
+        /// Order of the list of top candidates: most saved, or most saved per hour of encoding.
+        #[arg(long, value_enum, default_value_t)]
+        sort: report::TopBy,
     },
     /// Find videos that show the same thing: the same video at another resolution, bitrate,
     /// codec or container, and copies cut at the start or the end. Read-only: decodes a few
@@ -255,11 +261,46 @@ enum Cmd {
         /// Don't read yt-dlp .info.json files.
         #[arg(long)]
         no_info_json: bool,
+        /// Measure every CRF trial again. Normally a trial measured in an earlier run for the
+        /// same file, sample clips, settings and ffmpeg build is reused.
+        #[arg(long)]
+        fresh_search: bool,
+        /// Sound tracks: keep copies AAC, Opus and MP3 untouched (other formats become Opus);
+        /// shrink also re-encodes tracks far above what Opus needs (stereo above 144 kbps
+        /// becomes Opus at 96 kbps).
+        #[arg(long, value_enum, default_value_t = encode::Audio::Keep)]
+        audio: encode::Audio,
         /// Leave a section out of the output, e.g. --remove 1:20-2:05 or --remove 58:30-end.
         /// Times are h:mm:ss, m:ss or seconds, with optional decimals; cuts are frame-accurate.
         /// Repeatable; needs a single input file. Audio is re-encoded to Opus.
         #[arg(long, value_name = "START-END", value_parser = sections::parse_range)]
         remove: Vec<(f64, f64)>,
+    },
+    /// Development aid: measures the VMAF of a video's sample clips at each CRF in a list, one
+    /// JSON line per CRF. The CRF search is tested against curves measured this way.
+    #[command(hide = true)]
+    Curve {
+        input: PathBuf,
+        /// CRFs to measure: ranges and single values, e.g. 24-40 or 28,28.25,28.5.
+        #[arg(long, default_value = "24-40")]
+        crfs: String,
+        /// Folder for the sample clips (removed afterwards).
+        #[arg(long)]
+        tmp: PathBuf,
+        #[arg(long, default_value_t = 6)]
+        preset: u8,
+        #[arg(long, default_value = search::DEFAULT_PARAMS, value_parser = search::parse_params)]
+        svt_params: String,
+        #[arg(long, default_value_t = 4)]
+        samples: usize,
+        #[arg(long, default_value_t = 8.0)]
+        sample_secs: f64,
+        #[arg(long, env = "AV1OPT_FFMPEG", default_value = "ffmpeg")]
+        ffmpeg: String,
+        #[arg(long, env = "AV1OPT_FFPROBE", default_value = "ffprobe")]
+        ffprobe: String,
+        #[arg(long, default_value = "auto")]
+        memory_limit: String,
     },
     /// Local web app: scan folders, queue encodes with live progress, compare source and AV1
     /// output side by side, browse past encodes. Listens on 127.0.0.1 only.
@@ -289,11 +330,13 @@ enum Cmd {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
-        Cmd::Scan { paths, ffprobe, jobs, min_savings, csv, top, target_vmaf } => {
-            let model = estimate::Model::fit(&history::load(), target_vmaf);
+        Cmd::Scan { paths, ffprobe, jobs, min_savings, csv, top, target_vmaf, preset, sort } => {
+            let past = history::load();
+            let model = estimate::Model::fit(&past, target_vmaf);
+            let time = estimate::TimeModel::fit(&past, preset);
             // Absolute roots keep cache keys stable however the folder was typed.
             let paths: Vec<PathBuf> = paths.iter().map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone())).collect();
-            scan(&paths, &ffprobe, jobs, min_savings, csv.as_deref(), top, &model)
+            scan(&paths, &ffprobe, jobs, min_savings, csv.as_deref(), top, &model, &time, sort)
         }
         Cmd::Dups { paths, jobs, prefer, avoid, tolerance, refresh, top, csv, json, ffmpeg, ffprobe, memory_limit, nice } => {
             let abs = |p: &PathBuf| std::path::absolute(p).unwrap_or_else(|_| p.clone());
@@ -423,7 +466,7 @@ fn main() -> Result<()> {
         Cmd::Encode {
             inputs, out_dir, container, target_vmaf, preset, svt_params, tuned, min_crf, max_crf, samples, sample_secs,
             min_savings, force, overwrite, retry_skipped, keep_temp, allow_zfs, ffmpeg, ffprobe, scenes, workers, memory_limit, nice,
-            strip_metadata, keep_dates, meta_preset, meta, no_info_json, remove,
+            strip_metadata, keep_dates, meta_preset, meta, no_info_json, remove, audio, fresh_search,
         } => {
             let meta = metadata::MetaOptions {
                 keep: !strip_metadata,
@@ -460,7 +503,7 @@ fn main() -> Result<()> {
             }
             let opts = encode::Options {
                 container, target_vmaf, preset, svt_params, tuning, min_crf, max_crf, samples, sample_secs,
-                min_savings, force, overwrite, keep_temp, scenes, workers: workers.into(), meta, remove,
+                min_savings, force, overwrite, keep_temp, scenes, workers: workers.into(), meta, remove, audio, fresh_search,
             };
             let jobs = batch::expand(&inputs, &out_dir, is_video);
             if jobs.is_empty() {
@@ -480,6 +523,46 @@ fn main() -> Result<()> {
                 std::process::exit(2);
             }
             Ok(())
+        }
+        Cmd::Curve { input, crfs, tmp, preset, svt_params, samples, sample_secs, ffmpeg, ffprobe, memory_limit } => {
+            let mut list: Vec<f64> = Vec::new();
+            for part in crfs.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                match part.split_once('-') {
+                    Some((a, b)) => list.extend((a.parse::<u8>()?..=b.parse::<u8>()?).map(f64::from)),
+                    None => list.push(part.parse()?),
+                }
+            }
+            fsguard::ensure_writable_location(&tmp, false)?;
+            let dir = tmp.join(format!(".av1opt-curve-{}", std::process::id()));
+            std::fs::create_dir_all(&dir)?;
+            // SAFETY: plain syscall on our own process; children inherit the priority.
+            unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 10) };
+            let tools = tools::Tools::new(ffmpeg, ffprobe, memory_cap(&memory_limit, 1));
+            let run = || -> Result<()> {
+                let size = std::fs::metadata(&input)?.len();
+                let info = probe::probe(&tools.ffprobe, &input, size)?;
+                let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+                let vmaf_threads = if info.width.max(info.height) >= 3200 { threads.min(4) } else { threads };
+                let enc = search::EncodeSettings { preset, pix_fmt_out: "yuv420p10le", params: svt_params.clone() };
+                let pos = search::sample_positions(info.duration_s, samples, sample_secs);
+                let clips = search::extract_samples(&tools, &input, &info, &dir, pos)?;
+                for crf in list {
+                    let started = std::time::Instant::now();
+                    let t = search::trial(&tools, &info, &clips, &dir, &enc, crf, vmaf_threads, info.video_bitrate / 8.0)?;
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "video": input.file_name().map(|n| n.to_string_lossy()), "width": info.width, "height": info.height,
+                            "preset": preset, "params": svt_params, "crf": crf, "vmaf": t.mean_vmaf, "min_vmaf": t.min_vmaf,
+                            "size_ratio": t.size_ratio, "secs": started.elapsed().as_secs_f64(),
+                        })
+                    );
+                }
+                Ok(())
+            };
+            let result = run();
+            let _ = std::fs::remove_dir_all(&dir);
+            result
         }
         #[cfg(feature = "ui")]
         Cmd::Ui { port, no_open, ffmpeg, ffprobe, memory_limit, nice, jobs } => {
@@ -515,7 +598,18 @@ fn memory_cap(setting: &str, workers: u8) -> Option<String> {
     Some(format!("{}M", mb / workers.max(1) as u64))
 }
 
-fn scan(paths: &[PathBuf], ffprobe: &str, jobs: usize, min_savings: f64, csv: Option<&Path>, top: usize, model: &estimate::Model) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn scan(
+    paths: &[PathBuf],
+    ffprobe: &str,
+    jobs: usize,
+    min_savings: f64,
+    csv: Option<&Path>,
+    top: usize,
+    model: &estimate::Model,
+    time: &estimate::TimeModel,
+    sort: report::TopBy,
+) -> Result<()> {
     let progress = |n: usize, total: usize| {
         if n == 0 {
             eprintln!("found {total} video files");
@@ -535,9 +629,9 @@ fn scan(paths: &[PathBuf], ffprobe: &str, jobs: usize, min_savings: f64, csv: Op
     } else {
         eprintln!("estimates: learned from {} past encodes (spread x{:.2})", model.samples, (1.28 * model.sigma).exp());
     }
-    report::print(&results, top);
+    report::print(&results, top, time, sort);
     if let Some(csv) = csv {
-        report::write_csv(&results, csv)?;
+        report::write_csv(&results, csv, time)?;
         eprintln!("wrote {}", csv.display());
     }
     Ok(())

@@ -52,6 +52,9 @@ pub struct JobOptions {
     /// Tag name and template pairs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub meta_tags: Vec<(String, String)>,
+    /// Re-encode sound tracks far above what Opus needs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shrink_audio: bool,
     /// Sections left out of the output, (start, end) seconds. Only for single-file jobs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remove: Vec<(f64, f64)>,
@@ -118,6 +121,8 @@ impl JobOptions {
             workers: self.workers as usize,
             meta: self.meta()?,
             remove: self.remove.clone(),
+            fresh_search: false,
+            audio: if self.shrink_audio { crate::encode::Audio::Shrink } else { crate::encode::Audio::Keep },
         })
     }
 

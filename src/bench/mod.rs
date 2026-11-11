@@ -182,7 +182,7 @@ struct Line {
     m: Measure,
 }
 
-fn cache_dir() -> Result<PathBuf> {
+pub fn cache_dir() -> Result<PathBuf> {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
@@ -329,7 +329,7 @@ pub fn run(paths: &[PathBuf], tools: &Tools, o: &Options, progress: &(dyn Fn(Pro
         let vmaf_threads = if info.width.max(info.height) >= 3200 { threads.min(4) } else { threads };
         // Cut only when something actually has to be encoded.
         let mut samples: Option<Vec<Sample>> = None;
-        let mut start_crf = 35u8;
+        let mut start_crf = search::START_CRF;
         for (ci, c) in o.configs.iter().enumerate() {
             let enc = EncodeSettings { preset: c.preset, pix_fmt_out: "yuv420p10le", params: c.params.clone() };
             let mut trials: Vec<Measure> = Vec::new();

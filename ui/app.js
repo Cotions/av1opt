@@ -55,6 +55,13 @@ function hms(sec) {
   const hh = Math.floor(sec / 3600), mm = Math.floor(sec / 60) % 60, ss = sec % 60;
   return (hh ? hh + ":" + String(mm).padStart(2, "0") : mm) + ":" + String(ss).padStart(2, "0");
 }
+function span(sec) { // a length of time for people: minutes, hours, then days
+  if (sec == null || isNaN(sec) || sec <= 0) return "–";
+  if (sec < 60) return "<1 min";
+  if (sec < 5400) return Math.round(sec / 60) + " min";
+  if (sec < 172800) return (sec / 3600).toFixed(1) + " h";
+  return (sec / 86400).toFixed(1) + " days";
+}
 function tc(sec) { // time with tenths, for the player
   if (sec == null || isNaN(sec)) return "–";
   const t = Math.max(0, sec);
@@ -236,6 +243,7 @@ function metaLabel(o) {
     parts.push(p ? `${p.name} tags` : `${o.meta_tags.length} tag${o.meta_tags.length === 1 ? "" : "s"}`);
   }
   if (o.keep_dates) parts.push("dates kept");
+  if (o.shrink_audio) parts.push("audio shrunk");
   if (o.remove && o.remove.length) parts.push(`${o.remove.length} section${o.remove.length === 1 ? "" : "s"} removed`);
   return parts.length ? " · " + parts.join(" · ") : "";
 }
@@ -243,7 +251,7 @@ function metaLabel(o) {
 function defaultOptions() {
   return Object.assign({
     container: "mp4", target_vmaf: 93, preset: 6, svt_params: "", tuned: false, scenes: false, workers: 1, min_savings: 0.15, force: false, retry_skipped: false,
-    keep_metadata: true, keep_dates: false, info_json: true, meta_preset: "", meta_tags: [],
+    keep_metadata: true, keep_dates: false, info_json: true, meta_preset: "", meta_tags: [], shrink_audio: false,
   }, prefs.get("encodeOptions", {}));
 }
 
@@ -548,6 +556,7 @@ function encodeDialog(inputs, roots = []) {
     const minSav = h("input", { type: "number", min: "0", max: "95", step: "1", value: Math.round(o.min_savings * 100) });
     const force = h("input", { type: "checkbox", checked: o.force });
     const retry = h("input", { type: "checkbox", checked: o.retry_skipped });
+    const shrinkAudio = h("input", { type: "checkbox", checked: o.shrink_audio });
     const meta = metaEditor(o, inputs);
     const one = inputs.length === 1 && /\.[A-Za-z0-9]{2,5}$/.test(inputs[0]) ? inputs[0] : null;
     // Only built when opened, so the dialog doesn't load the video for nothing.
@@ -567,6 +576,7 @@ function encodeDialog(inputs, roots = []) {
         container: container.value, target_vmaf: Number(vmaf.value), preset: Number(preset.value), svt_params: svtParams.value.trim(),
         tuned: tuning.length > 0 && tuned.checked, scenes: scenes.checked,
         workers: Number(workers.value), min_savings: Number(minSav.value) / 100, force: force.checked, retry_skipped: retry.checked,
+        shrink_audio: shrinkAudio.checked,
         ...meta.get(),
       };
       // The tick is remembered also while there are no tuned settings to use.
@@ -606,6 +616,7 @@ function encodeDialog(inputs, roots = []) {
           h("div", { class: "checks-col" },
             h("label", { class: "check", title: "Splits at scene cuts and picks a CRF per scene; slower but smaller on mixed content" }, scenes, "Per-scene CRF (slower, smaller on mixed content)"),
             h("label", { class: "check sub" }, workers, "scenes encoded at once"),
+            h("label", { class: "check", title: "AAC, Opus and MP3 sound is normally copied untouched. With this, a track far above what Opus needs (stereo above 144 kbps) is re-encoded to Opus (stereo at 96 kbps): smaller, but lossy a second time" }, shrinkAudio, "Shrink heavy sound tracks to Opus (stereo above 144 kbps becomes 96 kbps)"),
             h("label", { class: "check" }, force, "Force: also re-encode AV1 files and low-gain ones"),
             h("label", { class: "check" }, retry, "Retry files skipped in earlier runs")),
           h("h3", {}, "Metadata"),
@@ -661,7 +672,7 @@ views.scan = (root) => {
     prefs.set("scanVmaf", Number(vmaf.value));
     start.disabled = true;
     try {
-      const r = await api("/api/scans", { paths: [...roots], min_savings: Number(minSav.value) / 100, target_vmaf: Number(vmaf.value) });
+      const r = await api("/api/scans", { paths: [...roots], min_savings: Number(minSav.value) / 100, target_vmaf: Number(vmaf.value), preset: Number(defaultOptions().preset) || 6 });
       scanId = lastScanId = r.id;
       progText.textContent = "listing files…";
       progress.firstChild.style.width = "0%";
@@ -711,6 +722,9 @@ function renderScan(out, r) {
   let sortKey = "saved", sortDir = -1;
   const selected = new Set();
   const savedOf = (row) => row.size - row.estimate.likely;
+  // Bytes saved per hour of encoding: what to start with when time is short.
+  const rateOf = (row) => row.verdict === "Candidate" && row.est_secs ? savedOf(row) / row.est_secs * 3600 : 0;
+  const timeBasis = `Search and encode at preset ${r.preset}, ${r.time_samples ? "going by " + plural(r.time_samples, "past encode") + " on this machine" : "a rough guess until a few files are encoded on this machine"}`;
   const rows = r.rows;
   const body = h("tbody");
   const selInfo = h("span", { class: "dim" });
@@ -719,12 +733,14 @@ function renderScan(out, r) {
 
   const shown = () => {
     let v = rows.filter((x) => filter === "all" || (filter === "candidate" ? x.verdict === "Candidate" : x.verdict !== "Candidate"));
-    const key = { saved: savedOf, size: (x) => x.size, name: (x) => x.rel, mbps: (x) => x.video_mbps || 0, dur: (x) => x.duration_s || 0 }[sortKey];
+    const key = { saved: savedOf, size: (x) => x.size, name: (x) => x.rel, mbps: (x) => x.video_mbps || 0, dur: (x) => x.duration_s || 0, time: (x) => x.est_secs || 0, rate: rateOf }[sortKey];
     v.sort((a, b) => { const ka = key(a), kb = key(b); return (ka < kb ? -1 : ka > kb ? 1 : 0) * sortDir; });
     return v;
   };
   const updateSel = () => {
-    selInfo.textContent = selected.size ? `${selected.size} selected · ${bytes(rows.filter((x) => selected.has(x.path)).reduce((a, x) => a + savedOf(x), 0))} est. saved` : "";
+    const sel = rows.filter((x) => selected.has(x.path));
+    const secs = sel.reduce((a, x) => a + (x.est_secs || 0), 0);
+    selInfo.textContent = sel.length ? `${sel.length} selected · ${bytes(sel.reduce((a, x) => a + savedOf(x), 0))} est. saved${secs ? " · about " + span(secs) + " to encode" : ""}` : "";
     encodeBtn.disabled = !selected.size;
   };
   let limit = 500; // more rows make every sort and filter click slow
@@ -743,15 +759,17 @@ function renderScan(out, r) {
         h("td", { class: "num" }, bytes(x.size)),
         h("td", { class: "num" }, x.verdict === "Candidate" ? `~${bytes(x.estimate.likely)}` : "–"),
         h("td", { class: "num" }, x.verdict === "Candidate" ? h("span", { title: `range ${bytes(x.size - x.estimate.high)} – ${bytes(x.size - x.estimate.low)}` }, `${bytes(savedOf(x))} (${pct(savedOf(x) / x.size)})`) : "–"),
+        h("td", { class: "num" }, x.verdict === "Candidate" ? span(x.est_secs) : "–"),
+        h("td", { class: "num" }, rateOf(x) ? bytes(rateOf(x)) + "/h" : "–"),
         h("td", {}, h("span", { class: "pill " + cls, title: x.error || "" }, x.verdict_label)));
     }));
-    if (v.length > limit) body.append(h("tr", {}, h("td", { colspan: 10, class: "dim" }, `${v.length - limit} more not shown. `,
+    if (v.length > limit) body.append(h("tr", {}, h("td", { colspan: 12, class: "dim" }, `${v.length - limit} more not shown. `,
       h("button", { class: "small", onclick: () => { limit = Infinity; draw(); } }, "Show all"))));
-    if (!v.length) body.append(h("tr", {}, h("td", { colspan: 10, class: "empty" }, "Nothing here.")));
+    if (!v.length) body.append(h("tr", {}, h("td", { colspan: 12, class: "empty" }, "Nothing here.")));
     allBox.checked = v.length > 0 && v.every((x) => selected.has(x.path));
   };
   allBox.onchange = () => { for (const x of shown()) { if (allBox.checked) selected.add(x.path); else selected.delete(x.path); } draw(); updateSel(); };
-  const th = (label, key, cls) => h("th", { class: "sort " + (cls || ""), onclick: () => { if (sortKey === key) sortDir *= -1; else { sortKey = key; sortDir = key === "name" ? 1 : -1; } draw(); } }, label);
+  const th = (label, key, cls, title) => h("th", { class: "sort " + (cls || ""), title, onclick: () => { if (sortKey === key) sortDir *= -1; else { sortKey = key; sortDir = key === "name" ? 1 : -1; } draw(); } }, label);
   const filt = h("select", { onchange: (e) => { filter = e.target.value; prefs.set("scanFilter", filter); draw(); } },
     h("option", { value: "candidate" }, "Candidates"), h("option", { value: "skip" }, "Skipped"), h("option", { value: "all" }, "All files"));
   filt.value = filter;
@@ -761,11 +779,12 @@ function renderScan(out, r) {
       h("div", { class: "stat" }, h("div", { class: "v" }, t.files), h("div", { class: "l" }, `videos · ${bytes(t.bytes)}`)),
       h("div", { class: "stat" }, h("div", { class: "v" }, t.candidates), h("div", { class: "l" }, `candidates · ${bytes(t.candidate_bytes)}`)),
       h("div", { class: "stat" }, h("div", { class: "v ok" }, bytes(t.saved_likely)), h("div", { class: "l" }, `estimated savings (${bytes(t.saved_low)} – ${bytes(t.saved_high)})`)),
-      h("div", { class: "stat" }, h("div", { class: "v" }, pct(t.bytes ? t.saved_likely / t.bytes : 0)), h("div", { class: "l" }, "of the whole library"))),
+      h("div", { class: "stat" }, h("div", { class: "v" }, pct(t.bytes ? t.saved_likely / t.bytes : 0)), h("div", { class: "l" }, "of the whole library")),
+      h("div", { class: "stat", title: timeBasis }, h("div", { class: "v" }, t.encode_secs ? "≈ " + span(t.encode_secs) : "–"), h("div", { class: "l" }, `to encode the candidates${r.time_samples ? "" : " (rough guess)"}`))),
     h("div", { class: "panel" },
       h("div", { class: "row" }, filt, selInfo, h("span", { class: "spacer" }), encodeBtn),
       h("div", { class: "tablewrap" }, h("table", {},
-        h("thead", {}, h("tr", {}, h("th", {}, allBox), th("File", "name"), h("th", {}, "Codec"), h("th", { class: "num" }, "Size px"), th("Length", "dur", "num"), th("Mbps", "mbps", "num"), th("Size", "size", "num"), h("th", { class: "num" }, "AV1 est."), th("Saves", "saved", "num"), h("th", {}, "Verdict"))),
+        h("thead", {}, h("tr", {}, h("th", {}, allBox), th("File", "name"), h("th", {}, "Codec"), h("th", { class: "num" }, "Size px"), th("Length", "dur", "num"), th("Mbps", "mbps", "num"), th("Size", "size", "num"), h("th", { class: "num" }, "AV1 est."), th("Saves", "saved", "num"), th("Time", "time", "num", timeBasis), th("Per hour", "rate", "num", "Estimated saving per hour of encoding: sort by this to start where the time pays most"), h("th", {}, "Verdict"))),
         body))));
   draw();
   updateSel();

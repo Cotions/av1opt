@@ -89,6 +89,8 @@ pub struct Tools {
     prefix: Vec<String>,
     /// Progress listener and cancel switch (the UI); None on the command line.
     pub hooks: Option<Arc<Hooks>>,
+    /// First line of `ffmpeg -version`, asked for once.
+    version: std::sync::OnceLock<String>,
 }
 
 impl Tools {
@@ -105,7 +107,22 @@ impl Tools {
             }
             None => Vec::new(),
         };
-        Tools { ffmpeg, ffprobe, prefix, hooks: None }
+        Tools { ffmpeg, ffprobe, prefix, hooks: None, version: std::sync::OnceLock::new() }
+    }
+
+    /// Which ffmpeg build this is (the first line of `ffmpeg -version`; empty if it won't
+    /// say). Measurements kept between runs only count for the build that made them.
+    pub fn encoder_version(&self) -> &str {
+        self.version.get_or_init(|| {
+            Command::new(&self.ffmpeg)
+                .args(["-hide_banner", "-version"])
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8_lossy(&o.stdout).lines().next().map(str::to_owned))
+                .unwrap_or_default()
+        })
     }
 
     /// Builds the ffmpeg command; with AV1OPT_DEBUG set, prints it first.

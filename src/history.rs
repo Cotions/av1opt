@@ -32,10 +32,23 @@ pub struct Record {
     pub target_vmaf: f64,
     pub preset: u8,
     pub mode: String,
+    /// The CRF the search chose (absent in lines from before it was recorded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crf: Option<f64>,
+    /// SVT-AV1 parameters besides the CRF (absent: unknown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub svt_params: Option<String>,
+    /// Seconds the CRF search and the encode of the whole video took (absent: not recorded,
+    /// or the encode was not of the whole video). Trials known from an earlier run make a
+    /// search short, so only the encode's time says how fast the machine is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_secs: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encode_secs: Option<f64>,
 }
 
 impl Record {
-    pub fn new(info: &MediaInfo, output_bitrate: f64, target_vmaf: f64, preset: u8, mode: &str) -> Self {
+    pub fn new(info: &MediaInfo, output_bitrate: f64, target_vmaf: f64, preset: u8, mode: &str, crf: f64, svt_params: &str) -> Self {
         let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         Record {
             format: FORMAT,
@@ -50,6 +63,10 @@ impl Record {
             target_vmaf,
             preset,
             mode: mode.to_string(),
+            crf: Some(crf),
+            svt_params: Some(svt_params.to_string()),
+            search_secs: None,
+            encode_secs: None,
         }
     }
 }

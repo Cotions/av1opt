@@ -38,7 +38,31 @@ pub struct Options {
     pub meta: MetaOptions,
     /// Parts of the video to leave out, as (start, end) seconds of the source.
     pub remove: Vec<(f64, f64)>,
+    pub audio: Audio,
+    /// Measure every CRF trial again instead of reusing trials from earlier runs.
+    pub fresh_search: bool,
 }
+
+/// What happens to sound tracks that could be copied as they are.
+#[derive(Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum Audio {
+    /// AAC, Opus and MP3 tracks are copied untouched; other formats become Opus.
+    #[default]
+    Keep,
+    /// As keep, but a track spending well over what Opus needs for its channels (stereo:
+    /// above 144 kbps) is re-encoded to Opus (stereo: 96 kbps). Lossy a second time.
+    Shrink,
+}
+
+/// Opus bitrate that is hard to tell from the original for this many channels, in kbps:
+/// 56 mono, 96 stereo, 256 for 5.1.
+fn lean_opus_kbps(channels: u32) -> u32 {
+    (channels.max(1) * 40 + 16).min(384)
+}
+
+/// A copyable track is only re-encoded when it spends this many times the lean bitrate:
+/// below that the saving isn't worth a second lossy pass.
+const SHRINK_ABOVE: f64 = 1.5;
 
 /// Name prefix of scene-mode work folders. Unlike temp folders they survive crashes on purpose:
 /// the next run resumes from them.
@@ -156,7 +180,16 @@ pub fn clean_stale_temp(out_dir: &Path) {
 /// Re-encodes one file into `out_dir`. Returns the output path.
 pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Result<PathBuf> {
     let size = std::fs::metadata(input).with_context(|| format!("cannot read {}", input.display()))?.len();
-    let info = probe::probe(&tools.ffprobe, input, size)?;
+    let mut info = probe::probe(&tools.ffprobe, input, size)?;
+    if o.audio == Audio::Shrink {
+        // Matroska rarely says what a track spends; measure the ones it leaves open.
+        for (i, s) in info.audio.iter_mut().enumerate() {
+            if s.bitrate <= 0.0 && COPY_AUDIO.contains(&s.codec.as_str()) {
+                s.bitrate = probe::audio_bitrate(&tools.ffprobe, input, i).unwrap_or(0.0);
+            }
+        }
+    }
+    let info = info;
     if info.dolby_vision {
         skip!("Dolby Vision is not supported: re-encoding would drop its dynamic metadata");
     }
@@ -244,34 +277,44 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     });
 
     let t0 = Instant::now();
-    let (best, trials, mut samples) = match &saved {
+    let (best, trials, mut lab) = match &saved {
         Some(p) => {
             eprintln!("resuming earlier run: crf {} from the saved search", p.best.crf);
-            (Some(p.best), p.trials.clone(), Vec::new())
+            (search::Outcome::Found(p.best), p.trials.clone(), None)
         }
         None => {
-            eprintln!("searching CRF for VMAF >= {} ({model}, preset {preset})", o.target_vmaf);
-            tools.emit(Event::Phase { phase: "sampling".into(), detail: format!("{} samples", o.samples) });
+            // A trial that misses the target while already too large to be worth it settles
+            // the matter: the CRF the target needs is lower, and its encode larger.
+            let max_size_ratio = (!o.force && cut.is_none()).then_some(1.0 - o.min_savings);
+            let guess = crate::estimate::CrfModel::fit(&history::load(), o.target_vmaf, svt_params);
+            let start_crf = guess.start(&info, o.min_crf, o.max_crf);
+            let learned = if guess.samples == 0 { String::new() } else { format!(", going by {} past encode{}", guess.samples, if guess.samples == 1 { "" } else { "s" }) };
+            eprintln!("searching CRF for VMAF >= {} ({model}, preset {preset}), from CRF {start_crf}{learned}", o.target_vmaf);
             let pos = match &cut {
                 Some(c) => c.sample_positions(o.samples, o.sample_secs),
                 None => search::sample_positions(info.duration_s, o.samples, o.sample_secs),
             };
-            let samples = search::extract_samples(tools, input, &info, &tmp.path, pos)?;
-            let params = SearchParams { target_vmaf: o.target_vmaf, min_crf: o.min_crf, max_crf: o.max_crf, vmaf_threads };
-            tools.emit(Event::Phase { phase: "searching".into(), detail: format!("VMAF >= {} ({model}, preset {preset})", o.target_vmaf) });
-            let (best, trials) = search::search(tools, &info, &samples, &tmp.path, &enc, &params)?;
-            (best, trials, samples)
+            let cache = search::TrialCache::open(input, size, &pos, tools.encoder_version(), !o.fresh_search);
+            let mut lab = search::Lab::new(tools, input, &info, &tmp.path, pos, vmaf_threads, cache);
+            let params = SearchParams { target_vmaf: o.target_vmaf, min_crf: o.min_crf, max_crf: o.max_crf, start_crf, max_size_ratio };
+            tools.emit(Event::Phase { phase: "searching".into(), detail: format!("VMAF >= {} ({model}, preset {preset}), from CRF {start_crf}", o.target_vmaf) });
+            let (best, trials) = search::search(&mut lab, &enc, &params)?;
+            (best, trials, Some(lab))
         }
     };
     // With sections removed the output is wanted anyway: settle for the best quality tried.
-    let reached = best.is_some();
+    let reached = matches!(best, search::Outcome::Found(_));
     let best = match best {
-        Some(b) => b,
-        None if cut.is_some() && let Some(t) = trials.iter().min_by(|a, b| a.crf.total_cmp(&b.crf)) => {
+        search::Outcome::Found(b) => b,
+        search::Outcome::TooLarge(t) => skip!(
+            "CRF {} misses VMAF {} ({:.2}) at {:.0}% of the source's size already: savings would be below --min-savings {:.0}%",
+            t.crf, o.target_vmaf, t.mean_vmaf, t.size_ratio * 100.0, o.min_savings * 100.0
+        ),
+        search::Outcome::OutOfReach if cut.is_some() && let Some(t) = trials.iter().min_by(|a, b| a.crf.total_cmp(&b.crf)) => {
             notes.push(format!("VMAF {} is out of reach (CRF {} gives {:.2}); encoded at CRF {} for the cut", o.target_vmaf, t.crf, t.mean_vmaf, t.crf));
             *t
         }
-        None => skip!("even CRF {} misses VMAF {}; source is too lean to re-encode at this target", o.min_crf, o.target_vmaf),
+        search::Outcome::OutOfReach => skip!("even CRF {} misses VMAF {}; source is too lean to re-encode at this target", o.min_crf, o.target_vmaf),
     };
     let predicted_savings = 1.0 - best.size_ratio;
     tools.emit(Event::Chosen { crf: best.crf, vmaf: best.mean_vmaf, predicted_savings });
@@ -292,6 +335,10 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         bail!("not enough free space in {}: {:.1} GB free, ~{:.1} GB needed", out_dir.display(), free as f64 / 1e9, need as f64 / 1e9);
     }
 
+    // The sample clips are lossless and large; only scene mode measures on them again.
+    if !scenes && let Some(lab) = lab.as_mut() {
+        lab.discard_samples();
+    }
     let partial = tmp.path.join(format!("partial.{}", o.container.ext()));
     let covers = prepare_covers(tools, input, &info, o.container, &tmp.path, &mut notes);
     let t1 = Instant::now();
@@ -307,9 +354,10 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
             None => {
                 // How much better the real preset scores than the fast probe preset at the
                 // same CRF; probe scores are shifted by this to predict the real encode.
-                let pt = search::trial(tools, &info, &samples, &tmp.path, &probe, best.crf, vmaf_threads, 1.0)?;
+                let lab = lab.as_mut().expect("a search that wasn't resumed has its lab");
+                let (pt, _) = lab.trial(&probe, best.crf)?;
                 let bias = best.mean_vmaf - pt.mean_vmaf;
-                samples.clear();
+                lab.discard_samples();
                 std::fs::create_dir_all(&work.path)?;
                 tools.emit(Event::Phase { phase: "scenes".into(), detail: "finding scene changes".into() });
                 let (cuts, total_frames) = scenes::detect(tools, input, &info, &work.path)?;
@@ -328,13 +376,13 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         let chunks = scenes::encode_all(&ctx, &plan)?;
         tools.emit(Event::Phase { phase: "muxing".into(), detail: format!("joining {} chunks", chunks.len()) });
         let video = scenes::concat(&work.path, chunks.len())?;
-        let (args, streams) = mux_args(&video, input, &info, o.container, &covers, &meta, &o.meta, &partial, &mut notes);
+        let (args, streams) = mux_args(&video, input, &info, o.container, o.audio, &covers, &meta, &o.meta, &partial, &mut notes);
         tools.run(&args)?;
         let _ = std::fs::remove_file(&video);
         (streams, Some(chunks), Some(plan.total_frames))
     } else {
         let cut = cut.as_ref().map(|c| prepare_cut(tools, input, &info, c, o.meta.keep, &tmp.path, &mut notes)).transpose()?;
-        let (args, streams) = full_encode_args(input, &info, &enc, best.crf, o.container, &covers, &meta, &o.meta, cut.as_ref(), &partial, &mut notes);
+        let (args, streams) = full_encode_args(input, &info, &enc, best.crf, o.container, o.audio, &covers, &meta, &o.meta, cut.as_ref(), &partial, &mut notes);
         for n in &notes {
             eprintln!("note: {n}");
             tools.emit(Event::Note { text: n.clone() });
@@ -405,7 +453,11 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         Some(c) => c.iter().map(|r| r.bytes).sum::<u64>() as f64 * 8.0 / info.duration_s,
         None => out_info.video_bitrate,
     };
-    let record = history::Record::new(&info, video_bitrate, o.target_vmaf, preset, report.mode);
+    let mut record = history::Record::new(&info, video_bitrate, o.target_vmaf, preset, report.mode, best.crf, svt_params);
+    // With sections removed the times are for a shorter video than the record describes.
+    if cut.is_none() {
+        (record.search_secs, record.encode_secs) = (Some(search_secs), Some(encode_secs));
+    }
     // A cut encoded below the target would teach the size model wrong sizes for it.
     if let Err(e) = if reached { history::append(&record) } else { Ok(()) } {
         eprintln!("warning: could not record this encode in the history: {e:#}");
@@ -468,6 +520,7 @@ fn full_encode_args(
     enc: &EncodeSettings,
     crf: f64,
     container: Container,
+    audio: Audio,
     covers: &[CoverFile],
     tags: &Resolved,
     mo: &MetaOptions,
@@ -506,7 +559,7 @@ fn full_encode_args(
     }
     a.extend(enc.video_args(crf));
     a.extend(["-fps_mode:v:0", "passthrough"].map(String::from));
-    let streams = stream_args(info, 0, container, covers, cut.map(|_| sub_inputs.as_slice()), notes);
+    let streams = stream_args(info, 0, container, audio, covers, cut.map(|_| sub_inputs.as_slice()), notes);
     let mut meta = metadata::ffmpeg_args(mo, tags, 0);
     if cut.is_some() {
         // Chapters at their new times, or none if the source had none.
@@ -531,6 +584,7 @@ fn mux_args(
     input: &Path,
     info: &MediaInfo,
     container: Container,
+    audio: Audio,
     covers: &[CoverFile],
     tags: &Resolved,
     mo: &MetaOptions,
@@ -545,7 +599,7 @@ fn mux_args(
     ]
     .map(String::from)
     .to_vec();
-    let streams = stream_args(info, 1, container, covers, None, notes);
+    let streams = stream_args(info, 1, container, audio, covers, None, notes);
     a.extend(metadata::ffmpeg_args(mo, tags, 1));
     a.extend(streams.args.iter().cloned());
     a.push(path_arg(out));
@@ -601,6 +655,7 @@ fn stream_args(
     info: &MediaInfo,
     src: usize,
     container: Container,
+    audio: Audio,
     cover_files: &[CoverFile],
     cut_subs: Option<&[Option<usize>]>,
     notes: &mut Vec<String>,
@@ -616,7 +671,13 @@ fn stream_args(
             meta_from.push((format!("a:{i}"), format!("a:{i}")));
         } else if COPY_AUDIO.contains(&s.codec.as_str()) {
             a.extend(["-map".into(), format!("{src}:a:{i}")]);
-            a.extend([format!("-c:a:{i}"), "copy".into()]);
+            let lean = lean_opus_kbps(s.channels);
+            if audio == Audio::Shrink && s.bitrate > lean as f64 * 1000.0 * SHRINK_ABOVE {
+                a.extend([format!("-c:a:{i}"), "libopus".into(), format!("-b:a:{i}"), format!("{lean}k")]);
+                notes.push(format!("audio {i}: {} {:.0} kbps -> Opus {lean} kbps", s.codec, s.bitrate / 1000.0));
+            } else {
+                a.extend([format!("-c:a:{i}"), "copy".into()]);
+            }
         } else {
             a.extend(["-map".into(), format!("{src}:a:{i}")]);
             a.extend([format!("-c:a:{i}"), "libopus".into(), format!("-b:a:{i}"), format!("{kbps}k")]);
@@ -829,4 +890,52 @@ fn free_bytes(dir: &Path) -> Option<u64> {
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: valid NUL-terminated path and a properly sized out-parameter.
     (unsafe { libc::statvfs(c.as_ptr(), &mut st) } == 0).then(|| st.f_bavail as u64 * st.f_frsize as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::probe::AudioInfo;
+
+    fn info(audio: &[(&str, u32, f64)]) -> MediaInfo {
+        MediaInfo {
+            video_index: 0, codec: "h264".into(), width: 1920, height: 1080, fps: 30.0, duration_s: 60.0,
+            video_bitrate: 5e6, pix_fmt: "yuv420p".into(), hdr: false, dolby_vision: false, color_transfer: String::new(), interlaced: false, vfr: false,
+            start_time: 0.0, video_start: 0.0, covers: vec![], attachments: 0, tags: Default::default(),
+            audio_streams: audio.len() as u32, subtitle_streams: 0,
+            audio: audio.iter().map(|&(codec, channels, bitrate)| AudioInfo { codec: codec.into(), channels, bitrate }).collect(),
+            subtitle_codecs: vec![],
+        }
+    }
+
+    /// The codec and bitrate arguments of each audio stream, e.g. "copy" or "libopus 96k".
+    fn audio_plan(i: &MediaInfo, mode: Audio) -> (Vec<String>, Vec<String>) {
+        let mut notes = Vec::new();
+        let s = stream_args(i, 0, Container::Mp4, mode, &[], None, &mut notes);
+        let value = |key: String| s.args.iter().position(|a| *a == key).map(|p| s.args[p + 1].clone());
+        let plan = (0..i.audio.len())
+            .map(|n| [value(format!("-c:a:{n}")), value(format!("-b:a:{n}"))].into_iter().flatten().collect::<Vec<_>>().join(" "))
+            .collect();
+        (plan, notes)
+    }
+
+    #[test]
+    fn sound_is_copied_unless_asked_to_shrink() {
+        let i = info(&[("aac", 2, 256_000.0), ("mp3", 2, 320_000.0), ("opus", 6, 510_000.0), ("flac", 2, 900_000.0)]);
+        let (plan, notes) = audio_plan(&i, Audio::Keep);
+        assert_eq!(plan, ["copy", "copy", "copy", "libopus 128k"]);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        let (plan, notes) = audio_plan(&i, Audio::Shrink);
+        assert_eq!(plan, ["libopus 96k", "libopus 96k", "libopus 256k", "libopus 128k"]);
+        assert!(notes[0].contains("aac 256 kbps -> Opus 96 kbps"), "{notes:?}");
+    }
+
+    #[test]
+    fn lean_and_unmeasured_sound_is_left_alone() {
+        // 144 kbps is the line for stereo; a track whose bitrate isn't known is never touched.
+        let i = info(&[("aac", 2, 128_000.0), ("aac", 2, 144_000.0), ("aac", 2, 145_000.0), ("aac", 2, 0.0), ("aac", 1, 64_000.0), ("aac", 1, 96_000.0)]);
+        let (plan, _) = audio_plan(&i, Audio::Shrink);
+        assert_eq!(plan, ["copy", "copy", "libopus 96k", "copy", "copy", "libopus 56k"]);
+        assert_eq!([1, 2, 6, 8, 20].map(lean_opus_kbps), [56, 96, 256, 336, 384]);
+    }
 }

@@ -26,6 +26,7 @@ pub struct Trial {
 /// SVT-AV1 parameters used when none are given. SVT-AV1's own default is tune=1 (PSNR).
 pub const DEFAULT_PARAMS: &str = "tune=0";
 
+#[derive(Clone)]
 pub struct EncodeSettings {
     pub preset: u8,
     pub pix_fmt_out: &'static str,
@@ -207,15 +208,185 @@ pub fn extract_samples(tools: &Tools, input: &Path, info: &MediaInfo, tmp: &Path
         .collect()
 }
 
+/// CRF trials measured in earlier runs, kept in `$XDG_CACHE_HOME/av1opt/trials-v1.jsonl`: an
+/// encode that was stopped, failed after its search, or is run again with another target or
+/// container doesn't measure the same CRFs twice. A trial counts only for the same file
+/// (path, size, date), the same sample clips and the same ffmpeg build.
+pub struct TrialCache {
+    path: Option<PathBuf>,
+    /// What the trials were measured on, as one string.
+    file: String,
+    /// By encoder settings (see [`settings_key`]) and CRF in quarter steps.
+    known: std::collections::HashMap<(String, u32), Trial>,
+}
+
+/// Everything about an encode besides the CRF, as the cache names it.
+fn settings_key(preset: u8, pix_fmt: &str, params: &str) -> String {
+    format!("{preset}|{pix_fmt}|{params}")
+}
+
+#[derive(Serialize, Deserialize)]
+struct CacheLine {
+    file: String,
+    preset: u8,
+    pix_fmt: String,
+    params: String,
+    time: u64,
+    #[serde(flatten)]
+    trial: Trial,
+}
+
+/// The cache is tidied once it holds more lines than this: the newest half stays.
+const CACHE_MAX_LINES: usize = 40_000;
+
+impl TrialCache {
+    /// A cache that remembers nothing and writes nothing.
+    pub fn off() -> Self {
+        TrialCache { path: None, file: String::new(), known: Default::default() }
+    }
+
+    /// Opens the cache for one video and its sample positions. `reuse` false starts empty
+    /// (trials are measured again) but still records what is measured.
+    pub fn open(input: &Path, size: u64, positions: &[(f64, f64)], encoder: &str, reuse: bool) -> Self {
+        let Ok(dir) = crate::bench::cache_dir() else { return Self::off() };
+        Self::open_at(dir.join("trials-v1.jsonl"), input, size, positions, encoder, reuse)
+    }
+
+    fn open_at(path: PathBuf, input: &Path, size: u64, positions: &[(f64, f64)], encoder: &str, reuse: bool) -> Self {
+        let mtime = std::fs::metadata(input).ok().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+        let abs = std::fs::canonicalize(input).unwrap_or_else(|_| input.to_path_buf());
+        let clips: Vec<String> = positions.iter().map(|(start, secs)| format!("{start:.3}+{secs:.3}")).collect();
+        let file = format!("{}|{size}|{mtime}|{}|{encoder}", abs.display(), clips.join(","));
+        let mut known = std::collections::HashMap::new();
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        if reuse {
+            // The file name is in every line; skip the JSON of the others.
+            let needle = serde_json::to_string(&file).unwrap_or_default();
+            for l in text.lines().filter(|l| l.contains(&needle)) {
+                if let Ok(c) = serde_json::from_str::<CacheLine>(l)
+                    && c.file == file
+                {
+                    known.insert((settings_key(c.preset, &c.pix_fmt, &c.params), quarters(c.trial.crf)), c.trial);
+                }
+            }
+        }
+        if text.lines().count() > CACHE_MAX_LINES {
+            let keep: Vec<&str> = text.lines().skip(text.lines().count() - CACHE_MAX_LINES / 2).collect();
+            let tmp = path.with_extension("jsonl.tmp");
+            if std::fs::write(&tmp, keep.join("\n") + "\n").is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+        TrialCache { path: Some(path), file, known }
+    }
+
+    fn get(&self, enc: &EncodeSettings, crf: f64) -> Option<Trial> {
+        self.known.get(&(settings_key(enc.preset, enc.pix_fmt_out, &enc.params), quarters(crf))).copied()
+    }
+
+    /// Every trial known for these settings at a whole CRF, lowest CRF first.
+    fn whole(&self, enc: &EncodeSettings) -> Vec<Trial> {
+        let key = settings_key(enc.preset, enc.pix_fmt_out, &enc.params);
+        let mut all: Vec<Trial> = self.known.iter().filter(|((k, q), _)| *k == key && q % 4 == 0).map(|(_, t)| *t).collect();
+        all.sort_by(|a, b| a.crf.total_cmp(&b.crf));
+        all
+    }
+
+    fn put(&mut self, enc: &EncodeSettings, t: Trial) {
+        self.known.insert((settings_key(enc.preset, enc.pix_fmt_out, &enc.params), quarters(t.crf)), t);
+        let Some(path) = &self.path else { return };
+        let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let line = CacheLine { file: self.file.clone(), preset: enc.preset, pix_fmt: enc.pix_fmt_out.to_string(), params: enc.params.clone(), time, trial: t };
+        // Losing the memory of one trial is not worth failing the encode for.
+        if let (Ok(json), Ok(mut f)) = (serde_json::to_string(&line), std::fs::OpenOptions::new().create(true).append(true).open(path)) {
+            use std::io::Write;
+            let _ = writeln!(f, "{json}");
+        }
+    }
+}
+
+/// A CRF as a whole number of quarter steps.
+fn quarters(crf: f64) -> u32 {
+    (crf * 4.0).round().max(0.0) as u32
+}
+
+/// Where trials are run for one video: cuts the sample clips when the first trial that
+/// isn't known from an earlier run needs them, and remembers every trial.
+pub struct Lab<'a> {
+    pub tools: &'a Tools,
+    pub info: &'a MediaInfo,
+    input: &'a Path,
+    tmp: &'a Path,
+    positions: Vec<(f64, f64)>,
+    samples: Vec<Sample>,
+    vmaf_threads: usize,
+    cache: TrialCache,
+}
+
+impl<'a> Lab<'a> {
+    pub fn new(tools: &'a Tools, input: &'a Path, info: &'a MediaInfo, tmp: &'a Path, positions: Vec<(f64, f64)>, vmaf_threads: usize, cache: TrialCache) -> Self {
+        Lab { tools, info, input, tmp, positions, samples: Vec::new(), vmaf_threads, cache }
+    }
+
+    /// The trial at `crf`, and whether it was known from an earlier run.
+    pub fn trial(&mut self, enc: &EncodeSettings, crf: f64) -> Result<(Trial, bool)> {
+        if let Some(t) = self.cache.get(enc, crf) {
+            return Ok((t, true));
+        }
+        if self.samples.is_empty() {
+            self.samples = extract_samples(self.tools, self.input, self.info, self.tmp, self.positions.clone())?;
+        }
+        let t = trial(self.tools, self.info, &self.samples, self.tmp, enc, crf, self.vmaf_threads, self.info.video_bitrate / 8.0)?;
+        self.cache.put(enc, t);
+        Ok((t, false))
+    }
+
+    /// Deletes the sample clips (they are large); a later trial would cut them again.
+    pub fn discard_samples(&mut self) {
+        for s in self.samples.drain(..) {
+            let _ = std::fs::remove_file(s.reference);
+        }
+    }
+}
+
 pub struct SearchParams {
     pub target_vmaf: f64,
     pub min_crf: u8,
     pub max_crf: u8,
-    pub vmaf_threads: usize,
+    /// The first CRF tried; the closer to the answer, the fewer trials.
+    pub start_crf: u8,
+    /// Give up once the answer is known to come out larger than this share of the source
+    /// video (None: search to the end whatever the size).
+    pub max_size_ratio: Option<f64>,
 }
 
-/// First guess and typical VMAF drop per CRF step for SVT-AV1 (pilot data: ~0.36 at 720p-1080p).
-const START_CRF: u8 = 35;
+/// What the CRF search concluded.
+pub enum Outcome {
+    /// Encode at this trial's CRF; its scores and size are what the line through the two
+    /// nearest measurements predicts.
+    Found(Trial),
+    /// Even the lowest CRF allowed misses the target.
+    OutOfReach,
+    /// This trial misses the target and is already larger than wanted; a lower CRF, which
+    /// the target needs, is larger still.
+    TooLarge(Trial),
+}
+
+/// Ends the search from inside a trial.
+#[derive(Debug)]
+struct TooLarge;
+
+impl std::fmt::Display for TooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the encode would be too large")
+    }
+}
+
+impl std::error::Error for TooLarge {}
+
+/// First guess when nothing is known about the video, and the typical VMAF drop per CRF step
+/// for SVT-AV1 (pilot data: ~0.36 at 720p-1080p).
+pub const START_CRF: u8 = 35;
 
 /// Winning CRF (None if even the minimum fails) and every (crf, score) evaluated.
 pub type CrfSearch = (Option<u8>, Vec<(u8, f64)>);
@@ -262,44 +433,183 @@ pub fn find_crf(start: u8, min: u8, max: u8, target: f64, mut eval: impl FnMut(u
     }
 }
 
-/// Runs [`find_crf`] with real sample encodes. Returns the chosen trial and all trials.
-pub fn search(
-    tools: &Tools,
-    info: &MediaInfo,
-    samples: &[Sample],
-    tmp: &Path,
-    enc: &EncodeSettings,
-    p: &SearchParams,
-) -> Result<(Option<Trial>, Vec<Trial>)> {
-    let source_bps = info.video_bitrate / 8.0;
-    let mut trials: BTreeMap<u8, Trial> = BTreeMap::new();
-    let (best, _) = find_crf(START_CRF, p.min_crf, p.max_crf, p.target_vmaf, |crf| {
-        let t = trial(tools, info, samples, tmp, enc, crf as f64, p.vmaf_threads, source_bps)?;
+/// Where the score crosses the target, and the measurements the answer rests on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Crossing {
+    /// Quarter-step CRF expected to just meet the target.
+    pub crf: f64,
+    /// The two measured CRFs it was read from (the same one twice: `crf` itself was measured).
+    pub from: (u8, u8),
+}
+
+/// How far an estimate may sit from the two measurements it is read from: the product of its
+/// distances to them, in CRF steps. A straight line through two points of a curve is off by
+/// about half the curvature times this product, so a small product means a small error
+/// whether the estimate lies between the points or just outside them.
+const MAX_REACH: f64 = 6.0;
+
+/// Curvature assumed when an estimate lies outside its two measurements (VMAF per CRF step
+/// squared). Scores fall faster as the CRF rises, so outside the points the straight line
+/// promises more than the encoder gives; the estimate is moved toward quality by that much.
+const CURVATURE: f64 = 0.02;
+
+enum Step {
+    Try(u8),
+    Done(Option<Crossing>),
+}
+
+fn next_step(tried: &BTreeMap<u8, f64>, min: u8, max: u8, target: f64) -> Step {
+    // The highest passing CRF, and the lowest failing one above it (a failing score below a
+    // passing one is noise).
+    let pass = tried.iter().rev().find(|(_, v)| **v >= target).map(|(c, v)| (*c, *v));
+    let fail = tried.iter().find(|(c, v)| **v < target && pass.is_none_or(|p| **c > p.0)).map(|(c, v)| (*c, *v));
+    match (pass, fail) {
+        (Some((p, vp)), Some((f, vf))) => {
+            let (lo, hi) = (p as f64, f as f64);
+            let x = lo + (vp - target) / (vp - vf) * (hi - lo);
+            if f - p <= 1 || (x - lo) * (hi - x) <= MAX_REACH {
+                return Step::Done(Some(Crossing { crf: quarter(x).clamp(lo, hi - 0.25), from: (p, f) }));
+            }
+            Step::Try((x.round() as u8).clamp(p + 1, f - 1))
+        }
+        (Some((p, _)), None) if p >= max => Step::Done(Some(Crossing { crf: p as f64, from: (p, p) })),
+        (Some((p, vp)), None) => {
+            let below = tried.range(..p).next_back();
+            let slope = below.map_or(VMAF_PER_CRF, |(b, vb)| ((vb - vp) / (p - b) as f64).clamp(0.1, 2.0));
+            let x = p as f64 + (vp - target) / slope;
+            if let Some((&b, _)) = below {
+                let reach = (x - p as f64) * (x - b as f64);
+                if reach <= MAX_REACH && x <= max as f64 {
+                    let safe = x - CURVATURE * reach / (2.0 * slope);
+                    return Step::Done(Some(Crossing { crf: quarter(safe).max(p as f64), from: (b, p) }));
+                }
+            }
+            Step::Try((x.round() as u8).clamp(p + 1, max))
+        }
+        (None, Some((f, _))) if f <= min => Step::Done(None),
+        (None, Some((f, vf))) => {
+            let above = tried.range(f + 1..).next();
+            let slope = above.map_or(VMAF_PER_CRF, |(b, vb)| ((vf - vb) / (b - f) as f64).clamp(0.1, 2.0));
+            let x = f as f64 - (target - vf) / slope;
+            if let Some((&b, _)) = above {
+                let reach = (f as f64 - x) * (b as f64 - x);
+                let safe = quarter(x - CURVATURE * reach / (2.0 * slope));
+                if reach <= MAX_REACH && safe >= min as f64 {
+                    return Step::Done(Some(Crossing { crf: safe, from: (f, b) }));
+                }
+            }
+            Step::Try((x.round().max(0.0) as u8).clamp(min, f - 1))
+        }
+        (None, None) => unreachable!("called after a trial"),
+    }
+}
+
+/// Mean VMAF by the CRF it was measured at.
+pub type Scores = Vec<(u8, f64)>;
+
+/// Finds the quarter-step CRF in `min..=max` where the score crosses `target`, assuming the
+/// score falls as CRF rises, with as few evaluations as it can: each new CRF is where a line
+/// through the two nearest measurements crosses the target, and the search stops as soon as
+/// that crossing is close enough to its measurements to be trusted ([`MAX_REACH`]), instead
+/// of narrowing down to two neighbouring CRFs as [`find_crf`] does. Usually 2-3 evaluations.
+/// Returns the crossing (None if even `min` fails) and every (crf, score) evaluated.
+pub fn find_crossing(
+    known: &[(u8, f64)],
+    start: u8,
+    min: u8,
+    max: u8,
+    target: f64,
+    mut eval: impl FnMut(u8) -> Result<f64>,
+) -> Result<(Option<Crossing>, Scores)> {
+    if min > max {
+        bail!("--min-crf {min} is above --max-crf {max}");
+    }
+    let mut tried: BTreeMap<u8, f64> = known.iter().filter(|(c, _)| (min..=max).contains(c)).copied().collect();
+    let start = start.clamp(min, max);
+    // Scores known beforehand that have the target between them say more than a guess. Known
+    // scores on one side only may be far off: the guess goes first while it can still tell
+    // something they don't.
+    let pass = tried.iter().rev().find(|(_, v)| **v >= target).map(|(c, _)| *c);
+    let fail = tried.iter().find(|(c, v)| **v < target && pass.is_none_or(|p| **c > p)).map(|(c, _)| *c);
+    let guess_first = match (pass, fail) {
+        (Some(_), Some(_)) => false,
+        (Some(p), None) => start > p,
+        (None, Some(f)) => start < f,
+        (None, None) => true,
+    };
+    let mut next = if guess_first { Step::Try(start) } else { next_step(&tried, min, max, target) };
+    loop {
+        let found = match next {
+            Step::Try(c) if !tried.contains_key(&c) => {
+                tried.insert(c, eval(c)?);
+                next = next_step(&tried, min, max, target);
+                continue;
+            }
+            // Scores that don't fall with the CRF could send the search back to a CRF it
+            // has measured; settle for the highest one that passed.
+            Step::Try(_) => tried.iter().rev().find(|(_, v)| **v >= target).map(|(c, _)| Crossing { crf: *c as f64, from: (*c, *c) }),
+            Step::Done(found) => found,
+        };
+        return Ok((found, tried.into_iter().collect()));
+    }
+}
+
+/// Runs [`find_crossing`] with real sample encodes. Returns the outcome and all trials.
+pub fn search(lab: &mut Lab, enc: &EncodeSettings, p: &SearchParams) -> Result<(Outcome, Vec<Trial>)> {
+    let tools = lab.tools;
+    let show = |t: &Trial, known: bool| {
         eprintln!(
-            "  crf {crf:2}: VMAF {:.2} (worst sample {:.2}), size ~{:.0}% of source",
-            t.mean_vmaf, t.min_vmaf, t.size_ratio * 100.0
+            "  crf {:2}: VMAF {:.2} (worst sample {:.2}), size ~{:.0}% of source{}",
+            t.crf, t.mean_vmaf, t.min_vmaf, t.size_ratio * 100.0, if known { " (measured earlier)" } else { "" }
         );
         tools.emit(crate::events::Event::Trial { crf: t.crf, mean_vmaf: t.mean_vmaf, min_vmaf: t.min_vmaf, size_ratio: t.size_ratio });
-        trials.insert(crf, t);
-        Ok(t.mean_vmaf)
-    })?;
-    // The answer lies between the best passing CRF and the next one up; interpolate to the
-    // quarter step where the score crosses the target (rounded down, toward quality).
-    let chosen = best.map(|c| match trials.get(&(c + 1)) {
-        Some(next) if trials[&c].mean_vmaf > next.mean_vmaf => {
-            let (a, b) = (trials[&c], *next);
-            let frac = quarter((a.mean_vmaf - p.target_vmaf) / (a.mean_vmaf - b.mean_vmaf)).clamp(0.0, 0.75);
-            let mix = |x: f64, y: f64| x + (y - x) * frac;
-            Trial {
-                crf: c as f64 + frac,
-                mean_vmaf: mix(a.mean_vmaf, b.mean_vmaf),
-                min_vmaf: mix(a.min_vmaf, b.min_vmaf),
-                size_ratio: mix(a.size_ratio, b.size_ratio),
-            }
+    };
+    let too_large = |t: &Trial| t.mean_vmaf < p.target_vmaf && p.max_size_ratio.is_some_and(|max| t.size_ratio > max);
+    // Trials from earlier runs count as if they had just been measured.
+    let mut trials: BTreeMap<u8, Trial> = BTreeMap::new();
+    for t in lab.cache.whole(enc) {
+        let crf = t.crf as u8;
+        if (p.min_crf..=p.max_crf).contains(&crf) {
+            show(&t, true);
+            trials.insert(crf, t);
         }
-        _ => trials[&c],
-    });
-    Ok((chosen, trials.into_values().collect()))
+    }
+    let known: Vec<(u8, f64)> = trials.iter().map(|(c, t)| (*c, t.mean_vmaf)).collect();
+    let found = match trials.values().find(|t| too_large(t)) {
+        Some(_) => Err(TooLarge.into()),
+        None => find_crossing(&known, p.start_crf, p.min_crf, p.max_crf, p.target_vmaf, |crf| {
+            let (t, known) = lab.trial(enc, crf as f64)?;
+            show(&t, known);
+            trials.insert(crf, t);
+            if too_large(&t) {
+                return Err(TooLarge.into());
+            }
+            Ok(t.mean_vmaf)
+        }),
+    };
+    let outcome = match found {
+        Ok((Some(c), _)) => Outcome::Found(expected(&trials[&c.from.0], &trials[&c.from.1], c.crf)),
+        Ok((None, _)) => Outcome::OutOfReach,
+        // The trial that ended the search is the lowest failing one so far or below it.
+        Err(e) if e.is::<TooLarge>() => match trials.values().filter(|t| t.mean_vmaf < p.target_vmaf).min_by(|a, b| a.crf.total_cmp(&b.crf)) {
+            Some(t) => Outcome::TooLarge(*t),
+            None => return Err(e),
+        },
+        Err(e) => return Err(e),
+    };
+    Ok((outcome, trials.into_values().collect()))
+}
+
+/// What an encode at `crf` should give, read off the line through two measured trials:
+/// scores change linearly with the CRF over a few steps, sizes by a constant factor per step.
+fn expected(a: &Trial, b: &Trial, crf: f64) -> Trial {
+    if a.crf == b.crf || crf == a.crf {
+        return Trial { crf, ..*a };
+    }
+    let w = (crf - a.crf) / (b.crf - a.crf);
+    let mix = |x: f64, y: f64| x + (y - x) * w;
+    let size_ratio = if a.size_ratio > 0.0 && b.size_ratio > 0.0 { mix(a.size_ratio.ln(), b.size_ratio.ln()).exp() } else { mix(a.size_ratio, b.size_ratio) };
+    Trial { crf, mean_vmaf: mix(a.mean_vmaf, b.mean_vmaf), min_vmaf: mix(a.min_vmaf, b.min_vmaf), size_ratio }
 }
 
 /// Encodes every sample at `crf` and scores it against its reference.
@@ -387,6 +697,211 @@ mod tests {
         eprintln!("average trials: {avg:.2}");
         // Binary search over 20..=55 needs ~5.2 on average.
         assert!(avg <= 4.0, "average {avg:.2} trials");
+    }
+
+    /// Exact crossing of a curve given at integer CRFs: between the highest passing CRF and
+    /// the next one.
+    fn crossing(min: u8, max: u8, target: f64, f: impl Fn(u8) -> f64) -> Option<f64> {
+        let p = brute(min, max, target, &f)?;
+        if p == max {
+            return Some(max as f64);
+        }
+        Some(p as f64 + (f(p) - target) / (f(p) - f(p + 1)))
+    }
+
+    /// Runs `find_crossing` on a curve; returns (trials, chosen - exact crossing, score at the
+    /// chosen CRF - target).
+    fn cross(start: u8, min: u8, max: u8, target: f64, f: impl Fn(u8) -> f64 + Copy) -> (usize, f64, f64) {
+        let (got, tried) = find_crossing(&[], start, min, max, target, |c| Ok(f(c))).unwrap();
+        let (got, want) = (got.expect("a crossing"), crossing(min, max, target, f).expect("reachable"));
+        let lo = got.crf.floor() as u8;
+        let score = if lo >= max { f(max) } else { f(lo) + (f(lo + 1) - f(lo)) * (got.crf - lo as f64) };
+        assert!(got.crf >= min as f64 && got.crf <= max as f64, "{got:?}");
+        assert!(tried.iter().any(|t| t.0 == got.from.0) && tried.iter().any(|t| t.0 == got.from.1), "{got:?} {tried:?}");
+        (tried.len(), got.crf - want, score - target)
+    }
+
+    #[test]
+    fn crossing_is_found_in_few_trials_on_smooth_curves() {
+        // Shapes like measured ones: flat near the top, falling faster as the CRF rises.
+        let curves: [&dyn Fn(u8) -> f64; 4] = [
+            &|c| (100.4 - 0.10 * c as f64 - 0.0052 * (c as f64).powi(2)).min(99.5),
+            &|c| (101.0 + 0.25 * c as f64 - 0.0142 * (c as f64).powi(2)).min(99.5),
+            &|c| (103.5 - 0.02 * c as f64 - 0.0065 * (c as f64).powi(2)).min(99.5),
+            &|c| 105.0 - 0.36 * c as f64,
+        ];
+        let (mut trials, mut cases) = (0, 0);
+        for f in curves {
+            for target in (0..=16).map(|i| 88.0 + i as f64 * 0.5) {
+                let Some(want) = crossing(20, 55, target, f) else { continue };
+                if want >= 55.0 {
+                    continue;
+                }
+                let (n, off, miss) = cross(START_CRF, 20, 55, target, f);
+                assert!(n <= 4, "target {target}: {n} trials");
+                // Never more than a hair below the target, never far above it.
+                assert!(miss > -0.05, "target {target}: {miss:+.3} VMAF");
+                assert!(off > -0.75 && off < 0.15, "target {target}: {off:+.2} CRF from the crossing");
+                trials += n;
+                cases += 1;
+            }
+        }
+        let avg = trials as f64 / cases as f64;
+        eprintln!("average trials: {avg:.2} over {cases} cases");
+        assert!(avg <= 3.0, "average {avg:.2} trials");
+    }
+
+    #[test]
+    fn a_good_first_guess_needs_two_trials() {
+        let f = |c: u8| 100.4 - 0.10 * c as f64 - 0.0052 * (c as f64).powi(2);
+        for target in [90.0, 92.0, 93.0, 94.5, 96.0] {
+            let want = crossing(20, 55, target, f).unwrap();
+            for d in [-2i32, -1, 0, 1, 2] {
+                let start = (want.round() as i32 + d) as u8;
+                let (n, off, miss) = cross(start, 20, 55, target, f);
+                assert_eq!(n, 2, "target {target}, start {start}");
+                assert!(miss > -0.05 && off > -0.75, "target {target}, start {start}: {off:+.2} CRF, {miss:+.3} VMAF");
+            }
+        }
+    }
+
+    #[test]
+    fn crossing_handles_the_ends_of_the_range() {
+        // Out of reach: the lowest CRF is tried before giving up.
+        let (got, tried) = find_crossing(&[], START_CRF, 20, 55, 99.0, |c| Ok(90.0 - c as f64 * 0.1)).unwrap();
+        assert_eq!(got, None);
+        assert!(tried.iter().any(|t| t.0 == 20), "{tried:?}");
+        // Always passing: the highest CRF, measured.
+        let (got, tried) = find_crossing(&[], START_CRF, 20, 55, 50.0, |_| Ok(99.0)).unwrap();
+        assert_eq!(got, Some(Crossing { crf: 55.0, from: (55, 55) }));
+        assert!(tried.len() <= 3, "{tried:?}");
+        // One CRF allowed.
+        let (got, tried) = find_crossing(&[], START_CRF, 30, 30, 93.0, |_| Ok(94.0)).unwrap();
+        assert_eq!((got.map(|c| c.crf), tried.len()), (Some(30.0), 1));
+        let (got, _) = find_crossing(&[], START_CRF, 30, 30, 93.0, |_| Ok(92.0)).unwrap();
+        assert_eq!(got, None);
+        assert!(find_crossing(&[], START_CRF, 40, 30, 93.0, |_| Ok(95.0)).is_err());
+        // The crossing sits just above the lowest CRF: nothing below `min` is ever chosen.
+        let (got, _) = find_crossing(&[], START_CRF, 28, 55, 93.0, |c| Ok(93.1 - (c as f64 - 28.0) * 0.4)).unwrap();
+        let got = got.unwrap();
+        assert!(got.crf >= 28.0 && got.crf <= 28.25, "{got:?}");
+    }
+
+    #[test]
+    fn crossing_survives_scores_that_do_not_fall_steadily() {
+        // Bumps of up to 0.3 VMAF on a 0.36/CRF slope, so neighbouring CRFs can swap order.
+        for seed in 0..40u32 {
+            let f = move |c: u8| 105.0 - 0.36 * c as f64 + 0.3 * (((c as u32 * 7919 + seed * 104729) % 1000) as f64 / 500.0 - 1.0);
+            for target in [90.0, 93.0, 95.0] {
+                let (got, tried) = find_crossing(&[], START_CRF, 20, 55, target, |c| Ok(f(c))).unwrap();
+                let got = got.expect("reachable");
+                assert!(tried.len() <= 6, "seed {seed}: {} trials", tried.len());
+                // Within the bumps of where the smooth curve crosses.
+                let smooth = (105.0 - target) / 0.36;
+                assert!((got.crf - smooth).abs() < 2.5, "seed {seed} target {target}: {} vs {smooth:.2}", got.crf);
+            }
+        }
+        // Flat, then a cliff: still ends.
+        let (got, tried) = find_crossing(&[], START_CRF, 20, 55, 93.0, |c| Ok(if c < 41 { 96.0 } else { 80.0 })).unwrap();
+        assert!(tried.len() <= 7, "{tried:?}");
+        assert!(got.unwrap().crf < 41.0);
+    }
+
+    #[test]
+    fn known_scores_spare_trials() {
+        let f = |c: u8| 100.0 - 0.012 * (c as f64 - 10.0).powi(2);
+        let run = |known: &[(u8, f64)], start: u8, target: f64| {
+            let mut asked = Vec::new();
+            let (got, _) = find_crossing(known, start, 20, 55, target, |c| {
+                asked.push(c);
+                Ok(f(c))
+            })
+            .unwrap();
+            (got.map(|c| c.crf), asked)
+        };
+        let (fresh, asked) = run(&[], 35, 93.0);
+        let fresh = fresh.unwrap();
+        assert!(asked.len() >= 2, "{asked:?}");
+        // The same search again, knowing its own trials, measures nothing.
+        let known: Vec<(u8, f64)> = asked.iter().map(|c| (*c, f(*c))).collect();
+        let (again, asked_again) = run(&known, 35, 93.0);
+        assert_eq!(again, Some(fresh));
+        assert!(asked_again.is_empty(), "{asked_again:?}");
+        // Another target between known scores starts from them, not from the guess.
+        let (got, asked) = run(&[(30, f(30)), (40, f(40))], 22, 92.0);
+        assert!(!asked.contains(&22), "{asked:?}");
+        assert!(asked.len() <= 1, "{asked:?}");
+        let x = got.unwrap();
+        assert!(f(x.floor() as u8) >= 92.0 && (30.0..40.0).contains(&x), "{x}");
+        // A known pass far below: the guess still goes first, and beyond the pass.
+        let (_, asked) = run(&[(20, f(20))], 36, 91.0);
+        assert_eq!(asked[0], 36, "{asked:?}");
+        // A guess the known scores already rule out is not measured.
+        let (_, asked) = run(&[(40, f(40))], 36, 85.0);
+        assert!(asked.iter().all(|c| *c > 40), "{asked:?}");
+        // Known scores outside the allowed range are left out.
+        let (got, asked) = run(&[(10, 99.9), (60, 50.0)], 35, 93.0);
+        assert_eq!((got, asked.len()), (Some(fresh), 2));
+    }
+
+    #[test]
+    fn trials_are_remembered_per_file_clips_and_settings() {
+        let dir = std::env::temp_dir().join(format!("av1opt-trials-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let video = dir.join("a \"video\".mkv");
+        std::fs::write(&video, b"12345").unwrap();
+        let store = dir.join("trials-v1.jsonl");
+        let clips = [(10.0, 8.0), (50.0, 8.0)];
+        let enc = EncodeSettings { preset: 6, pix_fmt_out: "yuv420p10le", params: "tune=0".into() };
+        let open = |clips: &[(f64, f64)], encoder: &str, reuse: bool| TrialCache::open_at(store.clone(), &video, 5, clips, encoder, reuse);
+
+        let mut c = open(&clips, "ffmpeg 1", true);
+        assert!(c.get(&enc, 35.0).is_none());
+        c.put(&enc, Trial { crf: 35.0, mean_vmaf: 94.5, min_vmaf: 92.0, size_ratio: 0.4 });
+        c.put(&enc, Trial { crf: 38.0, mean_vmaf: 93.5, min_vmaf: 91.0, size_ratio: 0.3 });
+        c.put(&enc, Trial { crf: 38.5, mean_vmaf: 93.2, min_vmaf: 90.5, size_ratio: 0.28 });
+        assert_eq!(c.get(&enc, 35.0).unwrap().mean_vmaf, 94.5);
+
+        // The next run knows them; the whole CRFs come back in order.
+        let c = open(&clips, "ffmpeg 1", true);
+        assert_eq!(c.get(&enc, 38.5).unwrap().size_ratio, 0.28);
+        assert_eq!(c.whole(&enc).iter().map(|t| t.crf).collect::<Vec<_>>(), [35.0, 38.0]);
+        // Other settings, other clips, another ffmpeg: measured again.
+        assert!(c.get(&EncodeSettings { preset: 4, ..enc.clone() }, 35.0).is_none());
+        assert!(c.get(&EncodeSettings { params: "tune=0:enable-qm=1".into(), ..enc.clone() }, 35.0).is_none());
+        assert!(c.get(&EncodeSettings { pix_fmt_out: "yuv420p", ..enc.clone() }, 35.0).is_none());
+        assert!(open(&[(10.0, 8.0)], "ffmpeg 1", true).get(&enc, 35.0).is_none());
+        assert!(open(&clips, "ffmpeg 2", true).get(&enc, 35.0).is_none());
+        // Asked to start fresh: nothing is known, but what is measured is kept.
+        let mut fresh = open(&clips, "ffmpeg 1", false);
+        assert!(fresh.get(&enc, 35.0).is_none());
+        fresh.put(&enc, Trial { crf: 35.0, mean_vmaf: 94.6, min_vmaf: 92.0, size_ratio: 0.4 });
+        assert_eq!(open(&clips, "ffmpeg 1", true).get(&enc, 35.0).unwrap().mean_vmaf, 94.6);
+        // A file that changed is another file.
+        std::fs::write(&video, b"123456").unwrap();
+        assert!(TrialCache::open_at(store.clone(), &video, 6, &clips, "ffmpeg 1", true).get(&enc, 35.0).is_none());
+        // A cache that can't be written still works for the run.
+        let mut off = TrialCache::off();
+        off.put(&enc, Trial { crf: 30.0, mean_vmaf: 96.0, min_vmaf: 95.0, size_ratio: 0.6 });
+        assert!(off.get(&enc, 30.0).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expectations_follow_the_two_trials() {
+        let a = Trial { crf: 30.0, mean_vmaf: 94.0, min_vmaf: 92.0, size_ratio: 0.40 };
+        let b = Trial { crf: 34.0, mean_vmaf: 92.0, min_vmaf: 89.0, size_ratio: 0.25 };
+        let mid = expected(&a, &b, 32.0);
+        assert!((mid.mean_vmaf - 93.0).abs() < 1e-9 && (mid.min_vmaf - 90.5).abs() < 1e-9);
+        // Sizes shrink by a constant factor per step: the geometric mean halfway.
+        assert!((mid.size_ratio - (0.40f64 * 0.25).sqrt()).abs() < 1e-9);
+        // Outside the two trials the line carries on.
+        let out = expected(&a, &b, 29.0);
+        assert!((out.mean_vmaf - 94.5).abs() < 1e-9 && out.size_ratio > 0.40);
+        // A measured CRF is reported as measured.
+        let same = expected(&a, &a, 30.0);
+        assert_eq!((same.crf, same.mean_vmaf, same.size_ratio), (30.0, 94.0, 0.40));
     }
 
     #[test]

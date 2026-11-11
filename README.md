@@ -34,6 +34,13 @@ fit of AV1 bits per pixel against source bits per pixel and resolution, pulled t
 built-in pilot model while there are few encodes), so estimates and their ranges tighten as
 you encode more.
 
+`scan` also says how long the candidates would take to search and encode (`--preset`, default
+6) and lists the time per file; `--sort per-hour` orders the top candidates by bytes saved per
+hour of encoding, the place to start when the library is larger than your patience. The time
+is seconds per frame by frame size: a guess from one six-core machine at first, then fitted to
+the encode times in the history, so it becomes this machine's speed after a few encodes.
+The CSV has it as `est_encode_secs`.
+
 ## dups
 
 ```
@@ -85,16 +92,24 @@ For each file:
 
 1. **Sample** – cuts up to 4 clips spread through the video into lossless, constant-frame-rate
    references (deinterlaced and cropped to even size when needed).
-2. **Search** – finds the highest CRF whose mean VMAF over the samples meets the target. It
-   interpolates between passing and failing CRFs, averaging ~3.4 trial encodes, then refines to
-   SVT-AV1's quarter-step CRF. 4K uses the `vmaf_4k` model.
+2. **Search** – finds the highest CRF whose mean VMAF over the samples meets the target. The
+   first CRF tried is a guess from the source's bits per pixel and frame size, corrected by
+   your own past encodes (the same history `scan` learns from). Every further trial goes where
+   the line through the two nearest measurements crosses the target, and the search stops as
+   soon as that crossing lies close enough to measured CRFs to be trusted: usually 2-3 trial
+   encodes. The answer is in SVT-AV1's quarter-step CRF. 4K uses the `vmaf_4k` model.
 3. **Decide** – skips files that are already AV1, Dolby Vision, can't reach the target, or would
-   save less than `--min-savings` (15%). HDR10 and HLG are encoded with their colour signalling
+   save less than `--min-savings` (15%). The search stops at the first trial that misses the
+   target while already larger than that: the CRF the target needs would be larger still.
+   HDR10 and HLG are encoded with their colour signalling
    and mastering/light-level metadata intact (VMAF is then measured on the HDR signal, which
    tracks encoding damage but is not calibrated like SDR scores).
 4. **Encode** – SVT-AV1, 10-bit, `--preset` 6 with `tune=0` unless `--svt-params` or `--tuned`
    say otherwise (see [bench](#bench)). Audio already in AAC/Opus/MP3 is copied, anything else becomes
-   Opus. MP4 output keeps text subtitles (as mov_text) and plays in Chrome and Firefox; use
+   Opus. `--audio shrink` also re-encodes copied tracks that spend more than 1.5 times what
+   Opus needs (96 kbps stereo, 56 mono, 256 for 5.1): a 320 kbps MP3 or 256 kbps AAC track
+   becomes 96 kbps Opus, a 128 kbps one is left alone. It is a second lossy pass, so it is
+   off unless asked for; the report notes every track it changed. MP4 output keeps text subtitles (as mov_text) and plays in Chrome and Firefox; use
    `--container mkv` to keep image subtitles too. Cover art is kept (MP4: attached picture,
    MKV: attachment with its original file name).
 5. **Verify** – codec, duration, stream and cover counts, HDR transfer, plus VMAF spot checks at positions the search
@@ -178,7 +193,11 @@ since chunking needs a constant frame rate.
 Folders are walked recursively and their layout is mirrored under `--out-dir`. Every result is
 appended to `av1opt-log.tsv` there; re-running the same command resumes: finished files are
 skipped, and files skipped for a reason (low savings, ...) are not searched again with the same settings (target, preset, CRF range, `--min-savings`, `--force`) unless
-`--retry-skipped` is given. If two inputs would produce the same output name (same file name
+`--retry-skipped` is given. Trial encodes are remembered in `~/.cache/av1opt/trials-v1.jsonl`
+for the same file (path, size, date), sample clips, settings and ffmpeg build: an encode that
+was stopped or failed, or is run again with another target, container or `--min-savings`,
+starts from the scores it already has and often measures nothing new. `--fresh-search`
+measures everything again. If two inputs would produce the same output name (same file name
 from two input folders), the second is reported as a name collision instead of being skipped.
 
 ## bench
@@ -242,6 +261,8 @@ av1opt ui [--port 8765] [--no-open] [--memory-limit 12G]
 A local web app in the browser (Chrome or Firefox), built from the same scan and encode code:
 
 - **Scan**: pick folders, see per-file and total savings estimates, select candidates and queue them.
+  **Time** is the estimated search and encode time of a file and **Per hour** its saving per
+  hour of encoding (click to sort); the selection line adds up both for the ticked files.
 - **Duplicates**: the `dups` search with progress and a Stop button. Each group shows a frame
   of every copy, the suggested keep and why; **Compare** opens two copies in the split player.
   Tick the copies you don't want, then **Move to trash** (after a confirmation), or copy or save
@@ -250,6 +271,8 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
   do), so it can be put back until you empty the trash, and no space is freed before that.
   The last copy of a video is never trashed, files that changed since the search are refused,
   and a drive without a usable trash gives an error instead of a copy to another disk.
+- **Encode dialog**: target VMAF, preset, container, encoder parameters, metadata, sections
+  to remove, and **Shrink heavy sound tracks to Opus** (`--audio shrink`, off by default).
 - **Queue**: encodes run one at a time with live progress: CRF search trials, chosen CRF,
   per-chunk results in scene mode, percent, fps and ETA. Cancel stops ffmpeg at once; finished
   scene chunks are kept, so queueing the same files again resumes. Unfinished jobs are
@@ -346,12 +369,22 @@ trash action refuses) and the benchmark's requests and tuned settings over HTTP 
 - **CRF has quarter steps.** `-svtav1-params crf=35.25` works; integer CRF alone left every
   chunk ~0.3 VMAF above target.
 - **Cover art can be a plain video stream.** Pick the real video by codec, not "first video stream".
+- **One SVT-AV1 encode already fills the CPU.** At preset 6 a single encode keeps 7-8 of 12
+  threads busy from 720p to 4K (measured on a 6-core Ryzen 5 5600X); four sample encodes at
+  once finished only 13-18% sooner than one after another, with four times the memory. The
+  time went to the search instead: 4-5 trials per file, 2-5 times the final encode on short
+  videos. So trials are saved (a better first guess, stopping as soon as the crossing is
+  pinned down, remembering trials) rather than run side by side.
 - **ffmpeg ignores `-svtav1-params` names it can't parse.** A typo only prints a warning and the
   encode runs without the option, so parameters are tried on a few generated frames first.
 
 ## Tests
 
-`cargo test` covers the CRF search (exactness against brute force, trial count), chunk CRF
+`cargo test` covers the CRF search (exactness against brute force, trial count, starting
+from scores known beforehand), the first-CRF guess and what it learns from past encodes, the
+encode time estimate (the first guess, learning a faster machine, other presets), the
+trial cache (what counts as the same file, clips and settings), which sound tracks are copied
+or shrunk, chunk CRF
 estimation, scene chunk planning, sample placement, frame-rate snapping and source filters, plus
 the duplicate finder's hashes (scaling, noise, black bars, flat frames), pair rules and keep
 suggestions, and the benchmark's arithmetic (size and time at the target, comparison across

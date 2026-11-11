@@ -8,7 +8,7 @@ use std::path::Path;
 use std::process::Command;
 
 /// Technical facts about one video file, as reported by ffprobe.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MediaInfo {
     /// Absolute stream index of the main video (cover art can come first, so `0:v:0` is wrong).
     #[serde(default)]
@@ -67,6 +67,9 @@ pub struct Cover {
 pub struct AudioInfo {
     pub codec: String,
     pub channels: u32,
+    /// Bits per second; 0 when the file doesn't say.
+    #[serde(default)]
+    pub bitrate: f64,
 }
 
 pub fn probe(ffprobe: &str, path: &Path, file_size: u64) -> Result<MediaInfo> {
@@ -165,6 +168,8 @@ pub fn probe(ffprobe: &str, path: &Path, file_size: u64) -> Result<MediaInfo> {
             .map(|s| AudioInfo {
                 codec: s["codec_name"].as_str().unwrap_or("unknown").to_string(),
                 channels: s["channels"].as_u64().unwrap_or(2) as u32,
+                // Matroska has no per-stream bitrate field; mkvmerge writes it as a tag.
+                bitrate: num(&s["bit_rate"]).or_else(|| num(&s["tags"]["BPS"])).unwrap_or(0.0),
             })
             .collect(),
         subtitle_codecs: streams
@@ -179,6 +184,26 @@ pub fn probe(ffprobe: &str, path: &Path, file_size: u64) -> Result<MediaInfo> {
             .map(|t| t.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect())
             .unwrap_or_default(),
     })
+}
+
+/// Bits per second of audio stream number `index` (among the audio streams), measured from
+/// the packets of its first two minutes. For containers that don't state it.
+pub fn audio_bitrate(ffprobe: &str, path: &Path, index: usize) -> Option<f64> {
+    let out = Command::new(ffprobe)
+        .args(["-v", "error", "-read_intervals", "%+120", "-select_streams", &format!("a:{index}")])
+        .args(["-show_entries", "packet=pts_time,duration_time,size", "-of", "csv=p=0"])
+        .arg(path)
+        .output()
+        .ok()?;
+    let (mut bytes, mut first, mut last) = (0.0, f64::INFINITY, f64::NEG_INFINITY);
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let mut f = line.split(',').map(|x| x.trim().parse::<f64>().ok());
+        let (Some(Some(pts)), Some(dur), Some(Some(size))) = (f.next(), f.next(), f.next()) else { continue };
+        bytes += size;
+        first = first.min(pts);
+        last = last.max(pts + dur.unwrap_or(0.0));
+    }
+    (last - first > 1.0).then(|| bytes * 8.0 / (last - first))
 }
 
 /// Parses ffprobe rates like "30000/1001".

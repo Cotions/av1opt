@@ -324,9 +324,9 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
 
     // Needs room for the encode plus slack; predicted size can be off for unusual content.
     // Scene mode holds the chunks, the joined stream and the final file at once.
-    // Lossless chunk references add up to ~2 GB each (4K) per worker.
+    // Lossless chunk references add up to ~4 GB each (4K) per worker.
     let copies = if scenes { 3.0 } else { 1.5 };
-    let refs = if scenes { o.workers as u64 * 2_000_000_000 } else { 0 };
+    let refs = if scenes { o.workers as u64 * 4_000_000_000 } else { 0 };
     let need = (size as f64 * best.size_ratio.max(0.3) * copies) as u64 + 500_000_000 + refs;
     if let Some(free) = free_bytes(out_dir)
         && free < need

@@ -103,7 +103,8 @@ For each file:
    be trusted. On the measured curves of eight test clips (every CRF from 22 to 46, targets
    88 to 97) that is 2.2 trial encodes on average from the fixed guess and 2.0 from a guess
    within 3 CRF of the answer, never more than 4, and the CRF chosen is never more than 0.05
-   VMAF short of the target. The answer is in SVT-AV1's quarter-step CRF. 4K uses the
+   VMAF short of the target. A trial encodes the samples end to end as one clip and scores
+   them in one pass. The answer is in SVT-AV1's quarter-step CRF. 4K uses the
    `vmaf_4k` model.
 3. **Decide** – skips files that are already AV1, Dolby Vision, can't reach the target, or would
    save less than `--min-savings` (15%). The search stops at the first trial that misses the
@@ -448,6 +449,19 @@ and the benchmark's requests and tuned settings over HTTP (no ffmpeg needed).
   time went to the search instead: 4-5 trials per file, 2-5 times the final encode on short
   videos. So trials are saved (a better first guess, stopping as soon as the crossing is
   pinned down, remembering trials) rather than run side by side.
+- **A lossless clip is read far more often than it is written.** Every trial decodes each
+  sample twice, as encoder input and as VMAF reference. FFV1 packs tightest but took 40 ms of
+  processor time per 1080p frame to decode (150 ms at 4K), a fifth of a whole trial; FFVHUFF
+  takes 8 ms (30 ms at 4K) for files twice the size (250 MB for 8 s of 1080p, 700 MB of 4K),
+  which the trial never notices because they are read from memory. Trials got 13% shorter.
+- **Encode the samples as one clip.** The encoder and libvmaf each start once per trial
+  instead of once per sample, and per-sample scores come from libvmaf's per-frame log. That
+  took another 11 to 16% off a trial. Checked frame for frame against the same stretches of a
+  whole encode (four clips, two CRFs each), the mean over the samples came out 0.03 VMAF
+  higher on average and at most 0.16 off; samples encoded one by one came out 0.04 lower
+  and at most 0.13 off. Neither is the better predictor; one is faster. Together with the
+  cheaper clips the search of four test files went from 140 s to 112 s (15 to 27% less
+  each), with the chosen CRF within 0.75 of before.
 - **The score falls faster the higher the CRF, in much the same way on every clip.** On
   eight clips measured at every CRF from 22 to 46 (preset 6) a CRF step cost 0.15 VMAF at
   CRF 22, 0.45 at 35 (0.3 to 0.6 depending on the clip) and 0.65 at 44. Where the curve sits

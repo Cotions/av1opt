@@ -267,6 +267,8 @@ pub fn run(paths: &[PathBuf], tools: &Tools, o: &Options, progress: &(dyn Fn(Pro
         bail!("{p}");
     }
     let encoder = caps.ffmpeg_version.unwrap_or_default();
+    // What remembered measurements are told apart by.
+    let measured_with = format!("{encoder}; {} clips", search::REFERENCE_CODEC);
     for c in &o.configs {
         search::check_params(tools, c.preset, &c.params)?;
     }
@@ -319,10 +321,11 @@ pub fn run(paths: &[PathBuf], tools: &Tools, o: &Options, progress: &(dyn Fn(Pro
             path: f.path.clone(), class: Class::of(info.width, info.height), codec: info.codec.clone(), width: info.width, height: info.height,
             fps: info.fps, duration_s: info.duration_s, source_bitrate: info.video_bitrate, hdr: info.hdr, cells: Vec::new(), error: None,
         };
-        // Earlier measurements of this very file with these clips and this encoder build.
+        // Earlier measurements of this very file with these clips and this encoder build,
+        // read from clips of the same kind (the time to read a clip is part of the timing).
         let mut known: HashMap<(u8, &str, u8), Measure> = lines
             .iter()
-            .filter(|l| l.path == f.path && l.size == f.size && l.mtime == f.mtime && l.samples == o.samples && (l.sample_secs - o.sample_secs).abs() < 1e-6 && l.encoder == encoder)
+            .filter(|l| l.path == f.path && l.size == f.size && l.mtime == f.mtime && l.samples == o.samples && (l.sample_secs - o.sample_secs).abs() < 1e-6 && l.encoder == measured_with)
             .map(|l| ((l.preset, l.params.as_str(), l.m.crf), l.m))
             .collect();
         // 4K VMAF with many threads was part of the memory blow-up in the first pilot.
@@ -346,7 +349,7 @@ pub fn run(paths: &[PathBuf], tools: &Tools, o: &Options, progress: &(dyn Fn(Pro
                         let m = measure(tools, info, samples.as_deref().unwrap_or_default(), &work.0, &enc, crf, vmaf_threads)?;
                         let line = Line {
                             path: f.path.clone(), size: f.size, mtime: f.mtime, samples: o.samples, sample_secs: o.sample_secs,
-                            encoder: encoder.clone(), preset: c.preset, params: c.params.clone(), m,
+                            encoder: measured_with.clone(), preset: c.preset, params: c.params.clone(), m,
                         };
                         // Losing the memory of one encode is not worth failing the run for.
                         if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&cache_path) {

@@ -220,7 +220,7 @@ fn extract_chunk(tools: &Tools, input: &Path, info: &MediaInfo, b: Bounds, out: 
     let args: Vec<String> = [
         "-y", "-v", "error", "-copyts", "-ss", &format!("{seek:.3}"), "-i", &path_arg(input),
         "-map", &format!("0:{}", info.video_index), "-an", "-sn", "-dn", "-vf", &vf.join(","),
-        "-c:v", "ffv1", "-pix_fmt", search::reference_pix_fmt(info), &path_arg(out),
+        "-c:v", search::REFERENCE_CODEC, "-pix_fmt", search::reference_pix_fmt(info), &path_arg(out),
     ]
     .map(String::from)
     .to_vec();

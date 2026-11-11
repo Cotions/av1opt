@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 pub struct Sample {
     pub reference: PathBuf,
     pub secs: f64,
+    /// Frames in the reference.
+    pub frames: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -95,6 +97,12 @@ pub fn quarter(crf: f64) -> f64 {
 }
 
 /// Lossless reference pixel format matching the source bit depth.
+/// Codec of the lossless references (sample clips, scene chunks). Every trial reads each clip
+/// twice, as encoder input and as VMAF reference, so what counts is how cheap it is to
+/// decode: FFV1 took 40 ms of processor time per 1080p frame, a fifth of a whole trial;
+/// this one takes 8 ms, for files twice the size (250 MB for 8 s of 1080p, 700 MB of 4K).
+pub const REFERENCE_CODEC: &str = "ffvhuff";
+
 pub fn reference_pix_fmt(info: &MediaInfo) -> &'static str {
     if info.pix_fmt.contains("10") || info.pix_fmt.contains("12") { "yuv420p10le" } else { "yuv420p" }
 }
@@ -140,7 +148,8 @@ pub fn source_filters(info: &MediaInfo) -> Vec<String> {
     f
 }
 
-/// Score every 3rd frame: within ~0.01 of scoring all of them, ~45% less VMAF time. Must be odd:
+/// Score every 3rd frame: ~45% less VMAF time. The mean of a trial's samples stays within
+/// ~0.1 of scoring every frame (one 8 s sample by itself: within ~0.25). Must be odd:
 /// SVT-AV1's hierarchical GOP alternates better and worse frames, so an even stride sees only
 /// one kind (measured +0.2 VMAF with a stride of 2).
 pub const VMAF_STRIDE: u32 = 3;
@@ -194,7 +203,7 @@ pub fn extract_reference(
         "-y", "-v", "error", "-ss", &format!("{seek:.4}"), "-i", &path_arg(input),
         "-ss", &format!("{preroll:.3}"), "-t", &format!("{secs:.3}"),
         "-map", &format!("0:{}", if is_source { info.video_index } else { 0 }), "-an", "-sn",
-        "-vf", &vf.join(","), "-c:v", "ffv1", "-pix_fmt", reference_pix_fmt(info), &path_arg(out),
+        "-vf", &vf.join(","), "-c:v", REFERENCE_CODEC, "-pix_fmt", reference_pix_fmt(info), &path_arg(out),
     ]
     .map(String::from)
     .to_vec();
@@ -234,7 +243,8 @@ pub fn extract_samples(tools: &Tools, input: &Path, info: &MediaInfo, tmp: &Path
             eprintln!("  sample {}/{n} at {} ({secs:.0}s)", i + 1, crate::tools::hms(start));
             tools.emit(crate::events::Event::Phase { phase: "sampling".into(), detail: format!("sample {}/{n} at {}", i + 1, crate::tools::hms(start)) });
             extract_reference(tools, input, info, true, first_frame(info), start, secs, &reference)?;
-            Ok(Sample { reference, secs })
+            let frames = tools.count_frames(&reference)?;
+            Ok(Sample { reference, secs, frames })
         })
         .collect()
 }
@@ -674,7 +684,14 @@ fn expected(a: &Trial, b: &Trial, crf: f64) -> Trial {
     Trial { crf, mean_vmaf: mix(a.mean_vmaf, b.mean_vmaf), min_vmaf: mix(a.min_vmaf, b.min_vmaf), size_ratio }
 }
 
-/// Encodes every sample at `crf` and scores it against its reference.
+/// Encodes the samples at `crf` and scores them against their references.
+///
+/// The samples are encoded end to end as one clip and scored in one run: the encoder and
+/// libvmaf start once instead of once per sample (a tenth to a sixth of a trial's time), and
+/// no sample begins on a keyframe it would not get in the real encode. Checked frame for
+/// frame against the same stretches of a whole encode (four clips, two CRFs each): the mean
+/// over the samples came out 0.03 VMAF higher on average and at most 0.16 off, where samples
+/// encoded one by one came out 0.04 lower and at most 0.13 off.
 #[allow(clippy::too_many_arguments)]
 pub fn trial(
     tools: &Tools,
@@ -689,7 +706,21 @@ pub fn trial(
     if samples.is_empty() {
         bail!("no samples");
     }
-    let (mut scores, mut bytes, mut secs) = (Vec::new(), 0u64, 0.0);
+    let joined = if samples.len() > 1 { trial_joined(tools, info, samples, tmp, enc, crf, threads)? } else { None };
+    let (scores, bytes) = match joined {
+        Some(r) => r,
+        None => trial_each(tools, info, samples, tmp, enc, crf, threads)?,
+    };
+    let secs: f64 = samples.iter().map(|s| s.secs).sum();
+    let mean = scores.iter().sum::<f64>() / scores.len() as f64;
+    let min = scores.iter().copied().fold(f64::INFINITY, f64::min);
+    let ratio = if source_bps > 0.0 { bytes as f64 / secs / source_bps } else { 1.0 };
+    Ok(Trial { crf, mean_vmaf: mean, min_vmaf: min, size_ratio: ratio })
+}
+
+/// Each sample encoded and scored by itself: the score of each, and the bytes of all.
+fn trial_each(tools: &Tools, info: &MediaInfo, samples: &[Sample], tmp: &Path, enc: &EncodeSettings, crf: f64, threads: usize) -> Result<(Vec<f64>, u64)> {
+    let (mut scores, mut bytes) = (Vec::new(), 0u64);
     for (i, s) in samples.iter().enumerate() {
         let out = tmp.join(format!("sample{i}.crf{crf}.mkv"));
         let mut args: Vec<String> = ["-y", "-v", "error", "-i", &path_arg(&s.reference)].map(String::from).to_vec();
@@ -698,18 +729,84 @@ pub fn trial(
         tools.run(&args)?;
         scores.push(tools.vmaf(&out, &s.reference, vmaf_model(info), reference_pix_fmt(info), threads, 0, VMAF_STRIDE)?);
         bytes += std::fs::metadata(&out)?.len();
-        secs += s.secs;
         std::fs::remove_file(&out)?;
     }
-    let mean = scores.iter().sum::<f64>() / scores.len() as f64;
-    let min = scores.iter().copied().fold(f64::INFINITY, f64::min);
-    let ratio = if source_bps > 0.0 { bytes as f64 / secs / source_bps } else { 1.0 };
-    Ok(Trial { crf, mean_vmaf: mean, min_vmaf: min, size_ratio: ratio })
+    Ok((scores, bytes))
+}
+
+/// A line of a concat demuxer list.
+fn concat_line(path: &Path) -> String {
+    format!("file '{}'\n", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+/// The samples encoded end to end as one clip: the score of each, and the bytes of all.
+/// None when the frames of the encode do not line up with the samples (never seen; the
+/// caller then measures each sample by itself).
+fn trial_joined(tools: &Tools, info: &MediaInfo, samples: &[Sample], tmp: &Path, enc: &EncodeSettings, crf: f64, threads: usize) -> Result<Option<(Vec<f64>, u64)>> {
+    // Absolute: a relative name in a concat list counts from the list's folder.
+    let list = tmp.join("samples.txt");
+    let lines = samples.iter().map(|s| Ok(concat_line(&std::path::absolute(&s.reference)?))).collect::<Result<String>>()?;
+    std::fs::write(&list, lines)?;
+    let out = tmp.join(format!("samples.crf{crf}.mkv"));
+    let mut args: Vec<String> = ["-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", &path_arg(&list)].map(String::from).to_vec();
+    args.extend(enc.video_args(crf));
+    args.push(path_arg(&out));
+    tools.run(&args)?;
+    let frames = tools.vmaf_frames(&out, &list, tmp, vmaf_model(info), reference_pix_fmt(info), threads, VMAF_STRIDE)?;
+    let bytes = std::fs::metadata(&out)?.len();
+    std::fs::remove_file(&out)?;
+    Ok(split_scores(&frames, &samples.iter().map(|s| s.frames).collect::<Vec<_>>(), VMAF_STRIDE as u64).map(|scores| (scores, bytes)))
+}
+
+/// Mean score of each clip from the scored frames (number, score) of clips of `lengths`
+/// frames laid end to end. None unless the scored frames reach the end of the last clip and
+/// stop there, to within the `stride` between scored frames.
+fn split_scores(frames: &[(u64, f64)], lengths: &[u64], stride: u64) -> Option<Vec<f64>> {
+    let total: u64 = lengths.iter().sum();
+    let last = frames.iter().map(|f| f.0).max()?;
+    if last >= total || last + stride < total {
+        return None;
+    }
+    let mut start = 0;
+    lengths
+        .iter()
+        .map(|&n| {
+            let own: Vec<f64> = frames.iter().filter(|f| (start..start + n).contains(&f.0)).map(|f| f.1).collect();
+            start += n;
+            (!own.is_empty()).then(|| own.iter().sum::<f64>() / own.len() as f64)
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn joined_samples_are_scored_one_by_one() {
+        // Three clips of 5, 4 and 6 frames; every third frame is scored.
+        let frames: Vec<(u64, f64)> = [(0, 90.0), (3, 92.0), (6, 80.0), (9, 70.0), (12, 72.0)].to_vec();
+        assert_eq!(split_scores(&frames, &[5, 4, 6], 3), Some(vec![91.0, 80.0, 71.0]));
+        // In any order, as a log may list them.
+        let mut mixed = frames.clone();
+        mixed.reverse();
+        assert_eq!(split_scores(&mixed, &[5, 4, 6], 3), Some(vec![91.0, 80.0, 71.0]));
+        // The encode came out shorter or longer than the samples: not to be trusted.
+        assert_eq!(split_scores(&frames[..4], &[5, 4, 6], 3), None);
+        assert_eq!(split_scores(&frames, &[5, 4, 3], 3), None);
+        assert_eq!(split_scores(&frames, &[5, 4, 9], 3), None);
+        // A clip too short to hold a scored frame, and no frames at all.
+        assert_eq!(split_scores(&[(0, 90.0), (3, 91.0)], &[2, 1, 2], 3), None);
+        assert_eq!(split_scores(&[], &[5], 3), None);
+        assert_eq!(concat_line(Path::new("/a b/it's.mkv")), "file '/a b/it'\\''s.mkv'\n");
+    }
+
+    #[test]
+    fn paths_given_to_ffmpeg_cannot_pass_for_a_protocol() {
+        let rel = path_arg(Path::new("a:b/x.mkv"));
+        assert!(rel.starts_with('/') && rel.ends_with("/a:b/x.mkv"), "{rel}");
+        assert_eq!(path_arg(Path::new("/lib/a:b/x.mkv")), "/lib/a:b/x.mkv");
+    }
 
     /// Highest CRF passing by brute force, for checking `find_crf`.
     fn brute(min: u8, max: u8, target: f64, f: impl Fn(u8) -> f64) -> Option<u8> {

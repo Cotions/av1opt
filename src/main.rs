@@ -160,7 +160,7 @@ enum Cmd {
         /// Measure everything again instead of using remembered sample encodes.
         #[arg(long)]
         refresh: bool,
-        /// Folder for the lossless sample clips while a video is measured (a few GB for 4K).
+        /// Folder for the lossless sample clips while a video is measured (several GB for 4K).
         /// Default: ~/.cache/av1opt. Must not be on ZFS.
         #[arg(long)]
         work_dir: Option<PathBuf>,

@@ -230,7 +230,15 @@ impl Tools {
 
     /// Runs ffmpeg and returns its stderr. Fails with the tail of stderr on error.
     pub fn run(&self, args: &[String]) -> Result<String> {
+        self.run_in(None, args)
+    }
+
+    /// Like [`Tools::run`], with ffmpeg's working directory set to `dir`.
+    fn run_in(&self, dir: Option<&Path>, args: &[String]) -> Result<String> {
         let mut cmd = self.command_for(args);
+        if let Some(d) = dir {
+            cmd.current_dir(d);
+        }
         cmd.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
         let child = self.spawn(&mut cmd)?;
         let out = self.finish(child)?;
@@ -375,7 +383,41 @@ impl Tools {
     }
 }
 
+/// (frame number, score) of every frame in a libvmaf JSON log.
+fn parse_vmaf_frames(log: &[u8]) -> Result<Vec<(u64, f64)>> {
+    let v: serde_json::Value = serde_json::from_slice(log).context("libvmaf's log is not JSON")?;
+    let frames = v["frames"].as_array().context("no frames in libvmaf's log")?;
+    frames
+        .iter()
+        .map(|f| Some((f["frameNum"].as_u64()?, f["metrics"]["vmaf"].as_f64()?)))
+        .collect::<Option<Vec<_>>>()
+        .context("a frame without a score in libvmaf's log")
+}
+
 impl Tools {
+    /// VMAF of every scored frame of `distorted`, which holds the clips of the concat list
+    /// `references` end to end: (frame number, score) pairs. Frames are paired by index, as in
+    /// [`Tools::vmaf`]. libvmaf's log is written in `dir` and removed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn vmaf_frames(&self, distorted: &Path, references: &Path, dir: &Path, model: &str, pix_fmt: &str, threads: usize, subsample: u32) -> Result<Vec<(u64, f64)>> {
+        // By relative name, with ffmpeg run in `dir`: a path in a filter graph needs escaping.
+        const LOG: &str = "vmaf-frames.json";
+        let filter = format!(
+            "[0:v]format={pix_fmt},settb=1,setpts=N[d];[1:v]format={pix_fmt},settb=1,setpts=N[r];\
+             [d][r]libvmaf=model=version={model}:n_threads={threads}:n_subsample={}:shortest=1:log_fmt=json:log_path={LOG}",
+            subsample.max(1)
+        );
+        let args: Vec<String> = ["-i".into(), path_arg(distorted), "-f".into(), "concat".into(), "-safe".into(), "0".into(), "-i".into(), path_arg(references)]
+            .into_iter()
+            .chain(["-lavfi", &filter, "-f", "null", "-"].map(String::from))
+            .collect();
+        self.run_in(Some(dir), &args)?;
+        let log = dir.join(LOG);
+        let text = std::fs::read(&log).context("libvmaf wrote no log")?;
+        let _ = std::fs::remove_file(&log);
+        parse_vmaf_frames(&text)
+    }
+
     /// Number of video packets (= frames) in the first video stream, without decoding.
     pub fn count_frames(&self, path: &Path) -> Result<u64> {
         let out = Command::new(&self.ffprobe)
@@ -391,8 +433,10 @@ impl Tools {
     }
 }
 
+/// A path as an ffmpeg argument. Absolute, because ffmpeg takes what stands before a colon in
+/// a relative name for a protocol (`a:b/x.mkv`: "Protocol not found").
 pub fn path_arg(p: &Path) -> String {
-    p.to_string_lossy().into_owned()
+    std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().into_owned()
 }
 
 pub fn hms(secs: f64) -> String {

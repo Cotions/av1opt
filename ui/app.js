@@ -242,7 +242,7 @@ function metaLabel(o) {
 
 function defaultOptions() {
   return Object.assign({
-    container: "mp4", target_vmaf: 93, preset: 6, scenes: false, workers: 1, min_savings: 0.15, force: false, retry_skipped: false,
+    container: "mp4", target_vmaf: 93, preset: 6, svt_params: "", tuned: false, scenes: false, workers: 1, min_savings: 0.15, force: false, retry_skipped: false,
     keep_metadata: true, keep_dates: false, info_json: true, meta_preset: "", meta_tags: [],
   }, prefs.get("encodeOptions", {}));
 }
@@ -537,6 +537,10 @@ function encodeDialog(inputs, roots = []) {
     const outEl = h("code", {}, outDir);
     const vmaf = h("input", { type: "number", step: "0.5", min: "50", max: "99.5", value: o.target_vmaf });
     const preset = h("input", { type: "number", min: "0", max: "13", value: o.preset });
+    const dflParams = (STATE && STATE.default_svt_params) || "tune=0";
+    const svtParams = h("input", { type: "text", class: "mono", spellcheck: "false", value: o.svt_params || dflParams, placeholder: dflParams });
+    const tuning = (STATE && STATE.tuning) || [];
+    const tuned = h("input", { type: "checkbox", checked: o.tuned });
     const container = h("select", {}, h("option", { value: "mp4" }, "MP4 (plays in browsers)"), h("option", { value: "mkv" }, "MKV (keeps image subtitles)"));
     container.value = o.container;
     const scenes = h("input", { type: "checkbox", checked: o.scenes });
@@ -560,11 +564,13 @@ function encodeDialog(inputs, roots = []) {
     const close = (v) => { if (cuts) cuts.stop(); bg.remove(); resolve(v); };
     const go = h("button", { class: "primary", onclick: async () => {
       const options = {
-        container: container.value, target_vmaf: Number(vmaf.value), preset: Number(preset.value), scenes: scenes.checked,
+        container: container.value, target_vmaf: Number(vmaf.value), preset: Number(preset.value), svt_params: svtParams.value.trim(),
+        tuned: tuning.length > 0 && tuned.checked, scenes: scenes.checked,
         workers: Number(workers.value), min_savings: Number(minSav.value) / 100, force: force.checked, retry_skipped: retry.checked,
         ...meta.get(),
       };
-      prefs.set("encodeOptions", options);
+      // The tick is remembered also while there are no tuned settings to use.
+      prefs.set("encodeOptions", { ...options, tuned: tuning.length ? tuned.checked : o.tuned });
       // Sections belong to this one video, so they aren't remembered with the settings.
       try { if (cuts) options.remove = cuts.get(); } catch (e) { toast(e.message, true); return; }
       prefs.set("outDir", outDir);
@@ -592,6 +598,9 @@ function encodeDialog(inputs, roots = []) {
           h("div", { class: "form-grid" },
             setting("Target VMAF", vmaf, "Quality to match: 93 looks like the source, higher keeps more and saves less"),
             setting("Preset", preset, "0–13: lower makes smaller files but encodes slower"),
+            setting("Encoder parameters", svtParams, "SVT-AV1 options as name=value:name=value; the Benchmark page finds good ones"),
+            tuning.length ? setting("Tuned settings", h("label", { class: "check" }, tuned, "Use the benchmark's settings by video size"),
+              tuning.map((x) => `${x.label}: ${configLabel(x.choice)}`).join("; ") + ". Other sizes use the preset and parameters above") : null,
             setting("Container", container, null),
             setting("Skip if saving under", h("span", { class: "unit" }, minSav, "%"), "Files that wouldn't shrink this much are left alone")),
           h("div", { class: "checks-col" },
@@ -984,6 +993,448 @@ function renderDups(out, run) {
   draw();
 }
 
+// ----- benchmark -----
+
+const CLASS_LABEL = { sd: "720p and below", hd: "1080p", uhd: "above 1080p" };
+function configLabel(c) { return c ? `preset ${c.preset} · ${c.params || "SVT-AV1 defaults"}` : "–"; }
+// A size or time ratio against the default as a change: 0.94 is "−6.0%".
+function rel(x, d = 1) {
+  if (x == null || isNaN(x)) return "–";
+  const v = (x - 1) * 100, t = Math.abs(v).toFixed(d);
+  return (Number(t) === 0 ? "" : v > 0 ? "+" : "−") + t + "%";
+}
+function times(x) { return x == null || isNaN(x) ? "–" : x.toFixed(x >= 10 ? 0 : 2) + "×"; }
+function plural(n, word) { return `${n} ${word}${n === 1 ? "" : "s"}`; }
+
+views.bench = (root) => {
+  const st = (STATE && STATE.settings) || {};
+  const roots = new Set(prefs.get("benchRoots", st.bench_paths && st.bench_paths.length ? st.bench_paths : st.scan_paths || []));
+  const f = Object.assign({ presets: null, params: null, vmaf: 93, videos: 6, samples: 2, secs: 6 }, prefs.get("benchForm", {}));
+  const chips = h("div", { class: "chips" });
+  const presetBoxes = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map((p) => [p, h("input", { type: "checkbox" })]);
+  const params = h("textarea", { rows: "5", spellcheck: "false", class: "mono" });
+  const vmaf = h("input", { type: "number", step: "0.5", min: "50", max: "99.5", value: f.vmaf });
+  const videos = h("input", { type: "number", min: "1", max: "50", value: f.videos });
+  const samples = h("input", { type: "number", min: "1", max: "8", value: f.samples });
+  const secs = h("input", { type: "number", min: "2", max: "30", value: f.secs });
+  const refresh = h("input", { type: "checkbox" });
+  const planText = h("p", { class: "dim" });
+  const start = h("button", { class: "primary" }, "Start benchmark");
+  const cancel = h("button", { hidden: true }, "Stop");
+  const progress = h("div", { class: "bar grow" }, h("div"));
+  const progText = h("span", { class: "dim" });
+  const out = h("div");
+  const ui = { tab: prefs.get("benchTab", "all"), video: 0, sort: "size", dir: 1, stopChart: null };
+  let base = { preset: 6, params: "tune=0" };
+  let defaults = null;
+  let running = false;
+  let seenVideos = -1;
+  let etaStart = null;
+  let gone = false;
+
+  const drawChips = () => {
+    chips.replaceChildren(...[...roots].map((r) => h("span", { class: "chip" }, h("code", {}, r), h("button", { title: "Remove", onclick: () => { roots.delete(r); prefs.set("benchRoots", [...roots]); drawChips(); } }, "×"))));
+    if (!roots.size) chips.append(h("span", { class: "dim" }, "No folders or videos yet."));
+    start.disabled = !roots.size || running;
+  };
+  drawChips();
+
+  const form = () => ({
+    presets: presetBoxes.filter(([, b]) => b.checked).map(([p]) => p),
+    param_sets: params.value.split("\n").map((x) => x.trim()).filter(Boolean),
+  });
+  // The server builds the same list: the default setting, then every preset with every set.
+  const plan = () => {
+    const { presets, param_sets } = form();
+    const seen = new Set([`${base.preset} ${base.params}`]);
+    for (const p of presets) for (const x of param_sets) seen.add(`${p} ${x}`);
+    const n = seen.size, v = Number(videos.value) || 0;
+    planText.textContent = `${plural(n, "setting")} (the default, preset ${base.preset} · ${base.params}, is always one) on up to ${plural(v, "video")}: around ${n * v * 3} sample encodes of ${samples.value} × ${secs.value} s. Slow presets and big videos take the longest.`;
+  };
+  for (const el of [params, videos, samples, secs, ...presetBoxes.map(([, b]) => b)]) el.addEventListener("input", plan);
+
+  const showRun = (run) => {
+    running = !!run && run.status === "running";
+    cancel.hidden = !running;
+    start.disabled = running || !roots.size;
+    if (!run) { progText.textContent = ""; return; }
+    if (!running) {
+      etaStart = null;
+      progress.firstChild.style.width = run.status === "done" ? "100%" : "0%";
+      progText.textContent = run.status === "done" ? "finished" : run.status === "failed" ? "failed" : "stopped: what was measured is remembered, and starting again carries on from there";
+      return;
+    }
+    const c = run.current || {}, total = run.cells_total;
+    progress.firstChild.style.width = (total ? 100 * run.cells_done / total : 0) + "%";
+    if (run.phase === "probing") { progText.textContent = c.total ? `reading videos ${c.done} / ${c.total}` : "listing files…"; return; }
+    if (!etaStart || run.cells_done < etaStart.done) etaStart = { t: performance.now(), done: run.cells_done };
+    const el = (performance.now() - etaStart.t) / 1000, n = run.cells_done - etaStart.done;
+    const eta = n >= 2 && el > 15 ? ` · about ${hms((total - run.cells_done) * el / n)} left` : "";
+    const vid = c.video != null ? `video ${c.video + 1} of ${run.videos_total}` : "starting";
+    let now = vid;
+    if (run.phase === "sampling" && c.path) now = `${vid}: cutting sample clips of ${basename(c.path)}`;
+    else if (c.config != null) now = `${vid} · ${configLabel(run.configs[c.config])} · CRF ${c.crf} gave VMAF ${num(c.vmaf, 1)}${c.cached ? " (remembered)" : ""}`;
+    progText.textContent = `${now} · ${run.cells_done} / ${total} done${eta}`;
+  };
+
+  async function load() {
+    let d;
+    try { d = await api("/api/bench"); } catch (e) { toast(e.message, true); return; }
+    if (gone) return;
+    if (!defaults) {
+      defaults = d.defaults;
+      base = defaults.baseline;
+      const on = new Set(f.presets || defaults.presets);
+      for (const [p, b] of presetBoxes) b.checked = on.has(p);
+      params.value = f.params != null ? f.params : defaults.param_sets.join("\n");
+      plan();
+    }
+    seenVideos = d.run ? d.run.videos_done : -1;
+    showRun(d.run);
+    renderBench(out, d, ui);
+  }
+
+  start.onclick = async () => {
+    const { presets, param_sets } = form();
+    prefs.set("benchForm", { presets, params: params.value, vmaf: Number(vmaf.value), videos: Number(videos.value), samples: Number(samples.value), secs: Number(secs.value) });
+    start.disabled = true;
+    try {
+      await api("/api/bench", { paths: [...roots], presets, param_sets, target_vmaf: Number(vmaf.value), max_videos: Number(videos.value),
+        samples: Number(samples.value), sample_secs: Number(secs.value), refresh: refresh.checked });
+      refresh.checked = false;
+      etaStart = null;
+      progress.firstChild.style.width = "0%";
+      progText.textContent = "listing files…";
+      await load();
+    } catch (e) { toast(e.message, true); start.disabled = !roots.size || running; }
+  };
+  cancel.onclick = async () => {
+    cancel.disabled = true;
+    try { await api("/api/bench/cancel", {}); } catch (e) { toast(e.message, true); }
+    cancel.disabled = false;
+  };
+
+  root.append(
+    h("h1", {}, "Benchmark encoder settings"),
+    h("div", { class: "panel" },
+      h("div", { class: "row" }, chips, h("span", { class: "spacer" }),
+        h("button", { onclick: async () => {
+          const p = await pick({ title: "Folders or videos to measure on", mode: "multi" });
+          if (p) { for (const x of p) roots.add(x); prefs.set("benchRoots", [...roots]); drawChips(); }
+        } }, "Add folders or videos…")),
+      h("p", { class: "dim" }, "Finds out which SVT-AV1 preset and parameters give the smallest files for the encode time on your own videos. A few videos are picked across the folders and sizes; short clips of each are encoded under every setting until the target VMAF is met, and the size and time needed are compared with the default. Read-only for these folders. Encodes in the queue wait while it runs, so the times mean something; best run on an otherwise idle machine."),
+      h("details", { class: "more" }, h("summary", {}, "What to measure"),
+        h("div", { class: "form-grid" },
+          setting("Presets", h("div", { class: "checks-row" }, presetBoxes.map(([p, b]) => h("label", { class: "check" }, b, String(p)))), "Lower is slower and smaller"),
+          setting("Parameter sets", params, "One per line, SVT-AV1 options as name=value:name=value. Every preset is tried with every line"),
+          setting("Target VMAF", vmaf, "Settings are compared at this quality; use the one you encode at"),
+          setting("Videos", videos, "At most this many, spread over the folders and sizes"),
+          setting("Clips per video", h("span", { class: "unit" }, samples, "of", secs, "seconds"), "More and longer clips are closer to a whole encode and take longer"),
+          setting("Measure again", h("label", { class: "check" }, refresh, "Ignore remembered sample encodes"), "Only needed when the machine was busy during the last run"))),
+      planText,
+      h("div", { class: "row" }, progress, progText, cancel, start)),
+    out);
+
+  const off = onEvent((m) => {
+    if (m.kind === "bench") {
+      showRun(m.run);
+      // A video is finished: its numbers can be shown.
+      if (m.run.videos_done !== seenVideos) { seenVideos = m.run.videos_done; load(); }
+    } else if (m.kind === "bench_done") load();
+  });
+  load();
+  return () => { gone = true; off(); if (ui.stopChart) ui.stopChart(); };
+};
+
+// Settings as dots: left is faster, down is smaller. One colour says "worth considering"
+// (no other setting is both smaller and faster); the default is the diamond.
+function benchChart(sum, rep, onHover) {
+  const wrap = h("div", { class: "bench-chart" });
+  const tip = h("div", { class: "tooltip", hidden: true });
+  const pts = sum.rows.filter((r) => r.size > 0 && r.time > 0);
+  const marks = new Map();
+  let width = 0;
+
+  const tipFor = (r) => [
+    h("strong", {}, configLabel(rep.configs[r.config])),
+    h("div", {}, `size ${rel(r.size)}${sum.videos > 1 ? ` (per video ${rel(r.size_best, 0)} to ${rel(r.size_worst, 0)})` : ""}`),
+    h("div", {}, `encode time ${times(r.time)} · CRF ${num(r.crf, 1)}`),
+    h("div", { class: "dim" }, [r.config === rep.baseline ? "the default" : null,
+      r.missing ? `no result on ${plural(r.missing, "video")}` : r.pareto ? "nothing is both smaller and faster" : null].filter(Boolean).join(" · ")),
+  ];
+
+  const draw = () => {
+    const W = width = Math.max(360, Math.floor(wrap.clientWidth) || 900), H = 380;
+    const m = { l: 50, r: 22, t: 30, b: 46 };
+    const pw = W - m.l - m.r, ph = H - m.t - m.b;
+    const ts = pts.map((r) => r.time).concat(1), ss = pts.map((r) => r.size).concat(1);
+    let t0 = Math.min(...ts), t1 = Math.max(...ts);
+    const padT = Math.max(1.12, Math.pow(t1 / t0, 0.08));
+    t0 /= padT; t1 *= padT;
+    let s0 = Math.min(...ss), s1 = Math.max(...ss);
+    const padS = Math.max(s1 - s0, 0.04) * 0.12 + Math.max(0, 0.04 - (s1 - s0)) / 2;
+    s0 -= padS; s1 += padS;
+    const x = (t) => m.l + Math.log(t / t0) / Math.log(t1 / t0) * pw;
+    const y = (v) => m.t + (s1 - v) / (s1 - s0) * ph;
+    const svg = s("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: "img",
+      "aria-label": `File size against encode time for ${pts.length} encoder settings, both relative to the default. The table below has the same numbers.` });
+    const text = (str, attrs) => { const t = s("text", attrs); t.textContent = str; svg.append(t); return t; };
+
+    // Size axis: a step that gives at most 7 lines.
+    const step = [0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1].find((d) => (s1 - s0) / d <= 7) || 2;
+    for (let v = Math.ceil(s0 / step) * step; v <= s1 + 1e-9; v += step) {
+      svg.append(s("line", { class: "grid", x1: m.l, x2: m.l + pw, y1: y(v), y2: y(v) }));
+      text(rel(v, step < 0.01 ? 1 : 0), { x: m.l - 8, y: y(v) + 4, "text-anchor": "end" });
+    }
+    // Time axis (log): the coarsest family of round factors that gives a few lines.
+    const families = [
+      [0.03125, 0.0625, 0.125, 0.25, 0.5, 1, 2, 4, 8, 16, 32, 64],
+      [0.125, 0.18, 0.25, 0.35, 0.5, 0.7, 1, 1.4, 2, 2.8, 4, 5.6, 8],
+      Array.from({ length: 40 }, (_, i) => (i + 1) / 10),
+      Array.from({ length: 60 }, (_, i) => (i + 1) / 20),
+    ];
+    const inside = (fam) => fam.filter((v) => v >= t0 && v <= t1);
+    const ticks = [1];
+    for (const v of inside(families.find((fam) => inside(fam).length >= 4) || families[3])) {
+      if (!ticks.some((u) => Math.abs(x(u) - x(v)) < 44)) ticks.push(v);
+    }
+    for (const v of ticks) {
+      svg.append(s("line", { class: "grid", x1: x(v), x2: x(v), y1: m.t, y2: m.t + ph }));
+      text(v + "×", { x: x(v), y: m.t + ph + 16, "text-anchor": "middle" });
+    }
+    svg.append(s("line", { class: "base", x1: x(1), x2: x(1), y1: m.t, y2: m.t + ph }), s("line", { class: "base", x1: m.l, x2: m.l + pw, y1: y(1), y2: y(1) }));
+    text("File size against the default (lower is smaller)", { x: 6, y: 14 });
+    text("Encode time against the default, log scale (left is faster)", { x: m.l + pw, y: H - 8, "text-anchor": "end" });
+
+    // The front as steps: everything above and right of it is beaten by a setting on it.
+    const front = pts.filter((r) => r.pareto).sort((a, b) => a.time - b.time);
+    if (front.length) {
+      let d = `M${x(front[0].time)},${m.t}V${y(front[0].size)}`;
+      for (const r of front.slice(1)) d += `H${x(r.time)}V${y(r.size)}`;
+      svg.append(s("path", { class: "front", d: d + `H${m.l + pw}` }));
+    }
+
+    marks.clear();
+    const order = [...pts].sort((a, b) => (a.pareto ? 1 : 0) - (b.pareto ? 1 : 0) || (a.config === rep.baseline ? 1 : 0) - (b.config === rep.baseline ? 1 : 0));
+    for (const r of order) {
+      const isBase = r.config === rep.baseline;
+      const g = s("g", { class: "pt" + (r.missing ? " part" : r.pareto ? " on" : ""), transform: `translate(${x(r.time)},${y(r.size)})`, tabindex: 0,
+        "aria-label": `${configLabel(rep.configs[r.config])}: size ${rel(r.size)}, encode time ${times(r.time)}` });
+      g.append(s("circle", { class: "hit", r: 14 }), isBase ? s("path", { class: "m", d: "M0,-7L7,0L0,7L-7,0Z" }) : s("circle", { class: "m", r: r.pareto ? 5 : 4 }));
+      const show = () => {
+        tip.replaceChildren(...tipFor(r));
+        tip.hidden = false;
+        const px = x(r.time), py = y(r.size), half = tip.offsetWidth / 2;
+        tip.style.left = Math.min(Math.max(px, half + 2), Math.max(half + 2, width - half - 2)) + "px";
+        tip.style.top = py + "px";
+        tip.style.transform = py < 110 ? "translate(-50%, 14px)" : "translate(-50%, calc(-100% - 12px))";
+        onHover(r.config);
+      };
+      const hide = () => { tip.hidden = true; onHover(null); };
+      g.addEventListener("pointerenter", show);
+      g.addEventListener("pointerleave", hide);
+      g.addEventListener("focus", show);
+      g.addEventListener("blur", hide);
+      svg.append(g);
+      marks.set(r.config, g);
+    }
+
+    // Names for the settings worth a look, where they fit without covering anything.
+    const taken = pts.map((r) => ({ x0: x(r.time) - 8, x1: x(r.time) + 8, y0: y(r.size) - 8, y1: y(r.size) + 8, of: r.config }));
+    const named = pts.filter((r) => r.pareto || r.config === rep.baseline).sort((a, b) => (b.config === rep.baseline) - (a.config === rep.baseline) || a.size - b.size);
+    for (const r of named) {
+      const label = r.config === rep.baseline ? `default (${configLabel(rep.configs[r.config])})` : configLabel(rep.configs[r.config]);
+      const w = label.length * 6.1 + 4, px = x(r.time), py = y(r.size);
+      // Left and below first: the front's line leaves a point upwards and to the right.
+      const spots = [
+        { x0: px - 11 - w, y0: py - 7, anchor: "end", tx: px - 11 },
+        { x0: px - w / 2, y0: py + 11, anchor: "middle", tx: px },
+        { x0: px + 11, y0: py - 7, anchor: "start", tx: px + 11 },
+        { x0: px - w / 2, y0: py - 24, anchor: "middle", tx: px },
+      ];
+      for (const sp of spots) {
+        const box = { x0: sp.x0, x1: sp.x0 + w, y0: sp.y0, y1: sp.y0 + 14 };
+        if (box.x0 < m.l + 2 || box.x1 > W - 2 || box.y0 < m.t || box.y1 > m.t + ph) continue;
+        if (taken.some((o) => o.of !== r.config && box.x0 < o.x1 && box.x1 > o.x0 && box.y0 < o.y1 && box.y1 > o.y0)) continue;
+        taken.push({ ...box, of: -1 });
+        text(label, { class: "lbl", x: sp.tx, y: sp.y0 + 11, "text-anchor": sp.anchor });
+        break;
+      }
+    }
+    wrap.replaceChildren(svg, tip);
+  };
+
+  const ro = new ResizeObserver(() => { const w = Math.floor(wrap.clientWidth); if (w && Math.max(360, w) !== width) draw(); });
+  ro.observe(wrap);
+  return {
+    el: wrap,
+    highlight: (config) => { for (const [c, g] of marks) g.classList.toggle("hi", c === config); },
+    stop: () => ro.disconnect(),
+  };
+}
+
+function renderBench(out, data, ui) {
+  if (ui.stopChart) { ui.stopChart(); ui.stopChart = null; }
+  const rep = data.report, run = data.run, tuning = data.tuning || [];
+  const kids = [];
+  if (run && run.status === "failed") kids.push(h("div", { class: "panel bad" }, run.error || "The benchmark failed."));
+
+  const setTuning = async (classes, config, done) => {
+    try {
+      const r = await api("/api/bench/tuning", { classes, config });
+      data.tuning = r.tuning;
+      if (STATE) STATE.tuning = r.tuning;
+      renderBench(out, data, ui);
+      toast(done);
+    } catch (e) { toast(e.message, true); }
+  };
+  const tunedPanel = h("div", { class: "panel" },
+    h("div", { class: "row" }, h("h3", { class: "flat" }, "Tuned settings"), h("span", { class: "spacer" }),
+      tuning.length > 1 ? h("button", { class: "small", onclick: () => setTuning([], null, "Tuned settings forgotten") }, "Forget all") : null),
+    tuning.map((t) => {
+      const c = t.choice;
+      return h("div", { class: "tuned-row" },
+        h("strong", {}, t.label), h("code", {}, configLabel(c)),
+        h("span", { class: "dim grow" }, c.videos ? `${rel(c.size)} size, ${times(c.time)} encode time against the default · measured on ${plural(c.videos, "video")} at VMAF ${c.target_vmaf} · ${when(c.made)}` : "set by hand"),
+        h("button", { class: "small", onclick: () => setTuning([t.class], null, `Tuned settings for ${t.label} forgotten`) }, "Forget"));
+    }),
+    h("p", { class: "dim" }, tuning.length
+      ? "Encodes with “Use tuned settings” ticked take the preset and parameters from here by the video's size. Sizes not listed use what the encode dialog says."
+      : "None yet. When a result is in, “Use for…” on a setting makes it the one for videos of that size; encodes with “Use tuned settings” ticked then take it."));
+
+  if (!rep) {
+    kids.push(tunedPanel);
+    if (!run || run.status !== "running") kids.push(h("div", { class: "panel empty" }, "No result yet. Add a folder and start: the default settings take a while but need no choices."));
+    out.replaceChildren(...kids);
+    return;
+  }
+
+  const vids = rep.videos || [], configs = rep.configs, base = rep.baseline;
+  const meta = rep.partial
+    ? `So far: ${plural(vids.length, "video")}${run && run.videos_total ? ` of ${run.videos_total}` : ""} measured · ${plural(configs.length, "setting")} · target VMAF ${rep.target_vmaf}`
+    : `Measured ${when(rep.made)} · ${plural(vids.length, "video")} · ${plural(configs.length, "setting")} · target VMAF ${rep.target_vmaf} · ${rep.fresh + rep.cached} sample encodes (${rep.cached} remembered) in ${hms(rep.elapsed_secs)}`;
+  kids.push(h("p", { class: "dim", title: rep.encoder || "" }, meta));
+
+  // With one size class, "all" and that class are the same numbers.
+  let sums = rep.summaries || [];
+  if (sums.length === 2) sums = [sums[1]];
+  const keyOf = (x) => x.class || "all";
+  const sum = sums.find((x) => keyOf(x) === ui.tab) || sums[0];
+  if (!sum) {
+    kids.push(h("div", { class: "panel" }, "Nothing to compare yet: the default setting has no result on any video measured. The table per video below says why."));
+  } else {
+    const tabs = sums.length > 1 ? h("div", { class: "tabs" }, sums.map((x) => h("button", {
+      class: x === sum ? "active" : "", onclick: () => { ui.tab = keyOf(x); prefs.set("benchTab", ui.tab); renderBench(out, data, ui); },
+    }, `${x.class ? CLASS_LABEL[x.class] : "All sizes"} · ${plural(x.videos, "video")}`))) : null;
+    const rowOf = (i) => sum.rows.find((r) => r.config === i);
+    const tile = (name, i, byTime) => {
+      const r = rowOf(i), better = r && i !== base;
+      return h("div", { class: "stat" },
+        h("div", { class: "v" }, better ? (byTime ? times(r.time) : rel(r.size)) : "–"),
+        h("div", { class: "l" }, better
+          ? [name, ": ", h("code", {}, configLabel(configs[i])), byTime ? ` · ${rel(r.size)} size` : ` · ${times(r.time)} encode time`]
+          : `${name}: nothing measured beats the default`));
+    };
+    const pickNames = [["smallest", "smallest"], ["balanced", "balanced"], ["fastest", "fastest"]];
+    const bodyRows = new Map();
+    const chart = benchChart(sum, rep, (config) => { for (const [c, tr] of bodyRows) tr.classList.toggle("hi", c === config); });
+    ui.stopChart = chart.stop;
+
+    const classes = sum.class ? [sum.class] : sums.filter((x) => x.class).map((x) => x.class);
+    const inUse = (c) => classes.length > 0 && classes.every((k) => { const t = tuning.find((x) => x.class === k); return t && t.choice.preset === c.preset && t.choice.params === c.params; });
+    const useLabel = sum.class ? `Use for ${CLASS_LABEL[sum.class]}` : "Use for all sizes";
+    const sorted = [...sum.rows].sort((a, b) => {
+      const ka = ui.sort === "setting" ? a.config : a[ui.sort], kb = ui.sort === "setting" ? b.config : b[ui.sort];
+      if (ka == null || kb == null) return (ka == null) - (kb == null);
+      return (ka - kb) * ui.dir || a.config - b.config;
+    });
+    const th = (label, key, title) => h("th", { class: "sort" + (key === "setting" ? "" : " num"), title, onclick: () => {
+      if (ui.sort === key) ui.dir *= -1; else { ui.sort = key; ui.dir = 1; }
+      renderBench(out, data, ui);
+    } }, label + (ui.sort === key ? (ui.dir > 0 ? " ↑" : " ↓") : ""));
+    const body = h("tbody", {}, sorted.map((r) => {
+      const c = configs[r.config];
+      const picks = pickNames.filter(([k]) => sum.picks[k] === r.config && r.config !== base).map(([, n]) => h("span", { class: "pill ok" }, n));
+      const tr = h("tr", { onmouseenter: () => chart.highlight(r.config), onmouseleave: () => chart.highlight(null) },
+        h("td", {}, h("span", { class: "dot" + (r.missing ? " part" : r.pareto ? " on" : ""), title: r.missing ? "" : r.pareto ? "Nothing is both smaller and faster" : "Another setting is both smaller and faster" }),
+          h("code", {}, configLabel(c)), r.config === base ? h("span", { class: "pill" }, "default") : null, picks),
+        h("td", { class: "num" }, rel(r.size)),
+        h("td", { class: "num dim" }, sum.videos > 1 && r.size != null ? `${rel(r.size_best, 0)} to ${rel(r.size_worst, 0)}` : "–"),
+        h("td", { class: "num" }, times(r.time)),
+        h("td", { class: "num" }, r.speed ? num(r.speed, 2) : "–"),
+        h("td", { class: "num" }, r.crf ? num(r.crf, 1) : "–"),
+        h("td", {}, r.missing ? h("span", { class: "pill warn", title: "It failed there or could not reach the target; the numbers cover the other videos" }, `no result on ${plural(r.missing, "video")}`)
+          : inUse(c) ? h("span", { class: "pill ok" }, "in use")
+          : rep.partial ? null
+          : h("button", { class: "small", onclick: () => setTuning(sum.class ? [sum.class] : [], r.config, `${configLabel(c)} is now used for ${sum.class ? CLASS_LABEL[sum.class] : "all sizes measured"}`) }, useLabel)));
+      bodyRows.set(r.config, tr);
+      return tr;
+    }));
+    const swatch = (cls, diamond) => { const v = s("svg", { viewBox: "-8 -8 16 16", class: "pt " + cls }); v.append(diamond ? s("path", { class: "m", d: "M0,-7L7,0L0,7L-7,0Z" }) : s("circle", { class: "m", r: 5 })); return v; };
+    kids.push(h("div", { class: "panel bench-fig" },
+      tabs,
+      [sum.picks.smallest, sum.picks.balanced, sum.picks.fastest].every((i) => i === base)
+        ? h("p", {}, "Nothing measured here beats the default, ", h("code", {}, configLabel(configs[base])), ": no setting is smaller without being slower, or faster without being bigger.")
+        : h("div", { class: "stats" }, tile("Smallest files", sum.picks.smallest, false), tile("Smallest at the default's speed", sum.picks.balanced, false), tile("Fastest at the default's size", sum.picks.fastest, true)),
+      h("div", { class: "legend" },
+        h("span", {}, swatch("on"), "nothing is both smaller and faster"),
+        h("span", {}, swatch(""), "beaten by another setting"),
+        h("span", {}, swatch("", true), "the default"),
+        sum.rows.some((r) => r.missing) ? h("span", {}, swatch("part"), "no result on some videos") : null),
+      chart.el,
+      sum.videos < 3 ? h("p", { class: "warn" }, `Only ${plural(sum.videos, "video")} here: one odd video can decide the order. More videos make it trustworthy.`) : null,
+      sum.left_out ? h("p", { class: "warn" }, `${plural(sum.left_out, "video")} left out: the default setting failed or could not reach the target there.`) : null,
+      h("div", { class: "tablewrap" }, h("table", {},
+        h("thead", {}, h("tr", {}, th("Setting", "setting"), th("Size", "size", "Typical file size against the default at the target quality"),
+          h("th", { class: "num", title: "The videos where it did best and worst" }, "Per video"), th("Encode time", "time", "Typical encode time against the default"),
+          h("th", { class: "num", title: "Seconds of video encoded per second on this machine" }, "× real time"), h("th", { class: "num", title: "Mean CRF that meets the target" }, "CRF"), h("th", {}, ""))),
+        body)),
+      rep.partial ? h("p", { class: "dim" }, "A setting can be put to use once every video is measured.") : null,
+      h("p", { class: "dim" }, "VMAF is the judge here. Settings tuned for metrics (tune=1, tune=2) tend to win on it; tune=0 aims at how the picture looks to people, which VMAF only partly sees. Before switching for a few percent, encode a clip both ways and look at them in Compare.")));
+  }
+  kids.push(tunedPanel);
+
+  if (vids.length) {
+    if (ui.video >= vids.length) ui.video = 0;
+    const info = h("p", { class: "dim" });
+    const vbody = h("tbody");
+    const drawVideo = () => {
+      const v = vids[ui.video];
+      info.textContent = `${v.path} · ${v.codec} ${v.width}×${v.height} · ${num(v.fps, 2)} fps${v.hdr ? " · HDR" : ""} · ${hms(v.duration_s)}${v.source_bitrate ? ` · ${num(v.source_bitrate / 1e6, 2)} Mbps` : ""} · ${CLASS_LABEL[v.class] || v.class}`;
+      if (v.error) { vbody.replaceChildren(h("tr", {}, h("td", { colspan: 8, class: "bad" }, v.error))); return; }
+      const b = v.cells[base] && v.cells[base].point;
+      vbody.replaceChildren(...configs.map((c, i) => {
+        const cell = v.cells[i] || { trials: [] }, p = cell.point;
+        const note = cell.error ? h("span", { class: "pill bad", title: cell.error }, "failed")
+          : !p ? h("span", { class: "pill warn" }, rep.min_crf != null ? `below VMAF ${rep.target_vmaf} even at CRF ${rep.min_crf}` : "target out of reach")
+          : p.capped ? h("span", { class: "pill", title: "The file could be smaller still; a higher CRF isn't tried" }, `VMAF ${num(p.vmaf, 1)} at the highest CRF`) : null;
+        return h("tr", {},
+          h("td", {}, h("code", {}, configLabel(c)), i === base ? h("span", { class: "pill" }, "default") : null),
+          h("td", { class: "num" }, p ? num(p.crf, 1) : "–"),
+          h("td", { class: "num" }, p ? num(p.bitrate / 1e6, 2) : "–"),
+          h("td", { class: "num" }, p && b ? rel(p.bitrate / b.bitrate) : "–"),
+          h("td", { class: "num" }, p ? num(p.cost, 2) : "–"),
+          h("td", { class: "num" }, p && b ? times(p.cost / b.cost) : "–"),
+          h("td", { class: "num" }, cell.trials.length),
+          h("td", {}, note));
+      }));
+    };
+    const sel = h("select", { onchange: (e) => { ui.video = Number(e.target.value); drawVideo(); } }, vids.map((v, i) => h("option", { value: i }, `${basename(v.path)} · ${v.width}×${v.height}`)));
+    sel.value = ui.video;
+    drawVideo();
+    kids.push(h("div", { class: "panel" },
+      h("details", { class: "more", open: ui.videoOpen, ontoggle: (e) => { ui.videoOpen = e.target.open; } }, h("summary", {}, "Each video on its own"),
+        h("div", { class: "row" }, sel), info,
+        h("div", { class: "tablewrap" }, h("table", {},
+          h("thead", {}, h("tr", {}, h("th", {}, "Setting"), h("th", { class: "num" }, "CRF"), h("th", { class: "num" }, "Mbps"), h("th", { class: "num" }, "Size"),
+            h("th", { class: "num", title: "Encode seconds per second of video" }, "Encode s/s"), h("th", { class: "num" }, "Encode time"), h("th", { class: "num", title: "Sample encodes it took to find the CRF" }, "Tries"), h("th", {}, ""))),
+          vbody))),
+      (rep.skipped || []).length ? h("details", { class: "more" }, h("summary", {}, `${plural(rep.skipped.length, "video")} found but not used`),
+        h("div", { class: "tablewrap" }, h("table", {}, h("tbody", {}, rep.skipped.map((x) => h("tr", {}, h("td", { class: "path" }, x.path), h("td", { class: "dim" }, x.reason))))))) : null));
+  }
+  out.replaceChildren(...kids);
+}
+
 // ----- queue -----
 
 const PHASES = { probing: "Probing", sampling: "Cutting samples", searching: "Searching CRF", scenes: "Finding scenes", chunks: "Encoding chunks", encoding: "Encoding", muxing: "Muxing", verifying: "Verifying" };
@@ -1002,11 +1453,12 @@ function vmafColor(v, target) {
 views.queue = (root) => {
   const list = h("div");
   const missing = h("div"); // saved jobs whose files were not there at start
+  const held = h("div", { class: "panel warn", hidden: true }, "A benchmark is running: encodes wait until it ends, so that its timings mean something. ", h("a", { href: "#/bench" }, "Benchmark"));
   root.append(
     h("div", { class: "row" }, h("h1", { class: "grow" }, "Encode queue"),
       h("button", { onclick: async () => { await api("/api/jobs/clear", {}); load(); } }, "Clear finished"),
       h("button", { class: "primary", onclick: async () => { const p = await pick({ title: "Videos or folders to encode", mode: "multi" }); if (p) encodeDialog(p); } }, "New encode…")),
-    missing, list);
+    held, missing, list);
   const drawMissing = (un) => {
     if (!un || !un.length) { missing.replaceChildren(); return; }
     const act = (what) => async () => {
@@ -1034,6 +1486,7 @@ views.queue = (root) => {
     let r;
     try { r = await api("/api/jobs"); } catch (e) { toast(e.message, true); return; }
     jobs = r.jobs;
+    held.hidden = !r.benchmark;
     drawMissing(r.unrestored);
     draw();
   }
@@ -1106,7 +1559,7 @@ views.queue = (root) => {
       statusPill(j.status),
       h("strong", {}, `${j.total} file${j.total === 1 ? "" : "s"}`),
       h("span", { class: "dim" }, `→ ${j.out_dir}`),
-      h("span", { class: "dim" }, `VMAF ${o.target_vmaf} · preset ${o.preset} · ${o.container}${o.scenes ? " · scenes×" + o.workers : ""}${metaLabel(o)}`),
+      h("span", { class: "dim" }, `VMAF ${o.target_vmaf} · preset ${o.preset}${o.svt_params && o.svt_params !== "tune=0" ? " · " + o.svt_params : ""}${o.tuned ? " · tuned by size" : ""} · ${o.container}${o.scenes ? " · scenes×" + o.workers : ""}${metaLabel(o)}`),
       h("span", { class: "spacer" }),
       saved > 0 ? h("span", { class: "ok" }, `${bytes(saved)} saved`) : null,
       h("span", { class: "dim" }, Object.entries(counts).map(([k, v]) => `${v} ${(STATUS[k] || [k])[0].toLowerCase()}`).join(" · ")),
@@ -1178,6 +1631,8 @@ views.queue = (root) => {
 
   const off = onEvent((m) => {
     if (m.kind === "jobs") return reload();
+    if (m.kind === "bench") { held.hidden = m.run.status !== "running"; return; }
+    if (m.kind === "bench_done") { held.hidden = true; return; }
     if (m.kind !== "job") return;
     if (m.event.type === "progress") {
       const live = fileEls.get(`${m.id}:${m.file}`);
@@ -1492,7 +1947,7 @@ function comparePlayer(root, r) {
         kv("Saved", h("span", { class: "ok" }, pct(r.savings, 1))),
         kv("Mode", r.mode === "scenes" ? `per-scene CRF, ${chunks.length} chunks` : "one CRF"),
         kv("CRF", r.mode === "scenes" && chunks.length ? `${Math.min(...chunks.map((c) => c.crf))}–${Math.max(...chunks.map((c) => c.crf))} (start ${r.crf})` : r.crf),
-        kv("Preset", r.preset),
+        kv("Encoder", `preset ${r.preset}${r.svt_params ? " · " + r.svt_params : ""}`),
         kv("Target", `VMAF ${target} (${r.vmaf_model})`),
         r.mean_vmaf != null ? kv("Mean VMAF", num(r.mean_vmaf)) : null,
         kv("Spot checks", (r.verify_vmaf || []).map((v) => num(v)).join(", ") || "–"),

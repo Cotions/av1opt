@@ -55,6 +55,13 @@ fn settings_key(o: &Options) -> String {
         let r: Vec<String> = o.remove.iter().map(|(a, b)| format!("{a}-{b}")).collect();
         k.push_str(&format!(" remove={}", r.join(",")));
     }
+    if o.svt_params != crate::search::DEFAULT_PARAMS {
+        k.push_str(&format!(" svt={}", o.svt_params));
+    }
+    if let Some(t) = &o.tuning {
+        let picks: Vec<String> = t.classes.iter().map(|(c, x)| format!("{}:{}:{}", c.id(), x.preset, x.params)).collect();
+        k.push_str(&format!(" tuned={}", picks.join(",")));
+    }
     k
 }
 

@@ -23,22 +23,69 @@ pub struct Trial {
     pub size_ratio: f64,
 }
 
+/// SVT-AV1 parameters used when none are given. SVT-AV1's own default is tune=1 (PSNR).
+pub const DEFAULT_PARAMS: &str = "tune=0";
+
 pub struct EncodeSettings {
     pub preset: u8,
     pub pix_fmt_out: &'static str,
+    /// SVT-AV1 parameters as `key=value:key=value`, without the CRF.
+    pub params: String,
 }
 
 impl EncodeSettings {
     /// SVT-AV1 takes CRF in quarter steps through its own parameters (ffmpeg's -crf is integer).
     pub fn video_args(&self, crf: f64) -> Vec<String> {
+        let params = if self.params.is_empty() { format!("crf={}", quarter(crf)) } else { format!("{}:crf={}", self.params, quarter(crf)) };
         // Stream specifiers keep these off copied cover-art streams.
-        [
-            "-c:v:0", "libsvtav1", "-preset:v:0", &self.preset.to_string(), "-pix_fmt:v:0", self.pix_fmt_out,
-            "-svtav1-params:v:0", &format!("tune=0:crf={}", quarter(crf)),
-        ]
-        .map(String::from)
-        .to_vec()
+        ["-c:v:0", "libsvtav1", "-preset:v:0", &self.preset.to_string(), "-pix_fmt:v:0", self.pix_fmt_out, "-svtav1-params:v:0", &params]
+            .map(String::from)
+            .to_vec()
     }
+}
+
+/// Checks and tidies a `key=value:key=value` list of SVT-AV1 parameters. Parameters the CRF
+/// search sets itself are refused.
+pub fn parse_params(s: &str) -> Result<String> {
+    const OWNED: [&str; 9] = ["crf", "qp", "rc", "tbr", "mbr", "preset", "passes", "pass", "aq-mode-crf"];
+    let mut out: Vec<String> = Vec::new();
+    for part in s.split(':').map(str::trim).filter(|p| !p.is_empty()) {
+        let Some((k, v)) = part.split_once('=').map(|(k, v)| (k.trim(), v.trim())) else { bail!("SVT-AV1 parameter '{part}' is not key=value") };
+        let plain = |x: &str| !x.is_empty() && x.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+        if !plain(k) || !plain(v) {
+            bail!("SVT-AV1 parameter '{part}': names and values are letters, digits, '-', '_' and '.'");
+        }
+        if OWNED.contains(&k) {
+            bail!("SVT-AV1 parameter '{k}' is set by av1opt (CRF search and --preset)");
+        }
+        if out.iter().any(|o| o.split('=').next() == Some(k)) {
+            bail!("SVT-AV1 parameter '{k}' is given twice");
+        }
+        out.push(format!("{k}={v}"));
+    }
+    Ok(out.join(":"))
+}
+
+/// Tries `params` on a few generated frames: ffmpeg only warns about names SVT-AV1 doesn't
+/// know and carries on without them, which would quietly encode with other settings.
+pub fn check_params(tools: &Tools, preset: u8, params: &str) -> Result<()> {
+    let enc = EncodeSettings { preset: preset.max(8), pix_fmt_out: "yuv420p10le", params: params.to_string() };
+    let mut args: Vec<String> = ["-v", "warning", "-f", "lavfi", "-i", "testsrc2=s=256x144:r=24:d=0.5"].map(String::from).to_vec();
+    args.extend(enc.video_args(35.0));
+    args.extend(["-f", "null", "-"].map(String::from));
+    let stderr = match tools.run(&args) {
+        Ok(s) => s,
+        Err(e) if crate::events::is_cancelled(&e) => return Err(e),
+        Err(e) => {
+            let text = format!("{e:#}");
+            let why = text.lines().find(|l| l.contains("Svt[error]")).map(|l| l.split("Svt[error]:").last().unwrap_or(l).trim().to_string());
+            bail!("SVT-AV1 refuses '{params}'{}", why.map_or(String::new(), |w| format!(": {w}")));
+        }
+    };
+    if let Some(bad) = stderr.lines().find_map(|l| l.split("Error parsing option ").nth(1)) {
+        bail!("SVT-AV1 doesn't know the parameter '{}' (in '{params}')", bad.split(':').next().unwrap_or(bad).trim());
+    }
+    Ok(())
 }
 
 /// Rounds down to SVT-AV1's quarter-step CRF grid.
@@ -340,6 +387,19 @@ mod tests {
         eprintln!("average trials: {avg:.2}");
         // Binary search over 20..=55 needs ~5.2 on average.
         assert!(avg <= 4.0, "average {avg:.2} trials");
+    }
+
+    #[test]
+    fn params_are_tidied_and_checked() {
+        assert_eq!(parse_params(" tune=0 : enable-qm=1:qm-min=0: ").unwrap(), "tune=0:enable-qm=1:qm-min=0");
+        assert_eq!(parse_params("").unwrap(), "");
+        assert_eq!(parse_params("keyint=10s:ac-bias=1.5").unwrap(), "keyint=10s:ac-bias=1.5");
+        for bad in ["tune", "crf=30", "tune=0:tune=1", "a=b c", "x='1'", "=1", "preset=4", "tune=0,enable-qm=1"] {
+            assert!(parse_params(bad).is_err(), "{bad}");
+        }
+        let enc = |params: &str| EncodeSettings { preset: 6, pix_fmt_out: "yuv420p10le", params: params.into() };
+        assert_eq!(enc("tune=0").video_args(35.3).last().unwrap(), "tune=0:crf=35.25");
+        assert_eq!(enc("").video_args(35.0).last().unwrap(), "crf=35");
     }
 
     #[test]

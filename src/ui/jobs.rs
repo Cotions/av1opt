@@ -22,6 +22,12 @@ pub struct JobOptions {
     pub target_vmaf: f64,
     #[serde(default = "d_preset")]
     pub preset: u8,
+    /// SVT-AV1 parameters besides the CRF; None for the defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub svt_params: Option<String>,
+    /// Use the benchmark's picks per resolution class where there are any.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tuned: bool,
     #[serde(default)]
     pub scenes: bool,
     #[serde(default = "d_workers")]
@@ -95,6 +101,11 @@ impl JobOptions {
             container,
             target_vmaf: self.target_vmaf,
             preset: self.preset,
+            svt_params: match self.svt_params.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+                Some(p) => crate::search::parse_params(p)?,
+                None => crate::search::DEFAULT_PARAMS.to_string(),
+            },
+            tuning: if self.tuned { Some(crate::tuning::Tuning::load()?) } else { None },
             min_crf: 20,
             max_crf: 55,
             samples: 4,
@@ -186,6 +197,11 @@ pub struct Queue {
     unrestored: Mutex<Vec<(Value, String)>>,
 }
 
+/// True while a job is encoding.
+pub fn encoding(app: &App) -> bool {
+    app.jobs.jobs.lock().unwrap().iter().any(|j| j.status == "running")
+}
+
 /// True once the server is stopping: no new work may start.
 pub fn shutting_down(app: &App) -> bool {
     app.jobs.shutting_down.load(Ordering::SeqCst)
@@ -197,6 +213,7 @@ pub fn shutdown(app: &App) {
     app.jobs.shutting_down.store(true, Ordering::SeqCst);
     app.preview_hooks.cancel();
     super::dups::shutdown(app);
+    super::bench::shutdown(app);
     for j in app.jobs.jobs.lock().unwrap().iter_mut() {
         j.cancel_requested = true;
         if let Some(h) = &j.hooks {
@@ -238,7 +255,8 @@ fn full(j: &Job) -> Value {
 
 pub fn list(app: &App) -> Value {
     let jobs: Vec<Value> = app.jobs.jobs.lock().unwrap().iter().map(full).collect();
-    json!({ "jobs": jobs, "unrestored": unrestored_list(app) })
+    // Queued jobs wait while a benchmark measures; the page says so.
+    json!({ "jobs": jobs, "unrestored": unrestored_list(app), "benchmark": super::bench::running(app) })
 }
 
 /// Headers only, for the queue badge.
@@ -281,6 +299,14 @@ pub fn add(app: &App, body: &Value) -> Result<Value> {
     }
     if let Some(p) = app.encode_problem() {
         bail!("{p} (see Settings)");
+    }
+    // ffmpeg carries on without parameters SVT-AV1 doesn't know; better said now than found
+    // in a finished encode. (Jobs restored at startup were checked when they were added.)
+    if let Some(o) = body.get("options").filter(|o| !o.is_null()) {
+        let o = serde_json::from_value::<JobOptions>(o.clone())?.to_options()?;
+        if o.svt_params != crate::search::DEFAULT_PARAMS {
+            crate::search::check_params(&app.tools(1), o.preset, &o.svt_params)?;
+        }
     }
     add_unchecked(app, body)
 }
@@ -581,8 +607,11 @@ pub fn start_worker(app: Arc<App>) {
                 // Checked before taking the lock: probing runs ffmpeg. With unusable tools,
                 // queued jobs wait (the page shows why) instead of failing.
                 let tools_ok = app.encode_problem().is_none();
+                // A benchmark measures encode times: jobs wait until it is done (it wakes us).
+                let benchmarking = super::bench::running(&app);
                 let mut jobs = app.jobs.jobs.lock().unwrap();
                 if tools_ok
+                    && !benchmarking
                     && !app.jobs.shutting_down.load(Ordering::SeqCst)
                     && let Some(j) = jobs.iter_mut().find(|j| j.status == "queued")
                 {

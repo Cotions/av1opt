@@ -425,3 +425,104 @@ fn duplicate_search_runs_and_guards_its_files() {
     assert_eq!(s.get("/thumb").status, 400);
     assert_eq!(s.post("/api/dups/pair", &json!({ "left": a, "right": "/etc/passwd" })).status, 400);
 }
+
+#[test]
+fn benchmark_requests_and_tuned_settings() {
+    // A finished benchmark of an earlier session: three settings, the third without a result
+    // on one 1080p video.
+    let row = |config: usize, size: f64, time: f64, missing: usize| {
+        json!({ "config": config, "size": size, "time": time, "size_worst": size, "size_best": size, "crf": 33.0, "speed": 1.0, "missing": missing, "pareto": missing == 0 })
+    };
+    let summary = |class: Value, videos: usize| {
+        json!({ "class": class, "videos": videos, "left_out": 0, "rows": [row(0, 1.0, 1.0, 0), row(1, 0.9, 1.5, 0), row(2, 1.3, 0.5, 1)],
+            "picks": { "smallest": 1, "balanced": 0, "fastest": 0 } })
+    };
+    let report = json!({
+        "format": 1, "made": 1_700_000_000u64, "encoder": "ffmpeg version test", "target_vmaf": 93.0, "min_crf": 20, "max_crf": 55, "samples": 2, "sample_secs": 6.0,
+        "configs": [{ "preset": 6, "params": "tune=0" }, { "preset": 4, "params": "tune=0:enable-qm=1" }, { "preset": 10, "params": "tune=0" }],
+        "baseline": 0, "videos": [], "summaries": [summary(Value::Null, 2), summary(json!("hd"), 2)], "skipped": [],
+        "elapsed_secs": 60.0, "fresh": 10, "cached": 0,
+    });
+    let s = Server::start("bench", |d| {
+        std::fs::write(d.join("videos/a.mkv"), b"x").unwrap();
+        std::fs::write(d.join("data/av1opt/bench-last.json"), report.to_string()).unwrap();
+        let saved = json!({ "format": 1, "jobs": [{ "inputs": [d.join("videos/a.mkv")], "roots": [], "out_dir": d.join("out"), "options": { "tuned": true, "svt_params": "tune=2" } }] });
+        std::fs::write(d.join("data/av1opt/ui-queue.json"), saved.to_string()).unwrap();
+    });
+    let videos = s.dir.join("videos");
+
+    // What the page starts from: no run, the saved result, nothing tuned, the defaults.
+    let b = s.get("/api/bench").json();
+    assert!(b["run"].is_null(), "{b}");
+    assert_eq!(b["report"]["configs"][1]["preset"], 4, "{b}");
+    assert_eq!(b["tuning"], json!([]));
+    assert_eq!(b["defaults"]["baseline"], json!({ "preset": 6, "params": "tune=0" }));
+    assert_eq!(b["defaults"]["presets"], json!([4, 6, 8]));
+    assert!(b["defaults"]["param_sets"].as_array().unwrap().contains(&json!("tune=0")));
+    let st = s.get("/api/state").json();
+    assert_eq!(st["tuning"], json!([]));
+    assert_eq!(st["default_svt_params"], "tune=0");
+
+    // Bad requests are refused before anything runs.
+    for (body, why) in [
+        (json!({ "paths": [] }), "folder"),
+        (json!({ "paths": [videos], "target_vmaf": 30 }), "VMAF"),
+        (json!({ "paths": [videos], "presets": [14] }), "presets"),
+        (json!({ "paths": [videos], "presets": [] }), "presets"),
+        (json!({ "paths": [videos], "max_videos": 0 }), "videos"),
+        (json!({ "paths": [videos], "samples": 9 }), "clips"),
+        (json!({ "paths": [videos], "param_sets": ["crf=20"] }), "crf"),
+        (json!({ "paths": [videos], "param_sets": ["tune"] }), "tune"),
+        (json!({ "paths": [videos], "presets": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13] }), "settings"),
+    ] {
+        let r = s.post("/api/bench", &body);
+        assert_eq!(r.status, 400, "{body}: {}", r.body);
+        assert!(r.body.contains(why), "{body}: {}", r.body);
+    }
+    // `false` is no ffmpeg: a good request says where to fix that, and nothing starts.
+    let r = s.post("/api/bench", &json!({ "paths": [videos] }));
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert!(r.body.contains("Settings"), "{}", r.body);
+    assert!(s.get("/api/bench").json()["run"].is_null());
+    assert_eq!(s.post("/api/bench/cancel", &json!({})).status, 200);
+
+    // Settings come from the result on the page, with that size's own numbers.
+    let r = s.post("/api/bench/tuning", &json!({ "classes": ["hd"], "config": 1 }));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let t = r.json();
+    assert_eq!(t["tuning"][0]["class"], "hd");
+    assert_eq!(t["tuning"][0]["label"], "1080p");
+    assert_eq!(t["tuning"][0]["choice"]["preset"], 4);
+    assert_eq!(t["tuning"][0]["choice"]["params"], "tune=0:enable-qm=1");
+    assert_eq!(t["tuning"][0]["choice"]["videos"], 2);
+    let file: Value = serde_json::from_slice(&std::fs::read(s.data("tuning.json")).unwrap()).unwrap();
+    assert_eq!(file["format"], 1);
+    assert_eq!(file["classes"]["hd"]["size"], 0.9);
+    assert_eq!(s.get("/api/state").json()["tuning"][0]["choice"]["preset"], 4);
+    assert_eq!(s.get("/api/bench").json()["tuning"][0]["class"], "hd");
+
+    // Not a setting without a result somewhere, one that isn't there, a size nothing was
+    // measured for, or a size that doesn't exist.
+    for (body, why) in [
+        (json!({ "classes": ["hd"], "config": 2 }), "no result"),
+        (json!({ "classes": ["hd"], "config": 7 }), "no such setting"),
+        (json!({ "classes": ["uhd"], "config": 1 }), "no videos of that size"),
+        (json!({ "classes": ["4k"], "config": 1 }), "4k"),
+    ] {
+        let r = s.post("/api/bench/tuning", &body);
+        assert_eq!(r.status, 400, "{body}: {}", r.body);
+        assert!(r.body.contains(why), "{body}: {}", r.body);
+    }
+    assert_eq!(s.get("/api/bench").json()["tuning"].as_array().unwrap().len(), 1, "refused requests change nothing");
+
+    // "All sizes" sets every size the result has, and forgetting takes them away again.
+    let r = s.post("/api/bench/tuning", &json!({ "config": 0 }));
+    assert_eq!(r.json()["tuning"][0]["choice"]["preset"], 6, "{}", r.body);
+    let r = s.post("/api/bench/tuning", &json!({ "classes": ["hd"], "config": null }));
+    assert_eq!(r.json()["tuning"], json!([]), "{}", r.body);
+
+    // A saved job keeps its encoder options.
+    let o = &s.get("/api/jobs/heads").json()["jobs"][0]["options"];
+    assert_eq!(o["tuned"], true, "{o}");
+    assert_eq!(o["svt_params"], "tune=2");
+}

@@ -3,11 +3,12 @@
 Shrink video libraries by re-encoding to AV1 at a target perceptual quality (VMAF),
 instead of one fixed setting for everything. Built on stock FFmpeg with SVT-AV1 and libvmaf.
 
-Three commands:
+Four commands:
 
 - `scan` — read-only survey of a library: what each file is, what re-encoding would roughly save.
 - `dups` — read-only search for videos that are kept more than once.
 - `encode` — per-file CRF search against a VMAF target, full encode, verification, report.
+- `bench` — which preset and SVT-AV1 parameters pay off on your own videos, measured.
 
 ## Requirements
 
@@ -90,7 +91,8 @@ For each file:
    save less than `--min-savings` (15%). HDR10 and HLG are encoded with their colour signalling
    and mastering/light-level metadata intact (VMAF is then measured on the HDR signal, which
    tracks encoding damage but is not calibrated like SDR scores).
-4. **Encode** – SVT-AV1, 10-bit. Audio already in AAC/Opus/MP3 is copied, anything else becomes
+4. **Encode** – SVT-AV1, 10-bit, `--preset` 6 with `tune=0` unless `--svt-params` or `--tuned`
+   say otherwise (see [bench](#bench)). Audio already in AAC/Opus/MP3 is copied, anything else becomes
    Opus. MP4 output keeps text subtitles (as mov_text) and plays in Chrome and Firefox; use
    `--container mkv` to keep image subtitles too. Cover art is kept (MP4: attached picture,
    MKV: attachment with its original file name).
@@ -178,6 +180,57 @@ skipped, and files skipped for a reason (low savings, ...) are not searched agai
 `--retry-skipped` is given. If two inputs would produce the same output name (same file name
 from two input folders), the second is reported as a name collision instead of being skipped.
 
+## bench
+
+```
+av1opt bench /videos [--presets 4,6,8] [--params tune=0 --params tune=2:enable-qm=1] [--save]
+```
+
+Answers "would another preset or SVT-AV1 parameter give me smaller files, and what would it
+cost in encode time?" on your own videos instead of someone else's test clips. Read-only for the
+videos.
+
+1. **Pick** – up to `--max-videos` (6) videos, spread evenly over the folders given and over
+   three size classes: 720p and below, 1080p, above 1080p (by pixel count, so portrait and
+   cropped videos count with their landscape peers). Dolby Vision and very short files are left out.
+2. **Measure** – `--samples` (2) lossless clips of `--sample-secs` (6) seconds per video. Every
+   setting (each preset with each parameter set, plus the default: preset 6 with `tune=0`) gets
+   the same CRF search as `encode`, so each ends at the target VMAF; every sample encode is timed.
+3. **Compare at equal quality** – a setting's size and time at exactly the target are read
+   between the last CRF that passes and the first that fails. Settings are then compared with
+   the default per video and averaged as ratios (geometric mean), for all videos and per size
+   class. A setting that fails or cannot reach the target on a video the default manages is
+   shown with a note and never picked.
+4. **Pick winners** – *smallest* (whatever the time), *balanced* (smallest within 10% of the
+   default's encode time) and *fastest* (within 2% of the default's size). Differences under 1%
+   count as none: the default stays.
+
+The table lists every setting with size and time against the default, the best and worst video,
+and marks the ones no other setting beats on both counts. `--csv` writes one row per video and
+setting, `--json` everything including each sample encode.
+
+`--save [balanced|smallest|fastest]` stores the winner of each size class in
+`~/.local/share/av1opt/tuning.json`; `av1opt encode --tuned` then takes preset and parameters from
+there by the video's size (classes without an entry use `--preset` and `--svt-params`).
+`av1opt tuning` shows what is stored, `av1opt tuning --clear` forgets it. Without `--tuned`
+nothing changes: `encode --svt-params key=value:key=value` sets parameters by hand.
+
+Sample encodes are remembered in `~/.cache/av1opt/bench-v1.jsonl` (by file, clip layout,
+encoder build, preset, parameters and CRF), so a stopped run carries on where it was and adding
+a setting later only measures the new one. `--refresh` measures again.
+
+Read the result with these in mind:
+
+- **VMAF is the judge.** Settings tuned for metrics (`tune=1`, `tune=2`) tend to win on it;
+  `tune=0` aims at how the picture looks to people, which VMAF only partly sees. Compare a clip
+  by eye (the UI's Compare) before switching away from it on a few percent.
+- **Times are wall-clock on this machine**, including reading the lossless clip. Run it on an
+  otherwise idle machine; small differences in time are noise.
+- **A dozen seconds per video is a sample.** More videos (`--max-videos`) say more than more
+  settings; the per-video range in the table shows how much the videos disagree.
+- Parameter names SVT-AV1 doesn't know are refused up front: ffmpeg would only warn and encode
+  without them.
+
 ## ui (optional)
 
 ```
@@ -200,6 +253,12 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
   (click to seek). Sources the browser can't decode (HEVC in some browsers, MPEG-2, ...) are shown as a
   20 s near-lossless H.264 preview made on demand in `~/.cache/av1opt/previews`, never next to
   the source; MKV outputs the browser won't open are remuxed to MP4 there too.
+- **Benchmark**: the `bench` comparison with progress and a Stop button, results while it
+  runs, and a chart of size against encode time per size class (hover a dot for its numbers;
+  the table below has them all). "Use for…" on a row makes that setting the tuned one for the
+  size class; the encode dialog then offers "Use the benchmark's settings by video size".
+  Encodes wait while a benchmark runs and a benchmark won't start during an encode, so the
+  timings mean something. The last result is kept in `~/.local/share/av1opt/bench-last.json`.
 - **History**: every report found in the output folders used so far (and folders you add).
 
 The server listens on 127.0.0.1 only and prints a sign-in link with a random token (the browser
@@ -255,7 +314,7 @@ environment, so set the ffmpeg path once in Settings.
 
 ### Saved files and versions
 
-Reports, history lines, `ui.json`, `ui-queue.json` and the scene-mode work folders carry a
+Reports, history lines, `ui.json`, `ui-queue.json`, `tuning.json`, benchmark results and the scene-mode work folders carry a
 `format` number. Files from before versioning count as format 1. A newer av1opt keeps reading
 older files; an older one skips reports and history lines from a newer format, leaves a newer
 `ui.json` untouched, sets a newer `ui-queue.json` aside as `ui-queue.format<N>.json`, and starts
@@ -265,8 +324,8 @@ a scene-mode file over rather than resuming a work folder of another format.
 
 `AV1OPT_DEBUG=1` prints every ffmpeg command. `--keep-temp` keeps samples and the partial encode.
 `cargo test --features ui` also runs `tests/ui_api.rs`, which starts the real `av1opt ui` and
-checks sign-in, request checks, media access, the job queue and the duplicate search over HTTP
-(no ffmpeg needed).
+checks sign-in, request checks, media access, the job queue, the duplicate search and the
+benchmark's requests and tuned settings over HTTP (no ffmpeg needed).
 
 ## Lessons baked in
 
@@ -281,10 +340,13 @@ checks sign-in, request checks, media access, the job queue and the duplicate se
 - **CRF has quarter steps.** `-svtav1-params crf=35.25` works; integer CRF alone left every
   chunk ~0.3 VMAF above target.
 - **Cover art can be a plain video stream.** Pick the real video by codec, not "first video stream".
+- **ffmpeg ignores `-svtav1-params` names it can't parse.** A typo only prints a warning and the
+  encode runs without the option, so parameters are tried on a few generated frames first.
 
 ## Tests
 
 `cargo test` covers the CRF search (exactness against brute force, trial count), chunk CRF
 estimation, scene chunk planning, sample placement, frame-rate snapping and source filters, plus
 the duplicate finder's hashes (scaling, noise, black bars, flat frames), pair rules and keep
-suggestions.
+suggestions, and the benchmark's arithmetic (size and time at the target, comparison across
+videos, picks, spreading the test videos).

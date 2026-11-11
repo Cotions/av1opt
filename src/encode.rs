@@ -17,6 +17,11 @@ pub struct Options {
     pub container: Container,
     pub target_vmaf: f64,
     pub preset: u8,
+    /// SVT-AV1 parameters besides the CRF (`key=value:...`), normally [`search::DEFAULT_PARAMS`].
+    pub svt_params: String,
+    /// Benchmark picks per resolution class; where a class has one, it replaces `preset` and
+    /// `svt_params`.
+    pub tuning: Option<crate::tuning::Tuning>,
     pub min_crf: u8,
     pub max_crf: u8,
     pub samples: usize,
@@ -80,6 +85,8 @@ struct Report<'a> {
     mode: &'a str,
     crf: f64,
     preset: u8,
+    /// SVT-AV1 parameters besides the CRF.
+    svt_params: &'a str,
     target_vmaf: f64,
     vmaf_model: &'a str,
     /// Frame-weighted VMAF of the final chunks (scene mode only).
@@ -179,7 +186,9 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     // 4K VMAF with many threads was part of the memory blow-up in the first pilot.
     let vmaf_threads = if info.width.max(info.height) >= 3200 { threads.min(4) } else { threads };
-    let enc = EncodeSettings { preset: o.preset, pix_fmt_out: "yuv420p10le" };
+    let tuned = o.tuning.as_ref().and_then(|t| t.pick(info.width, info.height));
+    let (preset, svt_params) = tuned.map_or((o.preset, o.svt_params.as_str()), |c| (c.preset, c.params.as_str()));
+    let enc = EncodeSettings { preset, pix_fmt_out: "yuv420p10le", params: svt_params.to_string() };
     let model = search::vmaf_model(&info);
 
     eprintln!(
@@ -193,6 +202,15 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     // Scene mode joins constant-rate chunks; a variable-rate source would be retimed, so it
     // keeps the single-pass path.
     let mut notes = Vec::new();
+    if o.tuning.is_some() {
+        let class = crate::tuning::Class::of(info.width, info.height).label();
+        notes.push(match tuned {
+            Some(_) => format!("tuned settings for {class}: preset {preset}, {svt_params}"),
+            None => format!("no tuned settings for {class}: preset {preset}, {svt_params}"),
+        });
+    } else if svt_params != search::DEFAULT_PARAMS {
+        notes.push(format!("SVT-AV1 parameters: {svt_params}"));
+    }
     if info.hdr {
         // libvmaf's models are trained on SDR; on PQ/HLG pixels the score still tracks
         // encoding damage, but its absolute meaning differs from SDR.
@@ -219,7 +237,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     } else if o.scenes && info.vfr {
         notes.push("variable frame rate source: encoded in one pass instead of per scene".to_string());
     }
-    let work = scenes.then(|| work_dir(input, out_dir, size, o)).transpose()?;
+    let work = scenes.then(|| work_dir(input, out_dir, size, o, preset, svt_params)).transpose()?;
     let saved: Option<scenes::Plan> = work.as_ref().and_then(|w| {
         let p: scenes::Plan = serde_json::from_slice(&std::fs::read(w.path.join("plan.json")).ok()?).ok()?;
         (p.key == w.key).then_some(p)
@@ -232,7 +250,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
             (Some(p.best), p.trials.clone(), Vec::new())
         }
         None => {
-            eprintln!("searching CRF for VMAF >= {} ({model}, preset {})", o.target_vmaf, o.preset);
+            eprintln!("searching CRF for VMAF >= {} ({model}, preset {preset})", o.target_vmaf);
             tools.emit(Event::Phase { phase: "sampling".into(), detail: format!("{} samples", o.samples) });
             let pos = match &cut {
                 Some(c) => c.sample_positions(o.samples, o.sample_secs),
@@ -240,7 +258,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
             };
             let samples = search::extract_samples(tools, input, &info, &tmp.path, pos)?;
             let params = SearchParams { target_vmaf: o.target_vmaf, min_crf: o.min_crf, max_crf: o.max_crf, vmaf_threads };
-            tools.emit(Event::Phase { phase: "searching".into(), detail: format!("VMAF >= {} ({model}, preset {})", o.target_vmaf, o.preset) });
+            tools.emit(Event::Phase { phase: "searching".into(), detail: format!("VMAF >= {} ({model}, preset {preset})", o.target_vmaf) });
             let (best, trials) = search::search(tools, &info, &samples, &tmp.path, &enc, &params)?;
             (best, trials, samples)
         }
@@ -283,7 +301,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         if !vf.is_empty() {
             notes.push(format!("video filters: {}", vf.join(",")));
         }
-        let probe = EncodeSettings { preset: (o.preset + 4).clamp(o.preset, 12), pix_fmt_out: enc.pix_fmt_out };
+        let probe = EncodeSettings { preset: (preset + 4).clamp(preset, 12), pix_fmt_out: enc.pix_fmt_out, params: enc.params.clone() };
         let plan = match saved {
             Some(p) => p,
             None => {
@@ -321,7 +339,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
             eprintln!("note: {n}");
             tools.emit(Event::Note { text: n.clone() });
         }
-        tools.emit(Event::Phase { phase: "encoding".into(), detail: format!("crf {}, preset {}", best.crf, o.preset) });
+        tools.emit(Event::Phase { phase: "encoding".into(), detail: format!("crf {}, preset {preset}", best.crf) });
         tools.run_with_progress(&args, out_duration, "encoding")?;
         (streams, None, None)
     };
@@ -366,7 +384,8 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         savings: 1.0 - output_bytes as f64 / size as f64,
         mode: if chunks.is_some() { "scenes" } else { "whole" },
         crf: best.crf,
-        preset: o.preset,
+        preset,
+        svt_params,
         target_vmaf: o.target_vmaf,
         vmaf_model: model,
         mean_vmaf: chunks.as_deref().map(scenes::mean_vmaf),
@@ -386,7 +405,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         Some(c) => c.iter().map(|r| r.bytes).sum::<u64>() as f64 * 8.0 / info.duration_s,
         None => out_info.video_bitrate,
     };
-    let record = history::Record::new(&info, video_bitrate, o.target_vmaf, o.preset, report.mode);
+    let record = history::Record::new(&info, video_bitrate, o.target_vmaf, preset, report.mode);
     // A cut encoded below the target would teach the size model wrong sizes for it.
     if let Err(e) = if reached { history::append(&record) } else { Ok(()) } {
         eprintln!("warning: could not record this encode in the history: {e:#}");
@@ -423,16 +442,20 @@ struct WorkDir {
     key: String,
 }
 
-fn work_dir(input: &Path, out_dir: &Path, size: u64, o: &Options) -> Result<WorkDir> {
+fn work_dir(input: &Path, out_dir: &Path, size: u64, o: &Options, preset: u8, svt_params: &str) -> Result<WorkDir> {
     let mtime = std::fs::metadata(input)?
         .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_secs());
-    let key = format!(
-        "v{PLAN_FORMAT}|{}|{size}|{mtime}|{}|{}|{}|{}|{}|{}",
-        std::path::absolute(input)?.display(), o.target_vmaf, o.preset, o.min_crf, o.max_crf, o.samples, o.sample_secs
+    let mut key = format!(
+        "v{PLAN_FORMAT}|{}|{size}|{mtime}|{}|{preset}|{}|{}|{}|{}",
+        std::path::absolute(input)?.display(), o.target_vmaf, o.min_crf, o.max_crf, o.samples, o.sample_secs
     );
+    // Only when they differ, so work folders from before this setting existed still resume.
+    if svt_params != search::DEFAULT_PARAMS {
+        key.push_str(&format!("|{svt_params}"));
+    }
     // Created only when chunk work starts, so skipped files leave nothing behind.
     let path = out_dir.join(format!("{WORK_PREFIX}{:016x}", scenes::fnv1a(&key)));
     Ok(WorkDir { path, key })

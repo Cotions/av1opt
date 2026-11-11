@@ -53,6 +53,8 @@ pub fn state(app: &App) -> Value {
         "version": env!("CARGO_PKG_VERSION"),
         "api": super::API_VERSION,
         "meta_presets": crate::metadata::PRESETS,
+        "tuning": super::bench::tuning_json(&crate::tuning::Tuning::load().unwrap_or_default()),
+        "default_svt_params": crate::search::DEFAULT_PARAMS,
     })
 }
 

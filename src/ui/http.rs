@@ -1,6 +1,6 @@
 //! Request handling: session check, routing, static files, the event stream and media ranges.
 
-use super::{App, dups, err_json, jobs, library};
+use super::{App, bench, dups, err_json, jobs, library};
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -161,6 +161,10 @@ fn api(app: &Arc<App>, m: &Method, path: &str, q: &[(String, String)], body: &Va
         (Method::Post, ["dups", "pair"]) => dups::pair(app, body),
         (Method::Get, ["dups", id]) => dups::get(app, id.parse()?),
         (Method::Post, ["dups", id, "cancel"]) => dups::cancel(app, id.parse()?),
+        (Method::Get, ["bench"]) => bench::get(app),
+        (Method::Post, ["bench"]) => bench::start(app, body),
+        (Method::Post, ["bench", "cancel"]) => bench::cancel(app),
+        (Method::Post, ["bench", "tuning"]) => bench::tune(app, body),
         (Method::Get, ["jobs"]) => Ok(jobs::list(app)),
         (Method::Get, ["jobs", "heads"]) => Ok(jobs::heads(app)),
         (Method::Post, ["jobs", "unrestored", "retry"]) => jobs::unrestored_action(app, true),

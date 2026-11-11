@@ -68,10 +68,12 @@ button.primary:hover { background: #63d3b1; }
 button.danger { color: var(--bad); }
 button.small { padding: 2px 8px; font-size: 12px; }
 button:disabled { opacity: .45; cursor: default; }
-input, select {
+input, select, textarea {
   background: var(--bg); color: var(--text); border: 1px solid var(--line);
   border-radius: var(--radius); padding: 5px 8px; font: inherit;
 }
+textarea { resize: vertical; width: min(460px, 100%); }
+textarea.mono, input.mono { font-family: ui-monospace, "JetBrains Mono", "DejaVu Sans Mono", monospace; font-size: 12.5px; }
 input[type=number] { width: 80px; }
 input[type=checkbox] { accent-color: var(--accent); }
 label.field { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--dim); }
@@ -224,3 +226,35 @@ details.more[open] > summary { margin-bottom: 10px; }
 .dup-info { flex: 1; min-width: 0; }
 .dup-info .name { word-break: break-all; }
 .timeline svg.plain { height: 18px; cursor: pointer; }
+
+/* benchmark */
+.tabs { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 12px; }
+.tabs button.active { background: #1e3b33; border-color: var(--accent-dim); color: var(--accent); }
+.checks-row { display: flex; gap: 4px 14px; flex-wrap: wrap; }
+h3.flat { margin: 0; }
+.tuned-row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; padding: 7px 0; border-bottom: 1px solid var(--line); }
+.bench-fig .stats { margin-bottom: 12px; }
+.bench-fig .stat { background: var(--panel2); }
+.legend { display: flex; gap: 6px 18px; flex-wrap: wrap; font-size: 12px; color: var(--dim); }
+.legend span { display: inline-flex; gap: 6px; align-items: center; }
+.legend svg { width: 14px; height: 14px; flex: none; }
+.bench-chart { position: relative; margin: 6px 0 12px; }
+.bench-chart svg { display: block; }
+.bench-chart text { font-size: 11px; fill: var(--dim); }
+.bench-chart text.lbl { fill: var(--text); paint-order: stroke; stroke: var(--panel); stroke-width: 4px; stroke-linejoin: round; }
+.bench-chart .grid { stroke: var(--line); stroke-width: 1; }
+.bench-chart .base { stroke: var(--dim); stroke-width: 1; stroke-dasharray: 4 4; opacity: .7; }
+.bench-chart .front { fill: none; stroke: var(--accent); stroke-width: 1.5; opacity: .4; }
+.bench-chart .tooltip { z-index: 2; text-align: left; }
+.pt { outline: none; }
+.pt .hit { fill: transparent; }
+.pt .m { fill: var(--dim); stroke: var(--panel); stroke-width: 2; }
+.pt.on .m { fill: var(--accent); }
+.pt.part .m { fill: var(--panel); stroke: var(--dim); stroke-width: 1.5; }
+.pt.hi .m, .pt:focus-visible .m { stroke: var(--text); }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--dim); margin-right: 8px; }
+.dot.on { background: var(--accent); }
+.dot.part { background: none; border: 1.5px solid var(--dim); }
+tr.hi td { background: var(--panel2); }
+td .pill { margin-left: 6px; }
+td .pill:first-child { margin-left: 0; }

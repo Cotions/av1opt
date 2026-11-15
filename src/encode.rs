@@ -384,10 +384,10 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     });
 
     let t0 = tools.stopwatch();
-    let (best, mut trials, mut lab, params) = match &saved {
+    let (best, mut trials, mut lab, params, positions) = match &saved {
         Some(p) => {
             eprintln!("resuming earlier run: crf {} from the saved search", p.best.crf);
-            (search::Outcome::Found(p.best), p.trials.clone(), None, None)
+            (search::Outcome::Found(p.best), p.trials.clone(), None, None, None)
         }
         None => {
             // A trial that misses the target while already too large to be worth it settles
@@ -402,11 +402,11 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
                 None => search::sample_positions(info.duration_s, o.samples, o.sample_secs),
             };
             let cache = search::TrialCache::open(input, size, &pos, tools.encoder_version(), !o.fresh_search);
-            let mut lab = search::Lab::new(tools, input, &info, &tmp.path, pos, vmaf_threads, cache);
+            let mut lab = search::Lab::new(tools, input, &info, &tmp.path, pos.clone(), vmaf_threads, cache);
             let params = SearchParams { target_vmaf: o.target_vmaf, min_crf: o.min_crf, max_crf: o.max_crf, start_crf, max_size_ratio, worst_sample: None };
             tools.emit(Event::Phase { phase: "searching".into(), detail: format!("VMAF >= {} ({model}, preset {preset}), from CRF {start_crf}", o.target_vmaf) });
             let (best, trials) = search::search(&mut lab, &enc, &params)?;
-            (best, trials, Some(lab), Some(params))
+            (best, trials, Some(lab), Some(params), Some(pos))
         }
     };
     // With sections removed the output is wanted anyway: settle for the best quality tried.
@@ -562,7 +562,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         tools.run_with_progress(&args, out_duration, "encoding")?;
         (streams, None, None)
     };
-    let encode_secs = t1.secs(tools);
+    let mut encode_secs = t1.secs(tools);
     if chunks.is_some() {
         for n in &notes {
             eprintln!("note: {n}");
@@ -572,7 +572,73 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
 
     eprintln!("verifying");
     tools.emit(Event::Phase { phase: "verifying".into(), detail: "streams, duration, VMAF spot checks".into() });
-    let (verify_vmaf, out_info) = verify(tools, input, &info, &partial, &streams, expect_frames, cut.as_ref(), o.target_vmaf.min(best.mean_vmaf), vmaf_threads, &tmp.path)?;
+    let mut verified = verify(tools, input, &info, &partial, &streams, expect_frames, cut.as_ref(), o.target_vmaf.min(best.mean_vmaf), vmaf_threads, &tmp.path);
+    // A stretch the samples missed: now that it is known, it is a sample. One CRF found
+    // with it, one more encode; a second failure stands.
+    if let Err(e) = &verified
+        && let Some(low) = e.downcast_ref::<LowSpot>()
+        && chunks.is_none()
+        && cut.is_none()
+        && let (Some(pos), Some(params)) = (&positions, params)
+    {
+        let t2 = tools.stopwatch();
+        // Twice the margin: this stretch has read lower as a spot check than samples like
+        // it promised, and a third encode is not on offer.
+        let aim = o.target_vmaf - VERIFY_SLACK + 2.0 * HOLD_MARGIN;
+        let (at, lowest) = low.worst();
+        eprintln!("spot check at {} scored VMAF {lowest:.2}, a stretch the samples missed: searching again with it as a sample", hms(at));
+        tools.emit(Event::Phase { phase: "searching".into(), detail: format!("again, with the stretch at {} (VMAF {lowest:.2}) as a sample", hms(at)) });
+        let mut pos = pos.clone();
+        pos.extend(low.windows.iter().map(|w| (w.0, w.1)));
+        let cache = search::TrialCache::open(input, size, &pos, tools.encoder_version(), !o.fresh_search);
+        let mut lab = search::Lab::new(tools, input, &info, &tmp.path, pos, vmaf_threads, cache);
+        let start_crf = (best.crf - ((aim - lowest) / search::VMAF_PER_CRF).max(1.0)).floor().max(o.min_crf as f64) as u8;
+        let (found, all) = search::search(&mut lab, &enc, &SearchParams { worst_sample: Some(aim), start_crf, ..params })?;
+        lab.discard_samples();
+        match found {
+            search::Outcome::Found(b) if b.crf < best.crf => {
+                let predicted_savings = 1.0 - b.size_ratio;
+                tools.emit(Event::Chosen { crf: b.crf, vmaf: b.mean_vmaf, predicted_savings });
+                eprintln!("chose crf {} (VMAF {:.2}), predicted video savings {:.0}%", b.crf, b.mean_vmaf, predicted_savings * 100.0);
+                if predicted_savings < o.min_savings && !o.force {
+                    skip!(
+                        "a spot check at {} scored VMAF {lowest:.2} at CRF {}; the CRF that holds that stretch ({}) saves {:.0}%, below --min-savings {:.0}%",
+                        hms(at), best.crf, b.crf, predicted_savings * 100.0, o.min_savings * 100.0
+                    );
+                }
+                let n = format!(
+                    "CRF {} instead of {}: encoded a second time, after a spot check at {} scored VMAF {lowest:.1} (a stretch the samples had missed)",
+                    b.crf, best.crf, hms(at)
+                );
+                eprintln!("note: {n}");
+                tools.emit(Event::Note { text: n.clone() });
+                notes.push(n);
+                best = b;
+                trials = all;
+                search_secs += t2.secs(tools);
+                let t3 = tools.stopwatch();
+                let (args, _) = full_encode_args(input, &info, &enc, best.crf, o.container, o.audio, &covers, &meta, &o.meta, None, &partial, &mut Vec::new());
+                tools.emit(Event::Phase { phase: "encoding".into(), detail: format!("crf {}, preset {preset}", best.crf) });
+                tools.run_with_progress(&args, out_duration, "encoding")?;
+                encode_secs = t3.secs(tools);
+                eprintln!("verifying");
+                tools.emit(Event::Phase { phase: "verifying".into(), detail: "streams, duration, VMAF spot checks".into() });
+                verified = verify(tools, input, &info, &partial, &streams, expect_frames, None, o.target_vmaf.min(best.mean_vmaf), vmaf_threads, &tmp.path);
+            }
+            search::Outcome::TooLarge(t) => skip!(
+                "a spot check at {} scored VMAF {lowest:.2} at CRF {}; CRF {} still leaves that stretch at {:.2} at {:.0}% of the source's size: savings would be below --min-savings {:.0}%",
+                hms(at), best.crf, t.crf, t.min_vmaf, t.size_ratio * 100.0, o.min_savings * 100.0
+            ),
+            // The samples have nothing against this CRF, or nothing lower helps: the check stands.
+            search::Outcome::Found(_) | search::Outcome::OutOfReach => {}
+        }
+    }
+    // A CRF per scene is what evens a video out, where it was there to be had.
+    let hint = o.scenes == Scenes::Off && one_pass.is_none();
+    let (verify_vmaf, out_info) = verified.map_err(|e| match e.downcast::<LowSpot>() {
+        Ok(low) => LowSpot { hint, ..low }.into(),
+        Err(e) => e,
+    })?;
     let lost = metadata::missing(&meta, &out_info.tags);
     if !lost.is_empty() {
         let n = format!(
@@ -978,6 +1044,32 @@ fn prepare_cut<'a>(
     Ok(Cut { sections, subs, chapters })
 }
 
+/// Spot checks of the finished encode that scored below what verification allows.
+#[derive(Debug)]
+struct LowSpot {
+    /// Where in the source, how long, and the score.
+    windows: Vec<(f64, f64, f64)>,
+    floor: f64,
+    /// Whether a CRF per scene would have been the way out.
+    hint: bool,
+}
+
+impl LowSpot {
+    /// Start and score of the lowest check.
+    fn worst(&self) -> (f64, f64) {
+        self.windows.iter().min_by(|a, b| a.2.total_cmp(&b.2)).map_or((0.0, 0.0), |w| (w.0, w.2))
+    }
+}
+
+impl std::fmt::Display for LowSpot {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let hint = if self.hint { " (a CRF per scene, --scenes, evens quality out)" } else { "" };
+        write!(f, "verify: spot check VMAF {:.2} below {:.1}; keeping nothing{hint}", self.worst().1, self.floor)
+    }
+}
+
+impl std::error::Error for LowSpot {}
+
 /// Checks the encode before it replaces anything: stream layout, duration, and VMAF spot checks
 /// at positions the search did not sample.
 #[allow(clippy::too_many_arguments)]
@@ -1024,6 +1116,8 @@ fn verify(
     let model = search::vmaf_model(info);
     let pix = search::reference_pix_fmt(info);
     let mut scores = Vec::new();
+    let mut low = Vec::new();
+    let floor = target_vmaf - VERIFY_SLACK;
     for (i, (start, secs)) in spot_checks(duration).into_iter().enumerate() {
         // The same picture sits at different times in the source when sections were removed.
         let (start, src_start, secs) = cut.map_or((start, start, secs), |c| c.window(start, secs));
@@ -1042,16 +1136,17 @@ fn verify(
         eprintln!("  spot check at {}: VMAF {v:.2}", hms(start));
         tools.emit(Event::SpotCheck { at_secs: start, vmaf: v });
         scores.push(v);
+        if v < floor {
+            low.push((src_start, secs, v));
+        }
         let _ = std::fs::remove_file(&r);
         let _ = std::fs::remove_file(&d);
     }
-    // Short spot checks are noisier than the multi-sample search, so allow some slack.
-    let floor = target_vmaf - VERIFY_SLACK;
-    if let Some(bad) = scores.iter().find(|&&v| v < floor) {
+    // Short spot checks are noisier than the multi-sample search, hence the slack.
+    if !low.is_empty() {
         // One CRF for a video whose stretches need different ones; the same run would end
         // the same way.
-        let hint = if expect_frames.is_none() && cut.is_none() { " (a CRF per scene, --scenes, evens quality out)" } else { "" };
-        bail!("verify: spot check VMAF {bad:.2} below {floor:.1}; keeping nothing{hint}");
+        return Err(LowSpot { windows: low, floor, hint: false }.into());
     }
     Ok((scores, out_info))
 }

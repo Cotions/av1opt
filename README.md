@@ -134,7 +134,12 @@ For each file:
    MKV: attachment with its original file name).
 5. **Verify** – codec, duration, stream and cover counts, HDR transfer, plus VMAF spot checks at positions the search
    did not sample (five seconds at 30% and at 70% of the way; all of a video of ten seconds
-   or less, once). Nothing is written unless all checks pass.
+   or less, once). Nothing is written unless all checks pass. A spot check more than 4 VMAF
+   below the target is a stretch the samples missed: for a video encoded in one pass it is
+   added to them, the search runs again (the worst sample two points above that line this
+   time) and the video is encoded once more at the lower CRF it finds, which the report
+   says. If that saves less than `--min-savings` the video is skipped; a second failed check
+   stands.
 6. **Report** – the output plus `<name>.av1opt.json` with every CRF tried, scores, sizes and timings.
 
 ### Metadata
@@ -546,6 +551,12 @@ and the benchmark's requests and tuned settings over HTTP (no ffmpeg needed).
   joined video was thrown away after 32 minutes by a spot check of 87: a frame doubled inside
   the stretch checked sets every later frame against its neighbour. One frame in 10,000 is
   the limit now, and such a video is encoded in one pass with its own frame times.
+- **Four samples miss things.** The same video in one pass then failed for real: its chunks
+  had shown that a sixth of it needs a CRF of 29 to 32 where the samples asked for 38.75,
+  and a spot check landed on such a stretch (86.8). Run again, it would have failed the same
+  way for ever. The source's bitrate does not show where these are (a constant 5 Mbps; rank
+  correlation with chunk difficulty 0.1). A failed spot check is now a sample of a second
+  search, and the video is encoded once more.
 - **ffmpeg ignores `-svtav1-params` names it can't parse.** A typo only prints a warning and the
   encode runs without the option, so parameters are tried on a few generated frames first.
 

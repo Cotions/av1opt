@@ -134,7 +134,11 @@ impl Case {
 
     /// Names in the output folder, sorted.
     fn outputs(&self) -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(self.out()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        self.outputs_in(&self.out())
+    }
+
+    fn outputs_in(&self, dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         names.sort();
         names
     }
@@ -954,6 +958,26 @@ fn scenes_are_encoded_apart_only_where_the_samples_disagree() {
     // hard half reads within a fraction of a point of the line.
     r.has("each scene gets its own CRF").has("frames come at uneven times").has("looking for the CRF that keeps it at 90 or above").has("to keep the worst sample at VMAF 90");
     assert!(entries(&late, ".av1opt-").is_empty());
+
+    // A picture that gets harder as it goes (the zoom into the Mandelbrot set), so that
+    // five seconds of it score lower than the two the samples saw: the spot check fails,
+    // its stretch becomes a sample, and the second encode at the CRF found with it stands.
+    c.ffmpeg(&[
+        "-i", "uneven.mp4", "-vf", "select='mod(n,6)'", "-fps_mode", "vfr",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "12", "-pix_fmt", "yuv420p", "-c:a", "copy", "zoom.mkv",
+    ]);
+    let again = c.dir.join("again");
+    let r = c.encode_into(&again, &[&c.videos().join("zoom.mkv")], &["--scenes=auto"]);
+    r.ok().has("encoded 1,").has("a stretch the samples missed: searching again with it as a sample");
+    let rep = c.report_in(&again, "zoom");
+    assert_eq!(rep["mode"], "whole");
+    assert!(notes(&rep).contains("encoded a second time, after a spot check at"), "{rep}");
+    assert!(rep["verify_vmaf"].as_array().unwrap().iter().all(|v| v.as_f64().unwrap() >= 89.0), "{rep}");
+    // The CRF in the report is the one of the encode that was kept, and among its trials.
+    let chosen = rep["crf"].as_f64().unwrap();
+    let first: f64 = r.err.split("chose crf ").nth(1).and_then(|t| t.split_whitespace().next()?.parse().ok()).unwrap();
+    assert!(chosen < first, "CRF {chosen} after {first}");
+    assert_eq!(c.outputs_in(&again), ["av1opt-log.tsv", "zoom.av1opt.json", "zoom.mp4"]);
 }
 
 #[test]

@@ -216,9 +216,15 @@ impl Pace {
     /// The source's frames do not come at the constant rate its header names: a screen
     /// recording, a phone video, a Matroska file whose header says 24 fps over frames that
     /// come at 12. Cutting it into constant-rate chunks would drop frames or double them.
-    /// A few are let through: a broadcast with a damaged second is still constant-rate.
+    /// A few are let through: a broadcast with a damaged moment is still constant-rate.
+    ///
+    /// Few means few. A webcam recording at 30 fps whose frames come a quarter of a frame
+    /// late now and then (8 of 27,895 frames doubled once on the grid, 75 of 28,008 in
+    /// another) was let through at one frame in 200: its chunks each met the target, and
+    /// the joined video was then thrown away by a spot check of 87, because a frame doubled
+    /// inside the stretch checked sets every frame after it against its neighbour.
     pub fn uneven(&self) -> bool {
-        self.dropped + self.repeated > (self.source_frames / 200).max(2)
+        self.dropped + self.repeated > (self.source_frames / 10_000).max(2)
     }
 
     /// From ffmpeg's log at `-v verbose`, where the `fps` filter sums up what it did:
@@ -512,6 +518,9 @@ mod tests {
         assert!(!Pace { source_frames: 100, dropped: 1, repeated: 1 }.uneven());
         assert!(Pace { source_frames: 100, dropped: 3, repeated: 0 }.uneven());
         assert!(Pace { source_frames: 172800, dropped: 900, repeated: 0 }.uneven());
+        // Webcam recordings whose frames drift off the grid, as seen.
+        assert!(Pace { source_frames: 27_895, dropped: 0, repeated: 8 }.uneven());
+        assert!(Pace { source_frames: 28_008, dropped: 0, repeated: 75 }.uneven());
         // No such line (another ffmpeg, another wording): nothing is concluded.
         assert_eq!(Pace::from_log("frame=  190 fps=0.0 q=-0.0 Lsize=N/A"), None);
         assert_eq!(Pace::from_log("[Parsed_fps_0 @ 0x1] something else entirely"), None);

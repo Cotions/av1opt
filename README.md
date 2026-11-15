@@ -539,6 +539,13 @@ and the benchmark's requests and tuned settings over HTTP (no ffmpeg needed).
   frames than its header says would have lost some), and the checks passed because they
   compare at the same constant rate. ffmpeg's `fps` filter counts the frames it drops and
   repeats; scene detection runs it over the whole file anyway, so that count now decides.
+- **A webcam's 30 fps drifts.** The first videos from a real library were 30 fps MP4s whose
+  frames come a quarter of a frame late now and then: no gap, an average of 29.99, nothing a
+  header shows. On the constant-rate grid of scene mode 8 frames of 27,895 were doubled, well
+  under the one in 200 the count above let through. Every chunk met the target, and the
+  joined video was thrown away after 32 minutes by a spot check of 87: a frame doubled inside
+  the stretch checked sets every later frame against its neighbour. One frame in 10,000 is
+  the limit now, and such a video is encoded in one pass with its own frame times.
 - **ffmpeg ignores `-svtav1-params` names it can't parse.** A typo only prints a warning and the
   encode runs without the option, so parameters are tried on a few generated frames first.
 

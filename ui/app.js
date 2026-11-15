@@ -2372,7 +2372,7 @@ function comparePlayer(root, r) {
   if (!r.pair) tl.append(s("line", { x1: 0, x2: 1000, y1: y(target), y2: y(target), stroke: "#8b939b", "stroke-dasharray": "4 4", "stroke-width": 1, "vector-effect": "non-scaling-stroke" }));
   for (const c of segs) {
     const rect = s("rect", { x: x(c.start_secs), width: Math.max(0.5, x(c.end) - x(c.start_secs) - 0.6), y: y(c.vmaf), height: Math.max(1, 96 - y(c.vmaf)), fill: vmafColor(c.vmaf, target), opacity: 0.85 });
-    rect.dataset.tip = `chunk ${c.index + 1} · ${tc(c.start_secs)}–${tc(c.end)} · CRF ${c.crf}${c.corrected ? " (corrected)" : ""} · VMAF ${num(c.vmaf)} · ${bytes(c.bytes)} · ${num(c.bytes * 8 / (c.end - c.start_secs) / 1e6, 2)} Mbps`;
+    rect.dataset.tip = `chunk ${c.index + 1} · ${tc(c.start_secs)}–${tc(c.end)} · CRF ${c.crf}${c.corrected ? " (corrected)" : ""} · VMAF ${num(c.vmaf)}${c.out_of_reach ? " (target out of reach at any CRF)" : ""} · ${bytes(c.bytes)} · ${num(c.bytes * 8 / (c.end - c.start_secs) / 1e6, 2)} Mbps`;
     tl.append(rect);
   }
   // Verification spot checks: 5 s windows at 30% and 70% of (duration − 5 s), or one check

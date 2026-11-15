@@ -392,6 +392,7 @@ impl<'a> Lab<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct SearchParams {
     pub target_vmaf: f64,
     pub min_crf: u8,

@@ -51,6 +51,9 @@ pub struct ChunkResult {
     pub bytes: u64,
     /// The first final encode missed the target and the chunk was redone at a lower CRF.
     pub corrected: bool,
+    /// The probes said no CRF reaches the target here (see [`Estimate::out_of_reach`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub out_of_reach: bool,
 }
 
 /// Chunk length limits in seconds.
@@ -103,15 +106,20 @@ pub fn plan(cuts: &[u64], total: u64, min: u64, max: u64) -> Vec<u64> {
 /// the final encode of the chunk is measured and corrected anyway. Steps from `start` by the
 /// expected VMAF-per-CRF slope, then interpolates to the quarter step nearest the target, so
 /// chunks land on the target on average instead of systematically above it.
-/// Returns the chosen CRF and every (crf, score) probed.
+///
+/// Some pictures score below the target however many bits they get (noise the metric reads as
+/// damage, mostly). When every probe misses and the gain they show per CRF step would still
+/// miss at `floor`, the lowest CRF allowed at all, the pick is the highest CRF probed that
+/// scores within [`LEVEL_OFF`] of the best: spending more there buys nothing to see.
 pub fn estimate_crf(
     start: u8,
     min: u8,
     max: u8,
+    floor: u8,
     target: f64,
     max_probes: usize,
     mut eval: impl FnMut(u8) -> Result<f64>,
-) -> Result<(f64, Vec<(u8, f64)>)> {
+) -> Result<Estimate> {
     let mut probes: Vec<(u8, f64)> = Vec::new();
     let mut crf = start.clamp(min, max);
     loop {
@@ -152,7 +160,34 @@ pub fn estimate_crf(
         (None, None) => start as f64,
     };
     let pick = (pick * 4.0).round() / 4.0;
-    Ok((pick.clamp(min as f64, max as f64), probes))
+    let crf = pick.clamp(min as f64, max as f64);
+    if pass.is_none()
+        && let Some(&(low, at_low)) = probes.iter().min_by_key(|p| p.0)
+        && let Some(&(high, at_high)) = probes.iter().max_by_key(|p| p.0)
+    {
+        // What a CRF step was seen to buy; one probe alone shows nothing, so the usual gain.
+        let gain = if high > low { ((at_low - at_high) / (high - low) as f64).max(0.0) } else { search::VMAF_PER_CRF };
+        if at_low + gain * f64::from(low.saturating_sub(floor)) < target {
+            let top = probes.iter().map(|p| p.1).fold(f64::MIN, f64::max);
+            let level = probes.iter().filter(|p| p.1 >= top - LEVEL_OFF).map(|p| p.0).max().unwrap_or(low);
+            return Ok(Estimate { crf: level as f64, probes, out_of_reach: true });
+        }
+    }
+    Ok(Estimate { crf, probes, out_of_reach: false })
+}
+
+/// A probe scoring this close to the best one is taken as no worse: where quality has
+/// levelled off below the target, the highest such CRF is the one to encode at.
+const LEVEL_OFF: f64 = 0.5;
+
+/// What [`estimate_crf`] chose.
+pub struct Estimate {
+    pub crf: f64,
+    /// Every (crf, score) probed.
+    pub probes: Vec<(u8, f64)>,
+    /// No CRF down to the floor is expected to reach the target: every probe missed, and
+    /// the gain between them is too small to get there.
+    pub out_of_reach: bool,
 }
 
 fn score_at(probes: &[(u8, f64)], crf: u8) -> f64 {
@@ -322,7 +357,7 @@ fn encode_chunk(c: &Ctx, plan: &Plan, i: usize) -> Result<ChunkResult> {
     let center = plan.best.crf.round() as u8;
     let lo = center.saturating_sub(CRF_SPREAD).max(c.min_crf);
     let hi = center.saturating_add(CRF_SPREAD).min(c.max_crf);
-    let (mut crf, probes) = estimate_crf(center, lo, hi, c.target, 3, |crf| {
+    let Estimate { mut crf, probes, out_of_reach } = estimate_crf(center, lo, hi, c.min_crf, c.target, 3, |crf| {
         encode_obu(c.tools, &reference, c.probe, crf as f64, &probe_out)?;
         Ok(score(&probe_out, VMAF_STRIDE)? + plan.bias)
     })?;
@@ -332,7 +367,9 @@ fn encode_chunk(c: &Ctx, plan: &Plan, i: usize) -> Result<ChunkResult> {
     let mut vmaf = score(&part, VMAF_STRIDE)?;
     let mut corrected = false;
     let (lo_f, hi_f) = (c.min_crf as f64, c.max_crf as f64);
-    if (vmaf < c.target - CORRECT_MARGIN && crf > lo_f) || (vmaf > c.target + CORRECT_MARGIN && crf < hi_f) {
+    // A chunk the probes put out of reach is not chased down the CRFs: they showed that
+    // nothing is gained there.
+    if (vmaf < c.target - CORRECT_MARGIN && crf > lo_f && !out_of_reach) || (vmaf > c.target + CORRECT_MARGIN && crf < hi_f) {
         // Below target: round toward quality. Above: undo only part of the surplus, since
         // the probe already predicted the target here and the slope is uncertain.
         let delta = (vmaf - c.target) / search::VMAF_PER_CRF;
@@ -354,7 +391,7 @@ fn encode_chunk(c: &Ctx, plan: &Plan, i: usize) -> Result<ChunkResult> {
         }
     }
     let bytes = std::fs::metadata(&part)?.len();
-    let r = ChunkResult { index: i, start_secs, frames, crf, probes, vmaf, bytes, corrected };
+    let r = ChunkResult { index: i, start_secs, frames, crf, probes, vmaf, bytes, corrected, out_of_reach };
     // The JSON is written first and the encode renamed last: a chunk counts as done only when
     // its .obu exists, which can't happen half-written.
     std::fs::write(chunk_path(c.work, i, "json"), serde_json::to_vec(&r)?)?;
@@ -517,8 +554,9 @@ mod tests {
                 if !(20.0..=55.0).contains(&exact) {
                     continue;
                 }
-                let (crf, probes) = estimate_crf(35, 20, 55, target, 3, |c| Ok(f(c))).unwrap();
+                let Estimate { crf, probes, out_of_reach } = estimate_crf(35, 20, 55, 20, target, 3, |c| Ok(f(c))).unwrap();
                 assert!(probes.len() <= 3);
+                assert!(!out_of_reach, "slope {slope} offset {offset}");
                 // Never above the true answer (quality first), at most 1 below.
                 assert!((crf - exact).abs() <= 0.5,
                     "slope {slope} offset {offset}: crf {crf}, exact {exact:.2}, probes {probes:?}");
@@ -528,10 +566,32 @@ mod tests {
 
     #[test]
     fn estimate_handles_unreachable_targets() {
-        let (crf, _) = estimate_crf(35, 20, 55, 93.0, 3, |_| Ok(80.0)).unwrap();
-        assert_eq!(crf, 20.0);
-        let (crf, _) = estimate_crf(35, 20, 55, 93.0, 3, |_| Ok(99.0)).unwrap();
-        assert_eq!(crf, 55.0);
+        // Always above: as high as the range goes.
+        let e = estimate_crf(35, 20, 55, 20, 93.0, 3, |_| Ok(99.0)).unwrap();
+        assert_eq!((e.crf, e.out_of_reach), (55.0, false));
+        // A score that falls as usual but starts too low: the lowest CRF, as close as it gets.
+        let e = estimate_crf(35, 20, 55, 20, 93.0, 3, |c| Ok(95.0 - 0.3 * c as f64)).unwrap();
+        assert_eq!((e.crf, e.out_of_reach), (20.0, true));
+    }
+
+    #[test]
+    fn a_score_that_has_levelled_off_below_the_target_is_not_paid_for() {
+        // The same score whatever the CRF: no bits spent on going lower.
+        let e = estimate_crf(35, 20, 55, 20, 93.0, 3, |_| Ok(88.0)).unwrap();
+        assert_eq!((e.crf, e.out_of_reach), (35.0, true));
+        assert!(e.probes.len() >= 2, "one probe can't show a level score: {:?}", e.probes);
+        // A slight rise toward low CRFs that would still miss at the floor: the highest CRF
+        // that scores as well as the best, within half a point.
+        let e = estimate_crf(35, 23, 47, 20, 93.0, 3, |c| Ok(91.0 - 0.02 * c as f64)).unwrap();
+        assert_eq!((e.crf, e.out_of_reach), (35.0, true));
+        // The probes stop at the range's end, but the gain they show reaches the target
+        // before the floor: the lowest CRF of the range, and the final encode is corrected
+        // from there as before.
+        let e = estimate_crf(35, 30, 47, 20, 93.0, 3, |c| Ok(100.0 - 0.3 * c as f64)).unwrap();
+        assert_eq!((e.crf, e.out_of_reach), (30.0, false));
+        // Just short of the target at the first probe and reachable: nothing changes.
+        let e = estimate_crf(35, 20, 55, 20, 93.0, 3, |c| Ok(103.0 - 0.3 * c as f64)).unwrap();
+        assert!(!e.out_of_reach && (e.crf - 33.25).abs() <= 0.5, "{} {:?}", e.crf, e.probes);
     }
 
     #[test]

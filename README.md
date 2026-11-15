@@ -112,10 +112,11 @@ For each file:
    within 3 CRF of the answer, never more than 4, and the CRF chosen is never more than 0.05
    VMAF short of the target. A trial encodes the samples end to end as one clip and scores
    them in one pass. The answer is in SVT-AV1's quarter-step CRF. 4K uses the
-   `vmaf_4k` model. One CRF has to carry the video's worst stretch: if the worst sample at
-   the chosen CRF scores more than 4 VMAF below the target (what verification allows a spot
-   check), the search goes on to the CRF that brings it up to that mark, and the report says
-   so. A sample more than 2 below the samples' mean gets a note that quality differs along
+   `vmaf_4k` model. One CRF has to carry the video's worst stretch: verification allows a
+   spot check 4 VMAF below the target, and a spot check of the same stretch reads a little
+   higher or lower than the samples did. If the worst sample at the chosen CRF is not a
+   point above that mark, the search goes on to the CRF that puts it there, and the report
+   says so. A sample more than 2 below the samples' mean gets a note that quality differs along
    the video (see [per-scene CRF](#per-scene-crf---scenes)).
 3. **Decide** – skips files that are already AV1, Dolby Vision, can't reach the target, or would
    save less than `--min-savings` (15%). The search stops at the first trial that misses the
@@ -197,7 +198,11 @@ One CRF for a whole video spends too many bits on easy scenes and too few on har
 2. Each chunk gets its own CRF from 2-3 fast probe encodes (preset +4), corrected by the measured
    VMAF gap between the probe preset and the real preset.
 3. Each chunk is encoded at the real preset and measured; a chunk more than 1 VMAF off target is
-   redone once with a corrected CRF.
+   redone once with a corrected CRF. Some pictures score below the target however many bits
+   they get (noise the metric reads as damage, mostly): when every probe of a chunk misses
+   and the gain between them would still miss at `--min-crf`, the chunk is encoded at the
+   highest CRF that scored within half a point of the best and not redone, and the report
+   counts such scenes.
 4. Chunks are joined into one AV1 stream and muxed with the source's audio, subtitles, chapters
    and metadata. Verification additionally checks the exact frame count.
 

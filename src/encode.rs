@@ -94,6 +94,8 @@ pub const UNEVEN_GAP: f64 = 2.0;
 
 /// How far below the target a spot check of the finished encode may score.
 pub const VERIFY_SLACK: f64 = 4.0;
+/// How far above that line the search keeps the worst sample (see `hold_worst_sample`).
+const HOLD_MARGIN: f64 = 1.0;
 
 /// Where the finished encode is compared with the source, as (start, length) in seconds of
 /// the output: five seconds at 30% and at 70% of the way, or all of a video too short for
@@ -226,6 +228,43 @@ macro_rules! skip {
 
 const COPY_AUDIO: &[&str] = &["aac", "opus", "mp3"];
 const TEXT_SUBS: &[&str] = &["subrip", "ass", "ssa", "mov_text", "webvtt", "text"];
+
+/// One CRF has to carry the video's worst stretch: verification wants every spot check
+/// within `VERIFY_SLACK` of the target, and a sample below that says some would not be.
+/// Found here, it costs a trial or two; found by verification, the whole encode. Lowers
+/// `best` to the CRF that keeps the worst sample up, where there is one.
+fn hold_worst_sample(
+    lab: &mut search::Lab,
+    enc: &EncodeSettings,
+    params: SearchParams,
+    o: &Options,
+    best: &mut search::Trial,
+    trials: &mut Vec<search::Trial>,
+    notes: &mut Vec<String>,
+) -> Result<()> {
+    // A spot check of the same stretch reads a little above or below the samples (0.9 below,
+    // on a generated clip): a worst sample on the line, or just above it, can still fail.
+    let aim = o.target_vmaf - VERIFY_SLACK + HOLD_MARGIN;
+    if best.min_vmaf >= aim {
+        return Ok(());
+    }
+    eprintln!("worst sample VMAF {:.2} at CRF {}: looking for the CRF that keeps it at {aim} or above", best.min_vmaf, best.crf);
+    let (held, all) = search::search(lab, enc, &SearchParams { worst_sample: Some(aim), start_crf: best.crf.floor() as u8, ..params })?;
+    *trials = all;
+    match held {
+        search::Outcome::Found(b) => {
+            notes.push(format!("CRF {} instead of {} to keep the worst sample at VMAF {aim} (it was {:.1})", b.crf, best.crf, best.min_vmaf));
+            *best = b;
+        }
+        search::Outcome::TooLarge(t) => skip!(
+            "CRF {} leaves the worst sample at VMAF {:.2} (wanted: {aim}) at {:.0}% of the source's size already: savings would be below --min-savings {:.0}%",
+            t.crf, t.min_vmaf, t.size_ratio * 100.0, o.min_savings * 100.0
+        ),
+        // Nothing to gain from a lower CRF that still misses: verification decides.
+        search::Outcome::OutOfReach => notes.push(format!("the worst sample stays below VMAF {aim} down to CRF {}", o.min_crf)),
+    }
+    Ok(())
+}
 
 /// Removes temp folders left by runs that crashed or were interrupted (their PID is gone).
 pub fn clean_stale_temp(out_dir: &Path) {
@@ -404,30 +443,11 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         }
     }
     let work = work.filter(|_| scenes);
-    // One CRF has to carry the video's worst stretch: verification wants every spot check
-    // within `VERIFY_SLACK` of the target, and a sample below that says some would not be.
-    // Found here, it costs a trial or two; found by verification, the whole encode.
-    let floor = o.target_vmaf - VERIFY_SLACK;
     if !scenes
         && reached
-        && best.min_vmaf < floor
         && let (Some(lab), Some(params)) = (lab.as_mut(), params)
     {
-        eprintln!("worst sample VMAF {:.2} at CRF {}: looking for the CRF that keeps it at {floor} or above", best.min_vmaf, best.crf);
-        let (held, all) = search::search(lab, &enc, &SearchParams { worst_sample: Some(floor), start_crf: best.crf.floor() as u8, ..params })?;
-        trials = all;
-        match held {
-            search::Outcome::Found(b) => {
-                notes.push(format!("CRF {} instead of {} to keep the worst sample at VMAF {floor} (it was {:.1})", b.crf, best.crf, best.min_vmaf));
-                best = b;
-            }
-            search::Outcome::TooLarge(t) => skip!(
-                "CRF {} leaves the worst sample at VMAF {:.2} (wanted: {floor}) at {:.0}% of the source's size already: savings would be below --min-savings {:.0}%",
-                t.crf, t.min_vmaf, t.size_ratio * 100.0, o.min_savings * 100.0
-            ),
-            // Nothing to gain from a lower CRF that still misses: verification decides.
-            search::Outcome::OutOfReach => notes.push(format!("the worst sample stays below VMAF {floor} down to CRF {}", o.min_crf)),
-        }
+        hold_worst_sample(lab, &enc, params, o, &mut best, &mut trials, &mut notes)?;
     }
     let predicted_savings = 1.0 - best.size_ratio;
     tools.emit(Event::Chosen { crf: best.crf, vmaf: best.mean_vmaf, predicted_savings });
@@ -462,12 +482,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     if plan.is_none()
         && let Some(w) = &work
     {
-        // How much better the real preset scores than the fast probe preset at the
-        // same CRF; probe scores are shifted by this to predict the real encode.
         let lab = lab.as_mut().expect("a search that wasn't resumed has its lab");
-        let (pt, _) = lab.trial(&probe, best.crf)?;
-        let bias = best.mean_vmaf - pt.mean_vmaf;
-        lab.discard_samples();
         std::fs::create_dir_all(&w.path)?;
         tools.emit(Event::Phase { phase: "scenes".into(), detail: "finding scene changes".into() });
         let found = scenes::detect(tools, input, &info, &w.path)?;
@@ -480,8 +495,27 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
                 ));
                 let _ = std::fs::remove_dir_all(&w.path);
                 work = None;
+                // One CRF after all, so it is the one that has to carry the worst stretch.
+                let was = best.crf;
+                if reached && let Some(params) = params {
+                    hold_worst_sample(lab, &enc, params, o, &mut best, &mut trials, &mut notes)?;
+                }
+                lab.discard_samples();
+                if best.crf != was {
+                    let predicted_savings = 1.0 - best.size_ratio;
+                    tools.emit(Event::Chosen { crf: best.crf, vmaf: best.mean_vmaf, predicted_savings });
+                    eprintln!("chose crf {} (VMAF {:.2}), predicted video savings {:.0}%", best.crf, best.mean_vmaf, predicted_savings * 100.0);
+                    if predicted_savings < o.min_savings && !o.force {
+                        skip!("predicted savings {:.0}% below --min-savings {:.0}%", predicted_savings * 100.0, o.min_savings * 100.0);
+                    }
+                }
             }
             None => {
+                // How much better the real preset scores than the fast probe preset at the
+                // same CRF; probe scores are shifted by this to predict the real encode.
+                let (pt, _) = lab.trial(&probe, best.crf)?;
+                let bias = best.mean_vmaf - pt.mean_vmaf;
+                lab.discard_samples();
                 let (first_pts, chunks) = scenes::bounds(&info, &found.cuts, found.total);
                 eprintln!("{} scene cuts, {} frames, {} chunks", found.cuts.len(), found.total, chunks.len());
                 let p = scenes::Plan { key: w.key.clone(), best, trials: trials.clone(), bias, first_pts, total_frames: found.total, chunks };
@@ -504,6 +538,13 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
             min_crf: o.min_crf, max_crf: o.max_crf, vmaf_threads, workers: o.workers,
         };
         let chunks = scenes::encode_all(&ctx, &plan)?;
+        let short: Vec<f64> = chunks.iter().filter(|c| c.out_of_reach).map(|c| c.vmaf).collect();
+        if let Some(lowest) = short.iter().copied().min_by(f64::total_cmp) {
+            notes.push(format!(
+                "{} of {} scenes stay below VMAF {} at any CRF (lowest: {lowest:.1}): encoded where more bits stop adding quality",
+                short.len(), chunks.len(), o.target_vmaf
+            ));
+        }
         tools.emit(Event::Phase { phase: "muxing".into(), detail: format!("joining {} chunks", chunks.len()) });
         let video = scenes::concat(&work.path, chunks.len())?;
         let (args, streams) = mux_args(&video, input, &info, o.container, o.audio, &covers, &meta, &o.meta, &partial, &mut notes);

@@ -927,14 +927,33 @@ fn scenes_are_encoded_apart_only_where_the_samples_disagree() {
     // which verification would otherwise have thrown the finished encode away for.
     let whole = c.dir.join("whole");
     let r = c.encode_into(&whole, &[&uneven], &[]);
-    r.ok().has("looking for the CRF that keeps it at 89 or above");
+    r.ok().has("looking for the CRF that keeps it at 90 or above");
     let rep = c.report_in(&whole, "uneven");
     assert_eq!(rep["mode"], "whole");
-    assert!(notes(&rep).contains("a CRF per scene (--scenes) would even it out") && notes(&rep).contains("to keep the worst sample at VMAF 89"), "{rep}");
+    assert!(notes(&rep).contains("a CRF per scene (--scenes) would even it out") && notes(&rep).contains("to keep the worst sample at VMAF 90"), "{rep}");
     let chosen = rep["crf"].as_f64().unwrap();
     let mean_only = rep["search"].as_array().unwrap().iter().filter(|t| t["mean_vmaf"].as_f64().unwrap() >= 93.0).map(|t| t["crf"].as_f64().unwrap()).fold(0.0, f64::max);
     assert!(chosen <= mean_only - 2.0, "CRF {chosen}, the mean alone allowed {mean_only}");
     assert!(rep["verify_vmaf"].as_array().unwrap().iter().all(|v| v.as_f64().unwrap() >= 89.0), "{rep}");
+
+    // An easy half and a hard one with every sixth frame left out, in a Matroska file whose
+    // header names a constant rate all the same: that scenes can't be cut apart shows only
+    // once they have been looked for. The one CRF it falls back to is held down for the
+    // worst sample too.
+    c.ffmpeg(&[
+        "-f", "lavfi", "-i", "testsrc2=s=640x360:r=24:d=12",
+        "-f", "lavfi", "-i", "life=s=640x360:r=24:mold=10:ratio=0.1:seed=1:death_color=#C83232:life_color=#00ff00,trim=duration=12",
+        "-f", "lavfi", "-i", "sine=f=440:d=24",
+        "-filter_complex", "[0:v]format=yuv420p[a];[1:v]format=yuv420p[b];[a][b]concat=n=2:v=1:a=0,select='mod(n,6)'[v]",
+        "-map", "[v]", "-map", "2:a", "-fps_mode", "vfr", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "12", "-c:a", "aac", "-b:a", "64k", "gaps.mkv",
+    ]);
+    let gaps = c.videos().join("gaps.mkv");
+    let late = c.dir.join("late");
+    let r = c.encode_into(&late, &[&gaps], &["--scenes=auto"]);
+    // What verification then makes of it is not this test's matter: its spot check of the
+    // hard half reads within a fraction of a point of the line.
+    r.has("each scene gets its own CRF").has("frames come at uneven times").has("looking for the CRF that keeps it at 90 or above").has("to keep the worst sample at VMAF 90");
+    assert!(entries(&late, ".av1opt-").is_empty());
 }
 
 #[test]

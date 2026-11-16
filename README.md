@@ -571,6 +571,16 @@ and the benchmark's requests and tuned settings over HTTP (no ffmpeg needed).
   back. The 15-minute video that started this, whole: 28,008 of 28,008 timestamps identical
   to the source's, 52 chunks at CRF 28.5 to 41.5, spot checks 92.6 and 90.8, 204 MB where
   the one pass that passed (CRF 33, after a first one at 38.75 had failed) took 248 MB.
+- **Passed through is not kept.** In one pass such a video did not have its own frame times
+  after all: ffmpeg passes timestamps through, but counts them in the encoder's units, and
+  those are one frame of the declared rate unless it is told otherwise. Every frame was
+  there, moved to the nearest whole frame (up to 6.7 ms off in two minutes of a real 30 fps
+  recording, half a frame at most, no drift building up), which nobody sees, but a spot
+  check sets the source's frames against the output's on a common grid: a generated clip
+  where every frame differs from the last read 90.3 and 87.1 where its samples promised 93,
+  and failed. The encoder now counts in the source's time base: timestamps identical,
+  spot checks 93.1 and 93.1. On the real recording the difference was small (87.3 instead
+  of 86.8 for the stretch that failed): its failures were real.
 - **Not every uneven video is a drifting one.** A screen recording that shows some frames
   three times as long as others failed its spot check (87.9) when encoded per scene with
   its own frame times: a chunk's VMAF counts each frame once, the spot check counts each

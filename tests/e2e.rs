@@ -691,6 +691,25 @@ fn variable_frame_rate_keeps_every_frame_at_its_time() {
     assert_eq!(r["mode"], "whole");
     assert!(r["notes"].to_string().contains("uneven times (96 frames; at a constant 24 fps 0 would be dropped and 94 shown twice)"), "{}", r["notes"]);
     assert!(std::fs::read_dir(c.dir.join("out-scenes")).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().starts_with(".av1opt-")));
+
+    // A camera whose clock drifts: every 25th frame stays a quarter longer, on a 90 kHz
+    // clock, under a header that names a rate. Counted in frames of that rate, each frame
+    // was moved to the nearest whole one (up to half a frame off, and a spot check then
+    // compared frames with their neighbours). In one pass too, every frame keeps its tick.
+    c.ffmpeg(&[
+        "-f", "lavfi", "-i", "testsrc2=s=320x180:r=24:d=8", "-f", "lavfi", "-i", "sine=f=440:d=8", "-vf", "settb=1/90000,setpts='N*3750+floor(N/25)*900'",
+        "-fps_mode", "passthrough", "-enc_time_base", "1:90000", "-video_track_timescale", "90000",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "16", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "64k", "drift.mp4",
+    ]);
+    let src = c.videos().join("drift.mp4");
+    let out_dir = c.dir.join("out-drift");
+    c.encode_into(&out_dir, &[&src], &[]).ok().has("encoded 1,");
+    let (got, want) = (frame_times(&out_dir.join("drift.mp4")), frame_times(&src));
+    assert_eq!((got.len(), want.len()), (192, 192));
+    assert!(want.windows(2).any(|w| w[1] - w[0] > 0.05), "the source's frames should come unevenly");
+    let worst = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+    assert!(worst < 0.00002, "a frame is {worst:.6} s from its place");
+    assert_in_step(&out_dir.join("drift.mp4"), &src, "1");
 }
 
 #[test]

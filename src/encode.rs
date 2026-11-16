@@ -829,6 +829,16 @@ fn full_encode_args(
     }
     a.extend(enc.video_args(crf));
     a.extend(["-fps_mode:v:0", "passthrough"].map(String::from));
+    // Passed through, a frame's time is still counted in the encoder's units, and those are
+    // one frame of the declared rate unless it is told otherwise: a frame that comes a
+    // quarter of a frame late was moved to the nearest whole one. In the source's own units
+    // every frame keeps the time it had.
+    if let (n, d) = info.time_base
+        && n > 0
+        && d > 0
+    {
+        a.extend(["-enc_time_base:v:0".into(), format!("{n}:{d}")]);
+    }
     let streams = stream_args(info, 0, container, audio, covers, cut.map(|_| sub_inputs.as_slice()), notes);
     let mut meta = metadata::ffmpeg_args(mo, tags, 0);
     if cut.is_some() {

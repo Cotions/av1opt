@@ -33,7 +33,7 @@ range; `encode` measures the real numbers. Never writes to the scanned folders.
 Every successful `encode` appends its source and output bitrates to
 `~/.local/share/av1opt/history.jsonl`. `scan` fits its size model to that history (a log-linear
 fit of AV1 bits per pixel against source bits per pixel and resolution, pulled toward the
-built-in pilot model while there are few encodes), so estimates and their ranges tighten as
+built-in model while there are few encodes), so estimates and their ranges tighten as
 you encode more.
 
 `scan` also says how long the candidates would take to search and encode (`--preset`, default
@@ -213,8 +213,9 @@ One CRF for a whole video spends too many bits on easy scenes and too few on har
 
 On a 60 s test clip mixing six kinds of footage, `--scenes` gave a 6% smaller file at identical
 full-length VMAF (93.07), with per-segment VMAF between 91.9 and 94.1 instead of 90.8 to 95.9.
-On a single continuous shot it gives no gain. It takes about 1.5-2x as long; `--workers 2`
-encodes two chunks at once (each ffmpeg then gets half of `--memory-limit`).
+On a single continuous shot it gives no gain. It takes about 1.5-2x as long on short clips
+and about 3x on real 15-minute recordings (six of them: 180 minutes where one pass was
+estimated at 58); `--workers 2` encodes two chunks at once (each ffmpeg then gets half of `--memory-limit`).
 
 `--scenes=auto` spends that time only where it buys something: on videos whose samples score
 far apart at one CRF (the worst one 2 VMAF or more below their mean), and one CRF for the
@@ -557,6 +558,16 @@ and the benchmark's requests and tuned settings over HTTP (no ffmpeg needed).
   way for ever. The source's bitrate does not show where these are (a constant 5 Mbps; rank
   correlation with chunk difficulty 0.1). A failed spot check is now a sample of a second
   search, and the video is encoded once more.
+- **What two folders taught.** 64 videos, 32 GB, 1080p webcam recordings at a flat 5 Mbps:
+  62 encoded (31.1 GB to 13.9 GB), 2 skipped as not worth it, none lost. Three failed a spot
+  check in one pass (86.1, 86.8, 88.1) and all three passed on the second search and encode
+  (CRF 4 to 6 lower). `scan`, on the pilot model alone, had called the 60 fps third of them
+  not worth encoding (0% predicted, 37% measured) because the model took AV1's bits per pixel
+  to be the same whatever the source spends; the pilot model now leans with the source.
+  Encode times were predicted within 5% for one pass.
+- **A container's length is not the picture's.** One recording had 7:40 of video under 17:32
+  of sound. Samples and spot checks were placed along the 17:32 and asked for frames that
+  don't exist. They go by the video stream's own length now.
 - **ffmpeg ignores `-svtav1-params` names it can't parse.** A typo only prints a warning and the
   encode runs without the option, so parameters are tried on a few generated frames first.
 

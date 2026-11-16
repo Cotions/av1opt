@@ -3,7 +3,8 @@
 //! Predicts the AV1 bits per pixel needed at the target quality from the source's bits per
 //! pixel and resolution, with a log-linear model fitted to past encodes (see [`crate::history`]).
 //! Without history it falls back to the 2026-11-01 pilot (8 clips, preset 6, VMAF ~91-95):
-//! ~0.035 bits per pixel at 1080p, falling mildly at higher resolutions. A few encodes only
+//! ~0.035 bits per pixel at 1080p, falling mildly at higher resolutions and for sources that
+//! spend few bits themselves. A few encodes only
 //! nudge that prior; many encodes replace it. Every estimate is a range from the data's spread.
 
 use crate::history::Record;
@@ -15,6 +16,12 @@ const PIXELS_1080P: f64 = 1920.0 * 1080.0;
 /// Bigger frames compress better per pixel. Pilot data was noisy (one 4K clip needed ~1/4
 /// the 1080p bpp, small clips only slightly more), so the prior stays mild and conservative.
 const RES_EXPONENT: f64 = -0.2;
+/// A source that spends few bits per pixel needs fewer in AV1 too: the detail it would cost is
+/// already gone, or (at 60 fps) each frame differs little from the last. 73 encodes at VMAF 93
+/// (2026-11-15, mostly 1080p webcam recordings at 5 Mbps, 30 and 60 fps) fit a slope of 0.22.
+/// With a flat prior the 60 fps half of them (0.04 bpp) were predicted to save nothing and
+/// marked not worth encoding; they came out 37% smaller.
+const SOURCE_EXPONENT: f64 = 0.2;
 /// Prior strength in "encodes": with 3 real encodes, data and prior weigh the same.
 const PRIOR_WEIGHT: f64 = 3.0;
 /// Spread of the prior in natural-log units (pilot: 0.018-0.096 bpp around 0.035).
@@ -45,7 +52,7 @@ fn bpp(bitrate: f64, width: u32, height: u32, fps: f64) -> f64 {
 
 impl Model {
     pub fn prior() -> Self {
-        Model { beta: [BPP_1080P.ln(), 0.0, RES_EXPONENT], sigma: PRIOR_SIGMA, samples: 0 }
+        Model { beta: [BPP_1080P.ln(), SOURCE_EXPONENT, RES_EXPONENT], sigma: PRIOR_SIGMA, samples: 0 }
     }
 
     /// Ridge regression toward the prior, on encodes made for a similar VMAF target.
@@ -352,6 +359,20 @@ mod tests {
         assert_eq!(m.samples, 0);
         let (lo, mid, hi) = m.predict_bpp(0.1, PIXELS_1080P);
         assert!((mid - BPP_1080P).abs() < 1e-9 && lo < mid && mid < hi);
+    }
+
+    #[test]
+    fn a_lean_60_fps_source_is_still_a_candidate_without_history() {
+        // 1080p60 at 5 Mbps: 0.04 bits per pixel, already near what AV1 needs at 30 fps.
+        let m = MediaInfo { codec: "h264".into(), width: 1920, height: 1080, fps: 60.0, duration_s: 900.0, video_bitrate: 5e6, ..Default::default() };
+        let size = (5.13e6 * 900.0 / 8.0) as u64;
+        let (verdict, range) = judge(&m, size, 0.2, &Model::prior());
+        assert_eq!(verdict, Verdict::Candidate);
+        let saved = 1.0 - range.likely / size as f64;
+        assert!((0.2..0.4).contains(&saved), "{saved}");
+        // The same picture at 30 fps and 5 Mbps spends twice the bits per pixel: more to save.
+        let (_, slower) = judge(&MediaInfo { fps: 30.0, ..m }, size, 0.2, &Model::prior());
+        assert!(slower.likely < range.likely);
     }
 
     #[test]

@@ -23,7 +23,9 @@ pub struct Options {
     pub tuning: Option<crate::tuning::Tuning>,
     pub min_crf: u8,
     pub max_crf: u8,
-    pub samples: usize,
+    /// Sample clips the CRF search goes by; `None` for as many as the video's length asks
+    /// for ([`search::sample_count`]).
+    pub samples: Option<usize>,
     pub sample_secs: f64,
     pub min_savings: f64,
     pub force: bool,
@@ -90,7 +92,15 @@ impl<'de> serde::Deserialize<'de> for Scenes {
 /// where it was 2.9 and 4.1, stretches fell 8.5 and 5.5 below, and 3-4% of five-second
 /// windows would have failed verification. Encoded per scene, the worst five seconds of
 /// those two came out 3.4 and 3.2 below the target.
-pub const UNEVEN_GAP: f64 = 2.0;
+///
+/// That was with four samples of eight seconds, and 2 was the line. Four seconds score
+/// lower where a video is hard for a moment, and the worst of eight is lower than the worst
+/// of four: on 13 real recordings the gap went from 2.1 to 4.4 for the same video. Of
+/// those 13, the three that had failed a spot check in one pass came out at 4.4, 4.6 and
+/// 5.1, one whose spot check had passed 1.3 above the line at 5.5, one that four long
+/// samples had marked as well at 4.2, and the other eight at 3.3 or less. 4 is also where a sample is as far below the mean as verification lets
+/// a spot check be below the target.
+pub const UNEVEN_GAP: f64 = 4.0;
 
 /// How far below the target a spot check of the finished encode may score.
 pub const VERIFY_SLACK: f64 = 4.0;
@@ -392,9 +402,10 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
             let start_crf = guess.start(&info, o.min_crf, o.max_crf);
             let learned = if guess.samples == 0 { String::new() } else { format!(", going by {} past encode{}", guess.samples, if guess.samples == 1 { "" } else { "s" }) };
             eprintln!("searching CRF for VMAF >= {} ({model}, preset {preset}), from CRF {start_crf}{learned}", o.target_vmaf);
+            let count = |secs: f64| o.samples.unwrap_or_else(|| search::sample_count(secs));
             let pos = match &cut {
-                Some(c) => c.sample_positions(o.samples, o.sample_secs),
-                None => search::sample_positions(info.picture_secs(), o.samples, o.sample_secs),
+                Some(c) => c.sample_positions(count(c.kept()), o.sample_secs),
+                None => search::sample_positions(info.picture_secs(), count(info.picture_secs()), o.sample_secs),
             };
             let cache = search::TrialCache::open(input, size, &pos, tools.encoder_version(), !o.fresh_search);
             let mut lab = search::Lab::new(tools, input, &info, &tmp.path, pos.clone(), vmaf_threads, cache);
@@ -761,7 +772,7 @@ fn work_dir(input: &Path, out_dir: &Path, size: u64, o: &Options, preset: u8, sv
         .map_or(0, |d| d.as_secs());
     let mut key = format!(
         "v{PLAN_FORMAT}|{}|{size}|{mtime}|{}|{preset}|{}|{}|{}|{}",
-        std::path::absolute(input)?.display(), o.target_vmaf, o.min_crf, o.max_crf, o.samples, o.sample_secs
+        std::path::absolute(input)?.display(), o.target_vmaf, o.min_crf, o.max_crf, o.samples.map_or("auto".to_string(), |n| n.to_string()), o.sample_secs
     );
     // Only when they differ, so work folders from before this setting existed still resume.
     if svt_params != search::DEFAULT_PARAMS {

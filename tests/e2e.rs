@@ -978,8 +978,10 @@ fn scenes_are_encoded_apart_only_where_the_samples_disagree() {
     // only once they have been looked for. With frames that stay twice as long as others,
     // a chunk's score would not be what is seen either: one CRF it is, held down for the
     // worst sample too.
+    // (Colour bars that stand still: a sample of them has to score 8 above one of the hard
+    // half for the worst of the two to lie 4 below their mean.)
     let halves = [
-        "-f", "lavfi", "-i", "testsrc2=s=640x360:r=24:d=12",
+        "-f", "lavfi", "-i", "smptebars=s=640x360:r=24:d=12",
         "-f", "lavfi", "-i", "life=s=640x360:r=24:mold=10:ratio=0.1:seed=1:death_color=#C83232:life_color=#00ff00,trim=duration=12",
         "-f", "lavfi", "-i", "sine=f=440:d=24",
     ];

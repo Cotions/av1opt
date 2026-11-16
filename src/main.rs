@@ -231,10 +231,12 @@ enum Cmd {
         min_crf: u8,
         #[arg(long, default_value_t = 55, value_parser = clap::value_parser!(u8).range(1..=63))]
         max_crf: u8,
-        /// Number of sample clips used by the CRF search.
-        #[arg(long, default_value_t = 4)]
-        samples: usize,
-        #[arg(long, default_value_t = 8.0)]
+        /// Number of sample clips the CRF search goes by. Without it: one for about every two
+        /// minutes of video, 8 at least and 32 at most.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=200))]
+        samples: Option<u64>,
+        /// Length of a sample clip in seconds.
+        #[arg(long, default_value_t = search::SAMPLE_SECS)]
         sample_secs: f64,
         /// Skip the full encode if predicted video savings are below this (0-1).
         #[arg(long, default_value_t = 0.15)]
@@ -323,9 +325,10 @@ enum Cmd {
         preset: u8,
         #[arg(long, default_value = search::DEFAULT_PARAMS, value_parser = search::parse_params)]
         svt_params: String,
-        #[arg(long, default_value_t = 4)]
-        samples: usize,
-        #[arg(long, default_value_t = 8.0)]
+        /// Number of sample clips. Without it: as many as `encode` would take.
+        #[arg(long)]
+        samples: Option<usize>,
+        #[arg(long, default_value_t = search::SAMPLE_SECS)]
         sample_secs: f64,
         #[arg(long, env = "AV1OPT_FFMPEG", default_value = "ffmpeg")]
         ffmpeg: String,
@@ -538,7 +541,7 @@ fn main() -> Result<()> {
                 search::check_params(&tools, preset, &svt_params)?;
             }
             let opts = encode::Options {
-                container, target_vmaf, preset, svt_params, tuning, min_crf, max_crf, samples, sample_secs,
+                container, target_vmaf, preset, svt_params, tuning, min_crf, max_crf, samples: samples.map(|n| n as usize), sample_secs,
                 min_savings, force, overwrite, keep_temp, scenes, workers: workers.into(), meta, remove, audio, fresh_search,
             };
             let mut jobs = batch::expand(&inputs, &out_dir, is_video);
@@ -583,7 +586,7 @@ fn main() -> Result<()> {
                 let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
                 let vmaf_threads = if info.width.max(info.height) >= 3200 { threads.min(4) } else { threads };
                 let enc = search::EncodeSettings { preset, pix_fmt_out: "yuv420p10le", params: svt_params.clone() };
-                let pos = search::sample_positions(info.picture_secs(), samples, sample_secs);
+                let pos = search::sample_positions(info.picture_secs(), samples.unwrap_or_else(|| search::sample_count(info.picture_secs())), sample_secs);
                 let clips = search::extract_samples(&tools, &input, &info, &dir, pos)?;
                 for crf in list {
                     let started = std::time::Instant::now();

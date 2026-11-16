@@ -220,6 +220,17 @@ pub fn first_frame(info: &MediaInfo) -> f64 {
     (info.video_start - info.start_time).max(0.0)
 }
 
+/// How long a sample clip is unless `--sample-secs` says otherwise: about what a spot check
+/// looks at, so that a sample can score as low as a spot check of the same stretch will.
+pub const SAMPLE_SECS: f64 = 4.0;
+
+/// How many sample clips a video of this length gets unless `--samples` says otherwise:
+/// one for about every two minutes, so that two minutes that are harder than the rest
+/// can't lie between samples, with 8 at least and 32 at most.
+pub fn sample_count(duration: f64) -> usize {
+    ((duration / 120.0).round() as usize).clamp(8, 32)
+}
+
 /// Sample start times: up to `count` clips of `secs` seconds, spread over the video and
 /// skipping the first and last 5% (intros, credits). Returns (start, length) pairs.
 pub fn sample_positions(duration: f64, count: usize, secs: f64) -> Vec<(f64, f64)> {
@@ -1282,5 +1293,20 @@ mod tests {
             }
         }
         assert!(sample_positions(0.0, 4, 8.0).is_empty());
+    }
+
+    #[test]
+    fn a_longer_video_gets_more_samples() {
+        // Eight up to a quarter of an hour, then one for every two minutes more.
+        assert_eq!([10.0, 600.0, 900.0, 1019.0].map(sample_count), [8; 4]);
+        assert_eq!([1021.0, 1800.0, 3600.0, 3840.0, 7200.0, 36000.0].map(sample_count), [9, 15, 30, 32, 32, 32]);
+        // No more than two minutes and a bit from one sample to the next, up to an hour.
+        for dur in [900.0, 1500.0, 2400.0, 3600.0] {
+            let pos = sample_positions(dur, sample_count(dur), SAMPLE_SECS);
+            assert_eq!(pos.len(), sample_count(dur));
+            assert!(pos.windows(2).all(|w| w[1].0 - w[0].0 < 125.0), "{dur}: {pos:?}");
+        }
+        // A short one gets what fits, with as much between two samples as they are long.
+        assert_eq!(sample_positions(20.0, sample_count(20.0), SAMPLE_SECS).len(), 2);
     }
 }

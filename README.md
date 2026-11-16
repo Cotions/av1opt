@@ -100,8 +100,11 @@ av1opt encode movie.mkv some/folder -o /out [--target-vmaf 93] [--preset 6] [--c
 
 For each file:
 
-1. **Sample** – cuts up to 4 clips spread through the video into lossless, constant-frame-rate
-   references (deinterlaced and cropped to even size when needed).
+1. **Sample** – cuts clips of 4 seconds spread through the video into lossless,
+   constant-frame-rate references (deinterlaced and cropped to even size when needed): 8 of
+   them up to a quarter of an hour, then one for every two minutes more, 32 at most, so that
+   two minutes harder than the rest can't lie between samples. `--samples` and
+   `--sample-secs` set both by hand.
 2. **Search** – finds the highest CRF whose mean VMAF over the samples meets the target. The
    first CRF tried is a guess: 35 for VMAF 93, moved by what your own past encodes say about
    bits per pixel and frame size (the same history `scan` learns from). The second goes where
@@ -117,7 +120,7 @@ For each file:
    spot check 4 VMAF below the target, and a spot check of the same stretch reads a little
    higher or lower than the samples did. If the worst sample at the chosen CRF is not a
    point above that mark, the search goes on to the CRF that puts it there, and the report
-   says so. A sample more than 2 below the samples' mean gets a note that quality differs along
+   says so. A sample 4 or more below the samples' mean gets a note that quality differs along
    the video (see [per-scene CRF](#per-scene-crf---scenes)).
 3. **Decide** – skips files that are already AV1, Dolby Vision, can't reach the target, or would
    save less than `--min-savings` (15%). The search stops at the first trial that misses the
@@ -219,8 +222,9 @@ and about 3x on real 15-minute recordings (six of them: 180 minutes where one pa
 estimated at 58); `--workers 2` encodes two chunks at once (each ffmpeg then gets half of `--memory-limit`).
 
 `--scenes=auto` spends that time only where it buys something: on videos whose samples score
-far apart at one CRF (the worst one 2 VMAF or more below their mean), and one CRF for the
-rest. Whole encodes of eight test clips, every frame scored against the source: on the six
+far apart at one CRF (the worst one 4 VMAF or more below their mean), and one CRF for the
+rest. (The numbers that follow were measured with four samples of eight seconds, where that
+line was at 2.) Whole encodes of eight test clips, every frame scored against the source: on the six
 whose worst sample was 0.3 to 1.6 below the mean, no five seconds of the encode fell more
 than 3 VMAF below the target. On the two where it was 2.9 and 4.1 below, stretches fell 8.5
 and 5.5 below the target (3-4% of all five-second windows were under what verification
@@ -577,6 +581,20 @@ and the benchmark's requests and tuned settings over HTTP (no ffmpeg needed).
   way for ever. The source's bitrate does not show where these are (a constant 5 Mbps; rank
   correlation with chunk difficulty 0.1). A failed spot check is now a sample of a second
   search, and the video is encoded once more.
+- **Eight short samples see more than four long ones.** Three of 64 real videos failed
+  their first spot check and were encoded twice. Searched again with other samples (the
+  search alone, five ways, on those three and two that had passed): four of 8 seconds chose
+  CRF 38.5, 40.25 and 40.25 as before; eight of 4 seconds, in the same search time, 33.5,
+  35.75 and 37.75, where the second encodes had passed at 33, 36.25 and 35.75. Two of the
+  three would have been right the first time and the third nearly. Sixteen got all three
+  for twice the search time, which costs more than the second encodes it saves. A spot
+  check looks at five seconds: a sample of four scores as low as it will, one of eight
+  averages the hard moment away. So samples are 4 seconds now, 8 of them, and more with
+  length. The worst of eight short samples lies further below their mean than the worst of
+  four long ones (2.1 became 4.4 for the same video), so the line for "quality differs
+  along the video" moved from 2 to 4: on 13 videos that marks the three failures (4.4, 4.6,
+  5.1), one whose spot check had passed 1.3 above the line and one the four long samples had
+  marked too, and none of the other eight (3.3 or less).
 - **What two folders taught.** 64 videos, 32 GB, 1080p webcam recordings at a flat 5 Mbps:
   62 encoded (31.1 GB to 13.9 GB), 2 skipped as not worth it, none lost. Three failed a spot
   check in one pass (86.1, 86.8, 88.1) and all three passed on the second search and encode

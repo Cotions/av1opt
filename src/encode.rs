@@ -334,8 +334,6 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         codec: info.codec.clone(), width: info.width, height: info.height, fps: info.fps, duration_s: info.duration_s,
         video_mbps: info.video_bitrate / 1e6, hdr: info.hdr,
     });
-    // Scene mode joins constant-rate chunks; a variable-rate source would be retimed, so it
-    // keeps the single-pass path.
     let mut notes = Vec::new();
     if info.duration_s - info.picture_secs() > 1.0 {
         notes.push(format!("the picture stops at {}, the sound runs on to {}: both kept as they are", hms(info.picture_secs()), hms(info.duration_s)));
@@ -370,13 +368,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         ));
     }
     // Why scenes can't be encoded apart here, if they can't.
-    let one_pass = if cut.is_some() {
-        Some("sections removed")
-    } else if info.vfr {
-        Some("variable frame rate source")
-    } else {
-        None
-    };
+    let one_pass = if cut.is_some() { Some("sections removed") } else { None };
     if o.scenes == Scenes::Always && let Some(why) = one_pass {
         notes.push(format!("{why}: encoded in one pass instead of per scene"));
     }
@@ -489,9 +481,12 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         std::fs::create_dir_all(&w.path)?;
         tools.emit(Event::Phase { phase: "scenes".into(), detail: "finding scene changes".into() });
         let found = scenes::detect(tools, input, &info, &w.path)?;
-        match found.pace.filter(scenes::Pace::uneven) {
-            // The header named a constant rate the frames don't keep (see `Pace`).
-            Some(p) => {
+        // The frames don't keep the constant rate chunks are cut at (see `Pace`). They are
+        // cut by their own timestamps then, if those can be gone by and the frames are
+        // shown about as long as each other (see `Times::steady`).
+        let uneven_pace = found.pace.filter(scenes::Pace::uneven);
+        match (uneven_pace, found.times.as_ref().filter(|t| uneven_pace.is_some() && t.steady())) {
+            (Some(p), None) => {
                 notes.push(format!(
                     "frames come at uneven times ({} frames; at a constant {} fps {} would be dropped and {} shown twice): encoded in one pass instead of per scene",
                     p.source_frames, search::cfr(&info), p.dropped, p.repeated
@@ -513,15 +508,28 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
                     }
                 }
             }
-            None => {
+            (pace, times) => {
                 // How much better the real preset scores than the fast probe preset at the
                 // same CRF; probe scores are shifted by this to predict the real encode.
                 let (pt, _) = lab.trial(&probe, best.crf)?;
                 let bias = best.mean_vmaf - pt.mean_vmaf;
                 lab.discard_samples();
-                let (first_pts, chunks) = scenes::bounds(&info, &found.cuts, found.total);
-                eprintln!("{} scene cuts, {} frames, {} chunks", found.cuts.len(), found.total, chunks.len());
-                let p = scenes::Plan { key: w.key.clone(), best, trials: trials.clone(), bias, first_pts, total_frames: found.total, chunks };
+                let (first_pts, chunks, total_frames, timed) = match (pace, times) {
+                    (Some(p), Some(t)) => {
+                        eprintln!(
+                            "frames come at uneven times (at a constant {} fps {} of {} would be dropped and {} shown twice): each keeps its own",
+                            search::cfr(&info), p.dropped, p.source_frames, p.repeated
+                        );
+                        let (first, chunks) = scenes::bounds_timed(&info, &found.cuts, t);
+                        (first, chunks, t.pts.len() as u64, Some(t.tb))
+                    }
+                    _ => {
+                        let (first, chunks) = scenes::bounds(&info, &found.cuts, found.total);
+                        (first, chunks, found.total, None)
+                    }
+                };
+                eprintln!("{} scene cuts, {total_frames} frames, {} chunks", found.cuts.len(), chunks.len());
+                let p = scenes::Plan { key: w.key.clone(), best, trials: trials.clone(), bias, first_pts, total_frames, chunks, timed };
                 std::fs::write(w.path.join("plan.json"), serde_json::to_vec_pretty(&p)?)?;
                 plan = Some(p);
             }
@@ -531,6 +539,9 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         let vf = search::source_filters(&info);
         if !vf.is_empty() {
             notes.push(format!("video filters: {}", vf.join(",")));
+        }
+        if plan.timed.is_some() {
+            notes.push("frames come at uneven times: scenes are cut and joined by the source's own timestamps, every frame where it was".into());
         }
         // Finding the scenes belongs to the search; the encode's clock starts here, so that
         // stretch is not counted twice.
@@ -549,8 +560,16 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
             ));
         }
         tools.emit(Event::Phase { phase: "muxing".into(), detail: format!("joining {} chunks", chunks.len()) });
-        let video = scenes::concat(&work.path, chunks.len())?;
-        let (args, streams) = mux_args(&video, input, &info, o.container, o.audio, &covers, &meta, &o.meta, &partial, &mut notes);
+        let joined = scenes::concat(&work.path, chunks.len())?;
+        let video = match plan.timed {
+            Some(_) => {
+                let stamped = scenes::stamp(tools, &work.path, &joined, &info)?;
+                let _ = std::fs::remove_file(&joined);
+                stamped
+            }
+            None => joined,
+        };
+        let (args, streams) = mux_args(&video, plan.timed.is_none(), input, &info, o.container, o.audio, &covers, &meta, &o.meta, &partial, &mut notes);
         tools.run(&args)?;
         let _ = std::fs::remove_file(&video);
         (streams, Some(chunks), Some(plan.total_frames))
@@ -817,10 +836,12 @@ fn full_encode_args(
     (a, streams)
 }
 
-/// Joined scene-chunk video plus audio, subtitles and metadata from the source.
+/// Joined scene-chunk video plus audio, subtitles and metadata from the source. `grid`: the
+/// video is a bare stream at the constant rate; otherwise it carries a timestamp per frame.
 #[allow(clippy::too_many_arguments)]
 fn mux_args(
     video: &Path,
+    grid: bool,
     input: &Path,
     info: &MediaInfo,
     container: Container,
@@ -833,12 +854,11 @@ fn mux_args(
 ) -> (Vec<String>, Streams) {
     // Keep the source's video/audio offset; the joined video itself starts at zero.
     let offset = info.video_start - info.start_time;
-    let mut a: Vec<String> = [
-        "-y", "-v", "error", "-itsoffset", &format!("{offset:.6}"), "-framerate", &search::cfr(info),
-        "-i", &path_arg(video), "-i", &path_arg(input), "-map", "0:v", "-c:v", "copy",
-    ]
-    .map(String::from)
-    .to_vec();
+    let mut a: Vec<String> = ["-y", "-v", "error", "-itsoffset", &format!("{offset:.6}")].map(String::from).to_vec();
+    if grid {
+        a.extend(["-framerate".into(), search::cfr(info)]);
+    }
+    a.extend(["-i", &path_arg(video), "-i", &path_arg(input), "-map", "0:v", "-c:v", "copy"].map(String::from));
     let streams = stream_args(info, 1, container, audio, covers, None, notes);
     a.extend(metadata::ffmpeg_args(mo, tags, 1));
     a.extend(streams.args.iter().cloned());
@@ -1190,7 +1210,7 @@ mod tests {
         MediaInfo {
             video_index: 0, codec: "h264".into(), width: 1920, height: 1080, fps: 30.0, duration_s: 60.0,
             video_bitrate: 5e6, pix_fmt: "yuv420p".into(), hdr: false, dolby_vision: false, color_transfer: String::new(), interlaced: false, vfr: false,
-            start_time: 0.0, video_start: 0.0, covers: vec![], attachments: 0, tags: Default::default(), video_s: 0.0, nominal_fps: 0.0,
+            start_time: 0.0, video_start: 0.0, covers: vec![], attachments: 0, tags: Default::default(), video_s: 0.0, nominal_fps: 0.0, time_base: (0, 0),
             audio_streams: audio.len() as u32, subtitle_streams: 0,
             audio: audio.iter().map(|&(codec, channels, bitrate)| AudioInfo { codec: codec.into(), channels, bitrate }).collect(),
             subtitle_codecs: vec![],

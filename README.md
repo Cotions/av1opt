@@ -232,10 +232,17 @@ video, which its four samples had not shown. Without `--scenes`, the report of s
 says that quality differs along it.
 
 Finished chunks are kept in `.av1opt-work-*` in the output folder, so an interrupted run resumes
-where it stopped (including the search). Variable-frame-rate sources are encoded in one pass,
-since chunking needs a constant frame rate. A file's header is not taken at its word for
-that: the scene pass counts how many frames a constant rate would drop or show twice, and
-past a handful (more than 1 in 200) the file is encoded in one pass, with a note in the report.
+where it stopped (including the search). Chunks are cut and compared at a constant frame
+rate, and a file's header is not taken at its word for having one: the scene pass counts how
+many frames that rate would drop or show twice. Past one in 10,000 the chunks are cut at the
+frames' own timestamps instead, each frame is encoded once, and the joined video is stamped
+with the times the source's frames had, to the tick (an MP4 keeps the source's time base;
+Matroska counts in milliseconds as it always does). That is for frames shown about as long
+as each other, as from a camera whose clock drifts. Where more than one step in a hundred is
+under half the usual or over one and a half times it (a screen recording, a stream with
+frames missing), a chunk's score would count the frames that stay longest no more than the
+rest: such a file is encoded in one pass, with a note in the report, and so is one whose
+timestamps repeat or run backwards.
 
 Folders are walked recursively and their layout is mirrored under `--out-dir`: one folder's
 contents directly below it, several folders each below a folder of their own name
@@ -554,7 +561,16 @@ and the benchmark's requests and tuned settings over HTTP (no ffmpeg needed).
   under the one in 200 the count above let through. Every chunk met the target, and the
   joined video was thrown away after 32 minutes by a spot check of 87: a frame doubled inside
   the stretch checked sets every later frame against its neighbour. One frame in 10,000 is
-  the limit now, and such a video is encoded in one pass with its own frame times.
+  the limit now. Such a video first went to one pass with its own frame times, which was
+  nearly all of that library; now scene mode itself goes by them: chunks are cut where the
+  source's timestamps say, hold each frame once, and the joined video gets every timestamp
+  back (2,677 of 2,677 identical on a 90-second excerpt, 5 chunks at CRF 28.5 to 37.25).
+- **Not every uneven video is a drifting one.** A screen recording that shows some frames
+  three times as long as others failed its spot check (87.9) when encoded per scene with
+  its own frame times: a chunk's VMAF counts each frame once, the spot check counts each
+  moment once, so a frame that stays three times as long weighs three times as much there.
+  Scene mode by the source's timestamps is for frames of about one length; the rest keep
+  their one pass.
 - **Four samples miss things.** The same video in one pass then failed for real: its chunks
   had shown that a sixth of it needs a CRF of 29 to 32 where the samples asked for 38.75,
   and a spot check landed on such a stretch (86.8). Run again, it would have failed the same

@@ -256,6 +256,7 @@ impl TimeModel {
     }
 
     /// The same model for encodes that give every scene its own CRF.
+    #[cfg(any(feature = "ui", test))]
     pub fn per_scene(self) -> Self {
         TimeModel { factor: self.scenes, ..self }
     }

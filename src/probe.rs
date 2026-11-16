@@ -21,6 +21,10 @@ pub struct MediaInfo {
     /// the average, which a webcam's drifting frame times pull a little below this.
     #[serde(default)]
     pub nominal_fps: f64,
+    /// Time base of the video stream's timestamps as (numerator, denominator), e.g. (1, 90000);
+    /// (0, 0) when unknown.
+    #[serde(default)]
+    pub time_base: (i64, i64),
     /// Frame rate varies (average differs from the nominal rate), e.g. phone recordings.
     #[serde(default)]
     pub vfr: bool,
@@ -188,6 +192,12 @@ pub fn probe(ffprobe: &str, path: &Path, file_size: u64) -> Result<MediaInfo> {
         height,
         fps,
         nominal_fps: nominal_rate.unwrap_or(0.0),
+        time_base: video["time_base"]
+            .as_str()
+            .and_then(|s| s.split_once('/'))
+            .and_then(|(n, d)| Some((n.parse().ok()?, d.parse().ok()?)))
+            .filter(|&(n, d): &(i64, i64)| n > 0 && d > 0)
+            .unwrap_or((0, 0)),
         vfr,
         duration_s,
         video_s,

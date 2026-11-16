@@ -974,16 +974,18 @@ fn scenes_are_encoded_apart_only_where_the_samples_disagree() {
     assert!(rep["verify_vmaf"].as_array().unwrap().iter().all(|v| v.as_f64().unwrap() >= 89.0), "{rep}");
 
     // An easy half and a hard one with every sixth frame left out, in a Matroska file whose
-    // header names a constant rate all the same: that scenes can't be cut apart shows only
-    // once they have been looked for. The one CRF it falls back to is held down for the
+    // header names a constant rate all the same: that scenes can't be cut apart at it shows
+    // only once they have been looked for. With frames that stay twice as long as others,
+    // a chunk's score would not be what is seen either: one CRF it is, held down for the
     // worst sample too.
-    c.ffmpeg(&[
+    let halves = [
         "-f", "lavfi", "-i", "testsrc2=s=640x360:r=24:d=12",
         "-f", "lavfi", "-i", "life=s=640x360:r=24:mold=10:ratio=0.1:seed=1:death_color=#C83232:life_color=#00ff00,trim=duration=12",
         "-f", "lavfi", "-i", "sine=f=440:d=24",
-        "-filter_complex", "[0:v]format=yuv420p[a];[1:v]format=yuv420p[b];[a][b]concat=n=2:v=1:a=0,select='mod(n,6)'[v]",
-        "-map", "[v]", "-map", "2:a", "-fps_mode", "vfr", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "12", "-c:a", "aac", "-b:a", "64k", "gaps.mkv",
-    ]);
+    ];
+    let x264 = ["-map", "[v]", "-map", "2:a", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "12", "-c:a", "aac", "-b:a", "64k"];
+    let joined = "[0:v]format=yuv420p[a];[1:v]format=yuv420p[b];[a][b]concat=n=2:v=1:a=0";
+    c.ffmpeg(&[&halves[..], &["-filter_complex", &format!("{joined},select='mod(n,6)'[v]"), "-fps_mode", "vfr"], &x264[..], &["gaps.mkv"]].concat());
     let gaps = c.videos().join("gaps.mkv");
     let late = c.dir.join("late");
     let r = c.encode_into(&late, &[&gaps], &["--scenes=auto"]);
@@ -991,6 +993,33 @@ fn scenes_are_encoded_apart_only_where_the_samples_disagree() {
     // hard half reads within a fraction of a point of the line.
     r.has("each scene gets its own CRF").has("frames come at uneven times").has("looking for the CRF that keeps it at 90 or above").has("to keep the worst sample at VMAF 90");
     assert!(entries(&late, ".av1opt-").is_empty());
+
+    // The same two halves with every frame there, each 25th staying a quarter longer: the
+    // clock of a camera that drifts. At any constant rate some frames would be dropped and
+    // others shown twice. Each scene still gets its CRF, cut and joined by the frames' own
+    // times: every one of them is where it was, to the tick, and the sound as it was.
+    c.ffmpeg(&[
+        &halves[..],
+        &["-filter_complex", &format!("{joined},settb=1/90000,setpts='N*3750+floor(N/25)*900'[v]"), "-fps_mode", "passthrough", "-enc_time_base", "1:90000", "-video_track_timescale", "90000"],
+        &x264[..],
+        &["drift.mp4"],
+    ].concat());
+    let drift = c.videos().join("drift.mp4");
+    let own = c.dir.join("own");
+    let r = c.encode_into(&own, &[&drift], &["--scenes=auto"]);
+    r.ok().has("each scene gets its own CRF").has("fps 2 of 576 would be dropped and 7 shown twice): each keeps its own");
+    let rep = c.report_in(&own, "drift");
+    assert_eq!(rep["mode"], "scenes", "{rep}");
+    assert!(rep["notes"].to_string().contains("scenes are cut and joined by the source's own timestamps"), "{rep}");
+    assert_eq!(rep["chunks"].as_array().unwrap().iter().map(|ch| ch["frames"].as_u64().unwrap()).sum::<u64>(), 576, "{rep}");
+    let (got, want) = (frame_times(&own.join("drift.mp4")), frame_times(&drift));
+    assert_eq!((got.len(), want.len()), (576, 576));
+    let worst = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+    assert!(worst < 0.00002, "a frame is {worst:.6} s from its place");
+    assert_in_step(&own.join("drift.mp4"), &drift, "1");
+    assert_eq!(packets_md5(&own.join("drift.mp4"), "0:a:0"), packets_md5(&drift, "0:a:0"));
+    assert!(rep["verify_vmaf"].as_array().unwrap().iter().all(|v| v.as_f64().unwrap() >= 89.0), "{rep}");
+    assert!(entries(&own, ".av1opt-").is_empty());
 
     // A picture that gets harder as it goes (the zoom into the Mandelbrot set), so that
     // five seconds of it score lower than the two the samples saw: the spot check fails,

@@ -186,9 +186,18 @@ pub struct TimeModel {
     pub scenes: f64,
     /// Per-scene encodes `scenes` was learned from.
     pub scene_samples: usize,
-    /// What `secs` multiplies by: 1, or `scenes` for the model [`TimeModel::per_scene`] gives.
+    /// The share of videos that get a CRF per scene where `--scenes=auto` decides.
+    pub auto_share: f64,
+    /// Encodes made with `--scenes=auto` that share was learned from.
+    pub auto_samples: usize,
+    /// What `secs` multiplies by: 1, `scenes` for the model [`TimeModel::per_scene`] gives,
+    /// or what lies between for [`TimeModel::auto`].
     factor: f64,
 }
+
+/// Of 13 real recordings searched with eight samples of four seconds, five were uneven
+/// enough for a CRF per scene.
+const AUTO_SHARE: f64 = 1.0 / 3.0;
 
 /// Six 15-minute 1080p recordings (2026-11-15) took 180 minutes per scene where one pass was
 /// predicted, and for 55 others measured, at 58.
@@ -201,8 +210,6 @@ const SPF_EXPONENT: f64 = 0.85;
 const PRESET_TIME: [f64; 14] = [40.0, 20.0, 9.0, 5.0, 2.8, 1.7, 1.0, 0.75, 0.55, 0.45, 0.35, 0.3, 0.27, 0.25];
 /// The CRF search costs about as much as encoding its sample clips this many times.
 const SEARCH_ENCODES: f64 = 2.0;
-/// Seconds of video the search's sample clips add up to (4 clips of 8 s) unless the video is shorter.
-const SEARCH_CLIP_SECS: f64 = 32.0;
 
 /// Encodes shorter than this say little about seconds per frame.
 const MIN_TIMED_SECS: f64 = 10.0;
@@ -238,7 +245,7 @@ impl TimeModel {
         }
         let det = a * d - b * b;
         let beta = if det.abs() > 1e-9 { [(r0 * d - b * r1) / det, (a * r1 - b * r0) / det] } else { prior };
-        let whole = TimeModel { beta, preset, samples: pts.len(), scenes: SCENES_FACTOR, scene_samples: 0, factor: 1.0 };
+        let whole = TimeModel { beta, preset, samples: pts.len(), scenes: SCENES_FACTOR, scene_samples: 0, auto_share: AUTO_SHARE, auto_samples: 0, factor: 1.0 };
         // Per-scene encodes against what one pass would have taken, search included on both
         // sides: the geometric mean, pulled toward the first guess like everything else here.
         let ratios: Vec<f64> = records
@@ -252,7 +259,23 @@ impl TimeModel {
             })
             .collect();
         let scenes = ((PRIOR_WEIGHT * SCENES_FACTOR.ln() + ratios.iter().sum::<f64>()) / (PRIOR_WEIGHT + ratios.len() as f64)).exp();
-        TimeModel { scenes, scene_samples: ratios.len(), ..whole }
+        // How often "auto" ended in a CRF per scene, of the encodes that say they were made with it.
+        let auto: Vec<bool> = records.iter().filter(|r| r.scenes.as_deref() == Some("auto")).map(|r| r.mode == "scenes").collect();
+        let auto_share = (PRIOR_WEIGHT * AUTO_SHARE + auto.iter().filter(|s| **s).count() as f64) / (PRIOR_WEIGHT + auto.len() as f64);
+        TimeModel { scenes, scene_samples: ratios.len(), auto_share, auto_samples: auto.len(), ..whole }
+    }
+
+    /// How many times one pass a video takes on average where `--scenes=auto` decides: one
+    /// pass for most, a CRF per scene for the share that turn out uneven.
+    pub fn auto_factor(&self) -> f64 {
+        1.0 + self.auto_share * (self.scenes - 1.0)
+    }
+
+    /// The same model for encodes with `--scenes=auto`. Which videos get a CRF per scene
+    /// shows only once their samples are scored, so each is given the average.
+    #[cfg(any(feature = "ui", test))]
+    pub fn auto(self) -> Self {
+        TimeModel { factor: self.auto_factor(), ..self }
     }
 
     /// The same model for encodes that give every scene its own CRF.
@@ -272,7 +295,9 @@ impl TimeModel {
         if pixels <= 0.0 || m.fps <= 0.0 || secs <= 0.0 {
             return 0.0;
         }
-        let searched = secs.min(SEARCH_CLIP_SECS) * SEARCH_ENCODES;
+        // What the search's sample clips add up to, unless the video is shorter.
+        let clips = crate::search::sample_count(secs) as f64 * crate::search::SAMPLE_SECS;
+        let searched = secs.min(clips) * SEARCH_ENCODES;
         self.secs_per_frame(pixels) * m.fps * (secs + searched) * self.factor
     }
 }
@@ -380,7 +405,7 @@ mod tests {
             format: 1,
             time: 0, codec: "h264".into(), width: w, height: h, fps: 30.0, duration_s: 60.0,
             source_bitrate: src_bpp * px, output_bitrate: out_bpp * px, target_vmaf: 93.0, preset: 6,
-            mode: "whole".into(), crf: None, svt_params: None, search_secs: None, encode_secs: None,
+            mode: "whole".into(), crf: None, svt_params: None, search_secs: None, encode_secs: None, scenes: None,
         }
     }
 
@@ -507,7 +532,8 @@ mod tests {
         assert!(TimeModel::fit(&[], 4).secs_per_frame(PIXELS_1080P) > 2.0 * SPF_1080P);
         assert!(TimeModel::fit(&[], 8).secs_per_frame(PIXELS_1080P) < 0.7 * SPF_1080P);
         let hour = guess.secs(&info(1920, 1080, 3600.0));
-        assert!((hour / (SPF_1080P * 30.0 * 3600.0) - 1.0 - 64.0 / 3600.0).abs() < 1e-9, "{hour}");
+        // Thirty sample clips of four seconds, encoded about twice.
+        assert!((hour / (SPF_1080P * 30.0 * 3600.0) - 1.0 - 240.0 / 3600.0).abs() < 1e-9, "{hour}");
         // A short video is searched on all of it: the search outweighs the encode.
         let short = guess.secs(&info(1920, 1080, 10.0));
         assert!((short / (SPF_1080P * 300.0) - 3.0).abs() < 1e-9, "{short}");
@@ -567,6 +593,30 @@ mod tests {
         // They say nothing about the speed of one pass.
         assert_eq!(learned.samples, 0);
         assert_eq!(learned.secs(&info), guess.secs(&info));
+    }
+
+    #[test]
+    fn auto_costs_what_its_share_of_per_scene_encodes_costs() {
+        let info = MediaInfo { width: 1920, height: 1080, fps: 30.0, duration_s: 900.0, ..Default::default() };
+        // A third per scene at three times one pass, before anything is known.
+        let guess = TimeModel::fit(&[], 6);
+        assert_eq!(guess.auto_samples, 0);
+        assert!((guess.auto_factor() - (1.0 + 2.0 / 3.0)).abs() < 1e-9);
+        assert!((guess.auto().secs(&info) / guess.secs(&info) - guess.auto_factor()).abs() < 1e-9);
+        // 60 encodes made with "auto", every tenth per scene; others don't count, whatever their mode.
+        let made = |setting: &str, mode: &str| Record { scenes: Some(setting.into()), mode: mode.into(), search_secs: None, encode_secs: None, ..rec(0.1, 0.03, 1920, 1080) };
+        let mut recs: Vec<Record> = (0..60).map(|i| made("auto", if i % 10 == 0 { "scenes" } else { "whole" })).collect();
+        recs.extend((0..40).map(|_| made("always", "scenes")));
+        recs.extend((0..40).map(|_| made("off", "whole")));
+        recs.push(Record { mode: "scenes".into(), ..rec(0.1, 0.03, 1920, 1080) });
+        let learned = TimeModel::fit(&recs, 6);
+        assert_eq!(learned.auto_samples, 60);
+        assert!((learned.auto_share - 7.0 / 63.0).abs() < 1e-9, "{}", learned.auto_share);
+        // A longer video's search has more clips to encode.
+        let long = MediaInfo { duration_s: 3600.0, ..info.clone() };
+        let per_sec = |m: &MediaInfo| guess.secs(m) / m.duration_s;
+        assert!((per_sec(&info) - guess.secs_per_frame(PIXELS_1080P) * 30.0 * (900.0 + 64.0) / 900.0).abs() < 1e-9);
+        assert!((per_sec(&long) - guess.secs_per_frame(PIXELS_1080P) * 30.0 * (3600.0 + 240.0) / 3600.0).abs() < 1e-9);
     }
 
     #[test]

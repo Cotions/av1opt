@@ -963,6 +963,86 @@ fn scenes_get_their_own_crf_and_a_killed_run_goes_on_where_it_stopped() {
 
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn scenes_cut_by_the_frames_own_times_survive_a_kill_two_workers_matroska_and_fields() {
+    let c = Case::new("own-times");
+    // The four kinds of picture of `scenes_clip` on a clock that drifts: every 25th frame
+    // stays a quarter longer, so no constant rate holds them all.
+    c.ffmpeg(&[
+        "-f", "lavfi", "-i", "testsrc2=s=640x360:r=24:d=6", "-f", "lavfi", "-i", "mandelbrot=s=640x360:r=24,trim=duration=6",
+        "-f", "lavfi", "-i", "sierpinski=s=640x360:r=24:seed=1,trim=duration=6",
+        "-f", "lavfi", "-i", "life=s=640x360:r=24:mold=10:ratio=0.1:seed=1:death_color=#C83232:life_color=#00ff00,trim=duration=6",
+        "-f", "lavfi", "-i", "sine=f=440:d=24",
+        "-filter_complex", "[0:v]format=yuv420p[a];[1:v]format=yuv420p[b];[2:v]format=yuv420p[c];[3:v]format=yuv420p[d];[a][b][c][d]concat=n=4:v=1:a=0,settb=1/90000,setpts='N*3750+floor(N/25)*900'[v]",
+        "-map", "[v]", "-map", "4:a", "-fps_mode", "passthrough", "-enc_time_base", "1:90000", "-video_track_timescale", "90000",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "16", "-c:a", "aac", "-b:a", "64k", "d.mp4",
+    ]);
+    let src = c.videos().join("d.mp4");
+    let want = frame_times(&src);
+    assert_eq!(want.len(), 576);
+    let furthest = |out: &Path| {
+        let got = frame_times(out);
+        assert_eq!(got.len(), want.len(), "{}", out.display());
+        got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max)
+    };
+
+    // Two chunks at a time, killed after the first is done, then run again.
+    let args = || {
+        let mut a: Vec<std::ffi::OsString> = vec!["encode".into(), "-o".into(), c.out().into(), "--scenes".into(), "--workers".into(), "2".into()];
+        a.extend(SLOW.iter().map(Into::into));
+        a.push(src.clone().into());
+        a
+    };
+    let mut child = c.command().args(args()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    wait_until("the first finished chunk", 180, || entries(&c.out(), ".av1opt-work-").iter().any(|w| w.join("chunk00000.obu").exists()));
+    child.kill().unwrap();
+    child.wait().unwrap();
+    wait_until("ffmpeg to end with av1opt", 5, || ffmpegs_under(&c.dir).is_empty());
+    assert!(!c.out().join("d.mp4").exists());
+    let r = c.av1opt(&args());
+    r.ok().has("resuming earlier run: crf").has("encoded 1, skipped 0, failed 0");
+    assert!(!r.err.contains("searching CRF"), "{}", r.err);
+    let out = c.out().join("d.mp4");
+    let worst = furthest(&out);
+    assert!(worst < 0.00002, "a frame is {worst:.6} s from its place");
+    assert_in_step(&out, &src, "1");
+    assert_eq!(packets_md5(&out, "0:a:0"), packets_md5(&src, "0:a:0"));
+    let rep = c.report("d");
+    assert_eq!(rep["mode"], "scenes");
+    assert!(rep["notes"].to_string().contains("scenes are cut and joined by the source's own timestamps"), "{rep}");
+    let chunks = rep["chunks"].as_array().unwrap();
+    assert_eq!((chunks.len(), chunks.iter().map(|ch| ch["frames"].as_u64().unwrap()).sum::<u64>()), (4, 576), "{rep}");
+    assert_eq!(video(&out)["field_order"], "progressive");
+    assert_eq!(c.outputs(), ["av1opt-log.tsv", "d.av1opt.json", "d.mp4"]);
+
+    // Matroska counts in milliseconds: every frame within half of one.
+    let mkv = c.dir.join("mkv");
+    c.encode_into(&mkv, &[&src], &["--scenes", "--container", "mkv"]).ok().has("encoded 1,");
+    let worst = furthest(&mkv.join("d.mkv"));
+    assert!(worst < 0.00051, "a frame is {worst:.6} s from its place");
+    assert_in_step(&mkv.join("d.mkv"), &src, "1");
+
+    // Fields woven into frames, on such a clock too: the deinterlaced frames keep the
+    // times the woven ones had.
+    c.ffmpeg(&[
+        "-f", "lavfi", "-i", "testsrc2=s=352x288:r=50:d=6", "-f", "lavfi", "-i", "mandelbrot=s=352x288:r=50,trim=duration=6", "-f", "lavfi", "-i", "sine=f=440:d=12",
+        "-filter_complex", "[0:v]format=yuv420p[a];[1:v]format=yuv420p[b];[a][b]concat=n=2:v=1:a=0,tinterlace=interleave_top,fieldorder=tff,settb=1/90000,setpts='N*3600+floor(N/25)*900'[v]",
+        "-map", "[v]", "-map", "2:a", "-fps_mode", "passthrough", "-enc_time_base", "1:90000", "-video_track_timescale", "90000",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "14", "-flags", "+ildct+ilme", "-x264opts", "tff=1", "-c:a", "aac", "-b:a", "64k", "fields.mp4",
+    ]);
+    let woven = c.videos().join("fields.mp4");
+    assert_eq!(video(&woven)["field_order"], "tt");
+    let il = c.dir.join("fields");
+    c.encode_into(&il, &[&woven], &["--scenes"]).ok().has("shown twice): each keeps its own").has("encoded 1,");
+    let (got, want) = (frame_times(&il.join("fields.mp4")), frame_times(&woven));
+    assert_eq!((got.len(), want.len()), (300, 300));
+    let worst = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+    assert!(worst < 0.00002, "a frame is {worst:.6} s from its place");
+    assert_eq!(video(&il.join("fields.mp4"))["field_order"], "progressive");
+    assert_eq!(c.report_in(&il, "fields")["mode"], "scenes");
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn scenes_are_encoded_apart_only_where_the_samples_disagree() {
     let c = Case::new("auto");
     let uneven = c.scenes_clip("uneven.mp4");

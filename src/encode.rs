@@ -98,8 +98,8 @@ impl<'de> serde::Deserialize<'de> for Scenes {
 /// of four: on 13 real recordings the gap went from 2.1 to 4.4 for the same video. Of
 /// those 13, the three that had failed a spot check in one pass came out at 4.4, 4.6 and
 /// 5.1, one whose spot check had passed 1.3 above the line at 5.5, one that four long
-/// samples had marked as well at 4.2, and the other eight at 3.3 or less. 4 is also where a sample is as far below the mean as verification lets
-/// a spot check be below the target.
+/// samples had marked as well at 4.2, and the other eight at 3.3 or less. 4 is also where
+/// a sample is as far below the mean as verification lets a spot check be below the target.
 pub const UNEVEN_GAP: f64 = 4.0;
 
 /// How far below the target a spot check of the finished encode may score.
@@ -109,13 +109,17 @@ const HOLD_MARGIN: f64 = 1.0;
 
 /// Where the finished encode is compared with the source, as (start, length) in seconds of
 /// the output: five seconds at 30% and at 70% of the way, or all of a video too short for
-/// the two to be different stretches.
+/// the two to be different stretches. A video of 25 minutes or more gets one for every ten
+/// minutes, eight at most, spread the same way (the first as far from the start as the last
+/// from the end, one and a third times as far from each other): two checks say little
+/// about two hours.
 pub fn spot_checks(duration: f64) -> Vec<(f64, f64)> {
     const SECS: f64 = 5.0;
     if duration <= 2.0 * SECS {
         return vec![(0.0, duration.max(0.0))];
     }
-    [0.3, 0.7].map(|at| ((duration - SECS) * at, SECS)).to_vec()
+    let n = ((duration / 600.0).round() as usize).clamp(2, 8);
+    (0..n).map(|i| ((duration - SECS) * (i as f64 + 0.75) / (n as f64 + 0.5), SECS)).collect()
 }
 
 /// What happens to sound tracks that could be copied as they are.
@@ -500,7 +504,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
             (Some(p), None) => {
                 notes.push(format!(
                     "frames come at uneven times ({} frames; at a constant {} fps {} would be dropped and {} shown twice): encoded in one pass instead of per scene",
-                    p.source_frames, search::cfr(&info), p.dropped, p.repeated
+                    p.source_frames, search::cfr_label(&info), p.dropped, p.repeated
                 ));
                 let _ = std::fs::remove_dir_all(&w.path);
                 work = None;
@@ -529,7 +533,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
                     (Some(p), Some(t)) => {
                         eprintln!(
                             "frames come at uneven times (at a constant {} fps {} of {} would be dropped and {} shown twice): each keeps its own",
-                            search::cfr(&info), p.dropped, p.source_frames, p.repeated
+                            search::cfr_label(&info), p.dropped, p.source_frames, p.repeated
                         );
                         let (first, chunks) = scenes::bounds_timed(&info, &found.cuts, t);
                         (first, chunks, t.pts.len() as u64, Some(t.tb))
@@ -728,6 +732,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     if cut.is_none() {
         (record.search_secs, record.encode_secs) = (Some(search_secs), Some(encode_secs));
     }
+    record.scenes = Some(match o.scenes { Scenes::Off => "off", Scenes::Auto => "auto", Scenes::Always => "always" }.to_string());
     // A cut encoded below the target would teach the size model wrong sizes for it.
     if let Err(e) = if reached { history::append(&record) } else { Ok(()) } {
         eprintln!("warning: could not record this encode in the history: {e:#}");
@@ -880,6 +885,9 @@ fn mux_args(
         a.extend(["-framerate".into(), search::cfr(info)]);
     }
     a.extend(["-i", &path_arg(video), "-i", &path_arg(input), "-map", "0:v", "-c:v", "copy"].map(String::from));
+    // A bare stream says nothing about fields and the header would say "unknown"; what an
+    // encode in one pass says of itself holds here too.
+    a.extend(["-field_order:v:0", "progressive"].map(String::from));
     let streams = stream_args(info, 1, container, audio, covers, None, notes);
     a.extend(metadata::ffmpeg_args(mo, tags, 1));
     a.extend(streams.args.iter().cloned());
@@ -1215,6 +1223,11 @@ mod tests {
         assert_eq!(spot_checks(6.0), [(0.0, 6.0)]);
         assert_eq!(spot_checks(10.0), [(0.0, 10.0)]);
         assert_eq!(spot_checks(0.4), [(0.0, 0.4)]);
+        // Two up to 25 minutes, then one for every ten, eight at most.
+        assert_eq!([600.0, 1499.0, 1501.0, 3600.0, 4500.0, 7200.0, 36000.0].map(|d| spot_checks(d).len()), [2, 2, 3, 6, 8, 8, 8]);
+        let hour = spot_checks(3605.0);
+        assert_eq!(hour.iter().map(|c| c.0.round()).collect::<Vec<_>>(), [415.0, 969.0, 1523.0, 2077.0, 2631.0, 3185.0]);
+        assert!(hour.iter().all(|c| c.1 == 5.0));
     }
 
     #[test]

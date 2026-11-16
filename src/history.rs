@@ -45,6 +45,10 @@ pub struct Record {
     pub search_secs: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encode_secs: Option<f64>,
+    /// What `--scenes` was set to: "off", "auto" or "always" (absent: not recorded). With
+    /// `mode` it says how often "auto" ends in a CRF per scene.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scenes: Option<String>,
 }
 
 impl Record {
@@ -67,6 +71,7 @@ impl Record {
             svt_params: Some(svt_params.to_string()),
             search_secs: None,
             encode_secs: None,
+            scenes: None,
         }
     }
 }

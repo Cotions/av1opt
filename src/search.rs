@@ -130,6 +130,12 @@ pub fn cfr(info: &MediaInfo) -> String {
 }
 
 /// Numeric value of [`cfr`], i.e. frames per second of the constant-rate stream.
+/// That rate as people write it: "23.98", "30", "27.3".
+pub fn cfr_label(info: &MediaInfo) -> String {
+    let s = format!("{:.2}", cfr_value(info));
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
 pub fn cfr_value(info: &MediaInfo) -> f64 {
     let r = cfr(info);
     match r.split_once('/') {
@@ -1273,6 +1279,8 @@ mod tests {
         // A variable-rate stream declares whatever fits all its frame times: not a grid.
         assert_eq!(cfr(&info(27.3, 120.0, true)), "27.300");
         assert_eq!(cfr(&info(29.97, 90000.0, true)), "30000/1001");
+        // As a message names them.
+        assert_eq!([23.976, 30.0, 27.3, 59.94].map(|f| cfr_label(&info_with_fps(f))), ["23.98", "30", "27.3", "59.94"]);
     }
 
     #[test]

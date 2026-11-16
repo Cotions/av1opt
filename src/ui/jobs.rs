@@ -424,8 +424,12 @@ fn add_unchecked(app: &App, body: &Value) -> Result<Value> {
     // Time estimates for files a scan has seen; the others get theirs when they are probed.
     let time = crate::estimate::TimeModel::fit(&crate::history::load(), opts.preset);
     // Estimates are for the way the files will be encoded. "Where uneven" is not known
-    // before a file's samples are scored, and most files then go in one pass.
-    let time = if opts.scenes == crate::encode::Scenes::Always { time.per_scene() } else { time };
+    // before a file's samples are scored: each file gets the average of the two ways.
+    let time = match opts.scenes {
+        crate::encode::Scenes::Always => time.per_scene(),
+        crate::encode::Scenes::Auto => time.auto(),
+        crate::encode::Scenes::Off => time,
+    };
     let abs_inputs: Vec<PathBuf> = batch_jobs.iter().map(|j| std::fs::canonicalize(&j.input).unwrap_or_else(|_| j.input.clone())).collect();
     let known = crate::scan::cached_info(&abs_inputs);
     let files: Vec<FileState> = batch_jobs

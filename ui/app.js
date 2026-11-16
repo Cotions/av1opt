@@ -755,7 +755,7 @@ function renderScan(out, r) {
   const savedOf = (row) => row.size - row.estimate.likely;
   // Bytes saved per hour of encoding: what to start with when time is short.
   const rateOf = (row) => row.verdict === "Candidate" && row.est_secs ? savedOf(row) / row.est_secs * 3600 : 0;
-  const timeBasis = `Search and encode at preset ${r.preset}, ${r.time_samples ? "going by " + plural(r.time_samples, "past encode") + " on this machine" : "a rough guess until a few files are encoded on this machine"}. A CRF per scene takes about ${num(r.scenes_factor || 3, 1)} times as long${r.scene_samples ? " (" + plural(r.scene_samples, "such encode") + ")" : ""}`;
+  const timeBasis = `Search and encode at preset ${r.preset}, ${r.time_samples ? "going by " + plural(r.time_samples, "past encode") + " on this machine" : "a rough guess until a few files are encoded on this machine"}. A CRF per scene takes about ${num(r.scenes_factor || 3, 1)} times as long${r.scene_samples ? " (" + plural(r.scene_samples, "such encode") + ")" : ""}; one only where quality is uneven about ${num(r.auto_factor || 1.7, 1)} times on average${r.auto_samples ? " (" + Math.round((r.auto_share || 0) * 100) + "% of " + plural(r.auto_samples, "encode") + " made that way went per scene)" : ""}`;
   const rows = r.rows;
   const body = h("tbody");
   const selInfo = h("span", { class: "dim" });
@@ -2375,10 +2375,11 @@ function comparePlayer(root, r) {
     rect.dataset.tip = `chunk ${c.index + 1} · ${tc(c.start_secs)}–${tc(c.end)} · CRF ${c.crf}${c.corrected ? " (corrected)" : ""} · VMAF ${num(c.vmaf)}${c.out_of_reach ? " (target out of reach at any CRF)" : ""} · ${bytes(c.bytes)} · ${num(c.bytes * 8 / (c.end - c.start_secs) / 1e6, 2)} Mbps`;
     tl.append(rect);
   }
-  // Verification spot checks: 5 s windows at 30% and 70% of (duration − 5 s), or one check
-  // of all of a video of 10 s or less.
+  // Verification spot checks: 5 s windows at 30% and 70% of (duration − 5 s), spread the
+  // same way where a long video has more than two, or one check of all of a video of 10 s
+  // or less.
   (r.verify_vmaf || []).forEach((v, k, all) => {
-    const secs = all.length === 1 ? duration : Math.min(5, duration), st = all.length === 1 ? 0 : (duration - secs) * [0.3, 0.7][k];
+    const secs = all.length === 1 ? duration : Math.min(5, duration), st = all.length === 1 ? 0 : (duration - secs) * (k + 0.75) / (all.length + 0.5);
     const c = s("circle", { cx: x(st + secs / 2), cy: y(v), r: 4, fill: "#6aa7e8", stroke: "#111", "vector-effect": "non-scaling-stroke" });
     c.dataset.tip = `verify spot check ${tc(st)}–${tc(st + secs)} · VMAF ${num(v)}`;
     tl.append(c);

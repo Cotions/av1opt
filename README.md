@@ -37,8 +37,10 @@ built-in model while there are few encodes), so estimates and their ranges tight
 you encode more.
 
 `scan` also says how long the candidates would take to search and encode, in one pass and
-with a CRF per scene (a multiple learned from the per-scene encodes made here) (`--preset`, default
-6) and lists the time per file; `--sort per-hour` orders the top candidates by bytes saved per
+with a CRF per scene (a multiple learned from the per-scene encodes made here), and with
+`--scenes=auto` (the share of videos that end up per scene: a third at first, then what the
+encodes made that way here say; the queue of the UI counts each file at that average)
+(`--preset`, default 6) and lists the time per file; `--sort per-hour` orders the top candidates by bytes saved per
 hour of encoding, the place to start when the library is larger than your patience. The time
 is seconds per frame by frame size: a guess from one six-core machine at first, then fitted to
 the encode times in the history, so it becomes this machine's speed after a few encodes.
@@ -137,8 +139,9 @@ For each file:
    `--container mkv` to keep image subtitles too. Cover art is kept (MP4: attached picture,
    MKV: attachment with its original file name).
 5. **Verify** – codec, duration, stream and cover counts, HDR transfer, plus VMAF spot checks at positions the search
-   did not sample (five seconds at 30% and at 70% of the way; all of a video of ten seconds
-   or less, once). Nothing is written unless all checks pass. A spot check more than 4 VMAF
+   did not sample (five seconds at 30% and at 70% of the way; one for every ten minutes of
+   a video of 25 minutes or more, eight at most; all of a video of ten seconds or less,
+   once). Nothing is written unless all checks pass. A spot check more than 4 VMAF
    below the target is a stretch the samples missed: for a video encoded in one pass it is
    added to them, the search runs again (the worst sample two points above that line this
    time) and the video is encoded once more at the lower CRF it finds, which the report

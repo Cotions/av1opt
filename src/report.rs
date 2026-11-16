@@ -113,6 +113,16 @@ pub fn print(results: &[FileResult], top: usize, time: &TimeModel, by: TopBy) {
             n => format!("going by {n} such encodes"),
         };
         println!("with a CRF per scene (encode --scenes): about {}, {:.1}x as long ({seen})", span(total * time.scenes), time.scenes);
+        let share = match time.auto_samples {
+            0 => "a first guess".to_string(),
+            1 => "going by 1 encode made that way".to_string(),
+            n => format!("going by {n} encodes made that way"),
+        };
+        println!(
+            "with a CRF per scene only where quality is uneven (encode --scenes=auto): about {}, {:.0}% of them per scene ({share})",
+            span(total * time.auto_factor()),
+            time.auto_share * 100.0
+        );
     }
 
     println!("\n== By verdict ==");

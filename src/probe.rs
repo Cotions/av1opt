@@ -17,10 +17,18 @@ pub struct MediaInfo {
     pub width: u32,
     pub height: u32,
     pub fps: f64,
+    /// The rate the stream is declared at (ffprobe's r_frame_rate); 0 when unknown. `fps` is
+    /// the average, which a webcam's drifting frame times pull a little below this.
+    #[serde(default)]
+    pub nominal_fps: f64,
     /// Frame rate varies (average differs from the nominal rate), e.g. phone recordings.
     #[serde(default)]
     pub vfr: bool,
     pub duration_s: f64,
+    /// Length of the video stream itself, 0 when the container doesn't say. A recording whose
+    /// sound runs on after the picture stops has a `duration_s` far past its last frame.
+    #[serde(default)]
+    pub video_s: f64,
     /// Container start time and the video stream's own start time, in seconds.
     #[serde(default)]
     pub start_time: f64,
@@ -61,6 +69,13 @@ pub struct Cover {
     pub codec: String,
     /// Original attachment file name (Matroska), if any.
     pub filename: Option<String>,
+}
+
+impl MediaInfo {
+    /// Seconds of picture: what samples, spot checks and frame counts can come from.
+    pub fn picture_secs(&self) -> f64 {
+        if self.video_s > 0.0 && self.video_s < self.duration_s { self.video_s } else { self.duration_s }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +132,10 @@ pub fn probe(ffprobe: &str, path: &Path, file_size: u64) -> Result<MediaInfo> {
     let duration_s = num(&j["format"]["duration"])
         .or_else(|| num(&video["duration"]))
         .unwrap_or(0.0);
+    // Matroska keeps a stream's length in a tag ("00:07:39.966000000"), MP4 in the stream.
+    let video_s = num(&video["duration"])
+        .or_else(|| video["tags"]["DURATION"].as_str().and_then(clock_secs))
+        .unwrap_or(0.0);
     let avg_rate = parse_rate(video["avg_frame_rate"].as_str());
     let nominal_rate = parse_rate(video["r_frame_rate"].as_str());
     let fps = avg_rate.or(nominal_rate).unwrap_or(0.0);
@@ -127,8 +146,12 @@ pub fn probe(ffprobe: &str, path: &Path, file_size: u64) -> Result<MediaInfo> {
     let audio: Vec<&Value> = streams.iter().filter(|s| s["codec_type"] == "audio").collect();
     let audio_bitrate: f64 = audio.iter().filter_map(|s| num(&s["bit_rate"])).sum();
     let total_bitrate = if duration_s > 0.0 { file_size as f64 * 8.0 / duration_s } else { 0.0 };
-    let video_bitrate = num(&video["bit_rate"])
-        .unwrap_or_else(|| (total_bitrate - audio_bitrate).max(total_bitrate * 0.5));
+    // Without a stated rate: the bytes that aren't sound, over the seconds that have picture.
+    let picture_s = if video_s > 0.0 && video_s < duration_s { video_s } else { duration_s };
+    let video_bitrate = num(&video["bit_rate"]).unwrap_or_else(|| {
+        let spread = if picture_s > 0.0 { duration_s / picture_s } else { 1.0 };
+        (total_bitrate - audio_bitrate).max(total_bitrate * 0.5) * spread
+    });
 
     let transfer = video["color_transfer"].as_str().unwrap_or("");
     let dolby_vision = video["side_data_list"]
@@ -164,8 +187,10 @@ pub fn probe(ffprobe: &str, path: &Path, file_size: u64) -> Result<MediaInfo> {
         width,
         height,
         fps,
+        nominal_fps: nominal_rate.unwrap_or(0.0),
         vfr,
         duration_s,
+        video_s,
         start_time,
         video_start,
         video_bitrate,
@@ -226,9 +251,32 @@ fn parse_rate(s: Option<&str>) -> Option<f64> {
     (d > 0.0 && n > 0.0).then(|| n / d)
 }
 
+/// Seconds in a "hh:mm:ss.fraction" clock time.
+fn clock_secs(s: &str) -> Option<f64> {
+    let mut parts = s.trim().split(':');
+    let (h, m, sec) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    let (h, m, sec): (f64, f64, f64) = (h.parse().ok()?, m.parse().ok()?, sec.parse().ok()?);
+    (h >= 0.0 && m >= 0.0 && sec >= 0.0).then_some(h * 3600.0 + m * 60.0 + sec)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn picture_length_is_the_video_streams_own_when_sound_runs_on() {
+        assert_eq!(clock_secs("00:07:39.966000000"), Some(459.966));
+        assert_eq!(clock_secs("01:00:00"), Some(3600.0));
+        assert_eq!((clock_secs("459.9"), clock_secs("a:b:c"), clock_secs("1:2:3:4")), (None, None, None));
+        let info = |duration_s, video_s| MediaInfo { duration_s, video_s, ..Default::default() };
+        assert_eq!(info(1052.8, 460.0).picture_secs(), 460.0);
+        // Unknown, or a stream length past the container's: the container's word stands.
+        assert_eq!(info(600.0, 0.0).picture_secs(), 600.0);
+        assert_eq!(info(600.0, 600.4).picture_secs(), 600.0);
+    }
 
     #[test]
     fn an_unreadable_file_gets_a_one_line_reason() {

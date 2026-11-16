@@ -57,7 +57,7 @@ impl Record {
             width: info.width,
             height: info.height,
             fps: info.fps,
-            duration_s: info.duration_s,
+            duration_s: info.picture_secs(),
             source_bitrate: info.video_bitrate,
             output_bitrate,
             target_vmaf,

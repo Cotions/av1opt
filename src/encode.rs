@@ -295,7 +295,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     if info.dolby_vision {
         skip!("Dolby Vision is not supported: re-encoding would drop its dynamic metadata");
     }
-    if info.duration_s < 1.0 {
+    if info.picture_secs() < 1.0 {
         skip!("no usable duration");
     }
     // Removing sections is an edit the user asked for, so the output is wanted even when the
@@ -337,6 +337,9 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     // Scene mode joins constant-rate chunks; a variable-rate source would be retimed, so it
     // keeps the single-pass path.
     let mut notes = Vec::new();
+    if info.duration_s - info.picture_secs() > 1.0 {
+        notes.push(format!("the picture stops at {}, the sound runs on to {}: both kept as they are", hms(info.picture_secs()), hms(info.duration_s)));
+    }
     if o.tuning.is_some() {
         let class = crate::tuning::Class::of(info.width, info.height).label();
         notes.push(match tuned {
@@ -399,7 +402,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
             eprintln!("searching CRF for VMAF >= {} ({model}, preset {preset}), from CRF {start_crf}{learned}", o.target_vmaf);
             let pos = match &cut {
                 Some(c) => c.sample_positions(o.samples, o.sample_secs),
-                None => search::sample_positions(info.duration_s, o.samples, o.sample_secs),
+                None => search::sample_positions(info.picture_secs(), o.samples, o.sample_secs),
             };
             let cache = search::TrialCache::open(input, size, &pos, tools.encoder_version(), !o.fresh_search);
             let mut lab = search::Lab::new(tools, input, &info, &tmp.path, pos.clone(), vmaf_threads, cache);
@@ -687,7 +690,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     std::fs::write(output.with_extension("av1opt.json"), serde_json::to_vec_pretty(&report)?)?;
     // Chunk sizes are exact; container-reported bitrates can include audio (Matroska).
     let video_bitrate = match &chunks {
-        Some(c) => c.iter().map(|r| r.bytes).sum::<u64>() as f64 * 8.0 / info.duration_s,
+        Some(c) => c.iter().map(|r| r.bytes).sum::<u64>() as f64 * 8.0 / info.picture_secs(),
         None => out_info.video_bitrate,
     };
     let mut record = history::Record::new(&info, video_bitrate, o.target_vmaf, preset, report.mode, best.crf, svt_params);
@@ -1118,7 +1121,7 @@ fn verify(
     let mut scores = Vec::new();
     let mut low = Vec::new();
     let floor = target_vmaf - VERIFY_SLACK;
-    for (i, (start, secs)) in spot_checks(duration).into_iter().enumerate() {
+    for (i, (start, secs)) in spot_checks(cut.map_or(info.picture_secs(), Sections::kept)).into_iter().enumerate() {
         // The same picture sits at different times in the source when sections were removed.
         let (start, src_start, secs) = cut.map_or((start, start, secs), |c| c.window(start, secs));
         let r = tmp.join(format!("verify{i}.ref.mkv"));
@@ -1187,7 +1190,7 @@ mod tests {
         MediaInfo {
             video_index: 0, codec: "h264".into(), width: 1920, height: 1080, fps: 30.0, duration_s: 60.0,
             video_bitrate: 5e6, pix_fmt: "yuv420p".into(), hdr: false, dolby_vision: false, color_transfer: String::new(), interlaced: false, vfr: false,
-            start_time: 0.0, video_start: 0.0, covers: vec![], attachments: 0, tags: Default::default(),
+            start_time: 0.0, video_start: 0.0, covers: vec![], attachments: 0, tags: Default::default(), video_s: 0.0, nominal_fps: 0.0,
             audio_streams: audio.len() as u32, subtitle_streams: 0,
             audio: audio.iter().map(|&(codec, channels, bitrate)| AudioInfo { codec: codec.into(), channels, bitrate }).collect(),
             subtitle_codecs: vec![],

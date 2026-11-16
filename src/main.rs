@@ -583,7 +583,7 @@ fn main() -> Result<()> {
                 let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
                 let vmaf_threads = if info.width.max(info.height) >= 3200 { threads.min(4) } else { threads };
                 let enc = search::EncodeSettings { preset, pix_fmt_out: "yuv420p10le", params: svt_params.clone() };
-                let pos = search::sample_positions(info.duration_s, samples, sample_secs);
+                let pos = search::sample_positions(info.picture_secs(), samples, sample_secs);
                 let clips = search::extract_samples(&tools, &input, &info, &dir, pos)?;
                 for crf in list {
                     let started = std::time::Instant::now();

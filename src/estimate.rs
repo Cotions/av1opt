@@ -230,11 +230,12 @@ impl TimeModel {
     /// Seconds to search and encode this video; 0 when its size or length isn't known.
     pub fn secs(&self, m: &MediaInfo) -> f64 {
         let pixels = m.width as f64 * m.height as f64;
-        if pixels <= 0.0 || m.fps <= 0.0 || m.duration_s <= 0.0 {
+        let secs = m.picture_secs();
+        if pixels <= 0.0 || m.fps <= 0.0 || secs <= 0.0 {
             return 0.0;
         }
-        let searched = m.duration_s.min(SEARCH_CLIP_SECS) * SEARCH_ENCODES;
-        self.secs_per_frame(pixels) * m.fps * (m.duration_s + searched)
+        let searched = secs.min(SEARCH_CLIP_SECS) * SEARCH_ENCODES;
+        self.secs_per_frame(pixels) * m.fps * (secs + searched)
     }
 }
 
@@ -309,7 +310,7 @@ pub fn judge(m: &MediaInfo, file_size: u64, min_savings: f64, model: &Model) -> 
     if m.codec == "av1" {
         return (Verdict::AlreadyAv1, keep);
     }
-    if m.duration_s < 5.0 || m.width == 0 || m.fps <= 0.0 {
+    if m.picture_secs() < 5.0 || m.width == 0 || m.fps <= 0.0 {
         return (Verdict::TooShort, keep);
     }
     if m.dolby_vision {
@@ -318,10 +319,10 @@ pub fn judge(m: &MediaInfo, file_size: u64, min_savings: f64, model: &Model) -> 
 
     let pixels = m.width as f64 * m.height as f64;
     let (low, likely, high) = model.predict_bpp(bits_per_pixel(m), pixels);
-    let video_bytes = m.video_bitrate * m.duration_s / 8.0;
+    let video_bytes = m.video_bitrate * m.picture_secs() / 8.0;
     let other_bytes = (file_size as f64 - video_bytes).max(0.0);
     let new_size = |bpp: f64| {
-        let av1 = bpp * pixels * m.fps * m.duration_s / 8.0;
+        let av1 = bpp * pixels * m.fps * m.picture_secs() / 8.0;
         other_bytes + av1.min(video_bytes)
     };
     let est = SizeRange { low: new_size(low), likely: new_size(likely), high: new_size(high) };

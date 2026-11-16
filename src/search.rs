@@ -117,12 +117,16 @@ pub fn cfr(info: &MediaInfo) -> String {
         (23.976, "24000/1001"), (24.0, "24"), (25.0, "25"), (29.97, "30000/1001"),
         (30.0, "30"), (50.0, "50"), (59.94, "60000/1001"), (60.0, "60"),
     ];
+    // A steady stream is on the grid it declares. Its average can sit elsewhere: a webcam's
+    // 30 fps with drifting frame times averages 29.96, and a 30000/1001 grid would drop a
+    // frame in every thousand of it.
+    let fps = if !info.vfr && info.nominal_fps > 0.0 { info.nominal_fps } else { info.fps };
     // Closest standard rate, not the first within tolerance: 24 must not become 23.976,
     // which drops a frame every ~42 and misaligns VMAF comparisons.
     STD.iter()
-        .min_by(|a, b| (a.0 - info.fps).abs().total_cmp(&(b.0 - info.fps).abs()))
-        .filter(|(f, _)| (f - info.fps).abs() / f < 0.01)
-        .map_or_else(|| format!("{:.3}", info.fps), |(_, s)| s.to_string())
+        .min_by(|a, b| (a.0 - fps).abs().total_cmp(&(b.0 - fps).abs()))
+        .filter(|(f, _)| (f - fps).abs() / f < 0.01)
+        .map_or_else(|| format!("{fps:.3}"), |(_, s)| s.to_string())
 }
 
 /// Numeric value of [`cfr`], i.e. frames per second of the constant-rate stream.
@@ -1206,7 +1210,7 @@ mod tests {
         MediaInfo {
             video_index: 0, codec: "h264".into(), width: 1920, height: 1080, fps, duration_s: 60.0,
             video_bitrate: 5e6, pix_fmt: "yuv420p".into(), hdr: false, dolby_vision: false, color_transfer: String::new(), interlaced: false, vfr: false,
-            start_time: 0.0, video_start: 0.0, covers: vec![], attachments: 0, tags: Default::default(),
+            start_time: 0.0, video_start: 0.0, covers: vec![], attachments: 0, tags: Default::default(), video_s: 0.0, nominal_fps: 0.0,
             audio_streams: 0, subtitle_streams: 0, audio: vec![], subtitle_codecs: vec![],
         }
     }
@@ -1245,6 +1249,19 @@ mod tests {
         ] {
             assert_eq!(cfr(&info_with_fps(fps)), want, "fps {fps}");
         }
+    }
+
+    #[test]
+    fn cfr_goes_by_the_declared_rate_of_a_steady_stream() {
+        let info = |fps, nominal_fps, vfr| MediaInfo { nominal_fps, vfr, ..info_with_fps(fps) };
+        // 30 fps declared, 29.96 on average: the average alone is nearest to 30000/1001.
+        assert_eq!(cfr(&info_with_fps(29.96)), "30000/1001");
+        assert_eq!(cfr(&info(29.96, 30.0, false)), "30");
+        assert_eq!(cfr(&info(29.89, 30.0, false)), "30");
+        assert_eq!(cfr(&info(23.976, 24000.0 / 1001.0, false)), "24000/1001");
+        // A variable-rate stream declares whatever fits all its frame times: not a grid.
+        assert_eq!(cfr(&info(27.3, 120.0, true)), "27.300");
+        assert_eq!(cfr(&info(29.97, 90000.0, true)), "30000/1001");
     }
 
     #[test]

@@ -862,6 +862,33 @@ fn very_short_videos_are_encoded_or_refused_cleanly() {
     assert_eq!(r.err.matches("skipped: no usable duration").count(), 3, "{}", r.err);
 }
 
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn sound_that_runs_on_after_the_picture_is_kept_whole() {
+    // A recording left running: 12 s of picture under 30 s of sound. The container says 30 s,
+    // so samples and spot checks used to be asked of seconds that have no frames.
+    let c = Case::new("tail");
+    // MP4 states a stream's length in the stream, Matroska in a tag.
+    for name in ["tail.mp4", "tagged.mkv"] {
+        c.ffmpeg(&[
+            "-f", "lavfi", "-i", "testsrc2=s=320x180:r=24:d=12", "-f", "lavfi", "-i", "sine=f=440:d=30", "-c:v", "libx264", "-preset", "ultrafast",
+            "-crf", "16", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "64k", name,
+        ]);
+    }
+    let r = c.encode(&[&c.videos()], &[]);
+    r.ok().has("encoded 2, skipped 0, failed 0");
+    for (name, stem) in [("tail.mp4", "tail"), ("tagged.mkv", "tagged")] {
+        let out = c.out().join(format!("{stem}.mp4"));
+        assert_eq!(frames(&out), 288, "{name}");
+        assert!((duration(&out) - 30.0).abs() < 0.2, "{name}: {}", duration(&out));
+        assert_eq!(packets_md5(&out, "a:0"), packets_md5(&c.videos().join(name), "a:0"), "{name}");
+        let report = c.report(stem);
+        let notes = report["notes"].to_string();
+        assert!(notes.contains("the picture stops at 0:00:12, the sound runs on to 0:00:30"), "{name}: {notes}");
+        assert!(report["verify_vmaf"].as_array().is_some_and(|v| v.len() == 2), "{name}: {report}");
+    }
+}
+
 /// Settings slow enough to catch an encode in the middle.
 const SLOW: [&str; 6] = ["--preset", "6", "--samples", "2", "--sample-secs", "2"];
 

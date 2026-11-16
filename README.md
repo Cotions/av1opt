@@ -568,7 +568,9 @@ and the benchmark's requests and tuned settings over HTTP (no ffmpeg needed).
   the limit now. Such a video first went to one pass with its own frame times, which was
   nearly all of that library; now scene mode itself goes by them: chunks are cut where the
   source's timestamps say, hold each frame once, and the joined video gets every timestamp
-  back (2,677 of 2,677 identical on a 90-second excerpt, 5 chunks at CRF 28.5 to 37.25).
+  back. The 15-minute video that started this, whole: 28,008 of 28,008 timestamps identical
+  to the source's, 52 chunks at CRF 28.5 to 41.5, spot checks 92.6 and 90.8, 204 MB where
+  the one pass that passed (CRF 33, after a first one at 38.75 had failed) took 248 MB.
 - **Not every uneven video is a drifting one.** A screen recording that shows some frames
   three times as long as others failed its spot check (87.9) when encoded per scene with
   its own frame times: a chunk's VMAF counts each frame once, the spot check counts each

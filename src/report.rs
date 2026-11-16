@@ -107,6 +107,12 @@ pub fn print(results: &[FileResult], top: usize, time: &TimeModel, by: TopBy) {
             n => format!("speed learned from {n} past encodes on this machine"),
         };
         println!("encoding them: about {} at preset {} ({basis})", span(total), time.preset);
+        let seen = match time.scene_samples {
+            0 => "a first guess".to_string(),
+            1 => "going by 1 such encode".to_string(),
+            n => format!("going by {n} such encodes"),
+        };
+        println!("with a CRF per scene (encode --scenes): about {}, {:.1}x as long ({seen})", span(total * time.scenes), time.scenes);
     }
 
     println!("\n== By verdict ==");

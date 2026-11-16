@@ -36,7 +36,8 @@ fit of AV1 bits per pixel against source bits per pixel and resolution, pulled t
 built-in model while there are few encodes), so estimates and their ranges tighten as
 you encode more.
 
-`scan` also says how long the candidates would take to search and encode (`--preset`, default
+`scan` also says how long the candidates would take to search and encode, in one pass and
+with a CRF per scene (a multiple learned from the per-scene encodes made here) (`--preset`, default
 6) and lists the time per file; `--sort per-hour` orders the top candidates by bytes saved per
 hour of encoding, the place to start when the library is larger than your patience. The time
 is seconds per frame by frame size: a guess from one six-core machine at first, then fitted to
@@ -236,7 +237,9 @@ since chunking needs a constant frame rate. A file's header is not taken at its 
 that: the scene pass counts how many frames a constant rate would drop or show twice, and
 past a handful (more than 1 in 200) the file is encoded in one pass, with a note in the report.
 
-Folders are walked recursively and their layout is mirrored under `--out-dir`. Every result is
+Folders are walked recursively and their layout is mirrored under `--out-dir`: one folder's
+contents directly below it, several folders each below a folder of their own name
+(`encode -o out lib/Kay lib/Sofia` writes `out/Kay/...` and `out/Sofia/...`). Every result is
 appended to `av1opt-log.tsv` there; re-running the same command resumes: finished files are
 skipped, and files skipped for a reason (low savings, ...) are not searched again with the same settings (target, preset, CRF range, `--min-savings`, `--force`) unless
 `--retry-skipped` is given. `--order per-hour` encodes the files with the largest estimated

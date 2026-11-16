@@ -612,6 +612,12 @@ fn folders_are_mirrored_and_same_names_do_not_collide_silently() {
     let r = c.encode_into(&flat, &[&c.videos().join("show/season 1/e1.mp4"), &c.videos().join("other/e1.mp4")], &[]);
     assert_eq!(r.code, Some(2), "{}", r.err);
     r.has("encoded 1, skipped 0, failed 1").has("output name collision");
+
+    // The folders they sit in, given together, each keep their name: nothing collides.
+    let apart = c.dir.join("out-apart");
+    let r = c.encode_into(&apart, &[&c.videos().join("show/season 1"), &c.videos().join("other")], &[]);
+    r.ok().has("encoded 2, skipped 0, failed 0");
+    assert!(apart.join("season 1/e1.mp4").exists() && apart.join("other/e1.mp4").exists(), "{:?}", c.outputs_in(&apart));
 }
 
 /// The first video stream as ffprobe sees it (covers left out).

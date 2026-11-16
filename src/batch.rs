@@ -18,12 +18,26 @@ pub struct Job {
     pub out_dir: PathBuf,
 }
 
-/// Files are used as given; folders are walked and their structure is kept below `out_dir`.
+/// Where the files of the folder `input` go. Given alone, a folder's contents sit directly
+/// below `out_dir`. Given with other folders, each gets a folder of its own name there:
+/// two libraries encoded in one run stay apart, as they are where they came from.
+pub fn folder_out(inputs: &[PathBuf], input: &Path, out_dir: &Path) -> PathBuf {
+    let folders = inputs.iter().filter(|p| p.is_dir()).count();
+    let abs = std::path::absolute(input).unwrap_or_else(|_| input.to_path_buf());
+    match abs.file_name() {
+        Some(name) if folders > 1 => out_dir.join(name),
+        _ => out_dir.to_path_buf(),
+    }
+}
+
+/// Files are used as given; folders are walked and their structure is kept below `out_dir`
+/// (below a folder of their own name there when several are given, see [`folder_out`]).
 pub fn expand(inputs: &[PathBuf], out_dir: &Path, is_video: impl Fn(&Path) -> bool) -> Vec<Job> {
     let out_abs = std::path::absolute(out_dir).unwrap_or_else(|_| out_dir.to_path_buf());
     let mut jobs = Vec::new();
     for input in inputs {
         if input.is_dir() {
+            let below = folder_out(inputs, input, out_dir);
             let mut files: Vec<PathBuf> = walkdir::WalkDir::new(input)
                 .into_iter()
                 .filter_entry(|e| {
@@ -38,7 +52,7 @@ pub fn expand(inputs: &[PathBuf], out_dir: &Path, is_video: impl Fn(&Path) -> bo
             files.sort();
             for f in files {
                 let rel_dir = f.parent().and_then(|p| p.strip_prefix(input).ok()).unwrap_or(Path::new(""));
-                jobs.push(Job { out_dir: out_dir.join(rel_dir), input: f });
+                jobs.push(Job { out_dir: below.join(rel_dir), input: f });
             }
         } else {
             jobs.push(Job { input: input.clone(), out_dir: out_dir.to_path_buf() });
@@ -263,6 +277,29 @@ mod tests {
         });
         let names: Vec<&str> = jobs.iter().map(|j| j.input.to_str().unwrap()).collect();
         assert_eq!(names, ["d", "b", "a", "c", "e"]);
+    }
+
+    #[test]
+    fn several_folders_each_keep_a_folder_of_their_own() {
+        let dir = std::env::temp_dir().join(format!("av1opt-foldertest-{}", std::process::id()));
+        for d in ["in/Kay/old", "in/Sofia", "out"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        for f in ["in/Kay/a.mp4", "in/Kay/old/b.mp4", "in/Sofia/a.mp4", "in/loose.mp4"] {
+            std::fs::write(dir.join(f), "").unwrap();
+        }
+        let out = dir.join("out");
+        let outs = |inputs: &[&str]| -> Vec<PathBuf> {
+            let inputs: Vec<PathBuf> = inputs.iter().map(|i| dir.join(i)).collect();
+            expand(&inputs, &out, |_| true).into_iter().map(|j| j.out_dir.strip_prefix(&out).unwrap().to_path_buf()).collect()
+        };
+        let p = |names: &[&str]| -> Vec<PathBuf> { names.iter().map(PathBuf::from).collect() };
+        // One folder: as it always was, its contents directly below the output folder.
+        assert_eq!(outs(&["in/Kay"]), p(&["", "old"]));
+        assert_eq!(outs(&["in/Kay", "in/loose.mp4"]), p(&["", "old", ""]));
+        // Two: the same file name in both no longer lands on one output.
+        assert_eq!(outs(&["in/Kay", "in/Sofia/", "in/loose.mp4"]), p(&["Kay", "Kay/old", "Sofia", ""]));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

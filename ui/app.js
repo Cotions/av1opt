@@ -644,7 +644,7 @@ function encodeDialog(inputs, roots = [], watch = false) {
               tuning.map((x) => `${x.label}: ${configLabel(x.choice)}`).join("; ") + ". Other sizes use the preset and parameters above") : null,
             setting("Container", container, null),
             setting("Per-scene CRF", h("span", { class: "unit" }, scenes, workers, "at once"),
-              "Splits at scene changes and picks a CRF for each: even quality, about twice the time. “Where quality is uneven” does it only for videos whose samples score far apart at one CRF"),
+              "Splits at scene changes and picks a CRF for each: even quality, about three times the time. “Where quality is uneven” does it only for videos whose samples score far apart at one CRF"),
             setting("Skip if saving under", h("span", { class: "unit" }, minSav, "%"), "Files that wouldn't shrink this much are left alone")),
           h("div", { class: "checks-col" },
             h("label", { class: "check", title: "AAC, Opus and MP3 sound is normally copied untouched. With this, a track far above what Opus needs (stereo above 144 kbps) is re-encoded to Opus (stereo at 96 kbps): smaller, but lossy a second time" }, shrinkAudio, "Shrink heavy sound tracks to Opus (stereo above 144 kbps becomes 96 kbps)"),
@@ -755,7 +755,7 @@ function renderScan(out, r) {
   const savedOf = (row) => row.size - row.estimate.likely;
   // Bytes saved per hour of encoding: what to start with when time is short.
   const rateOf = (row) => row.verdict === "Candidate" && row.est_secs ? savedOf(row) / row.est_secs * 3600 : 0;
-  const timeBasis = `Search and encode at preset ${r.preset}, ${r.time_samples ? "going by " + plural(r.time_samples, "past encode") + " on this machine" : "a rough guess until a few files are encoded on this machine"}`;
+  const timeBasis = `Search and encode at preset ${r.preset}, ${r.time_samples ? "going by " + plural(r.time_samples, "past encode") + " on this machine" : "a rough guess until a few files are encoded on this machine"}. A CRF per scene takes about ${num(r.scenes_factor || 3, 1)} times as long${r.scene_samples ? " (" + plural(r.scene_samples, "such encode") + ")" : ""}`;
   const rows = r.rows;
   const body = h("tbody");
   const selInfo = h("span", { class: "dim" });

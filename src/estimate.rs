@@ -181,7 +181,18 @@ pub struct TimeModel {
     pub preset: u8,
     /// Encodes the model was fitted on.
     pub samples: usize,
+    /// How many times as long a video takes with a CRF per scene: every chunk is cut into a
+    /// lossless reference, probed two or three times, encoded and scored.
+    pub scenes: f64,
+    /// Per-scene encodes `scenes` was learned from.
+    pub scene_samples: usize,
+    /// What `secs` multiplies by: 1, or `scenes` for the model [`TimeModel::per_scene`] gives.
+    factor: f64,
 }
+
+/// Six 15-minute 1080p recordings (2026-11-15) took 180 minutes per scene where one pass was
+/// predicted, and for 55 others measured, at 58.
+const SCENES_FACTOR: f64 = 3.0;
 
 const SPF_1080P: f64 = 0.022;
 const SPF_EXPONENT: f64 = 0.85;
@@ -227,7 +238,26 @@ impl TimeModel {
         }
         let det = a * d - b * b;
         let beta = if det.abs() > 1e-9 { [(r0 * d - b * r1) / det, (a * r1 - b * r0) / det] } else { prior };
-        TimeModel { beta, preset, samples: pts.len() }
+        let whole = TimeModel { beta, preset, samples: pts.len(), scenes: SCENES_FACTOR, scene_samples: 0, factor: 1.0 };
+        // Per-scene encodes against what one pass would have taken, search included on both
+        // sides: the geometric mean, pulled toward the first guess like everything else here.
+        let ratios: Vec<f64> = records
+            .iter()
+            .filter(|r| r.mode == "scenes")
+            .filter_map(|r| {
+                let took = r.search_secs? + r.encode_secs.filter(|s| *s >= MIN_TIMED_SECS)?;
+                let info = MediaInfo { width: r.width, height: r.height, fps: r.fps, duration_s: r.duration_s, ..Default::default() };
+                let one_pass = whole.secs(&info) * preset_time(r.preset) / preset_time(preset);
+                (one_pass > 0.0).then(|| (took / one_pass).ln())
+            })
+            .collect();
+        let scenes = ((PRIOR_WEIGHT * SCENES_FACTOR.ln() + ratios.iter().sum::<f64>()) / (PRIOR_WEIGHT + ratios.len() as f64)).exp();
+        TimeModel { scenes, scene_samples: ratios.len(), ..whole }
+    }
+
+    /// The same model for encodes that give every scene its own CRF.
+    pub fn per_scene(self) -> Self {
+        TimeModel { factor: self.scenes, ..self }
     }
 
     pub fn secs_per_frame(&self, pixels: f64) -> f64 {
@@ -242,7 +272,7 @@ impl TimeModel {
             return 0.0;
         }
         let searched = secs.min(SEARCH_CLIP_SECS) * SEARCH_ENCODES;
-        self.secs_per_frame(pixels) * m.fps * (secs + searched)
+        self.secs_per_frame(pixels) * m.fps * (secs + searched) * self.factor
     }
 }
 
@@ -512,6 +542,30 @@ mod tests {
         assert_eq!(TimeModel::fit(&[blink], 6).samples, 0);
         let one = TimeModel::fit(&[timed(1920, 1080, 6, SPF_1080P / 4.0)], 6).secs_per_frame(PIXELS_1080P);
         assert!(one < SPF_1080P && one > SPF_1080P / 2.0, "{one}");
+    }
+
+    #[test]
+    fn a_crf_per_scene_costs_its_own_multiple_of_one_pass() {
+        let info = MediaInfo { width: 1920, height: 1080, fps: 30.0, duration_s: 900.0, ..Default::default() };
+        let guess = TimeModel::fit(&[], 6);
+        assert!((guess.scenes - SCENES_FACTOR).abs() < 1e-9 && guess.scene_samples == 0);
+        assert!((guess.per_scene().secs(&info) / guess.secs(&info) - SCENES_FACTOR).abs() < 1e-9);
+        // Per-scene encodes that took twice one pass, search and encode together, at two presets.
+        let took = |preset: u8| {
+            let mut r = rec(0.1, 0.03, 1920, 1080);
+            let one_pass = TimeModel::fit(&[], preset).secs(&MediaInfo { duration_s: r.duration_s, ..info.clone() });
+            (r.mode, r.preset, r.search_secs, r.encode_secs) = ("scenes".into(), preset, Some(one_pass * 0.5), Some(one_pass * 1.5));
+            r
+        };
+        let few = TimeModel::fit(&[took(6)], 6);
+        assert!(few.scenes < SCENES_FACTOR && few.scenes > 2.5, "{}", few.scenes);
+        let many: Vec<Record> = (0..60).map(|i| took(if i % 2 == 0 { 6 } else { 8 })).collect();
+        let learned = TimeModel::fit(&many, 6);
+        assert_eq!(learned.scene_samples, 60);
+        assert!((learned.scenes - 2.0).abs() < 0.05, "{}", learned.scenes);
+        // They say nothing about the speed of one pass.
+        assert_eq!(learned.samples, 0);
+        assert_eq!(learned.secs(&info), guess.secs(&info));
     }
 
     #[test]

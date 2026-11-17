@@ -36,12 +36,28 @@ pub struct EncodeSettings {
     pub params: String,
 }
 
+/// Key frames at most this far apart, unless the parameters set `keyint` themselves.
+/// SVT-AV1's own default is about five seconds. Every key frame is paid for in bits, and at
+/// ten seconds the same VMAF took 3.3% less on eight 10-second clips of real videos (2.6%
+/// less on four of 40 seconds), with VMAF NEG, XPSNR and SSIMULACRA2 agreeing and the encode
+/// no slower. Seeking lands on key frames: a player shows the frame asked for after decoding
+/// from the one before it, up to ten seconds of video instead of five.
+pub const KEYINT: &str = "10s";
+
 impl EncodeSettings {
     /// SVT-AV1 takes CRF in quarter steps through its own parameters (ffmpeg's -crf is integer).
     pub fn video_args(&self, crf: f64) -> Vec<String> {
-        let params = if self.params.is_empty() { format!("crf={}", quarter(crf)) } else { format!("{}:crf={}", self.params, quarter(crf)) };
+        let sets = |key: &str| self.params.split(':').any(|p| p.split_once('=').is_some_and(|(k, _)| k.trim() == key));
+        let mut params: Vec<String> = Vec::new();
+        if !self.params.is_empty() {
+            params.push(self.params.clone());
+        }
+        if !sets("keyint") {
+            params.push(format!("keyint={KEYINT}"));
+        }
+        params.push(format!("crf={}", quarter(crf)));
         // Stream specifiers keep these off copied cover-art streams.
-        ["-c:v:0", "libsvtav1", "-preset:v:0", &self.preset.to_string(), "-pix_fmt:v:0", self.pix_fmt_out, "-svtav1-params:v:0", &params]
+        ["-c:v:0", "libsvtav1", "-preset:v:0", &self.preset.to_string(), "-pix_fmt:v:0", self.pix_fmt_out, "-svtav1-params:v:0", &params.join(":")]
             .map(String::from)
             .to_vec()
     }
@@ -1208,8 +1224,10 @@ mod tests {
             assert!(parse_params(bad).is_err(), "{bad}");
         }
         let enc = |params: &str| EncodeSettings { preset: 6, pix_fmt_out: "yuv420p10le", params: params.into() };
-        assert_eq!(enc("tune=0").video_args(35.3).last().unwrap(), "tune=0:crf=35.25");
-        assert_eq!(enc("").video_args(35.0).last().unwrap(), "crf=35");
+        assert_eq!(enc("tune=0").video_args(35.3).last().unwrap(), "tune=0:keyint=10s:crf=35.25");
+        // A key-frame gap of the user's own is left alone.
+        assert_eq!(enc("tune=0:keyint=5s").video_args(35.0).last().unwrap(), "tune=0:keyint=5s:crf=35");
+        assert_eq!(enc("").video_args(35.0).last().unwrap(), "keyint=10s:crf=35");
     }
 
     #[test]

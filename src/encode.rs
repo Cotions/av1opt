@@ -3,6 +3,7 @@
 use crate::events::Event;
 use crate::probe::{self, MediaInfo};
 use crate::history;
+use crate::repair;
 use crate::metadata::{self, MetaOptions, Resolved};
 use crate::scenes;
 use crate::sections::{self, Sections};
@@ -192,8 +193,13 @@ struct Report<'a> {
     svt_params: &'a str,
     target_vmaf: f64,
     vmaf_model: &'a str,
-    /// Frame-weighted VMAF of the final chunks (scene mode only).
+    /// Frame-weighted VMAF of the final chunks (scene mode), or of the whole video where a
+    /// one-pass encode was scored along its whole length.
     mean_vmaf: Option<f64>,
+    /// One pass: the whole video scored against the source, and the stretches below the
+    /// floor that were encoded again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    whole: Option<&'a repair::Summary>,
     search: &'a [Trial],
     chunks: Option<&'a [scenes::ChunkResult]>,
     verify_vmaf: &'a [f64],
@@ -453,7 +459,14 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         }
     }
     let work = work.filter(|_| scenes);
+    // A one-pass encode is checked along its whole length afterwards, and what falls short
+    // is encoded again by itself (see `repair`): the video's one CRF need not carry its
+    // worst stretch then. Not with sections removed (the frames of source and encode no
+    // longer pair up one to one) nor in HDR (the stretches would lose the mastering data
+    // the one pass hands to the encoder).
+    let whole_check = !scenes && cut.is_none() && !info.hdr;
     if !scenes
+        && !whole_check
         && reached
         && let (Some(lab), Some(params)) = (lab.as_mut(), params)
     {
@@ -607,9 +620,28 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         }
     }
 
-    eprintln!("verifying");
-    tools.emit(Event::Phase { phase: "verifying".into(), detail: "streams, duration, VMAF spot checks".into() });
-    let mut verified = verify(tools, input, &info, &partial, &streams, expect_frames, cut.as_ref(), o.target_vmaf.min(best.mean_vmaf), vmaf_threads, &tmp.path);
+    let floor_for = |best: &search::Trial| o.target_vmaf.min(best.mean_vmaf) - VERIFY_SLACK;
+    let remux = |video: &Path, out: &Path| mux_args(video, false, input, &info, o.container, o.audio, &covers, &meta, &o.meta, out, &mut Vec::new()).0;
+    // The whole video where it can be gone by, spot checks where not.
+    let check = |best: &search::Trial, notes: &mut Vec<String>| -> Result<(Vec<f64>, MediaInfo, Option<repair::Summary>)> {
+        if whole_check {
+            eprintln!("verifying: the whole video against its source");
+            tools.emit(Event::Phase { phase: "verifying".into(), detail: "streams, duration, VMAF of the whole video".into() });
+            if let Some((scores, out_info, summary)) =
+                verify_whole(tools, input, &info, &partial, &streams, &enc, best.crf, floor_for(best), o.min_crf, vmaf_threads, &tmp.path, &remux, notes)?
+            {
+                return Ok((scores, out_info, Some(summary)));
+            }
+        }
+        eprintln!("verifying");
+        tools.emit(Event::Phase { phase: "verifying".into(), detail: "streams, duration, VMAF spot checks".into() });
+        verify(tools, input, &info, &partial, &streams, expect_frames, cut.as_ref(), o.target_vmaf.min(best.mean_vmaf), vmaf_threads, &tmp.path).map(|(v, i)| (v, i, None))
+    };
+    let t_check = tools.stopwatch();
+    let mut verified = check(&best, &mut notes);
+    if whole_check {
+        encode_secs += t_check.secs(tools);
+    }
     // A stretch the samples missed: now that it is known, it is a sample. One CRF found
     // with it, one more encode; a second failure stands.
     if let Err(e) = &verified
@@ -657,10 +689,8 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
                 let (args, _) = full_encode_args(input, &info, &enc, best.crf, o.container, o.audio, &covers, &meta, &o.meta, None, &partial, &mut Vec::new());
                 tools.emit(Event::Phase { phase: "encoding".into(), detail: format!("crf {}, preset {preset}", best.crf) });
                 tools.run_with_progress(&args, out_duration, "encoding")?;
+                verified = check(&best, &mut notes);
                 encode_secs = t3.secs(tools);
-                eprintln!("verifying");
-                tools.emit(Event::Phase { phase: "verifying".into(), detail: "streams, duration, VMAF spot checks".into() });
-                verified = verify(tools, input, &info, &partial, &streams, expect_frames, None, o.target_vmaf.min(best.mean_vmaf), vmaf_threads, &tmp.path);
             }
             search::Outcome::TooLarge(t) => skip!(
                 "a spot check at {} scored VMAF {lowest:.2} at CRF {}; CRF {} still leaves that stretch at {:.2} at {:.0}% of the source's size: savings would be below --min-savings {:.0}%",
@@ -672,7 +702,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     }
     // A CRF per scene is what evens a video out, where it was there to be had.
     let hint = o.scenes == Scenes::Off && one_pass.is_none();
-    let (verify_vmaf, out_info) = verified.map_err(|e| match e.downcast::<LowSpot>() {
+    let (verify_vmaf, out_info, repaired) = verified.map_err(|e| match e.downcast::<LowSpot>() {
         Ok(low) => LowSpot { hint, ..low }.into(),
         Err(e) => e,
     })?;
@@ -710,7 +740,8 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         svt_params,
         target_vmaf: o.target_vmaf,
         vmaf_model: model,
-        mean_vmaf: chunks.as_deref().map(scenes::mean_vmaf),
+        mean_vmaf: chunks.as_deref().map(scenes::mean_vmaf).or(repaired.as_ref().map(|r| r.mean_vmaf)),
+        whole: repaired.as_ref(),
         search: &trials,
         chunks: chunks.as_deref(),
         verify_vmaf: &verify_vmaf,
@@ -1122,21 +1153,9 @@ impl std::fmt::Display for LowSpot {
 
 impl std::error::Error for LowSpot {}
 
-/// Checks the encode before it replaces anything: stream layout, duration, and VMAF spot checks
-/// at positions the search did not sample.
-#[allow(clippy::too_many_arguments)]
-fn verify(
-    tools: &Tools,
-    input: &Path,
-    info: &MediaInfo,
-    out: &Path,
-    streams: &Streams,
-    expect_frames: Option<u64>,
-    cut: Option<&Sections>,
-    target_vmaf: f64,
-    threads: usize,
-    tmp: &Path,
-) -> Result<(Vec<f64>, MediaInfo)> {
+/// Checks the finished file before it replaces anything: its video codec, duration, streams
+/// and, where the number is known, frames.
+fn check_layout(tools: &Tools, info: &MediaInfo, out: &Path, streams: &Streams, expect_frames: Option<u64>, cut: Option<&Sections>) -> Result<MediaInfo> {
     let duration = cut.map_or(info.duration_s, Sections::kept);
     let out_info = probe::probe(&tools.ffprobe, out, std::fs::metadata(out)?.len())?;
     if out_info.codec != "av1" {
@@ -1164,35 +1183,71 @@ fn verify(
             bail!("verify: output has {got} frames, expected {want}");
         }
     }
+    Ok(out_info)
+}
 
-    let model = search::vmaf_model(info);
-    let pix = search::reference_pix_fmt(info);
+/// VMAF of `secs` seconds of the output from `start` against the source from `src_start`,
+/// both cut out and compared by themselves. `name` keeps the cuts of different checks apart.
+#[allow(clippy::too_many_arguments)]
+fn spot_check(
+    tools: &Tools,
+    input: &Path,
+    info: &MediaInfo,
+    out: &Path,
+    out_info: &MediaInfo,
+    (start, src_start, secs): (f64, f64, f64),
+    retry_below: f64,
+    threads: usize,
+    tmp: &Path,
+    name: &str,
+) -> Result<f64> {
+    let (model, pix) = (search::vmaf_model(info), search::reference_pix_fmt(info));
+    let r = tmp.join(format!("{name}.ref.mkv"));
+    let d = tmp.join(format!("{name}.out.mkv"));
+    search::extract_reference(tools, input, info, true, search::first_frame(info), src_start, secs, &r)?;
+    search::extract_reference(tools, out, info, false, search::first_frame(out_info), start, secs, &d)?;
+    let mut v = tools.vmaf(&d, &r, model, pix, threads, 0, 1)?;
+    // Seeking two different files can land a frame or two apart; retry nearby alignments
+    // before calling the encode bad.
+    if v < retry_below {
+        for off in [-2, -1, 1, 2] {
+            v = v.max(tools.vmaf(&d, &r, model, pix, threads, off, 1)?);
+        }
+    }
+    let _ = std::fs::remove_file(&r);
+    let _ = std::fs::remove_file(&d);
+    Ok(v)
+}
+
+/// Checks the encode before it replaces anything: stream layout, duration, and VMAF spot checks
+/// at positions the search did not sample.
+#[allow(clippy::too_many_arguments)]
+fn verify(
+    tools: &Tools,
+    input: &Path,
+    info: &MediaInfo,
+    out: &Path,
+    streams: &Streams,
+    expect_frames: Option<u64>,
+    cut: Option<&Sections>,
+    target_vmaf: f64,
+    threads: usize,
+    tmp: &Path,
+) -> Result<(Vec<f64>, MediaInfo)> {
+    let out_info = check_layout(tools, info, out, streams, expect_frames, cut)?;
     let mut scores = Vec::new();
     let mut low = Vec::new();
     let floor = target_vmaf - VERIFY_SLACK;
     for (i, (start, secs)) in spot_checks(cut.map_or(info.picture_secs(), Sections::kept)).into_iter().enumerate() {
         // The same picture sits at different times in the source when sections were removed.
         let (start, src_start, secs) = cut.map_or((start, start, secs), |c| c.window(start, secs));
-        let r = tmp.join(format!("verify{i}.ref.mkv"));
-        let d = tmp.join(format!("verify{i}.out.mkv"));
-        search::extract_reference(tools, input, info, true, search::first_frame(info), src_start, secs, &r)?;
-        search::extract_reference(tools, out, info, false, search::first_frame(&out_info), start, secs, &d)?;
-        let mut v = tools.vmaf(&d, &r, model, pix, threads, 0, 1)?;
-        // Seeking two different files can land a frame or two apart; retry nearby alignments
-        // before calling the encode bad.
-        if v < target_vmaf - VERIFY_SLACK {
-            for off in [-2, -1, 1, 2] {
-                v = v.max(tools.vmaf(&d, &r, model, pix, threads, off, 1)?);
-            }
-        }
+        let v = spot_check(tools, input, info, out, &out_info, (start, src_start, secs), floor, threads, tmp, &format!("verify{i}"))?;
         eprintln!("  spot check at {}: VMAF {v:.2}", hms(start));
         tools.emit(Event::SpotCheck { at_secs: start, vmaf: v });
         scores.push(v);
         if v < floor {
             low.push((src_start, secs, v));
         }
-        let _ = std::fs::remove_file(&r);
-        let _ = std::fs::remove_file(&d);
     }
     // Short spot checks are noisier than the multi-sample search, hence the slack.
     if !low.is_empty() {
@@ -1201,6 +1256,123 @@ fn verify(
         return Err(LowSpot { windows: low, floor, hint: false }.into());
     }
     Ok((scores, out_info))
+}
+
+/// How far below what a stretch scored by itself it may read in the joined video before the
+/// join is taken for broken: frames a step apart read ten or more lower.
+const JOIN_SLACK: f64 = 3.0;
+
+/// Verification of a one-pass encode along its whole length: every frame is scored against
+/// the source's, and stretches below the floor are encoded again and put in place (see
+/// [`repair`]). The scores returned are those of the usual spot-check places. `None` where
+/// the whole video can't be gone by, for the spot checks to decide.
+///
+/// `remux` gives the ffmpeg arguments that put a bare video stream together with the
+/// source's other streams.
+#[allow(clippy::too_many_arguments)]
+fn verify_whole(
+    tools: &Tools,
+    input: &Path,
+    info: &MediaInfo,
+    out: &Path,
+    streams: &Streams,
+    enc: &EncodeSettings,
+    crf: f64,
+    floor: f64,
+    min_crf: u8,
+    threads: usize,
+    tmp: &Path,
+    remux: &dyn Fn(&Path, &Path) -> Vec<String>,
+    notes: &mut Vec<String>,
+) -> Result<Option<(Vec<f64>, MediaInfo, repair::Summary)>> {
+    let mut out_info = check_layout(tools, info, out, streams, None, None)?;
+    let why_not = |e: &anyhow::Error| e.to_string().lines().last().unwrap_or("").to_string();
+    let survey = match repair::survey(tools, input, info, out, threads, tmp) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            eprintln!("the frames of the encode can't be set against the source's one for one: spot checks instead of the whole video");
+            return Ok(None);
+        }
+        Err(e) if crate::events::is_cancelled(&e) => return Err(e),
+        Err(e) => {
+            eprintln!("warning: the whole video could not be checked ({}): spot checks instead", why_not(&e));
+            return Ok(None);
+        }
+    };
+    let frames = survey.times.pts.len() as u64;
+    let ctx = repair::Ctx { tools, input, info, enc, crf, floor, min_crf, threads, dir: tmp };
+    let outcome = match repair::repair(&ctx, out, &survey) {
+        Ok(o) => o,
+        Err(e) if crate::events::is_cancelled(&e) => return Err(e),
+        Err(e) => match e.downcast::<repair::StillLow>() {
+            // In the source's time, as the search takes its samples.
+            Ok(low) => return Err(LowSpot { windows: low.windows.iter().map(|w| (w.0 + search::first_frame(info), w.1, w.2)).collect(), floor, hint: false }.into()),
+            Err(e) => {
+                let n = format!("stretches below VMAF {floor:.0} could not be encoded again ({}): judged by spot checks", why_not(&e));
+                eprintln!("note: {n}");
+                tools.emit(Event::Note { text: n.clone() });
+                notes.push(n);
+                return Ok(None);
+            }
+        },
+    };
+    let s = &outcome.summary;
+    if let Some(video) = &outcome.video {
+        tools.emit(Event::Phase { phase: "muxing".into(), detail: format!("joining {} stretches encoded again", s.stretches.len()) });
+        let joined = tmp.join(format!("repaired.{}", out.extension().map_or("mp4".into(), |e| e.to_string_lossy())));
+        tools.run(&remux(video, &joined))?;
+        let _ = std::fs::remove_file(video);
+        std::fs::rename(&joined, out)?;
+        out_info = check_layout(tools, info, out, streams, Some(frames), None)?;
+        // The stretches were scored by themselves. Read once more where they now are, the
+        // first and the last say whether every frame sits where it should.
+        let mut ends = vec![&s.stretches[0]];
+        if s.stretches.len() > 1 {
+            ends.push(&s.stretches[s.stretches.len() - 1]);
+        }
+        for (i, st) in ends.into_iter().enumerate() {
+            let secs = st.secs.min(repair::WINDOW_SECS);
+            let Some(alone) = outcome.at(st.start_secs, secs) else { continue };
+            let at = (st.start_secs + search::first_frame(&out_info), st.start_secs + search::first_frame(info), secs);
+            let v = spot_check(tools, input, info, out, &out_info, at, alone - JOIN_SLACK, threads, tmp, &format!("joined{i}"))?;
+            eprintln!("  joined video at {}: VMAF {v:.2} ({alone:.2} by itself)", hms(at.0));
+            if v < alone - JOIN_SLACK {
+                bail!("verify: the stretch at {} encoded again reads VMAF {v:.2} in the joined video, {alone:.2} by itself; keeping nothing", hms(at.0));
+            }
+        }
+        let (count, total) = (s.stretches.len(), s.stretches.iter().map(|x| x.secs).sum::<f64>());
+        let (lo, hi) = s.stretches.iter().fold((f64::INFINITY, 0.0_f64), |(lo, hi), x| (lo.min(x.crf), hi.max(x.crf)));
+        let crfs = if lo == hi { format!("{lo}") } else { format!("{lo}-{hi}") };
+        let grown = s.stretches.iter().map(|x| x.bytes as f64 - x.bytes_before as f64).sum::<f64>() / 1e6;
+        let n = format!(
+            "{count} stretch{} ({} in all) scored below VMAF {floor:.0} and {} encoded again at CRF {crfs}: the lowest {:.0} s of the video went from VMAF {:.1} to {:.1}, for {grown:+.1} MB",
+            if count == 1 { "" } else { "es" },
+            hms(total),
+            if count == 1 { "was" } else { "were" },
+            repair::WINDOW_SECS,
+            s.lowest_before,
+            s.lowest_vmaf,
+        );
+        eprintln!("note: {n}");
+        tools.emit(Event::Note { text: n.clone() });
+        notes.push(n);
+        let short: Vec<f64> = s.stretches.iter().filter(|x| x.out_of_reach).map(|x| x.vmaf).collect();
+        if let Some(lowest) = short.iter().copied().min_by(f64::total_cmp) {
+            let n = format!("{} of them stay below VMAF {floor:.0} at any CRF (lowest: {lowest:.1}): kept where more bits stop adding quality", short.len());
+            eprintln!("note: {n}");
+            tools.emit(Event::Note { text: n.clone() });
+            notes.push(n);
+        }
+    }
+    eprintln!("whole video as kept: mean VMAF {:.2}, lowest {:.0} s {:.2}", s.mean_vmaf, repair::WINDOW_SECS, s.lowest_vmaf);
+    let mut scores = Vec::new();
+    for (start, secs) in spot_checks(info.picture_secs()) {
+        if let Some(v) = outcome.at(start, secs) {
+            tools.emit(Event::SpotCheck { at_secs: start, vmaf: v });
+            scores.push(v);
+        }
+    }
+    Ok(Some((scores, out_info, outcome.summary)))
 }
 
 fn free_bytes(dir: &Path) -> Option<u64> {

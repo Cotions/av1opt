@@ -392,7 +392,7 @@ impl Tools {
 }
 
 /// (frame number, score) of every frame in a libvmaf JSON log.
-fn parse_vmaf_frames(log: &[u8]) -> Result<Vec<(u64, f64)>> {
+pub(crate) fn parse_vmaf_frames(log: &[u8]) -> Result<Vec<(u64, f64)>> {
     let v: serde_json::Value = serde_json::from_slice(log).context("libvmaf's log is not JSON")?;
     let frames = v["frames"].as_array().context("no frames in libvmaf's log")?;
     frames
@@ -408,22 +408,51 @@ impl Tools {
     /// [`Tools::vmaf`]. libvmaf's log is written in `dir` and removed.
     #[allow(clippy::too_many_arguments)]
     pub fn vmaf_frames(&self, distorted: &Path, references: &Path, dir: &Path, model: &str, pix_fmt: &str, threads: usize, subsample: u32) -> Result<Vec<(u64, f64)>> {
+        let reference = ["-f".into(), "concat".into(), "-safe".into(), "0".into(), "-i".into(), path_arg(references)];
+        self.vmaf_log(distorted, &reference, dir, model, pix_fmt, threads, subsample)
+    }
+
+    /// VMAF of every scored frame of `distorted` against the one clip `reference`, as
+    /// [`Tools::vmaf_frames`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn vmaf_each(&self, distorted: &Path, reference: &Path, dir: &Path, model: &str, pix_fmt: &str, threads: usize, subsample: u32) -> Result<Vec<(u64, f64)>> {
+        self.vmaf_log(distorted, &["-i".into(), path_arg(reference)], dir, model, pix_fmt, threads, subsample)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn vmaf_log(&self, distorted: &Path, reference: &[String], dir: &Path, model: &str, pix_fmt: &str, threads: usize, subsample: u32) -> Result<Vec<(u64, f64)>> {
         // By relative name, with ffmpeg run in `dir`: a path in a filter graph needs escaping.
-        const LOG: &str = "vmaf-frames.json";
+        // One log per thread, so runs in the same folder at the same time keep apart.
+        let log_name = format!("vmaf-frames-{:?}.json", std::thread::current().id()).replace(['(', ')'], "");
         let filter = format!(
             "[0:v]format={pix_fmt},settb=1,setpts=N[d];[1:v]format={pix_fmt},settb=1,setpts=N[r];\
-             [d][r]libvmaf=model=version={model}:n_threads={threads}:n_subsample={}:shortest=1:log_fmt=json:log_path={LOG}",
+             [d][r]libvmaf=model=version={model}:n_threads={threads}:n_subsample={}:shortest=1:log_fmt=json:log_path={log_name}",
             subsample.max(1)
         );
-        let args: Vec<String> = ["-i".into(), path_arg(distorted), "-f".into(), "concat".into(), "-safe".into(), "0".into(), "-i".into(), path_arg(references)]
+        let args: Vec<String> = ["-i".into(), path_arg(distorted)]
             .into_iter()
+            .chain(reference.iter().cloned())
             .chain(["-lavfi", &filter, "-f", "null", "-"].map(String::from))
             .collect();
         self.run_in(Some(dir), &args)?;
-        let log = dir.join(LOG);
+        let log = dir.join(log_name);
         let text = std::fs::read(&log).context("libvmaf wrote no log")?;
         let _ = std::fs::remove_file(&log);
         parse_vmaf_frames(&text)
+    }
+
+    /// Whether each packet (= frame) of the first video stream is a key frame, in the order
+    /// they are stored, without decoding.
+    pub fn key_packets(&self, path: &Path) -> Result<Vec<bool>> {
+        let out = Command::new(&self.ffprobe)
+            .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=flags", "-of", "csv=p=0"])
+            .arg(path)
+            .output()
+            .context("failed to run ffprobe")?;
+        if !out.status.success() {
+            bail!("cannot read the packets of {}", path.display());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.trim().is_empty()).map(|l| l.contains('K')).collect())
     }
 
     /// Number of video packets (= frames) in the first video stream, without decoding.

@@ -255,7 +255,7 @@ impl Times {
         Some(Times { pts, tb })
     }
 
-    fn secs(&self, units: i64) -> f64 {
+    pub(crate) fn secs(&self, units: i64) -> f64 {
         units as f64 * self.tb.0 as f64 / self.tb.1 as f64
     }
 
@@ -413,7 +413,7 @@ fn frame_time(cfr: &str) -> String {
 /// [`Plan::timed`]) no grid is laid over the source: the frames between the bounds are taken
 /// as they are and numbered along the constant rate, so the encoder and VMAF get the same
 /// kind of clip either way, holding every source frame once.
-fn extract_chunk(tools: &Tools, input: &Path, info: &MediaInfo, b: Bounds, timed: Option<(i64, i64)>, out: &Path) -> Result<()> {
+pub(crate) fn extract_chunk(tools: &Tools, input: &Path, info: &MediaInfo, b: Bounds, timed: Option<(i64, i64)>, out: &Path) -> Result<()> {
     let mut vf = search::source_filters(info);
     let cfr = search::cfr(info);
     if timed.is_none() {

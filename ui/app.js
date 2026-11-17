@@ -1578,7 +1578,7 @@ function renderBench(out, data, ui) {
 
 // ----- queue -----
 
-const PHASES = { probing: "Probing", sampling: "Cutting samples", searching: "Searching CRF", scenes: "Finding scenes", chunks: "Encoding chunks", encoding: "Encoding", muxing: "Muxing", verifying: "Verifying" };
+const PHASES = { probing: "Probing", sampling: "Cutting samples", searching: "Searching CRF", scenes: "Finding scenes", chunks: "Encoding chunks", encoding: "Encoding", muxing: "Muxing", verifying: "Verifying", repairing: "Encoding weak stretches again" };
 const STATUS = {
   pending: ["Waiting", ""], running: ["Running", "run"], ok: ["Done", "ok"], skip: ["Skipped", "warn"], error: ["Failed", "bad"],
   done_before: ["Done earlier", "ok"], cancelled: ["Cancelled", ""], queued: ["Queued", ""], done: ["Finished", "ok"], failed: ["Failed", "bad"],
@@ -2469,6 +2469,9 @@ function comparePlayer(root, r) {
         kv("Encoder", `preset ${r.preset}${r.svt_params ? " · " + r.svt_params : ""}`),
         kv("Target", `VMAF ${target} (${r.vmaf_model})`),
         r.mean_vmaf != null ? kv("Mean VMAF", num(r.mean_vmaf)) : null,
+        r.whole ? kv("Lowest 5 s", `VMAF ${num(r.whole.lowest_vmaf)}${r.whole.stretches.length ? ` (${num(r.whole.lowest_before)} before the repair)` : ""}`) : null,
+        r.whole && r.whole.stretches.length ? kv("Encoded again", h("span", { title: r.whole.stretches.map((x) => `${hms(x.start_secs)} +${num(x.secs, 1)} s: CRF ${x.crf}, VMAF ${num(x.vmaf_before)} → ${num(x.vmaf)}`).join("\n") },
+          `${r.whole.stretches.length} stretch${r.whole.stretches.length > 1 ? "es" : ""}, ${hms(r.whole.stretches.reduce((a, x) => a + x.secs, 0))} in all, +${bytes(Math.max(0, r.whole.stretches.reduce((a, x) => a + x.bytes - x.bytes_before, 0)))}`)) : null,
         kv("Spot checks", (r.verify_vmaf || []).map((v) => num(v)).join(", ") || "–"),
         kv("Time", `search ${hms(r.search_secs)}, encode ${hms(r.encode_secs)}`),
         kv("Source video", ii.codec ? `${ii.codec} ${ii.width}×${ii.height} ${num(ii.fps, 2)} fps${ii.hdr ? " HDR" : ""}` : (ii.error || "–")))),

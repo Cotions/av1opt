@@ -1059,18 +1059,41 @@ fn scenes_are_encoded_apart_only_where_the_samples_disagree() {
     assert!(!notes(&rep).contains("quality differs"), "{rep}");
     assert!(entries(&c.out(), ".av1opt-").is_empty());
 
-    // Without the setting the same video gets one CRF: one low enough for its worst sample,
-    // which verification would otherwise have thrown the finished encode away for.
+    // Without the setting the same video gets one CRF, the one its mean asks for. The whole
+    // encode is then scored against the source, and the stretches that came out below the
+    // floor are encoded again by themselves and put in place: every frame where it was,
+    // the sound untouched.
     let whole = c.dir.join("whole");
     let r = c.encode_into(&whole, &[&uneven], &[]);
-    r.ok().has("looking for the CRF that keeps it at 90 or above");
+    r.ok().has("verifying: the whole video against its source").has("encoding again:").has("whole video as kept:");
+    assert!(!r.err.contains("looking for the CRF that keeps it"), "{}", r.err);
     let rep = c.report_in(&whole, "uneven");
     assert_eq!(rep["mode"], "whole");
-    assert!(notes(&rep).contains("a CRF per scene (--scenes) would even it out") && notes(&rep).contains("to keep the worst sample at VMAF 90"), "{rep}");
+    assert!(notes(&rep).contains("a CRF per scene (--scenes) would even it out") && notes(&rep).contains("encoded again at CRF"), "{rep}");
+    // The video's CRF is the highest that reached the mean.
     let chosen = rep["crf"].as_f64().unwrap();
-    let mean_only = rep["search"].as_array().unwrap().iter().filter(|t| t["mean_vmaf"].as_f64().unwrap() >= 93.0).map(|t| t["crf"].as_f64().unwrap()).fold(0.0, f64::max);
-    assert!(chosen <= mean_only - 2.0, "CRF {chosen}, the mean alone allowed {mean_only}");
-    assert!(rep["verify_vmaf"].as_array().unwrap().iter().all(|v| v.as_f64().unwrap() >= 89.0), "{rep}");
+    let trials = rep["search"].as_array().unwrap();
+    assert!(trials.iter().all(|t| t["crf"].as_f64().unwrap() <= chosen || t["mean_vmaf"].as_f64().unwrap() < 93.0), "{rep}");
+    let w = &rep["whole"];
+    let stretches = w["stretches"].as_array().unwrap();
+    assert!(!stretches.is_empty(), "{rep}");
+    for st in stretches {
+        assert!(st["crf"].as_f64().unwrap() < chosen, "{rep}");
+        assert!(st["vmaf_before"].as_f64().unwrap() < 89.0, "{rep}");
+        assert!(st["vmaf"].as_f64().unwrap() >= 89.0 || st["out_of_reach"] == true, "{rep}");
+    }
+    assert!(w["lowest_vmaf"].as_f64().unwrap() > w["lowest_before"].as_f64().unwrap(), "{rep}");
+    assert!(stretches.iter().any(|st| st["out_of_reach"] == true) || w["lowest_vmaf"].as_f64().unwrap() >= 89.0, "{rep}");
+    assert_eq!(rep["mean_vmaf"], w["mean_vmaf"]);
+    let out = whole.join("uneven.mp4");
+    let (got, want) = (frame_times(&out), frame_times(&uneven));
+    assert_eq!(got.len(), want.len());
+    let worst = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+    assert!(worst < 0.00002, "a frame is {worst:.6} s from its place");
+    assert_in_step(&out, &uneven, "1");
+    assert_eq!(packets_md5(&out, "0:a:0"), packets_md5(&uneven, "0:a:0"));
+    assert_eq!(video(&out)["field_order"], "progressive");
+    assert_eq!(c.outputs_in(&whole), ["av1opt-log.tsv", "uneven.av1opt.json", "uneven.mp4"]);
 
     // An easy half and a hard one with every sixth frame left out, in a Matroska file whose
     // header names a constant rate all the same: that scenes can't be cut apart at it shows

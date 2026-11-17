@@ -16,7 +16,8 @@ pub enum Event {
     FileStart { index: usize, total: usize, input: PathBuf, output: PathBuf },
     /// Probe result of the file being encoded.
     Source { codec: String, width: u32, height: u32, fps: f64, duration_s: f64, video_mbps: f64, hdr: bool },
-    /// A new step: "sampling", "searching", "scenes", "chunks", "encoding", "muxing", "verifying".
+    /// A new step: "sampling", "searching", "scenes", "chunks", "encoding", "muxing", "verifying",
+    /// "repairing".
     Phase { phase: String, detail: String },
     /// One CRF search trial over all samples.
     Trial { crf: f64, mean_vmaf: f64, min_vmaf: f64, size_ratio: f64 },

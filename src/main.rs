@@ -8,6 +8,7 @@ mod fsguard;
 mod history;
 mod metadata;
 mod probe;
+mod repair;
 mod replace;
 mod report;
 mod scan;

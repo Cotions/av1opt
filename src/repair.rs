@@ -49,6 +49,10 @@ const TRIES: usize = 3;
 /// Times the video is gone over: a stretch encoded again can leave a window that lies
 /// across its edge short, which the next round sees.
 const ROUNDS: usize = 3;
+/// After the last round, windows this far below the floor at most are let be: the video is
+/// kept with them and the report says so. Anything lower sends the video to a second
+/// search, which lowers the CRF of all of it or gives it up as not worth encoding.
+const NEAR: f64 = 1.0;
 /// GOPs longer than this are not cut out: their lossless reference would be too large.
 const MAX_GOP_SECS: f64 = 30.0;
 
@@ -292,7 +296,7 @@ pub struct Stretch {
     pub secs: f64,
     pub frames: usize,
     pub crf: f64,
-    /// VMAF of its lowest five seconds before and after.
+    /// VMAF of the lowest five seconds that lie over it, before and after.
     pub vmaf_before: f64,
     pub vmaf: f64,
     pub bytes_before: u64,
@@ -313,6 +317,38 @@ pub struct Summary {
     /// The floor: what five seconds may score at least.
     pub floor: f64,
     pub stretches: Vec<Stretch>,
+    /// Five-second windows left just under the floor (by [`NEAR`] at most) when the rounds
+    /// ran out.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub near: usize,
+    /// Seconds the scoring and the encoding again took.
+    pub secs: f64,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+/// The lowest of the whole video's windows that lie over `run` and end by frame `upto`, with
+/// `new` in place of the run's own frames in `scores`. A stretch is judged as it will sit in
+/// the video: a window across its edge holds its neighbour's frames too, and can fall short
+/// where every window inside the stretch holds.
+fn lowest_over(secs: &[f64], scores: &[(usize, f64)], new: Option<&[(usize, f64)]>, run: Run, upto: usize) -> f64 {
+    let merged: Vec<(usize, f64)>;
+    let scores = match new {
+        Some(new) => {
+            let at = scores.partition_point(|s| s.0 < run.start);
+            let after = scores.partition_point(|s| s.0 < run.end);
+            merged = scores[..at].iter().chain(new).chain(&scores[after..]).copied().collect();
+            &merged
+        }
+        None => scores,
+    };
+    windows(secs, &Scores::new(scores), 0, secs.len() - 1)
+        .iter()
+        .filter(|w| run.overlaps(w.start, w.end) && w.end <= upto)
+        .map(|w| w.vmaf)
+        .fold(f64::INFINITY, f64::min)
 }
 
 pub struct Outcome {
@@ -381,7 +417,7 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
         if low_count > 0 { format!(", {low_count} of {} stretches below {:.0}", all.len(), c.floor) } else { String::new() }
     );
     if low_count == 0 {
-        let summary = Summary { mean_vmaf: mean(&scores), lowest_vmaf: lowest_before, lowest_before, floor: c.floor, stretches: Vec::new() };
+        let summary = Summary { mean_vmaf: mean(&scores), lowest_vmaf: lowest_before, lowest_before, floor: c.floor, stretches: Vec::new(), near: 0, secs: 0.0 };
         return Ok(Outcome { summary, video: None, scores, secs });
     }
 
@@ -420,9 +456,15 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
             // What stands there now: the one-pass encode, or an earlier round's.
             let earlier: Vec<&Fixed> = fixed.iter().filter(|f| f.run.overlaps(run.start, run.end)).collect();
             let from_crf = earlier.iter().map(|f| f.crf).fold(c.crf, f64::min);
-            let now = low.iter().filter(|w| run.overlaps(w.start, w.end)).map(|w| w.vmaf).fold(f64::INFINITY, f64::min);
+            // A window that reaches into the next stretch of this round is judged with that
+            // one, once this one's new frames are in it.
+            let upto = if todo.get(k + 1).is_some_and(|n| n.start == run.end) { run.end } else { frames };
+            let now = lowest_over(&secs, &scores, None, *run, upto);
+            if now >= c.floor {
+                continue;
+            }
             let before = earlier.iter().map(|f| f.before).fold(now, f64::min);
-            let f = fix(c, &survey.times, &secs, *run, serial, from_crf, now, before)?;
+            let f = fix(c, &survey.times, &secs, &scores, *run, upto, serial, from_crf, now, before)?;
             serial += 1;
             // It stands at the lowest CRF allowed: what is there stays.
             let Some(f) = f else {
@@ -451,7 +493,7 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
         .filter(|w| w.vmaf < c.floor && !settled.iter().any(|s| s.overlaps(w.start, w.end)))
         .map(|w| (secs[w.start], secs[w.end] - secs[w.start], w.vmaf))
         .collect();
-    if !still.is_empty() {
+    if still.iter().any(|w| w.2 < c.floor - NEAR) {
         return Err(StillLow { windows: still }.into());
     }
 
@@ -475,16 +517,17 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
     for f in &fixed {
         let _ = std::fs::remove_file(&f.file);
     }
-    let summary = Summary { mean_vmaf: mean(&scores), lowest_vmaf: lowest_of(&after), lowest_before, floor: c.floor, stretches };
+    let summary = Summary { mean_vmaf: mean(&scores), lowest_vmaf: lowest_of(&after), lowest_before, floor: c.floor, stretches, near: still.len(), secs: 0.0 };
     Ok(Outcome { summary, video: Some(video), scores, secs })
 }
 
-/// Encodes the frames of `run` again, at the highest CRF found that keeps its lowest window
-/// above the floor. `from_crf` and `now` are the CRF it stands at and its lowest window
-/// there; `before`, its lowest window in the one-pass encode. `None` where it stands at the
-/// lowest CRF allowed already.
+/// Encodes the frames of `run` again, at the highest CRF found that keeps the lowest window
+/// over it above the floor (see [`lowest_over`]; `all` holds the scores of the video as it
+/// stands). `from_crf` and `now` are the CRF it stands at and its lowest window there;
+/// `before`, its lowest window in the one-pass encode. `None` where it stands at the lowest
+/// CRF allowed already.
 #[allow(clippy::too_many_arguments)]
-fn fix(c: &Ctx, times: &Times, secs: &[f64], run: Run, serial: usize, from_crf: f64, now: f64, before: f64) -> Result<Option<Fixed>> {
+fn fix(c: &Ctx, times: &Times, secs: &[f64], all: &[(usize, f64)], run: Run, upto: usize, serial: usize, from_crf: f64, now: f64, before: f64) -> Result<Option<Fixed>> {
     struct Try {
         crf: f64,
         lowest: f64,
@@ -519,7 +562,7 @@ fn fix(c: &Ctx, times: &Times, secs: &[f64], run: Run, serial: usize, from_crf: 
             .into_iter()
             .map(|(i, v)| (run.start + i as usize, v))
             .collect();
-        let lowest = windows(secs, &Scores::new(&scores), run.start, run.end).iter().map(|w| w.vmaf).fold(f64::INFINITY, f64::min);
+        let lowest = lowest_over(secs, all, Some(&scores), run, upto);
         if !lowest.is_finite() {
             bail!("the stretch at {at} could not be scored");
         }
@@ -630,6 +673,28 @@ fn splice(source: &Path, head: &[u8; 32], index: &[IvfFrame], fixed: &[Fixed], o
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stretch_is_judged_with_the_frames_around_it() {
+        // 40 s; the GOP at 10-20 s is weak, most of all in its last two seconds.
+        let secs = secs(1200);
+        let old = scored(1200, |f| if (540..600).contains(&f) { 80.0 } else if (300..540).contains(&f) { 88.0 } else { 90.0 });
+        let run = Run { start: 300, end: 600 };
+        // As it stands, its last five seconds are the lowest: 3 s at 88 and 2 s at 80.
+        let now = lowest_over(&secs, &old, None, run, 1200);
+        assert!((now - (88.0 * 3.0 + 80.0 * 2.0) / 5.0).abs() < 0.2, "{now}");
+        // Encoded again: fine by itself, its last two seconds still low.
+        let new = scored(1200, |f| if (540..600).contains(&f) { 84.0 } else { 93.0 }).into_iter().filter(|s| (300..600).contains(&s.0)).collect::<Vec<_>>();
+        let alone = windows(&secs, &Scores::new(&new), 300, 600).iter().map(|w| w.vmaf).fold(f64::INFINITY, f64::min);
+        assert!(alone > 89.0, "{alone}");
+        // With the neighbour's frames: 2 s at 84 and 3 s at 90 are a window below 89.
+        let placed = lowest_over(&secs, &old, Some(&new), run, 1200);
+        assert!(placed < 88.0, "{placed}");
+        // Windows that reach into a stretch still to be done are left to that one.
+        assert!((lowest_over(&secs, &old, Some(&new), run, 600) - alone).abs() < 1e-9);
+        // The scores handed in are not changed, and frames outside the run keep theirs.
+        assert_eq!(lowest_over(&secs, &old, None, Run { start: 900, end: 1200 }, 1200), 90.0);
+    }
 
     /// 30 fps: frame `i` at `i / 30` s.
     fn secs(frames: usize) -> Vec<f64> {
@@ -825,7 +890,7 @@ mod tests {
     #[test]
     fn outcome_reads_any_stretch() {
         let o = Outcome {
-            summary: Summary { mean_vmaf: 0.0, lowest_vmaf: 0.0, lowest_before: 0.0, floor: 89.0, stretches: Vec::new() },
+            summary: Summary { mean_vmaf: 0.0, lowest_vmaf: 0.0, lowest_before: 0.0, floor: 89.0, stretches: Vec::new(), near: 0, secs: 0.0 },
             video: None,
             scores: scored(900, |i| if i < 300 { 90.0 } else { 96.0 }),
             secs: secs(900),

@@ -2,7 +2,7 @@
 //! SVT-AV1 parameters) and every video, find the CRF that gives the target VMAF on a few sample
 //! clips, and compare the settings by file size and encode time at that equal quality.
 //!
-//! Every sample encode is remembered in `$XDG_CACHE_HOME/av1opt/bench-v1.jsonl`, so a stopped
+//! Every sample encode is remembered in `$XDG_CACHE_HOME/av1opt/bench-v2.jsonl`, so a stopped
 //! run resumes, and adding a setting or changing the target only measures what is new.
 
 pub mod stats;
@@ -301,7 +301,7 @@ pub fn run(paths: &[PathBuf], tools: &Tools, o: &Options, progress: &(dyn Fn(Pro
     }
     progress(Progress::Plan { videos: chosen.len(), configs: o.configs.len() });
 
-    let cache_path = cache_dir()?.join("bench-v1.jsonl");
+    let cache_path = cache_dir()?.join("bench-v2.jsonl");
     let lines: Vec<Line> = if o.refresh {
         Vec::new()
     } else {

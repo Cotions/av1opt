@@ -118,12 +118,13 @@ For each file:
    within 3 CRF of the answer, never more than 4, and the CRF chosen is never more than 0.05
    VMAF short of the target. A trial encodes the samples end to end as one clip and scores
    them in one pass. The answer is in SVT-AV1's quarter-step CRF. 4K uses the
-   `vmaf_4k` model. One CRF has to carry the video's worst stretch: verification allows a
-   spot check 4 VMAF below the target, and a spot check of the same stretch reads a little
+   `vmaf_4k` model. A sample 4 or more below the samples' mean gets a note that quality
+   differs along the video (see [per-scene CRF](#per-scene-crf---scenes)). Where the whole
+   video can't be scored afterwards (step 5: HDR, removed sections), one CRF has to carry
+   its worst stretch: a spot check may read 4 VMAF below the target, and reads a little
    higher or lower than the samples did. If the worst sample at the chosen CRF is not a
-   point above that mark, the search goes on to the CRF that puts it there, and the report
-   says so. A sample 4 or more below the samples' mean gets a note that quality differs along
-   the video (see [per-scene CRF](#per-scene-crf---scenes)).
+   point above that mark there, the search goes on to the CRF that puts it there, and the
+   report says so.
 3. **Decide** – skips files that are already AV1, Dolby Vision, can't reach the target, or would
    save less than `--min-savings` (15%). The search stops at the first trial that misses the
    target while already larger than that: the CRF the target needs would be larger still.
@@ -131,22 +132,39 @@ For each file:
    and mastering/light-level metadata intact (VMAF is then measured on the HDR signal, which
    tracks encoding damage but is not calibrated like SDR scores).
 4. **Encode** – SVT-AV1, 10-bit, `--preset` 6 with `tune=0` unless `--svt-params` or `--tuned`
-   say otherwise (see [bench](#bench)). Audio already in AAC/Opus/MP3 is copied, anything else becomes
+   say otherwise (see [bench](#bench)). Two parameters are added to whatever set is in
+   use unless it names them itself: `keyint=10s` (a key frame every 10 seconds instead of
+   every 5) and `enable-qm=1` (quantization matrices). Audio already in AAC/Opus/MP3 is copied, anything else becomes
    Opus. `--audio shrink` also re-encodes copied tracks that spend more than 1.5 times what
    Opus needs (96 kbps stereo, 56 mono, 256 for 5.1): a 320 kbps MP3 or 256 kbps AAC track
    becomes 96 kbps Opus, a 128 kbps one is left alone. It is a second lossy pass, so it is
    off unless asked for; the report notes every track it changed. MP4 output keeps text subtitles (as mov_text) and plays in Chrome and Firefox; use
    `--container mkv` to keep image subtitles too. Cover art is kept (MP4: attached picture,
    MKV: attachment with its original file name).
-5. **Verify** – codec, duration, stream and cover counts, HDR transfer, plus VMAF spot checks at positions the search
-   did not sample (five seconds at 30% and at 70% of the way; one for every ten minutes of
-   a video of 25 minutes or more, eight at most; all of a video of ten seconds or less,
-   once). Nothing is written unless all checks pass. A spot check more than 4 VMAF
-   below the target is a stretch the samples missed: for a video encoded in one pass it is
-   added to them, the search runs again (the worst sample two points above that line this
-   time) and the video is encoded once more at the lower CRF it finds, which the report
-   says. If that saves less than `--min-savings` the video is skipped; a second failed check
-   stands.
+5. **Verify** – codec, duration, stream and cover counts, HDR transfer, and the picture.
+   A video encoded in one pass is scored against its source along its whole length (every
+   third frame, each against the source frame of the same number), in stretches of five
+   seconds a second apart. One CRF gives a video one quantizer, not one quality, so some
+   stretches end up well below the mean. Those more than 4 VMAF below the target are
+   **encoded again**: the groups of pictures that hold them (each starts with a key frame
+   and refers to nothing outside itself) are cut from the source, encoded at a lower CRF
+   (up to three tries, going by what the stretch itself gains per step) and put in the place
+   of the ones they replace. Every frame keeps its timestamp and the other streams are not
+   touched; the joined file's frames are counted, and its first and last new stretch are
+   scored once more where they now sit. A stretch that more bits don't lift (noise the
+   metric reads as damage, mostly) is kept at the best it got. The report lists each
+   stretch with its CRF, score and bytes before and after, and the mean and the lowest five
+   seconds of the whole video. Windows left less than a point under the line after three
+   rounds are kept and noted; stretches further short become
+   samples of a second search (the worst sample two points above the line this time) and
+   the video is encoded once more at the lower CRF it finds, which the report says; if that
+   saves less than `--min-savings` the video is skipped, and a second failure stands.
+   Where frames can't be paired one for one (removed sections, a source whose frames stay
+   for unequal times), in HDR and for videos encoded per scene, it is spot checks at
+   positions the search did not sample instead (five seconds at 30% and at 70% of the way;
+   one for every ten minutes of a video of 25 minutes or more, eight at most; all of a
+   video of ten seconds or less, once), and a spot check more than 4 below the target
+   leads to the same second search. Nothing is written unless all checks pass.
 6. **Report** – the output plus `<name>.av1opt.json` with every CRF tried, scores, sizes and timings.
 
 ### Metadata
@@ -301,7 +319,7 @@ there by the video's size (classes without an entry use `--preset` and `--svt-pa
 `av1opt tuning` shows what is stored, `av1opt tuning --clear` forgets it. Without `--tuned`
 nothing changes: `encode --svt-params key=value:key=value` sets parameters by hand.
 
-Sample encodes are remembered in `~/.cache/av1opt/bench-v1.jsonl` (by file, clip layout,
+Sample encodes are remembered in `~/.cache/av1opt/bench-v2.jsonl` (by file, clip layout,
 encoder build, preset, parameters and CRF), so a stopped run carries on where it was and adding
 a setting later only measures the new one. `--refresh` measures again.
 
@@ -617,6 +635,37 @@ and the benchmark's requests and tuned settings over HTTP (no ffmpeg needed).
   not worth encoding (0% predicted, 37% measured) because the model took AV1's bits per pixel
   to be the same whatever the source spends; the pilot model now leans with the source.
   Encode times were predicted within 5% for one pass.
+- **Two spot checks see ten seconds.** Four real 15-minute outputs that had passed
+  verification, scored frame for frame afterwards: 29, 47, 78 and 104 of their roughly 900
+  to 1,800 five-second windows were below the line a spot check draws (target - 4), the
+  lowest at VMAF 82.2 to 85.8, around means of 92.9 to 95.1. Two of the four had already
+  had their CRF lowered for a weak sample or a failed check, which had bought a higher mean
+  and left the dips. A one-pass encode is now scored along its whole length, and the
+  groups of pictures under the line are encoded again by themselves at the CRF each needs
+  and put in place. The same two videos: 166.6 MB instead of 192.5 (mean 92.8 instead of
+  94.7, lowest five seconds 89.0 instead of 82.8; 51 stretches, 9 of 15 minutes, at CRF 26
+  to 40.25 around a video at 40.75) and 220.1 MB instead of 248.2 (mean 94.1 instead of
+  95.1, lowest 89.0 instead of 85.8; 18 stretches, 3 minutes). A lower CRF for the whole
+  video spends most of its bits where none were missing.
+- **A stretch is judged where it sits.** The first version scored a stretch encoded again
+  by itself. On a third video one group of pictures passed at every CRF tried (91.6 to
+  92.5 over its own windows) while a window across its edge, part of it the neighbour's
+  frames, stayed at 88.5 to 88.9 through three rounds; the video then went to a
+  second search, which found that CRF 32 still left that window short at 91% of the
+  source's size, and it was skipped, where the build before had kept it 38% smaller. The
+  new frames are now set among the frames around them before they are scored, on the same
+  windows the whole video is judged by, and a window that ends up less than a point under
+  the line after three rounds no longer costs the video.
+- **A key frame every 10 seconds, and quantization matrices.** SVT-AV1 puts a key frame
+  about every 5 seconds and leaves quantization matrices off. At equal VMAF, 10 seconds
+  took 3.3% less on eight 10-second clips and 2.6% less on four of 40 seconds (20 seconds:
+  3.2%, none at all: 3.8%, so most of the gain is in the first doubling, which keeps
+  seeking quick and the stretches that can be encoded again short). Matrices took another
+  1.1%, less on every clip. Both together: 4.4% on the eight clips they were chosen on and
+  2.1% on six they were not (less on each of the six, by VMAF NEG and SSIMULACRA2 too),
+  with encoding time within 2% either way. Tried the same way and left out: `tune=2` and `tune=5`, variance
+  boost, encoding at a reduced resolution, and `tune=1` (better on some clips, worse on
+  others).
 - **A container's length is not the picture's.** One recording had 7:40 of video under 17:32
   of sound. Samples and spot checks were placed along the 17:32 and asked for frames that
   don't exist. They go by the video stream's own length now.
@@ -636,7 +685,8 @@ can be, sound and picture offsets, AVI, WebM, MOV, MPEG and transport streams at
 rates, very short videos, awkward file and folder names, skips, failures and name
 collisions, a scene-mode run killed half-way and resumed, an encode stopped half-way (nothing
 left behind, no ffmpeg left running, trials remembered), `--scenes=auto` on an even and an
-uneven video and the lower CRF an uneven one gets without it, `replace` with `--undo` on a
+uneven video and the stretches of an uneven one that are encoded again without it (frame
+times, sound and frame order of the joined file against the source), `replace` with `--undo` on a
 real output, `scan` on a folder with a candidate, an AV1 file and a broken one (nothing in
 the folder touched) and its `--hours` pick, `dups` on a smaller copy, a byte-identical copy and two cut copies, and
 `bench` with its remembered sample encodes and `--save` feeding `encode --tuned`. With `--features ui` it also drives a real server: a paused queue (ffmpeg

@@ -1285,6 +1285,7 @@ fn verify_whole(
     remux: &dyn Fn(&Path, &Path) -> Vec<String>,
     notes: &mut Vec<String>,
 ) -> Result<Option<(Vec<f64>, MediaInfo, repair::Summary)>> {
+    let took = tools.stopwatch();
     let mut out_info = check_layout(tools, info, out, streams, None, None)?;
     let why_not = |e: &anyhow::Error| e.to_string().lines().last().unwrap_or("").to_string();
     let survey = match repair::survey(tools, input, info, out, threads, tmp) {
@@ -1364,6 +1365,19 @@ fn verify_whole(
             notes.push(n);
         }
     }
+    if s.near > 0 {
+        let n = format!(
+            "{} of the video's {:.0} s windows stay{} just under VMAF {floor:.0} after three rounds of encoding again (lowest of the video: {:.1}): kept as {}",
+            s.near,
+            repair::WINDOW_SECS,
+            if s.near == 1 { "s" } else { "" },
+            s.lowest_vmaf,
+            if s.near == 1 { "it is" } else { "they are" }
+        );
+        eprintln!("note: {n}");
+        tools.emit(Event::Note { text: n.clone() });
+        notes.push(n);
+    }
     eprintln!("whole video as kept: mean VMAF {:.2}, lowest {:.0} s {:.2}", s.mean_vmaf, repair::WINDOW_SECS, s.lowest_vmaf);
     let mut scores = Vec::new();
     for (start, secs) in spot_checks(info.picture_secs()) {
@@ -1372,7 +1386,9 @@ fn verify_whole(
             scores.push(v);
         }
     }
-    Ok(Some((scores, out_info, outcome.summary)))
+    let mut summary = outcome.summary;
+    summary.secs = took.secs(tools);
+    Ok(Some((scores, out_info, summary)))
 }
 
 fn free_bytes(dir: &Path) -> Option<u64> {

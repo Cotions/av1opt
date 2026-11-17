@@ -44,20 +44,28 @@ pub struct EncodeSettings {
 /// from the one before it, up to ten seconds of video instead of five.
 pub const KEYINT: &str = "10s";
 
+/// Parameters added to whatever set is in use, unless it names the key itself: the key
+/// frame gap above, and quantization matrices (coarser steps for the fine detail an eye
+/// misses first; SVT-AV1 leaves them off). With them the same VMAF took 1.1% less on eight
+/// clips, less on every one of them, with VMAF NEG and SSIMULACRA2 saying the same and XPSNR
+/// seeing no difference, for 0.5% more encoding time.
+const IMPLIED: &[(&str, &str)] = &[("keyint", KEYINT), ("enable-qm", "1")];
+
 impl EncodeSettings {
+    /// The parameters the encoder is given besides the CRF: the set in use and what is
+    /// added to every set (see [`IMPLIED`]).
+    pub fn full_params(&self) -> String {
+        let sets = |key: &str| self.params.split(':').any(|p| p.split_once('=').is_some_and(|(k, _)| k.trim() == key));
+        let own = (!self.params.is_empty()).then(|| self.params.clone());
+        let implied = IMPLIED.iter().filter(|(k, _)| !sets(k)).map(|(k, v)| format!("{k}={v}"));
+        own.into_iter().chain(implied).collect::<Vec<_>>().join(":")
+    }
+
     /// SVT-AV1 takes CRF in quarter steps through its own parameters (ffmpeg's -crf is integer).
     pub fn video_args(&self, crf: f64) -> Vec<String> {
-        let sets = |key: &str| self.params.split(':').any(|p| p.split_once('=').is_some_and(|(k, _)| k.trim() == key));
-        let mut params: Vec<String> = Vec::new();
-        if !self.params.is_empty() {
-            params.push(self.params.clone());
-        }
-        if !sets("keyint") {
-            params.push(format!("keyint={KEYINT}"));
-        }
-        params.push(format!("crf={}", quarter(crf)));
+        let params = format!("{}:crf={}", self.full_params(), quarter(crf));
         // Stream specifiers keep these off copied cover-art streams.
-        ["-c:v:0", "libsvtav1", "-preset:v:0", &self.preset.to_string(), "-pix_fmt:v:0", self.pix_fmt_out, "-svtav1-params:v:0", &params.join(":")]
+        ["-c:v:0", "libsvtav1", "-preset:v:0", &self.preset.to_string(), "-pix_fmt:v:0", self.pix_fmt_out, "-svtav1-params:v:0", &params]
             .map(String::from)
             .to_vec()
     }
@@ -359,22 +367,22 @@ impl TrialCache {
     }
 
     fn get(&self, enc: &EncodeSettings, crf: f64) -> Option<Trial> {
-        self.known.get(&(settings_key(enc.preset, enc.pix_fmt_out, &enc.params), quarters(crf))).copied()
+        self.known.get(&(settings_key(enc.preset, enc.pix_fmt_out, &enc.full_params()), quarters(crf))).copied()
     }
 
     /// Every trial known for these settings at a whole CRF, lowest CRF first.
     fn whole(&self, enc: &EncodeSettings) -> Vec<Trial> {
-        let key = settings_key(enc.preset, enc.pix_fmt_out, &enc.params);
+        let key = settings_key(enc.preset, enc.pix_fmt_out, &enc.full_params());
         let mut all: Vec<Trial> = self.known.iter().filter(|((k, q), _)| *k == key && q % 4 == 0).map(|(_, t)| *t).collect();
         all.sort_by(|a, b| a.crf.total_cmp(&b.crf));
         all
     }
 
     fn put(&mut self, enc: &EncodeSettings, t: Trial) {
-        self.known.insert((settings_key(enc.preset, enc.pix_fmt_out, &enc.params), quarters(t.crf)), t);
+        self.known.insert((settings_key(enc.preset, enc.pix_fmt_out, &enc.full_params()), quarters(t.crf)), t);
         let Some(path) = &self.path else { return };
         let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-        let line = CacheLine { file: self.file.clone(), preset: enc.preset, pix_fmt: enc.pix_fmt_out.to_string(), params: enc.params.clone(), time, trial: t };
+        let line = CacheLine { file: self.file.clone(), preset: enc.preset, pix_fmt: enc.pix_fmt_out.to_string(), params: enc.full_params(), time, trial: t };
         // Losing the memory of one trial is not worth failing the encode for.
         if let (Ok(json), Ok(mut f)) = (serde_json::to_string(&line), std::fs::OpenOptions::new().create(true).append(true).open(path)) {
             use std::io::Write;
@@ -1224,10 +1232,11 @@ mod tests {
             assert!(parse_params(bad).is_err(), "{bad}");
         }
         let enc = |params: &str| EncodeSettings { preset: 6, pix_fmt_out: "yuv420p10le", params: params.into() };
-        assert_eq!(enc("tune=0").video_args(35.3).last().unwrap(), "tune=0:keyint=10s:crf=35.25");
-        // A key-frame gap of the user's own is left alone.
-        assert_eq!(enc("tune=0:keyint=5s").video_args(35.0).last().unwrap(), "tune=0:keyint=5s:crf=35");
-        assert_eq!(enc("").video_args(35.0).last().unwrap(), "keyint=10s:crf=35");
+        assert_eq!(enc("tune=0").video_args(35.3).last().unwrap(), "tune=0:keyint=10s:enable-qm=1:crf=35.25");
+        // What the user's own parameters name is left alone.
+        assert_eq!(enc("tune=0:keyint=5s").video_args(35.0).last().unwrap(), "tune=0:keyint=5s:enable-qm=1:crf=35");
+        assert_eq!(enc("enable-qm=0:tune=0").video_args(35.0).last().unwrap(), "enable-qm=0:tune=0:keyint=10s:crf=35");
+        assert_eq!(enc("").video_args(35.0).last().unwrap(), "keyint=10s:enable-qm=1:crf=35");
     }
 
     #[test]

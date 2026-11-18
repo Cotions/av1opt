@@ -485,4 +485,209 @@ mod tests {
         assert!(b[4] == b'-' && b[7] == b'-' && b[10] == b'T' && b[13] == b':' && b[16] == b':', "{d}");
         assert!(d[..4].parse::<u32>().unwrap() >= 2026);
     }
+
+    #[test]
+    fn everything_but_plain_characters_is_percent_encoded() {
+        assert_eq!(encode_path(Path::new("/az/AZ/09/-_.~")), "/az/AZ/09/-_.~");
+        assert_eq!(encode_path(Path::new("/a b/é%#?=\n.mkv")), "/a%20b/%C3%A9%25%23%3F%3D%0A.mkv");
+        assert_eq!(encode_path(Path::new("")), "");
+    }
+
+    #[test]
+    fn every_byte_of_a_name_goes_through_encoding_and_back() {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes: Vec<u8> = (0..=255).collect();
+        let path = Path::new(std::ffi::OsStr::from_bytes(&bytes));
+        let text = encode_path(path);
+        // Nothing in it can break the info file's lines.
+        assert!(text.is_ascii() && !text.contains(['\n', '\r', ' ']), "{text}");
+        assert_eq!(decode_path(&text).unwrap().as_os_str().as_bytes(), &bytes[..]);
+    }
+
+    #[test]
+    fn other_programs_spellings_of_a_path_are_understood() {
+        assert_eq!(decode_path("").unwrap(), Path::new(""));
+        assert_eq!(decode_path("/a%c3%a9").unwrap(), Path::new("/aé"));
+        // Characters an encoder could have left alone.
+        assert_eq!(decode_path("/vidéo #1.mkv").unwrap(), Path::new("/vidéo #1.mkv"));
+    }
+
+    #[test]
+    fn a_percent_sign_without_two_digits_is_no_encoding() {
+        for bad in ["%", "a%", "%4", "%%41", "%G0", "%0G", "%é", "é%é", "%4é"] {
+            assert_eq!(decode_path(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "defect: decode_path takes a sign for a hex digit, so %+1 reads as byte 1"]
+    fn a_sign_is_not_a_digit_of_an_encoded_byte() {
+        assert_eq!(decode_path("a%+1"), None);
+        assert_eq!(decode_path("%+f"), None);
+    }
+
+    /// A trash at `<dir>/drive/.Trash-1000` holding `name`, with this info file.
+    fn in_drive_trash(dir: &Path, name: &str, info: &str) -> PathBuf {
+        let bin = dir.join("drive/.Trash-1000");
+        std::fs::create_dir_all(bin.join("files")).unwrap();
+        std::fs::create_dir_all(bin.join("info")).unwrap();
+        std::fs::write(bin.join("files").join(name), b"x").unwrap();
+        std::fs::write(bin.join("info").join(format!("{name}.trashinfo")), info).unwrap();
+        bin.join("files").join(name)
+    }
+
+    #[test]
+    fn only_the_line_that_is_the_path_says_where_a_file_came_from() {
+        let dir = scratch("lines");
+        let top = dir.join("drive");
+        let on_drive = |t: &Path, o: &Path| holds_with(t, o, &|p| p == top);
+        let f = in_drive_trash(&dir, "none.mkv", "[Trash Info]\nDeletionDate=2026-11-10T22:15:03\n");
+        assert!(!on_drive(&f, &top.join("none.mkv")));
+        let f = in_drive_trash(&dir, "other.mkv", "[Trash Info]\nOldPath=other.mkv\n Path=other.mkv\npath=other.mkv\n");
+        assert!(!on_drive(&f, &top.join("other.mkv")));
+        // Of two, the first counts.
+        let f = in_drive_trash(&dir, "two.mkv", "[Trash Info]\nPath=a/two.mkv\nPath=b/two.mkv\n");
+        assert!(on_drive(&f, &top.join("a/two.mkv")));
+        assert!(!on_drive(&f, &top.join("b/two.mkv")));
+        let f = in_drive_trash(&dir, "bad.mkv", "[Trash Info]\nPath=bad%zz.mkv\n");
+        assert!(!on_drive(&f, &top.join("bad%zz.mkv")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_way_out_of_the_drive_is_not_hidden_by_encoding_it() {
+        let dir = scratch("encoded");
+        let top = dir.join("drive");
+        let f = in_drive_trash(&dir, "up.mkv", "[Trash Info]\nPath=%2E%2E%2Flib%2Fup.mkv\n");
+        assert!(!holds_with(&f, &top.join("../lib/up.mkv"), &|p| p == top));
+        assert!(!holds_with(&f, &dir.join("lib/up.mkv"), &|p| p == top));
+        let f = in_drive_trash(&dir, "abs.mkv", "[Trash Info]\nPath=%2Fetc%2Fabs.mkv\n");
+        assert!(!holds_with(&f, Path::new("/etc/abs.mkv"), &|p| p == top));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "defect: an empty Path= is taken to say the file came from the top of the drive"]
+    fn an_empty_path_names_no_file() {
+        let dir = scratch("emptypath");
+        let top = dir.join("drive");
+        let f = in_drive_trash(&dir, "e.mkv", "[Trash Info]\nPath=\n");
+        let held = holds_with(&f, &top, &|p| p == top);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!held);
+    }
+
+    #[test]
+    fn an_absolute_path_counts_in_the_users_own_trash_and_nowhere_else() {
+        let dir = scratch("absolute");
+        let home = dir.join("data/Trash");
+        TEST_HOME_TRASH.with(|h| *h.borrow_mut() = Some(home.clone()));
+        let wanted = dir.join("lib/a.mkv");
+        let info = format!("[Trash Info]\nPath={}\n", encode_path(&wanted));
+        // Before the user's trash exists nothing can be believed.
+        let f = in_drive_trash(&dir, "a.mkv", &info);
+        assert!(!holds_with(&f, &wanted, &|_| true));
+        std::fs::create_dir_all(home.join("files")).unwrap();
+        std::fs::create_dir_all(home.join("info")).unwrap();
+        assert!(!holds_with(&f, &wanted, &|_| true));
+        std::fs::write(home.join("files/a.mkv"), b"x").unwrap();
+        std::fs::write(home.join("info/a.mkv.trashinfo"), &info).unwrap();
+        assert!(holds_with(&home.join("files/a.mkv"), &wanted, &|_| false));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_outside_a_files_folder_is_held_by_no_trash() {
+        let dir = scratch("outside");
+        let top = dir.join("drive");
+        let f = in_drive_trash(&dir, "a.mkv", "[Trash Info]\nPath=a.mkv\n");
+        let moved = f.parent().unwrap().parent().unwrap().join("a.mkv");
+        std::fs::rename(&f, &moved).unwrap();
+        assert!(!holds_with(&moved, &top.join("a.mkv"), &|_| true));
+        assert!(!holds_with(Path::new("/"), &top.join("a.mkv"), &|_| true));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_path_that_ends_without_a_name_is_refused_and_nothing_moves() {
+        let dir = scratch("noname");
+        let home = dir.join("Trash");
+        std::fs::create_dir_all(dir.join("lib/sub")).unwrap();
+        let e = trash_with(&dir.join("lib/sub/.."), Some(&home), 1000, "x".into()).unwrap_err().to_string();
+        assert!(e.ends_with("has no name"), "{e}");
+        assert!(dir.join("lib/sub").is_dir() && !home.exists());
+        assert!(trash_with(Path::new("/"), Some(&home), 1000, "x".into()).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_left_in_the_trash_without_its_info_is_not_replaced() {
+        let dir = scratch("leftover");
+        let home = dir.join("Trash");
+        std::fs::create_dir_all(home.join("files")).unwrap();
+        std::fs::write(home.join("files/clip.mp4"), b"left behind").unwrap();
+        let a = dir.join("clip.mp4");
+        std::fs::write(&a, b"new").unwrap();
+        let dest = trash_with(&a, Some(&home), 1000, "x".into()).unwrap();
+        assert_eq!(dest, home.join("files/clip.mp4.2"));
+        assert_eq!(std::fs::read(home.join("files/clip.mp4")).unwrap(), b"left behind");
+        // The name it could not have is not left reserved.
+        assert!(!home.join("info/clip.mp4.trashinfo").exists());
+        assert!(home.join("info/clip.mp4.2.trashinfo").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_folder_goes_to_the_trash_whole_and_a_line_break_in_a_name_stays_in_its_line() {
+        let dir = scratch("whole");
+        let home = dir.join("data/Trash");
+        TEST_HOME_TRASH.with(|h| *h.borrow_mut() = Some(home.clone()));
+        let folder = dir.join("two\nlines");
+        std::fs::create_dir_all(folder.join("in")).unwrap();
+        std::fs::write(folder.join("in/a"), b"x").unwrap();
+        let dest = trash_with(&folder, Some(&home), 1000, "2026-11-10T22:15:03".into()).unwrap();
+        assert!(!folder.exists() && dest.join("in/a").exists());
+        let info = std::fs::read_to_string(home.join("info/two\nlines.trashinfo")).unwrap();
+        assert_eq!(info.lines().count(), 3, "{info}");
+        assert!(holds(&dest, &folder));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_rename_never_replaces_and_says_why_it_did_not_happen() {
+        let dir = scratch("rename");
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        std::fs::write(&a, b"first").unwrap();
+        std::fs::write(&b, b"second").unwrap();
+        assert_eq!(rename_new(&a, &b).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!((std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap()), (b"first".to_vec(), b"second".to_vec()));
+        // A link that leads nowhere is still something at that name.
+        std::os::unix::fs::symlink(dir.join("nowhere"), dir.join("link")).unwrap();
+        assert_eq!(rename_new(&a, &dir.join("link")).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(rename_new(&dir.join("gone"), &dir.join("c")).unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(rename_new(Path::new("a\0b"), &dir.join("c")).unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(rename_new(&a, Path::new("a\0b")).unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        rename_new(&a, &dir.join("c")).unwrap();
+        assert!(!a.exists() && dir.join("c").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_restore_with_nowhere_to_go_leaves_the_trash_as_it_was() {
+        let dir = scratch("nowhere");
+        let home = dir.join("Trash");
+        let a = dir.join("clip.mp4");
+        std::fs::write(&a, b"x").unwrap();
+        let dest = trash_with(&a, Some(&home), 1000, "x".into()).unwrap();
+        assert!(restore(&dest, &dir.join("gone/clip.mp4")).is_err());
+        assert!(dest.exists() && home.join("info/clip.mp4.trashinfo").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_trash_that_is_not_there_is_not_usable() {
+        let dir = scratch("missing");
+        assert_eq!(usable_bin(&dir.join("none"), 0, None).unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

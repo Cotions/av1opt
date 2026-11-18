@@ -348,6 +348,21 @@ pub fn clean_stale_temp(out_dir: &Path) {
     }
 }
 
+/// Whether the output's report can have its name, tried in `tmp`, which is on the same
+/// filesystem. It is the longest name a run gives anything, and the last thing written: found
+/// out then, the encode would be done and stand there without a report.
+fn fits_beside_output(output: &Path, tmp: &Path) -> Result<()> {
+    let report = output.with_extension("av1opt.json");
+    let trial = tmp.join(report.file_name().context("output has no file name")?);
+    match std::fs::write(&trial, b"") {
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidFilename => {
+            bail!("the file name is too long: the report beside the output would be called {}, more than this filesystem takes; rename the file", report.display())
+        }
+        written => written?,
+    }
+    Ok(std::fs::remove_file(trial)?)
+}
+
 /// Re-encodes one file into `out_dir`. Returns the output path.
 pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Result<PathBuf> {
     let size = std::fs::metadata(input).with_context(|| format!("cannot read {}", input.display()))?.len();
@@ -394,6 +409,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     std::fs::create_dir_all(out_dir)?;
     let tmp = TempDir { path: out_dir.join(format!(".av1opt-tmp-{}", std::process::id())), keep: o.keep_temp };
     std::fs::create_dir_all(&tmp.path)?;
+    fits_beside_output(&output, &tmp.path)?;
 
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     // 4K VMAF with many threads was part of the memory blow-up in the first pilot.

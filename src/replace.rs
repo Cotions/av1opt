@@ -101,7 +101,14 @@ fn same_folder(a: &Path, b: &Path) -> bool {
 
 /// The name for the report of `output` once a new encode needs its place, `NAME.replaced-N.av1opt.json`.
 fn aside_name(output: &Path, number: u64) -> PathBuf {
-    output.with_extension(format!("replaced-{number}.av1opt.json"))
+    with_ending(output, &format!(".replaced-{number}.av1opt.json"))
+}
+
+/// `path` with `ending` in place of its extension, its stem shortened if the two do not fit.
+fn with_ending(path: &Path, ending: &str) -> PathBuf {
+    let mut name = crate::files::leave_room(crate::files::folder_of(path), path.file_stem().unwrap_or_default(), ending.len());
+    name.push(ending);
+    path.with_file_name(name)
 }
 
 /// Moves the report of an output that was replaced out of the way of a new encode of that
@@ -132,7 +139,7 @@ fn place_beside_aside(report: &Path, from: &Path) -> Option<PathBuf> {
         return None;
     }
     let extension = from.extension()?.to_string_lossy();
-    Some(from.with_extension(format!("replaced-{number}.{extension}")))
+    Some(with_ending(from, &format!(".replaced-{number}.{extension}")))
 }
 
 /// Looks at one report and the two files it names. Changes nothing.
@@ -237,9 +244,10 @@ fn free_space(dir: &Path) -> Option<u64> {
 /// The name a file has while it is on its way to `dest`: hidden, in the same folder, and
 /// never taken for a video by a scan or a batch.
 fn staging_name(dest: &Path) -> PathBuf {
-    let mut name = std::ffi::OsString::from(".av1opt-");
-    name.push(dest.file_name().unwrap_or_default());
-    name.push(".part");
+    let (start, end) = (".av1opt-", ".part");
+    let mut name = std::ffi::OsString::from(start);
+    name.push(crate::files::leave_room(crate::files::folder_of(dest), dest.file_name().unwrap_or_default(), start.len() + end.len()));
+    name.push(end);
     dest.with_file_name(name)
 }
 
@@ -297,7 +305,7 @@ fn sync_dir(dir: &Path) {
 /// report keeps its date: that is when the encode was made, and History sorts by it.
 fn write_report(report: &Path, r: &Value) -> Result<()> {
     let date = std::fs::metadata(report).and_then(|m| m.modified()).ok();
-    let part = report.with_extension("json.part");
+    let part = crate::files::save_name(report);
     let write = || -> Result<()> {
         // (Made anew: a link left at that name is not written through.)
         let _ = std::fs::remove_file(&part);
@@ -957,6 +965,31 @@ mod tests {
         assert!(d.can_undo && d.trash == done.trash);
         undo(&report, false).unwrap();
         assert!(f.lib("a.mp4").exists() && f.out("a.mkv").exists());
+    }
+
+    #[test]
+    fn a_name_near_the_limit_is_replaced_set_aside_and_given_back() {
+        let f = Fix::new("long");
+        // As long as a stem can be and still have a report.
+        let most = crate::files::name_max(&f.dir) - REPORT_SUFFIX.len();
+        let stem = format!("{}{}", "é".repeat(most / 2), "x".repeat(most % 2));
+        let (source, output) = (format!("{stem}.mp4"), format!("{stem}.mkv"));
+        let report = f.encode(&source, &output, 1000, 400);
+        let done = f.apply(&report).unwrap();
+        assert!(done.warnings.is_empty(), "{:?}", done.warnings);
+        let Check::Replaced(d) = check(&report) else { panic!("{}", no(&report)) };
+        assert!(d.can_undo, "the report must say where the original went");
+
+        let aside = set_aside(&report, &f.out(&output), 1234).unwrap();
+        let Check::Replaced(d) = check(&aside) else { panic!("{}", no(&aside)) };
+        assert!(d.can_undo);
+        f.encode("y.mp4", &output, 900, 300);
+        undo(&aside, false).unwrap();
+        assert_eq!(std::fs::read(f.lib(&source)).unwrap().len(), 1000);
+        assert_eq!(std::fs::read(&d.from).unwrap().len(), 400);
+        assert!(d.from.parent() == Some(&*f.dir.join("out")) && d.from != f.out(&output));
+        let longest = crate::files::name_max(&f.dir);
+        assert_eq!(staging_name(&f.lib(&"e".repeat(longest))).file_name().unwrap().len(), longest);
     }
 
     #[test]

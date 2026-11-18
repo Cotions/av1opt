@@ -946,6 +946,27 @@ fn very_short_videos_are_encoded_or_refused_cleanly() {
 
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_name_with_no_room_for_its_report_is_refused_before_the_work() {
+    let c = Case::new("longname");
+    let clip = c.clip("clip.mkv", "320x180", 2);
+    // As long as a name can be here and still leave room for `.av1opt.json`, then one byte
+    // more. (How long that is depends on the filesystem.)
+    let takes = |n: &usize| std::fs::write(c.out().join("n".repeat(*n)), b"").is_ok() && std::fs::remove_file(c.out().join("n".repeat(*n))).is_ok();
+    let longest = (1..=255).rev().find(takes).unwrap();
+    let stem = longest - ".av1opt.json".len();
+    let (fits, over) = (c.videos().join(format!("{}.mkv", "f".repeat(stem))), c.videos().join(format!("{}.mkv", "o".repeat(stem + 1))));
+    std::fs::copy(&clip, &fits).unwrap();
+    std::fs::rename(&clip, &over).unwrap();
+    let r = c.encode(&[&over], &[]);
+    r.has("failed 1").has("the file name is too long");
+    assert!(!r.err.contains("sample 1/"), "{}", r.err);
+    assert_eq!(c.outputs(), ["av1opt-log.tsv"]);
+    c.encode(&[&fits], &[]).ok().has("encoded 1,");
+    assert_eq!(c.outputs().len(), 3, "{:?}", c.outputs());
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn a_name_that_is_not_text_is_refused_and_no_other_file_is_taken_for_it() {
     use std::os::unix::ffi::OsStrExt;
     let c = Case::new("nottext");

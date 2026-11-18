@@ -139,10 +139,11 @@ pub(crate) fn trash_with(path: &Path, home: Option<&Path>, uid: u32, when: Strin
 
     // The info file is made first and exclusively: that is what reserves the name.
     for n in 1..10_000u32 {
-        let mut unique = name.to_os_string();
-        if n > 1 {
-            unique.push(format!(".{n}"));
-        }
+        // The name in the trash need not be the file's (`Path=` says what that was), and with
+        // the ending of the info file it has to fit.
+        let number = if n > 1 { format!(".{n}") } else { String::new() };
+        let mut unique = crate::files::leave_room(&info, name, ".trashinfo".len() + number.len());
+        unique.push(number);
         let mut info_name = unique.clone();
         info_name.push(".trashinfo");
         let info_path = info.join(&info_name);
@@ -349,6 +350,29 @@ mod tests {
         assert!(trash_with(&a, Some(&home), 1000, "x".into()).is_err());
         assert!(trash_with(Path::new("relative.mkv"), Some(&home), 1000, "x".into()).is_err());
         assert_eq!(std::fs::read_dir(home.join("info")).unwrap().count(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_name_near_the_limit_goes_to_the_trash_and_comes_back() {
+        let dir = scratch("long");
+        let home = dir.join("data/Trash");
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        TEST_HOME_TRASH.with(|h| *h.borrow_mut() = Some(home.clone()));
+        let a = dir.join("lib").join(format!("{}.mkv", "é".repeat((crate::files::name_max(&dir) - 4) / 2)));
+        for turn in [&b"first"[..], b"second"] {
+            std::fs::write(&a, turn).unwrap();
+            let dest = trash_with(&a, Some(&home), 1000, "2026-11-10T22:15:03".into()).unwrap();
+            // Under a shorter name, and still known as that file.
+            assert!(!a.exists() && holds_with(&dest, &a, &|_| false), "{}", dest.display());
+            assert_eq!(std::fs::read(&dest).unwrap(), turn);
+        }
+        let mut names: Vec<_> = std::fs::read_dir(home.join("files")).unwrap().map(|e| e.unwrap().path()).collect();
+        names.sort();
+        assert_eq!(names.len(), 2);
+        restore(&names[0], &a).unwrap();
+        assert!(a.exists());
+        assert_eq!(std::fs::read_dir(home.join("info")).unwrap().count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

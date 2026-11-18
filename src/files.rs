@@ -1,6 +1,8 @@
 //! Writing files where another program, or another user, may be writing too.
 
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -21,11 +23,47 @@ pub fn write_new(path: &Path, data: &[u8]) -> std::io::Result<()> {
 /// number and a count of its saves, so two programs or two threads saving at once do not
 /// take each other's away.
 pub fn replace_with(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    static SAVES: AtomicU64 = AtomicU64::new(0);
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".{}.{}.tmp", std::process::id(), SAVES.fetch_add(1, Ordering::Relaxed)));
-    let tmp: PathBuf = path.with_file_name(name);
+    let tmp = save_name(path);
     write_new(&tmp, data).and_then(|()| std::fs::rename(&tmp, path)).inspect_err(|_| drop(std::fs::remove_file(&tmp)))
+}
+
+/// The most bytes a file name can have in `folder`: 255 on most filesystems, 143 in an
+/// encrypted home folder.
+pub fn name_max(folder: &Path) -> usize {
+    let folder = if folder.as_os_str().is_empty() { Path::new(".") } else { folder };
+    let Ok(c) = std::ffi::CString::new(folder.as_os_str().as_bytes()) else { return 255 };
+    // SAFETY: `c` is a valid NUL-terminated path.
+    usize::try_from(unsafe { libc::pathconf(c.as_ptr(), libc::_PC_NAME_MAX) }).ok().filter(|n| *n > 0).unwrap_or(255)
+}
+
+/// `name` in at most `room` bytes, ended where a character ends: what is cut off must not
+/// leave a name that is no longer text.
+fn cut_name(name: &OsStr, room: usize) -> OsString {
+    match name.to_str() {
+        _ if name.len() <= room => name.to_owned(),
+        Some(text) => text[..text.floor_char_boundary(room)].into(),
+        None => OsStr::from_bytes(&name.as_bytes()[..room]).to_owned(),
+    }
+}
+
+/// `name`, shortened if it must be for `added` more bytes to fit in a name in `folder`.
+pub fn leave_room(folder: &Path, name: &OsStr, added: usize) -> OsString {
+    cut_name(name, name_max(folder).saturating_sub(added))
+}
+
+/// The folder a path is in, for [`leave_room`].
+pub fn folder_of(path: &Path) -> &Path {
+    path.parent().unwrap_or(Path::new("."))
+}
+
+/// A name beside `path` for what is about to take its place, unique to this save. As much of
+/// the name as there is room for: one near the limit must still have a file beside it.
+pub fn save_name(path: &Path) -> PathBuf {
+    static SAVES: AtomicU64 = AtomicU64::new(0);
+    let tail = format!(".{}.{}.tmp", std::process::id(), SAVES.fetch_add(1, Ordering::Relaxed));
+    let mut name = leave_room(folder_of(path), path.file_name().unwrap_or_default(), tail.len());
+    name.push(tail);
+    path.with_file_name(name)
 }
 
 /// Adds `line` and a line end to the file at `path` in one write, so that two programs
@@ -45,6 +83,24 @@ pub fn append_line(path: &Path, line: &str, follow: bool) -> std::io::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_near_the_limit_can_still_be_saved_over() {
+        let dir = std::env::temp_dir().join(format!("av1opt-files-long-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("é".repeat(name_max(&dir) / 2));
+        std::fs::write(&path, b"old").unwrap();
+        replace_with(&path, b"new").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // Cut where a character ends, and byte by byte where there are none.
+        assert_eq!(cut_name(OsStr::new("aé"), 2), "a");
+        assert_eq!(cut_name(OsStr::new("aé"), 3), "aé");
+        assert_eq!(cut_name(OsStr::from_bytes(b"a\xff\xfe"), 2).as_bytes(), b"a\xff");
+    }
 
     #[test]
     fn saves_at_the_same_moment_all_succeed() {

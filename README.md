@@ -34,6 +34,10 @@ range; `encode` measures the real numbers. Low expected gain means under 20% her
 (`--min-savings`); `encode` has a `--min-savings` of its own, 15%, for what it measures. Never
 writes to the scanned folders.
 
+ffprobe gets two minutes per file, which only a stalled drive takes. A file it could not
+finish, or that the system could not read for it, shows as unreadable in this scan and is
+probed again by the next. A file ffprobe read and rejected is remembered until it changes.
+
 Every successful `encode` appends its source and output bitrates to
 `~/.local/share/av1opt/history.jsonl`, except a cut encoded below a target it could not reach,
 whose sizes would mislead. `scan` fits its size model to that history (a log-linear
@@ -121,6 +125,9 @@ For each file:
    (`--scenes`, HDR, removed sections), clips of 4 seconds, long enough to show a stretch: 8
    of them up to about 17 minutes, then one for every two minutes more, 32 at most.
    `--samples` and `--sample-secs` set both by hand, and with them the 4-second scheme.
+   A video whose first frame is not at zero (Matroska and MPEG-TS files can start late) is
+   measured from where it starts. A file that stops before the length it claims is refused,
+   and the message says that it ends early or is damaged.
 2. **Search** – finds the highest CRF between `--min-crf` (20) and `--max-crf` (55) whose mean
    VMAF over the samples meets the target. The
    first CRF tried is a guess: 35 for VMAF 93, moved by what your own past encodes say about
@@ -195,7 +202,10 @@ For each file:
    video of ten seconds or less, once). So it is where stretches can't be encoded again (no
    room for them on the drive, say), and the report then says so. A spot check more than 4
    below the target leads to the same second search; a video encoded per scene or with
-   sections removed fails instead. Nothing is written unless all checks pass.
+   sections removed fails instead. Nothing is written unless all checks pass. The source
+   has to be as it was, too: if its size or modification time changed during the encode, or
+   it went away, the encode fails. No output or report is kept, and neither are the chunks
+   of a per-scene encode, which no longer belong to the file as it is now.
 6. **Report** – the output plus `<name>.av1opt.json` with every CRF tried, scores, sizes and timings.
 
 ### Metadata
@@ -244,7 +254,7 @@ are moved to their new times (lines and chapters inside removed parts go); image
 (PGS, DVD) are dropped. Sample clips and spot checks are taken from kept parts only. A cut is
 never skipped for being AV1 already or saving too little, and if the VMAF target is out of reach
 it is encoded at the best CRF tried. A Dolby Vision file is skipped all the same, and sections
-can't be removed from a file whose sound runs more than a second past its picture. Per-scene
+can't be removed from a file whose sound or subtitles run more than a second past its picture. Per-scene
 mode isn't combined with cuts (one pass instead).
 The report lists the removed sections; an existing output with other sections removed is only
 overwritten with `--overwrite`. In the web UI, **Choose sections to remove…** in the encode dialog (one file) has
@@ -313,7 +323,8 @@ skipped for a reason (low savings, ...) are not searched again with the same set
 preset, CRF range, `--min-savings`, `--force`, and `--scenes`, `--audio`, `--svt-params`,
 `--tuned`, `--remove` and the samples where set) unless
 `--retry-skipped` is given. A finished file counts only for the source it was made from, as the
-report beside it says: one of the same name and another size is reported, not passed over (a
+report beside it says: one of the same name with another size or another modification time is
+reported, not passed over (a report too old to hold the time goes by the size alone, and a
 file there with no report at all counts as done). An output is never written where its own source or another
 input of the run is, whatever name leads there (`--overwrite` included): with `-o` the folder
 being walked, `a.mkv` is refused when `a.mp4` is there too, and the rest of the run goes on;
@@ -322,7 +333,7 @@ encode from an earlier run found among the inputs is left alone. `--order per-ho
 saving per hour of encoding first (`--order savings`: the largest saving first), going by the
 same estimates as `scan`, so a long run stopped early has saved the most for its time; in the
 web UI files are queued in the order of the scan table. Trial encodes are remembered in `~/.cache/av1opt/trials-v1.jsonl`
-for the same file (path, size, date), sample clips, settings, ffmpeg build and SVT-AV1 version: an encode that
+for the same file (path, size, date), sample clips, settings, ffmpeg build, SVT-AV1 version and way of measuring: an encode that
 was stopped or failed, or is run again with another container or `--min-savings`,
 starts from the scores it already has and often measures nothing new. Another target does so
 only with `--scenes`, HDR, removed sections or your own samples; in the usual case the scores
@@ -330,6 +341,21 @@ are counted towards a mark that depends on the target, so they are measured agai
 `--fresh-search`
 measures everything again. If two inputs would produce the same output name (same file name
 from two input folders), the second is reported as a name collision instead of being skipped.
+
+### File names
+
+A name that is not valid UTF-8 can't be passed to ffmpeg. `encode` refuses such a file with a
+message to rename it and goes on with the others. `scan` still lists it; `dups` and `bench`
+leave it out and say how many they left out. On the page the folder picker, the scan and the
+duplicate search leave such names out and say how many, and a folder that is queued or
+watched goes on without them.
+
+The report is named after the output and has the longer name of the two. If that name is more
+than the output folder's file system takes (255 bytes on most, 143 in an encrypted home
+folder), the file is refused before any sample is cut, with a message to rename it.
+
+`av1opt-log.tsv` writes a tab, a line break or a backslash in a name as `\t`, `\n`, `\r` or
+`\\`, so a name with a tab is not taken for the same name with a space.
 
 ## bench
 
@@ -410,7 +436,9 @@ single output files.
   that turns up in some other folder and points at files elsewhere moves nothing.
 - Nothing is deleted and no file is written over. The original goes to the trash of the drive
   it is on (as in the duplicates view), and the space is freed when you empty the trash. If the
-  output can't be put in place after that, the original is taken back out of the trash.
+  output can't be put in place after that, the original is taken back out of the trash. An
+  original whose name is near the file system's limit gets a shortened name in the trash and
+  still comes back under its own with `--undo`.
 - An output on another drive than the original is copied next to it under a hidden name
   first (after a look at the free space), so a copy that fails leaves the original alone; the
   file in the output folder is removed once the copy has its final name. On the same drive it
@@ -457,10 +485,18 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
   the estimated time left per job and for the whole queue (files no scan has seen are
   estimated once they are probed),
   per-chunk results in scene mode, percent, fps and ETA. Cancel stops ffmpeg at once; finished
-  scene chunks are kept, so queueing the same files again resumes. Unfinished jobs are
-  re-queued automatically the next time `av1opt ui` starts. **Do next** on a waiting job
+  scene chunks are kept, so queueing the same files again resumes. Unfinished jobs come
+  back on their own the next time `av1opt ui` starts, once the page is up, and the Queue page
+  says how many are still to come. **Do next** on a waiting job
   starts it before the other waiting ones, and **Queue again** on a cancelled or failed job
-  queues its files once more with the same settings. **Pause** holds the queue until
+  queues its files once more with the same settings. Inputs of a saved or requeued job that
+  are gone are left out and named on the job, and rejoin it if they are back at the next
+  start; a saved job with no input left is listed apart, with **Try again** and **Forget**.
+  A job queued by hand makes its output folder when it is queued. One that comes back from
+  the saved queue, is queued again or comes from a watch needs that folder to exist, so that
+  nothing is written under the mount point of a drive that is away: without it the job fails
+  saying so and stays in the saved queue for the next start, unless you clear it.
+  **Pause** holds the queue until
   you resume, and **Hours…** sets the hours of the day encodes may run in (for example 23:00
   to 07:00). Either way nothing new starts and the running encode is held where it is: its
   ffmpeg processes are stopped, not ended, so they use no processor but keep their memory,
@@ -475,12 +511,18 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
   once two looks found it unchanged and it has not been written to for two minutes, so a
   download still running is left alone, and only if a scan would call it a candidate: AV1,
   Dolby Vision, too short, too little to gain and unreadable files are left. A watch with
-  **Force** ticked leaves only AV1 and unreadable files. The videos in the folder
+  **Force** ticked leaves only AV1 and unreadable files. A video whose probe could not
+  finish, or that the system could not read, is not called unreadable at once: it gets three
+  looks before it is left. The videos in the folder
   when it was added are not queued unless asked for. Queueing is all a watch does: the
   pause and the hours decide when the encode runs, and originals are never replaced or
-  touched. What was seen is kept in `ui-watch.json`, and a video gone from the folder is
-  remembered for a month, so a drive that was not mounted does not come back as a folder
-  full of new videos.
+  touched. The output folder is made when the watch is added, and while it is not there
+  videos that are ready wait for it. It may lie inside the watched folder, which is then
+  walked without it, but it may not be that folder or contain it, wherever links lead; a
+  watch saved earlier with such a folder stays listed, says so and is not walked. What was
+  seen is kept in `ui-watch.json`. A video gone from a folder that still holds other videos
+  is forgotten after a month, and a look that finds no videos at all forgets nothing, so a
+  drive that was not mounted does not come back as a folder full of new videos.
 - **Compare**: source and AV1 output on top of each other with a split slider, synced playback,
   frame stepping and zoom, plus the per-chunk VMAF timeline from the `.av1opt.json` report
   (click to seek). Sources the browser can't decode (HEVC in some browsers, MPEG-2, ...) are shown as a
@@ -526,6 +568,10 @@ winning over `--ffmpeg` / `AV1OPT_FFMPEG`) and checks them for libsvtav1 and lib
 lack either, a banner says so and queued jobs wait instead of failing. `av1opt encode` runs the
 same check before it starts.
 
+One `av1opt ui` runs per user, or more exactly per data folder (`~/.local/share/av1opt`, where
+it holds a lock on `ui.lock`): two would encode the same saved jobs and overwrite each other's
+queue. A second start is refused and names the process that is running.
+
 Stopping the server (Ctrl-C, SIGTERM) stops running ffmpeg processes and keeps unfinished jobs
 for the next start. When av1opt is killed outright (`kill -9`, a crash) its ffmpeg processes
 are killed with it, held or not, so none is left writing a file nobody will finish.
@@ -538,7 +584,8 @@ and stops the server when the window closes. If the window process dies, the ser
 (stdin closes) and stops too. Closing the window or pressing Ctrl+Q while jobs are running or
 waiting asks first; logging out or SIGTERM quits without asking (jobs are kept). Folder
 choices use the system dialog, and a notification says when a job ends while the window is in
-the background. The server's messages are kept, with times, in
+the background. The page may copy to the clipboard and show a video full screen; every other
+permission is denied. The server's messages are kept, with times, in
 `~/.local/share/av1opt/desktop.log` (5 MB, then one older file `desktop.log.1`); Settings has
 *Open log*. If the av1opt it runs speaks another API version than the app was built for, it
 warns at start.
@@ -570,6 +617,10 @@ environment, so set the ffmpeg path once in Settings.
   can't freeze the desktop.
 - Temp files live in a hidden folder in the output directory and are removed afterwards; leftovers
   from crashed runs are cleaned up on the next run.
+- Output that nobody reads stops no work. When standard error is gone (a `tee` that has ended, a
+  terminal closed under a program that outlives it) messages are dropped and the work goes
+  on. When standard output is gone, as in `av1opt scan /videos | head`, the command ends
+  quietly, like any other in a pipe.
 
 ### Saved files and versions
 
@@ -580,6 +631,14 @@ older files; an older one skips reports and history lines from a newer format, l
 `ui-queue.format<N>.json` (the videos in a watched folder then count as there before), and starts
 a scene-mode file over rather than resuming a work folder of another format. A `tuning.json`
 from a newer av1opt is left as it is: `encode --tuned` refuses it and the page does not show it.
+
+A `ui.json` or `ui-queue.json` that can't be read is not written over. It is kept next to where
+it was under a name with the time in it (`ui.unreadable-20261118-213005.json`), and the server's
+output and a banner on the page say so. av1opt then starts with default settings or an empty
+queue. Settings hold the pause, the hours and the watched folders, so after losing them the
+queue starts paused until you resume it. A damaged line in `history.jsonl` or the trial cache
+costs that line alone. A failed save of the queue or of the last benchmark is said once, until
+saving works again.
 
 ### Debugging
 

@@ -272,7 +272,7 @@ fn size_verdict(made: u64, source: u64, min_savings: f64, anyway: bool) -> SizeV
             made as f64 / 1e6,
             source as f64 / 1e6
         ))
-    } else if savings < min_savings {
+    } else if made < source && savings < min_savings {
         SizeVerdict::KeepShort(format!("the finished file is {} smaller than its source, less than the --min-savings of {} the samples had promised", pct(savings), pct(min_savings)))
     } else {
         SizeVerdict::Keep
@@ -675,10 +675,10 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         }
     }
 
+    let lifted_crf = mean_only.then_some(best.crf);
     let floor_for = |best: &search::Trial| o.target_vmaf.min(best.mean_vmaf) - VERIFY_SLACK;
     let remux = |video: &Path, out: &Path| mux_args(video, false, input, &info, o.container, o.audio, &covers, &meta, &o.meta, out, &mut Vec::new()).0;
     // The CRF of a search that counted weak samples as encoded again (see `search::lifted_mean`).
-    let lifted_crf = mean_only.then_some(best.crf);
     // The whole video where it can be gone by, spot checks where not.
     let check = |best: &search::Trial, notes: &mut Vec<String>| -> Result<(Vec<f64>, MediaInfo, Option<repair::Summary>)> {
         if whole_check {
@@ -688,17 +688,6 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
                 verify_whole(tools, input, &info, &partial, &streams, &enc, best.crf, floor_for(best), o.min_crf, vmaf_threads, &tmp.path, &remux, notes)?
             {
                 return Ok((scores, out_info, Some(summary)));
-            }
-            // The search had counted its weak samples as encoded again, and they were not.
-            if lifted_crf == Some(best.crf) {
-                let n = format!(
-                    "the CRF was chosen for the mean the video would have with its stretches below VMAF {:.0} encoded again, which could not be done here: its mean may be below {}",
-                    floor_for(best),
-                    o.target_vmaf
-                );
-                eprintln!("note: {n}");
-                tools.emit(Event::Note { text: n.clone() });
-                notes.push(n);
             }
         }
         eprintln!("verifying");
@@ -749,7 +738,6 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
                 );
                 eprintln!("note: {n}");
                 tools.emit(Event::Note { text: n.clone() });
-                notes.retain(|n| !n.starts_with("the CRF was chosen for the mean"));
                 notes.push(n);
                 best = b;
                 trials = all;
@@ -775,6 +763,17 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         Ok(low) => LowSpot { hint, ..low }.into(),
         Err(e) => e,
     })?;
+    // The search had counted its weak samples as encoded again, and they were not.
+    if whole_check && repaired.is_none() && lifted_crf == Some(best.crf) {
+        let n = format!(
+            "the CRF was chosen for the mean the video would have with its stretches below VMAF {:.0} encoded again, which could not be done here: its mean may be below {}",
+            floor_for(&best),
+            o.target_vmaf
+        );
+        eprintln!("note: {n}");
+        tools.emit(Event::Note { text: n.clone() });
+        notes.push(n);
+    }
     let lost = metadata::missing(&meta, &out_info.tags);
     if !lost.is_empty() {
         let n = format!(
@@ -796,7 +795,15 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
             tools.emit(Event::Note { text: n.clone() });
             notes.push(n);
         }
-        SizeVerdict::Drop(why) => skip!("{why}"),
+        SizeVerdict::Drop(why) => {
+            // Chunks kept for a run that is to go on would only lead here again.
+            if let Some(w) = &work
+                && !o.keep_temp
+            {
+                let _ = std::fs::remove_dir_all(&w.path);
+            }
+            skip!("{why}")
+        }
     }
 
     // The place was free when the encode began, hours ago perhaps. A file that has turned up
@@ -1511,6 +1518,7 @@ mod tests {
         // Asked for whatever the size: --force, removed sections, a --min-savings below zero.
         assert_eq!(size_verdict(1200, 1000, 0.15, true), SizeVerdict::Keep);
         assert_eq!(size_verdict(1200, 1000, -1.0, false), SizeVerdict::Keep);
+        assert_eq!(size_verdict(1200, 1000, -0.1, false), SizeVerdict::Keep);
         assert!(matches!(size_verdict(1, 0, 0.15, false), SizeVerdict::Drop(_)));
     }
 

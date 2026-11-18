@@ -760,4 +760,94 @@ mod tests {
         assert_eq!(reason("", path), "could not read the file");
         assert_eq!(one_line("first\nsecond\n  \n"), "second");
     }
+
+    #[test]
+    fn a_rate_is_a_fraction_of_two_positive_numbers() {
+        let rate = |s: &str| parse_rate(Some(s));
+        assert_eq!(rate("25/1"), Some(25.0));
+        assert_eq!(rate("30000/1001"), Some(30000.0 / 1001.0));
+        assert_eq!(rate("23.976/1"), Some(23.976));
+        for bad in ["0/0", "0/1", "1/0", "-25/1", "25/-1", "25", "", "/", "25/", "/1", "a/b", "NaN/1", "1/NaN"] {
+            assert_eq!(rate(bad), None, "{bad:?}");
+        }
+        assert_eq!(parse_rate(None), None);
+    }
+
+    #[test]
+    fn the_latest_end_counts_whatever_order_the_packets_come_in() {
+        // Frames are stored out of display order.
+        assert_eq!(last_ends("0,2.000000,0.5\n0,1.000000,0.5\n", "0", 0.04), (Some(2.5), Some(2.5)));
+        // Stream 10 is not stream 1.
+        assert_eq!(last_ends("10,5.000000,1.000000\n1,2.000000,0.500000\n", "1", 0.04), (Some(6.0), Some(2.5)));
+        // Without a duration a frame lasts a frame, and a sound packet ends where it starts.
+        assert_eq!(last_ends("0,1.000000\n1,1.500000\n", "0", 0.25), (Some(1.5), Some(1.25)));
+    }
+
+    #[test]
+    fn packet_lines_that_say_nothing_are_passed_over() {
+        for lines in ["\n\n", "side data\n", "0\n", "0,N/A,0.04\n", ",\n"] {
+            assert_eq!(last_ends(lines, "0", 0.04), (None, None), "{lines:?}");
+        }
+        assert_eq!(last_ends("  0,1.000000,0.500000,  \r\n", "0", 0.04), (Some(1.5), Some(1.5)));
+    }
+
+    #[test]
+    fn a_clock_time_has_three_parts_none_of_them_negative() {
+        assert_eq!(clock_secs(" 00:00:01.500 "), Some(1.5));
+        assert_eq!(clock_secs("00:00:00"), Some(0.0));
+        assert_eq!(clock_secs("100:00:00"), Some(360_000.0));
+        for bad in ["", "1:2", "-1:00:00", "00:-1:00", "00:00:-1", "::", "N/A", "NaN:0:0"] {
+            assert_eq!(clock_secs(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_picture_is_placed_from_the_start_of_the_file() {
+        let info = |start_time, video_start| MediaInfo { start_time, video_start, duration_s: 100.0, video_s: 40.0, ..Default::default() };
+        assert_eq!(info(2.0, 5.0).picture_start(), 3.0);
+        assert_eq!(info(5.0, 5.0).picture_start(), 0.0);
+        // The picture cannot start before the file does.
+        assert_eq!(info(5.0, 2.0).picture_start(), 0.0);
+        assert_eq!(info(2.0, 5.0).picture_end(), 43.0);
+    }
+
+    #[test]
+    fn a_stream_as_long_as_the_file_is_the_files_length() {
+        let info = MediaInfo { duration_s: 60.0, video_s: 60.0, ..Default::default() };
+        assert_eq!(info.picture_secs(), 60.0);
+        assert_eq!(MediaInfo { video_s: -1.0, ..info.clone() }.picture_secs(), 60.0);
+        assert_eq!(MediaInfo { video_s: f64::NAN, ..info }.picture_secs(), 60.0);
+    }
+
+    #[test]
+    fn only_a_leading_path_is_taken_off_the_reason() {
+        let path = Path::new("/v/a.mkv");
+        assert_eq!(reason("/v/a.mkv: No such file", path), "No such file");
+        assert_eq!(reason("/v/a.mkv:: odd", path), "odd");
+        assert_eq!(reason("cannot open /v/a.mkv: denied", path), "cannot open /v/a.mkv: denied");
+        // Nothing but the path: nothing was said.
+        assert_eq!(reason("/v/a.mkv:", path), "could not read the file");
+        assert_eq!(reason(" \n\t\n", path), "could not read the file");
+    }
+
+    #[test]
+    fn the_last_line_with_something_on_it_is_the_message() {
+        assert_eq!(one_line(""), "");
+        assert_eq!(one_line("\n \n"), "");
+        assert_eq!(one_line("only"), "only");
+        assert_eq!(one_line("a\r\n  b  \r\n\r\n"), "b");
+    }
+
+    #[test]
+    fn only_a_probe_without_an_opinion_leaves_a_file_unjudged() {
+        assert!(left_unjudged(&NotJudged("timed out".into()).into()));
+        assert!(left_unjudged(&anyhow::Error::from(NotJudged("timed out".into())).context("reading a.mkv")));
+        assert!(!left_unjudged(&anyhow::anyhow!("Invalid data found when processing input")));
+    }
+
+    #[test]
+    fn a_gigabyte_begun_counts_as_a_whole_one() {
+        assert_eq!(Reads::AllOf(1_000_000_001).limit(), Duration::from_secs(120 + 2 * 60));
+        assert_eq!(Reads::AllOf(2_000_000_000).limit(), Duration::from_secs(120 + 2 * 60));
+    }
 }

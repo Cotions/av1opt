@@ -329,4 +329,190 @@ mod tests {
         assert_eq!(hd, [3, 10, 16]);
         assert!(spread(&items, 0).is_empty());
     }
+
+    fn near(a: f64, b: f64) -> bool {
+        (a - b).abs() <= 1e-9 * b.abs().max(1.0)
+    }
+
+    fn picks(v: &[Option<Point>]) -> Picks {
+        summarize(None, &[v], v.len(), 0).unwrap().picks
+    }
+
+    #[test]
+    fn bitrate_and_cost_are_per_second_of_video() {
+        let x = Measure { crf: 30, vmaf: 93.0, vmaf_min: 90.0, bytes: 1250, clip_secs: 10.0, encode_secs: 25.0 };
+        assert_eq!((x.bitrate(), x.cost()), (1000.0, 2.5));
+        // Clips of no length give large numbers, not infinite ones.
+        let none = Measure { clip_secs: 0.0, ..x };
+        assert!(none.bitrate().is_finite() && none.cost().is_finite());
+    }
+
+    #[test]
+    fn a_score_exactly_on_the_target_meets_it() {
+        let pt = at_target(&[m(30, 93.0, 4000.0, 2.0), m(35, 90.0, 2000.0, 1.0)], 93.0).unwrap();
+        assert!(near(pt.crf, 30.0) && near(pt.bitrate, 4e6) && near(pt.cost, 2.0));
+        assert!(!pt.capped);
+        // The one on the far side reaching the target exactly is the last that meets it.
+        let pt = at_target(&[m(30, 96.0, 4000.0, 2.0), m(35, 93.0, 2000.0, 1.0)], 93.0).unwrap();
+        assert!(pt.capped && pt.crf == 35.0);
+    }
+
+    #[test]
+    fn one_measure_is_enough_to_pass_and_not_to_interpolate() {
+        let pt = at_target(&[m(30, 95.0, 4000.0, 2.0)], 93.0).unwrap();
+        assert!(pt.capped && pt.crf == 30.0 && pt.vmaf == 95.0 && near(pt.bitrate, 4e6));
+        assert_eq!(at_target(&[m(30, 92.99, 4000.0, 2.0)], 93.0), None);
+    }
+
+    #[test]
+    fn the_order_of_the_measures_does_not_matter() {
+        let a = m(30, 95.0, 4000.0, 2.0);
+        let b = m(35, 92.0, 2000.0, 1.0);
+        let c = m(40, 88.0, 1000.0, 0.5);
+        assert_eq!(at_target(&[a, b, c], 93.0), at_target(&[c, a, b], 93.0));
+        assert_eq!(at_target(&[a, b, c], 93.0), at_target(&[b, c, a], 93.0));
+    }
+
+    #[test]
+    fn a_failure_below_the_last_pass_says_nothing_about_what_lies_above() {
+        let pt = at_target(&[m(30, 90.0, 4000.0, 2.0), m(35, 94.0, 2000.0, 1.0)], 93.0).unwrap();
+        assert!(pt.capped && pt.crf == 35.0);
+    }
+
+    #[test]
+    fn size_is_interpolated_on_a_log_scale_and_time_on_a_straight_line() {
+        // A quarter of the way from 95 down to 87.
+        let pt = at_target(&[m(30, 95.0, 8000.0, 4.0), m(34, 87.0, 500.0, 2.0)], 93.0).unwrap();
+        assert!(near(pt.crf, 31.0), "{}", pt.crf);
+        assert!(near(pt.bitrate, 4e6), "{}", pt.bitrate);
+        assert!(near(pt.cost, 3.5), "{}", pt.cost);
+    }
+
+    #[test]
+    fn a_measure_without_bytes_or_score_leaves_usable_numbers() {
+        // An empty result next to a real one.
+        let pt = at_target(&[m(30, 95.0, 4000.0, 2.0), m(35, 91.0, 0.0, 1.0)], 93.0).unwrap();
+        assert!(pt.bitrate.is_finite() && pt.bitrate > 0.0 && near(pt.crf, 32.5));
+        // A score that is no number neither meets the target nor misses it.
+        let pt = at_target(&[m(30, 95.0, 4000.0, 2.0), m(35, f64::NAN, 2000.0, 1.0)], 93.0).unwrap();
+        assert!(pt.capped && pt.crf == 30.0);
+        assert_eq!(at_target(&[m(30, f64::NAN, 4000.0, 2.0)], 93.0), None);
+    }
+
+    #[test]
+    fn a_setting_replaces_the_default_for_size_only_by_more_than_one_percent() {
+        let base = p(1000.0, 1.0);
+        let got = |size| picks(&[base, p(size, 1.0)]);
+        assert_eq!((got(989.9).smallest, got(989.9).balanced), (1, 1));
+        assert_eq!((got(990.1).smallest, got(990.1).balanced), (0, 0));
+    }
+
+    #[test]
+    fn balanced_stays_within_ten_percent_of_the_default_time() {
+        let got = |time| picks(&[p(1000.0, 1.0), p(900.0, time)]);
+        assert_eq!(got(1.0999).balanced, 1);
+        assert_eq!(got(1.1001).balanced, 0);
+        // Smallest does not care how long it takes.
+        assert_eq!(got(100.0).smallest, 1);
+    }
+
+    #[test]
+    fn fastest_stays_within_two_percent_of_the_default_size() {
+        let got = |size| picks(&[p(1000.0, 1.0), p(size, 0.5)]).fastest;
+        assert_eq!(got(1019.9), 1);
+        assert_eq!(got(1020.1), 0);
+    }
+
+    #[test]
+    fn fastest_replaces_the_default_only_by_more_than_five_percent() {
+        let got = |time| picks(&[p(1000.0, 1.0), p(1000.0, time)]).fastest;
+        assert_eq!(got(0.9499), 1);
+        assert_eq!(got(0.9501), 0);
+    }
+
+    #[test]
+    fn of_settings_that_tie_the_first_is_picked_and_both_stay_on_the_front() {
+        let v = [p(1000.0, 1.0), p(800.0, 0.5), p(800.0, 0.5)];
+        assert_eq!(picks(&v), Picks { smallest: 1, balanced: 1, fastest: 1 });
+        let s = summarize(None, &[&v], 3, 0).unwrap();
+        assert_eq!(s.rows.iter().map(|r| r.pareto).collect::<Vec<_>>(), [false, true, true]);
+    }
+
+    #[test]
+    fn the_default_need_not_be_the_first_setting() {
+        let v = [p(2000.0, 2.0), p(1000.0, 1.0)];
+        let s = summarize(None, &[&v], 2, 1).unwrap();
+        assert!(near(s.rows[0].size, 2.0) && near(s.rows[0].time, 2.0) && near(s.rows[1].size, 1.0));
+        assert_eq!(s.picks, Picks { smallest: 1, balanced: 1, fastest: 1 });
+    }
+
+    #[test]
+    fn a_video_measured_under_only_some_settings_is_left_out() {
+        let whole = [p(1000.0, 1.0), p(900.0, 1.0)];
+        let partial = [p(1.0, 1.0)];
+        let s = summarize(None, &[&whole, &partial], 2, 0).unwrap();
+        assert_eq!((s.videos, s.left_out), (1, 1));
+        assert!(near(s.rows[1].size, 0.9));
+        assert!(summarize(None, &[&partial], 2, 0).is_none());
+        assert!(summarize(None, &[], 2, 0).is_none());
+        assert!(summarize(None, &[&[][..]], 0, 0).is_none());
+    }
+
+    #[test]
+    fn a_gain_on_one_video_and_the_same_loss_on_another_cancel_out() {
+        let a = [p(1000.0, 1.0), p(2000.0, 4.0)];
+        let b = [p(1000.0, 1.0), p(500.0, 0.25)];
+        let r = &summarize(None, &[&a, &b], 2, 0).unwrap().rows[1];
+        assert!(near(r.size, 1.0) && near(r.time, 1.0), "{r:?}");
+        assert!(near(r.size_worst, 2.0) && near(r.size_best, 0.5));
+    }
+
+    #[test]
+    fn crf_and_speed_are_over_the_videos_a_setting_has_a_result_for() {
+        let at = |crf, cost| Some(Point { crf, bitrate: 1000.0, cost, vmaf: 93.0, capped: false });
+        let a = [at(30.0, 1.0), at(40.0, 1.0)];
+        let b = [at(30.0, 1.0), None];
+        let c = [at(30.0, 1.0), at(20.0, 3.0)];
+        let r = &summarize(None, &[&a, &b, &c], 2, 0).unwrap().rows[1];
+        assert_eq!(r.missing, 1);
+        assert!(near(r.crf, 30.0) && near(r.speed, 0.5), "{r:?}");
+    }
+
+    #[test]
+    fn a_setting_equal_on_both_counts_does_not_push_another_off_the_front() {
+        let s = summarize(None, &[&[p(1000.0, 1.0), p(1000.0, 1.0), p(1000.0, 1.5)]], 3, 0).unwrap();
+        assert_eq!(s.rows.iter().map(|r| r.pareto).collect::<Vec<_>>(), [true, true, false]);
+    }
+
+    #[test]
+    fn a_spread_is_as_long_as_asked_repeats_nothing_and_shares_places_evenly() {
+        for (sd, hd, uhd) in [(0, 0, 0), (1, 0, 0), (5, 5, 5), (20, 2, 10), (0, 7, 1), (3, 0, 30)] {
+            let items: Vec<(Class, usize)> = [(Class::Sd, sd), (Class::Hd, hd), (Class::Uhd, uhd)].into_iter().flat_map(|(c, n)| (0..n).map(move |_| c)).enumerate().map(|(i, c)| (c, i)).collect();
+            let class_of = |i: usize| items[i].0;
+            for max in 0..=items.len() + 2 {
+                let got = spread(&items, max);
+                assert_eq!(got.len(), max.min(items.len()), "{sd} {hd} {uhd} {max}");
+                let mut seen = got.clone();
+                seen.sort_unstable();
+                seen.dedup();
+                assert_eq!(seen.len(), got.len(), "{sd} {hd} {uhd} {max}: {got:?}");
+                let count = |c: Class| got.iter().filter(|&&i| class_of(i) == c).count();
+                let have = |c: Class| items.iter().filter(|x| x.0 == c).count();
+                for a in Class::ALL {
+                    for b in Class::ALL {
+                        // A class gets fewer than another only when it has no more to give.
+                        assert!(count(a) + 1 >= count(b) || count(a) == have(a), "{sd} {hd} {uhd} {max}: {got:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_single_place_goes_to_the_middle_of_the_first_class_with_videos() {
+        let mut items: Vec<(Class, u32)> = (10..15).map(|i| (Class::Hd, i)).collect();
+        items.extend((20..22).map(|i| (Class::Uhd, i)));
+        assert_eq!(spread(&items, 1), [12]);
+        assert_eq!(spread(&items, 2), [12, 21]);
+    }
 }

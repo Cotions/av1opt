@@ -87,7 +87,7 @@ pub fn append_line(path: &Path, line: &str, follow: bool) -> std::io::Result<()>
     }
     let mut file = o.open(path)?;
     let size = file.metadata()?.len();
-    let mut last = [b'\n'];
+    let mut last = *b"\n";
     if size > 0 {
         file.read_exact_at(&mut last, size - 1)?;
     }

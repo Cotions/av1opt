@@ -1463,6 +1463,292 @@ fn a_benchmark_ranks_settings_remembers_its_encodes_and_tunes_the_encoder() {
     assert_eq!(c.report("a")["preset"].as_u64(), Some(pick));
 }
 
+impl Case {
+    /// A program named ffmpeg that runs `body` in bash and then does what the real one does
+    /// (`$real` in `body`): the way to see, or spoil, what av1opt asks of ffmpeg.
+    fn stand_in_ffmpeg(&self, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = self.dir.join("bin/ffmpeg");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("#!/bin/bash\nreal='{}'\n{body}\nexec \"$real\" \"$@\"\n", ffmpeg_bin())).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+}
+
+fn is_av1_of(out: &Path, src: &Path) {
+    assert_eq!(video(out)["codec_name"], "av1", "{}", out.display());
+    assert_eq!(frames(out), frames(src), "{}", out.display());
+}
+
+fn made_from(report: &Value, src: &Path) {
+    assert_eq!(report["input"].as_str().map(Path::new), Some(std::fs::canonicalize(src).unwrap().as_path()), "{report}");
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_folder_that_is_its_own_output_keeps_its_originals_and_encodes_the_rest() {
+    let c = Case::new("ownfolder");
+    let dir = c.videos();
+    let (a_mkv, a_mp4, b_mkv) = (c.clip("a.mkv", "320x180", 4), c.clip("a.mp4", "320x180", 4), c.clip("b.mkv", "320x180", 4));
+    let originals: Vec<(&PathBuf, Vec<u8>)> = [&a_mkv, &a_mp4, &b_mkv].map(|p| (p, std::fs::read(p).unwrap())).into();
+    let (b_mp4, b_report) = (dir.join("b.mp4"), dir.join("b.av1opt.json"));
+    // Both of the pair are turned away in every run, and no original has changed after it.
+    let pair_refused = |r: &Run| {
+        assert_eq!(r.code, Some(2), "{}", r.err);
+        r.has(&format!("FAILED: its output would take the place of another input, {}", a_mp4.display()));
+        r.has("FAILED: output would overwrite the input; choose another output folder");
+        for (path, bytes) in &originals {
+            assert!(std::fs::read(path).unwrap() == *bytes, "{} changed", path.display());
+        }
+    };
+
+    for first_run in [&[][..], &["--overwrite"]] {
+        let r = c.encode_into(&dir, &[&dir], first_run);
+        pair_refused(&r);
+        r.has("encoded 1, skipped 0, failed 2, already done 0");
+        is_av1_of(&b_mp4, &b_mkv);
+        made_from(&c.report_in(&dir, "b"), &b_mkv);
+        let encoded = std::fs::read(&b_mp4).unwrap();
+
+        // The encode now lies among the videos: its source is done, and it is no new work.
+        let r = c.encode_into(&dir, &[&dir], &[]);
+        pair_refused(&r);
+        r.has("encoded 0, skipped 1, failed 2, already done 1").has(&format!("already done: {}", b_mp4.display()));
+        r.has(&format!("skipped: {} is the encode of {} from an earlier run", b_mp4.display(), std::fs::canonicalize(&b_mkv).unwrap().display()));
+        assert!(std::fs::read(&b_mp4).unwrap() == encoded, "the earlier encode changed");
+
+        // Told to overwrite, the encode is still an input of this run and is not written over.
+        let r = c.encode_into(&dir, &[&dir], &["--overwrite"]);
+        pair_refused(&r);
+        r.has("encoded 0, skipped 1, failed 3, already done 0").has(&format!("its output would take the place of another input, {}", b_mp4.display()));
+        assert!(std::fs::read(&b_mp4).unwrap() == encoded, "the earlier encode changed");
+
+        std::fs::remove_file(&b_mp4).unwrap();
+        std::fs::remove_file(&b_report).unwrap();
+    }
+    assert!(entries(&dir, ".av1opt-").is_empty(), "{:?}", entries(&dir, ".av1opt-"));
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn two_inputs_with_one_output_name_leave_the_output_to_the_first_under_overwrite() {
+    let c = Case::new("twins");
+    let first = c.clip("e.mkv", "320x180", 4);
+    // Another length than the first, so that the output shows whose it is.
+    c.ffmpeg(&["-f", "lavfi", "-i", "testsrc2=s=320x180:r=25:d=5", "-f", "lavfi", "-i", "sine=f=440:d=5", "-c:v", "mpeg4", "-q:v", "3", "-c:a", "libmp3lame", "-b:a", "128k", "e.avi"]);
+    let second = c.videos().join("e.avi");
+    let before = (std::fs::read(&first).unwrap(), std::fs::read(&second).unwrap());
+
+    let r = c.encode(&[&first, &second], &["--overwrite"]);
+    assert_eq!(r.code, Some(2), "{}", r.err);
+    r.has("encoded 1, skipped 0, failed 1, already done 0");
+    r.has(&format!("FAILED: its output is also that of another input, {}; give one of them another output folder", first.display()));
+    is_av1_of(&c.out().join("e.mp4"), &first);
+    made_from(&c.report("e"), &first);
+    assert_eq!(c.outputs(), ["av1opt-log.tsv", "e.av1opt.json", "e.mp4"]);
+    assert!((std::fs::read(&first).unwrap(), std::fs::read(&second).unwrap()) == before, "a source changed");
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn an_output_whose_report_was_deleted_counts_as_done() {
+    let c = Case::new("noreport");
+    let src = c.clip("a.mp4", "320x180", 4);
+    c.encode(&[&src], &[]).ok().has("encoded 1, skipped 0, failed 0, already done 0");
+    let out = c.out().join("a.mp4");
+    let (bytes, made) = (std::fs::read(&out).unwrap(), mtime(&out));
+    std::fs::remove_file(c.out().join("a.av1opt.json")).unwrap();
+
+    c.encode(&[&src], &[]).ok().has("encoded 0, skipped 0, failed 0, already done 1").has(&format!("already done: {}", out.display()));
+    assert!(std::fs::read(&out).unwrap() == bytes && mtime(&out) == made, "the output was written again");
+    assert_eq!(c.outputs(), ["a.mp4", "av1opt-log.tsv"]);
+    // One encode in the history: the second run did not make another.
+    let history = std::fs::read_to_string(c.dir.join("data/av1opt/history.jsonl")).unwrap();
+    assert_eq!(history.lines().count(), 1, "{history}");
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_memory_cap_reaches_ffmpeg_as_written_and_a_bad_one_is_refused() {
+    let c = Case::new("memcap");
+    let src = c.clip("m.mp4", "320x180", 2);
+    let seen = c.dir.join("cap");
+    // av1opt's own calls start this way, and only they run under the cap. What the kernel
+    // holds this process to is written down; nothing needs encoding to know that.
+    let ffmpeg = c.stand_in_ffmpeg(&format!(
+        "if [ \"$2\" = -nostdin ]; then cat \"/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/memory.max\" > '{}'; exit 1; fi",
+        seen.display()
+    ));
+    let ffmpeg = ffmpeg.to_str().unwrap();
+
+    for bad in ["garbage", "0", "12X"] {
+        let r = c.encode(&[&src], &["--ffmpeg", ffmpeg, "--memory-limit", bad]);
+        assert_eq!(r.code, Some(2), "{bad}: {}", r.err);
+        r.has("a memory cap is auto, none, or an amount such as 12G, 1.5G, 800M or 40%");
+        assert!(!seen.exists(), "{bad} got as far as ffmpeg");
+    }
+    assert!(c.outputs().is_empty(), "{:?}", c.outputs());
+
+    let memory_kb: f64 = std::fs::read_to_string("/proc/meminfo").unwrap().lines().find_map(|l| l.strip_prefix("MemTotal:")?.trim().strip_suffix("kB")?.trim().parse().ok()).unwrap();
+    let share = |percent: f64| memory_kb * 1024.0 * percent / 100.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    let scenes: &[&str] = &["--scenes", "--workers", "2"];
+    for (cap, extra, bytes) in [
+        ("1.5G", &[][..], 1536.0 * MIB),
+        ("800m", &[], 800.0 * MIB),
+        ("40%", &[], share(40.0)),
+        // Two workers each get half, a share of the memory too.
+        ("1.5g", scenes, 768.0 * MIB),
+        ("50.5%", scenes, share(25.25)),
+    ] {
+        let _ = std::fs::remove_file(&seen);
+        let mut args = vec!["--ffmpeg", ffmpeg, "--memory-limit", cap];
+        args.extend(extra);
+        let r = c.encode(&[&src], &args);
+        assert!(!r.err.contains("a memory cap is"), "{cap}: {}", r.err);
+        if r.err.contains("systemd-run --user unavailable") {
+            continue;
+        }
+        // Not there: systemd-run turned the value down and ffmpeg never started.
+        let held = std::fs::read_to_string(&seen).unwrap_or_else(|e| panic!("{cap} did not reach ffmpeg ({e}):\n{}", r.err));
+        let held: f64 = held.trim().parse().unwrap_or_else(|_| panic!("{cap}: the cap in force is {held:?}"));
+        assert!((held - bytes).abs() <= bytes * 0.001, "{cap}: held to {held} bytes, expected {bytes}");
+    }
+}
+
+/// Image subtitles as Blu-ray discs carry them, the contents of a `.sup` file: a dot on the
+/// screen for a second from each of `cues` (in seconds). ffmpeg can copy these but cannot
+/// make them, so they are written out here.
+fn image_subtitles(cues: &[u32]) -> Vec<u8> {
+    const PICTURE: [u8; 5] = [1, 64, 0, 180, 0x10];
+    const WINDOW: [u8; 10] = [1, 0, 0, 10, 0, 10, 0, 2, 0, 1];
+    let mut out = Vec::new();
+    let mut segment = |secs: u32, kind: u8, data: &[u8]| {
+        let time = (secs * 90_000).to_be_bytes();
+        out.extend_from_slice(b"PG");
+        out.extend_from_slice(&time);
+        out.extend_from_slice(&time);
+        out.push(kind);
+        out.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        out.extend_from_slice(data);
+    };
+    for (n, &at) in cues.iter().enumerate() {
+        let shown = (2 * n as u16).to_be_bytes();
+        segment(at, 0x16, &[&PICTURE[..], &shown, &[0x80, 0, 0, 1, 0, 0, 0, 0, 0, 10, 0, 10]].concat());
+        segment(at, 0x17, &WINDOW);
+        segment(at, 0x14, &[0, 0, 1, 235, 128, 128, 255]);
+        segment(at, 0x15, &[0, 0, 0, 0xC0, 0, 0, 8, 0, 2, 0, 1, 1, 1, 0, 0]);
+        segment(at, 0x80, &[]);
+        let cleared = (2 * n as u16 + 1).to_be_bytes();
+        segment(at + 1, 0x16, &[&PICTURE[..], &cleared, &[0, 0, 0, 0]].concat());
+        segment(at + 1, 0x17, &WINDOW);
+        segment(at + 1, 0x80, &[]);
+    }
+    out
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_long_track_that_is_not_kept_passes_the_length_check_and_a_cut_picture_does_not() {
+    let c = Case::new("longtrack");
+    // Six seconds of picture and sound, and a last subtitle a minute in: the container says
+    // a minute, and MP4 takes no image subtitles.
+    std::fs::write(c.videos().join("late.sup"), image_subtitles(&[1, 60])).unwrap();
+    c.ffmpeg(&[
+        "-f", "lavfi", "-i", "testsrc2=s=320x180:r=24:d=6", "-f", "lavfi", "-i", "sine=f=440:d=6", "-i", "late.sup", "-map", "0", "-map", "1", "-map", "2", "-c:v", "libx264", "-preset",
+        "ultrafast", "-crf", "16", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "64k", "-c:s", "copy", "long.mkv",
+    ]);
+    let src = c.videos().join("long.mkv");
+    assert!(duration(&src) >= 59.0, "{}", duration(&src));
+
+    c.encode(&[&src], &[]).ok().has("encoded 1, skipped 0, failed 0");
+    let out = c.out().join("long.mp4");
+    is_av1_of(&out, &src);
+    assert!((duration(&out) - 6.0).abs() < 0.2, "{}", duration(&out));
+    let p = probe(&out);
+    assert!(streams(&p, "subtitle").is_empty());
+    assert_eq!(packets_md5(&out, "a:0"), packets_md5(&src, "a:0"));
+    let notes = c.report("long")["notes"].to_string();
+    assert!(notes.contains("subtitle 0 (hdmv_pgs_subtitle) dropped"), "{notes}");
+
+    // The same file with an encode that stops halfway: what a long container forgives is
+    // not the picture's own length.
+    let halfway = c.stand_in_ffmpeg("if [[ \"${@: -1}\" == *partial.mp4 ]]; then exec \"$real\" \"${@:1:$#-1}\" -t 3 \"${@: -1}\"; fi");
+    let other = c.dir.join("out-halfway");
+    let r = c.encode_into(&other, &[&src], &["--ffmpeg", halfway.to_str().unwrap()]);
+    assert_eq!(r.code, Some(2), "{}", r.err);
+    r.has("encoded 0, skipped 0, failed 1").has("verify: duration 3.0s, expected 6.0s");
+    assert_eq!(c.outputs_in(&other), ["av1opt-log.tsv"]);
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_report_set_aside_for_a_newer_encode_still_brings_the_original_back() {
+    let c = Case::new("aside");
+    let replace = |what: &Path, extra: &[&str]| {
+        let mut a: Vec<std::ffi::OsString> = vec!["replace".into(), what.into()];
+        a.extend(extra.iter().map(Into::into));
+        c.av1opt(&a)
+    };
+    let read = |p: &Path| std::fs::read(p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+    let json = |p: &Path| serde_json::from_slice::<Value>(&read(p)).unwrap();
+    let trash = c.dir.join("data/Trash/files");
+
+    // An encode takes its original's place; the original is in the trash.
+    let src = c.clip("x.mkv", "320x180", 4);
+    let original = read(&src);
+    c.encode(&[&src], &[]).ok().has("encoded 1,");
+    let (out, report) = (c.out().join("x.mp4"), c.out().join("x.av1opt.json"));
+    let first = read(&out);
+    replace(&c.out(), &["--apply"]).ok();
+    let placed = c.videos().join("x.mp4");
+    assert!(read(&placed) == first && !src.exists() && !out.exists());
+    assert!(read(&trash.join("x.mkv")) == original);
+
+    // Another video of that name is encoded to the place the first came from.
+    std::fs::create_dir(c.videos().join("later")).unwrap();
+    let later = c.clip("later/x.mkv", "320x180", 5);
+    c.encode(&[&later], &[]).ok().has("encoded 1,").has("was kept as");
+    let (newer, newer_report) = (read(&out), read(&report));
+    is_av1_of(&out, &later);
+    made_from(&json(&report), &later);
+    assert!(json(&report).get("replaced").is_none(), "{}", json(&report));
+
+    // The first report is kept under a name that is still a report's.
+    let found = entries(&c.out(), "x.replaced-");
+    assert_eq!(found.len(), 1, "{found:?}");
+    let aside = &found[0];
+    let name = aside.file_name().unwrap().to_str().unwrap();
+    let stem = name.strip_suffix(".av1opt.json").unwrap_or_else(|| panic!("{name}"));
+    assert!(json(aside)["replaced"].is_object(), "{}", json(aside));
+    made_from_gone(&json(aside), &src);
+    replace(&c.out(), &["--undo"]).ok().has("1 original can go back to their place");
+
+    // Undone from it: the original is back, the first encode beside its report, and the
+    // newer encode and its report are as they were.
+    replace(aside, &["--undo", "--apply"]).ok().has("1 original back in place");
+    assert!(read(&src) == original, "the original came back changed");
+    assert!(!placed.exists());
+    assert!(read(&c.out().join(format!("{stem}.mp4"))) == first, "the first encode changed");
+    assert!(read(&out) == newer && read(&report) == newer_report, "the newer encode was touched");
+    assert!(entries(&trash, "").is_empty(), "{:?}", entries(&trash, ""));
+
+    // The older encode no longer offers itself; the newer one still does, for its own source.
+    assert_eq!(json(aside)["superseded"], true, "{}", json(aside));
+    replace(aside, &["--apply"]).ok().has("a newer encode took the place of this one");
+    assert!(read(&src) == original);
+    replace(&report, &["--apply"]).ok().has("1 original replaced");
+    assert!(read(&c.videos().join("later/x.mp4")) == newer && !later.exists());
+    assert!(read(&src) == original, "the first original was touched");
+}
+
+/// A report's source by the path it had: that file has since gone to the trash.
+fn made_from_gone(report: &Value, src: &Path) {
+    let folder = std::fs::canonicalize(src.parent().unwrap()).unwrap();
+    assert_eq!(report["input"].as_str().map(Path::new), Some(folder.join(src.file_name().unwrap()).as_path()), "{report}");
+}
+
 #[cfg(feature = "ui")]
 mod queue {
     use super::*;

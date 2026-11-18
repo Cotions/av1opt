@@ -155,9 +155,15 @@ pub struct AudioInfo {
     pub disposition: String,
 }
 
+/// Why a file in a format outside `tools::VIDEO_FORMATS` is not read.
+const NOT_A_VIDEO: &str = "this is not a video file in a format av1opt reads, whatever its name says: it may be a playlist or manifest that leads to other files, and those are not opened";
+
 /// What ffprobe said in the end, on one line: the lines before it are the
 /// demuxer's detail, and the last one starts with the path the caller already has.
 pub(crate) fn reason(stderr: &str, path: &Path) -> String {
+    if stderr.contains("Format not on whitelist") {
+        return NOT_A_VIDEO.into();
+    }
     let last = one_line(stderr);
     let last = last.strip_prefix(&*path.to_string_lossy()).map_or(last, |rest| rest.trim_start_matches(':').trim_start());
     if last.is_empty() { "could not read the file".into() } else { last.to_string() }
@@ -302,7 +308,7 @@ pub fn probe(ffprobe: &str, path: &Path, file_size: u64) -> Result<MediaInfo> {
 }
 
 fn probe_within(ffprobe: &str, path: &Path, file_size: u64, limit: Duration) -> Result<MediaInfo> {
-    let mut command = Command::new(ffprobe);
+    let mut command = crate::tools::probe_command(ffprobe);
     command.args(["-v", "error", "-show_format", "-show_streams", "-of", "json"]).arg(crate::tools::probe_arg(path));
     let out = match run_within(command, limit) {
         Ok(Some(out)) => out,
@@ -484,7 +490,7 @@ fn probe_within(ffprobe: &str, path: &Path, file_size: u64, limit: Duration) -> 
 /// Bits per second of audio stream number `index` (among the audio streams), measured from
 /// the packets of its first two minutes. For containers that don't state it.
 pub fn audio_bitrate(ffprobe: &str, path: &Path, index: usize) -> Option<f64> {
-    let mut command = Command::new(ffprobe);
+    let mut command = crate::tools::probe_command(ffprobe);
     command
         .args(["-v", "error", "-read_intervals", "%+120", "-select_streams", &format!("a:{index}")])
         .args(["-show_entries", "packet=pts_time,duration_time,size", "-of", "csv=p=0"])
@@ -505,7 +511,7 @@ pub fn audio_bitrate(ffprobe: &str, path: &Path, index: usize) -> Option<f64> {
 /// takes in a container that states no rate for it (Matroska), where going by the size of
 /// the file would count the sound in.
 pub fn stream_bytes(ffprobe: &str, path: &Path, index: usize) -> Option<u64> {
-    let mut command = Command::new(ffprobe);
+    let mut command = crate::tools::probe_command(ffprobe);
     command.args(["-v", "error", "-select_streams", &index.to_string(), "-show_entries", "packet=size", "-of", "csv=p=0"]).arg(crate::tools::probe_arg(path));
     let out = run_ffprobe(command, Reads::all_of(path)).ok().filter(|o| o.status.success())?;
     let bytes: u64 = String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.trim().trim_end_matches(',').parse::<u64>().ok()).sum();
@@ -551,7 +557,9 @@ fn matroska_ends(ffprobe: &str, path: &Path, video: u64, frame: f64, latest_end:
     let index = video.to_string();
     let first = packets(ffprobe, path, &["-select_streams", &index, "-read_intervals", "%+#16", "-show_entries", "packet=pts_time"])?;
     let first_frame = first.lines().filter_map(|l| l.trim().trim_end_matches(',').parse::<f64>().ok()).min_by(f64::total_cmp);
-    let from = format!("{:.3}%", (latest_end - END_SECS).max(0.0));
+    // An end far past any file: ffprobe printed no packets for an interval without one as soon
+    // as another option came before it.
+    let from = format!("{:.3}%+1000000", (latest_end - END_SECS).max(0.0));
     let last = packets(ffprobe, path, &["-read_intervals", &from, "-show_entries", "packet=stream_index,pts_time,duration_time"])?;
     let ends = last_ends(&last, &index, frame);
     Some(PacketEnds { file: ends.0?, picture: ends.1, first_frame })
@@ -577,7 +585,7 @@ fn last_ends(lines: &str, video: &str, frame: f64) -> (Option<f64>, Option<f64>)
 
 /// The packet lines ffprobe prints for `what`, or None if it fails or takes too long.
 fn packets(ffprobe: &str, path: &Path, what: &[&str]) -> Option<String> {
-    let mut command = Command::new(ffprobe);
+    let mut command = crate::tools::probe_command(ffprobe);
     command.args(["-v", "error"]).args(what).args(["-of", "csv=p=0"]).arg(crate::tools::probe_arg(path));
     let limit = END_READ_LIMIT;
     #[cfg(test)]

@@ -82,6 +82,56 @@ impl Capabilities {
     }
 }
 
+/// The containers a video may come in, by the names ffmpeg knows them under. A file is opened
+/// as what its contents look like, whatever it is called, and some of what ffmpeg reads is no
+/// video but a list of other files: a DASH manifest or a concat playlist named `.mkv` would
+/// have ffmpeg read those and encode them into the output. None of these leads anywhere else.
+///
+/// Matroska and WebM, the MP4 family, AVI, ASF (`.wmv`), FLV, MPEG transport and program
+/// streams (`.ts`, `.m2ts`, `.mpg`, `.vob`) are what the scan looks for. Ogg, RealMedia, WTV,
+/// MXF, DV and NUT are what else is found in libraries and can be named to `encode`, as are
+/// bare streams: MPEG video, MPEG-4 (`.m4v`), H.264, HEVC, VC-1, YUV4MPEG, AV1 as IVF or OBU.
+/// The last two are also what av1opt's own chunks and repairs are stored as.
+pub const VIDEO_FORMATS: &str = "matroska,webm,mov,mp4,m4a,3gp,3g2,mj2,avi,asf,flv,mpegts,mpeg,ogg,rm,wtv,mxf,dv,nut,mpegvideo,m4v,h264,hevc,vc1,yuv4mpegpipe,ivf,obu,av1";
+
+/// `-format_whitelist` and `-protocol_whitelist` for an input forced to `format` (`-f`), or for
+/// a video whose format ffmpeg is to find out. Files only: nothing av1opt opens is reached
+/// through a network, a pipe or anything else.
+fn input_limits(format: Option<&str>) -> [String; 4] {
+    let formats = match format {
+        None => VIDEO_FORMATS,
+        // av1opt's own list of its own lossless clips: the list, and the clips it names.
+        Some("concat") => "concat,matroska",
+        // Named by av1opt itself (its chapters and cut subtitles, generated test pictures).
+        Some(named) => named,
+    };
+    ["-format_whitelist".into(), formats.into(), "-protocol_whitelist".into(), "file".into()]
+}
+
+/// `args` with the limits in front of every input. Done here, on the way to ffmpeg, so that no
+/// call can leave them out.
+fn limit_inputs(args: &[String]) -> Vec<String> {
+    let mut limited = Vec::with_capacity(args.len() + 4);
+    let mut format = None;
+    let mut arg = args.iter().peekable();
+    while let Some(a) = arg.next() {
+        match a.as_str() {
+            "-f" => format = arg.peek().map(|f| f.as_str()),
+            "-i" => limited.extend(input_limits(format.take())),
+            _ => {}
+        }
+        limited.push(a.clone());
+    }
+    limited
+}
+
+/// An ffprobe command that can only read a file in one of [`VIDEO_FORMATS`].
+pub fn probe_command(ffprobe: &str) -> Command {
+    let mut command = Command::new(ffprobe);
+    command.args(input_limits(None));
+    command
+}
+
 /// The child is killed when av1opt goes away without stopping it (kill -9, a crash): an ffmpeg
 /// left behind would write a file nobody finishes, and one left behind paused would sit on
 /// its memory until someone found it. The signal follows the thread that started the child;
@@ -204,8 +254,10 @@ impl Tools {
         })
     }
 
-    /// Builds the ffmpeg command; with AV1OPT_DEBUG set, prints it first.
-    fn command_for(&self, args: &[String]) -> Command {
+    /// Builds the ffmpeg command, `first` and then `args` with their inputs limited; with
+    /// AV1OPT_DEBUG set, prints it first.
+    fn command_for(&self, first: &[&str], args: &[String]) -> Command {
+        let args = limit_inputs(args);
         if std::env::var_os("AV1OPT_DEBUG").is_some() && !args.is_empty() {
             let quoted: Vec<String> = args.iter().map(|a| if a.contains([' ', ';', '[']) { format!("'{a}'") } else { a.clone() }).collect();
             eprintln!("+ ffmpeg {}", quoted.join(" "));
@@ -221,7 +273,7 @@ impl Tools {
             None => Command::new(&self.ffmpeg),
         };
         // SVT-AV1 prints its config banner to stderr on every run; errors only.
-        c.env("SVT_LOG", "1").arg("-hide_banner").arg("-nostdin");
+        c.env("SVT_LOG", "1").arg("-hide_banner").arg("-nostdin").args(first).args(args);
         die_with_parent(&mut c);
         c
     }
@@ -281,11 +333,11 @@ impl Tools {
 
     /// Like [`Tools::run`], with ffmpeg's working directory set to `dir`.
     fn run_in(&self, dir: Option<&Path>, args: &[String]) -> Result<String> {
-        let mut cmd = self.command_for(args);
+        let mut cmd = self.command_for(&[], args);
         if let Some(d) = dir {
             cmd.current_dir(d);
         }
-        cmd.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+        cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
         let child = self.spawn(&mut cmd)?;
         let out = self.finish(child)?;
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -298,8 +350,8 @@ impl Tools {
     /// Runs ffmpeg and returns what it wrote to stdout. A run still going after `timeout` (a
     /// damaged file, a stalled network drive) is stopped and counts as failed.
     pub fn run_capture(&self, args: &[String], timeout: std::time::Duration) -> Result<Vec<u8>> {
-        let mut cmd = self.command_for(args);
-        cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut cmd = self.command_for(&[], args);
+        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = self.spawn(&mut cmd)?;
         let id = child.id();
         let (mut stdout, mut stderr) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
@@ -352,11 +404,11 @@ impl Tools {
     /// Like [`Tools::run_with_progress_in`], also returning what ffmpeg wrote to its log
     /// (errors only, unless `args` raise the level with `-v`).
     pub fn run_with_progress_log(&self, dir: Option<&Path>, args: &[String], total_secs: f64, label: &str) -> Result<(u64, String)> {
-        let mut cmd = self.command_for(args);
+        let mut cmd = self.command_for(&["-progress", "pipe:1", "-nostats", "-v", "error"], args);
         if let Some(d) = dir {
             cmd.current_dir(d);
         }
-        cmd.args(["-progress", "pipe:1", "-nostats", "-v", "error"]).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = self.spawn(&mut cmd)?;
         let mut stderr = child.stderr.take().unwrap();
         let err_reader = std::thread::spawn(move || {
@@ -489,7 +541,7 @@ impl Tools {
     /// Whether each packet (= frame) of the first video stream is a key frame, in the order
     /// they are stored, without decoding.
     pub fn key_packets(&self, path: &Path) -> Result<Vec<bool>> {
-        let mut command = Command::new(&self.ffprobe);
+        let mut command = probe_command(&self.ffprobe);
         command.args(["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=flags", "-of", "csv=p=0"]).arg(probe_arg(path));
         let out = crate::probe::run_ffprobe(command, crate::probe::Reads::all_of(path))?;
         if !out.status.success() {
@@ -501,7 +553,7 @@ impl Tools {
     /// Number of video packets (= frames) in the first video stream, without decoding. A file
     /// with no frames in it counts none; one that cannot be read is an error.
     pub fn count_frames(&self, path: &Path) -> Result<u64> {
-        let mut command = Command::new(&self.ffprobe);
+        let mut command = probe_command(&self.ffprobe);
         command.args(["-v", "error", "-select_streams", "v:0", "-count_packets", "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0"]).arg(probe_arg(path));
         let out = crate::probe::run_ffprobe(command, crate::probe::Reads::all_of(path))?;
         frames_counted(&out, path)
@@ -647,6 +699,115 @@ mod tests {
         assert!(!free.failure(killed, "", 5).to_string().contains("--memory-limit"));
         let ended = std::process::ExitStatus::from_raw(1 << 8);
         assert!(!capped("1G", "1G").failure(ended, "", 5).to_string().contains("--memory-limit"));
+    }
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn every_input_is_limited_to_what_it_is_meant_to_be() {
+        let limits = |formats: &str| strings(&["-format_whitelist", formats, "-protocol_whitelist", "file"]);
+        let expect = |parts: &[&[String]]| parts.concat();
+        // A video of the user's, a second one, and what is written is left as it is.
+        let args = strings(&["-y", "-ss", "3", "-i", "/v/a.mkv", "-i", "/v/b.mp4", "-map", "0:v", "-f", "ivf", "/o/c.ivf"]);
+        assert_eq!(limit_inputs(&args), expect(&[&strings(&["-y", "-ss", "3"]), &limits(VIDEO_FORMATS), &strings(&["-i", "/v/a.mkv"]), &limits(VIDEO_FORMATS), &strings(&["-i", "/v/b.mp4", "-map", "0:v", "-f", "ivf", "/o/c.ivf"])]));
+        // A format av1opt names for an input of its own goes for that input only.
+        let args = strings(&["-f", "concat", "-safe", "0", "-i", "/t/l.txt", "-i", "/t/d.mkv", "-f", "ffmetadata", "-i", "/t/c.ffmeta"]);
+        assert_eq!(
+            limit_inputs(&args),
+            expect(&[&strings(&["-f", "concat", "-safe", "0"]), &limits("concat,matroska"), &strings(&["-i", "/t/l.txt"]), &limits(VIDEO_FORMATS), &strings(&["-i", "/t/d.mkv", "-f", "ffmetadata"]), &limits("ffmetadata"), &strings(&["-i", "/t/c.ffmeta"])])
+        );
+        // Neither list holds what leads on to other files.
+        for leads_on in ["concat", "dash", "hls", "image2", "sdp", "rtsp", "tty", "lavfi"] {
+            assert!(!VIDEO_FORMATS.split(',').any(|f| f == leads_on), "{leads_on}");
+        }
+    }
+
+    /// One short clip in `container`, made by the ffmpeg under test.
+    fn clip(ffmpeg: &str, path: &Path, codec: &[&str]) {
+        let made = Command::new(ffmpeg)
+            .args(["-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i", "testsrc2=s=176x144:r=25:d=1"])
+            .args(codec)
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{}: {}", path.display(), String::from_utf8_lossy(&made.stderr));
+    }
+
+    fn room(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("av1opt-formats-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn every_container_the_scan_looks_for_is_still_read() {
+        let Some(tools) = real_tools("every_container_the_scan_looks_for_is_still_read") else { return };
+        let dir = room("accepted");
+        let mpeg4: &[&str] = &["-c:v", "mpeg4", "-pix_fmt", "yuv420p"];
+        let made: &[(&str, &[&str])] = &[
+            ("mp4", mpeg4), ("mkv", mpeg4), ("m4v", mpeg4), ("mov", mpeg4), ("avi", mpeg4), ("ts", mpeg4), ("m2ts", mpeg4), ("3gp", mpeg4),
+            ("webm", &["-c:v", "libsvtav1", "-preset", "12", "-pix_fmt", "yuv420p"]),
+            ("wmv", &["-c:v", "wmv2", "-pix_fmt", "yuv420p"]),
+            ("flv", &["-c:v", "flv1", "-pix_fmt", "yuv420p"]),
+            ("mpg", &["-c:v", "mpeg1video", "-pix_fmt", "yuv420p"]),
+            ("mpeg", &["-c:v", "mpeg2video", "-pix_fmt", "yuv420p"]),
+        ];
+        // Every one the scan knows is made here, so a new one cannot be forgotten.
+        let mut named: Vec<&str> = made.iter().map(|m| m.0).collect();
+        named.sort();
+        let mut scanned = crate::scan::VIDEO_EXTS.to_vec();
+        scanned.sort();
+        assert_eq!(named, scanned);
+        for (ext, codec) in made {
+            let path = dir.join(format!("clip.{ext}"));
+            clip(&tools.ffmpeg, &path, codec);
+            let size = std::fs::metadata(&path).unwrap().len();
+            let info = crate::probe::probe(&tools.ffprobe, &path, size).unwrap_or_else(|e| panic!("{ext}: {e:#}"));
+            assert_eq!((info.width, info.height), (176, 144), "{ext}");
+            assert!(tools.count_frames(&path).unwrap_or_else(|e| panic!("{ext}: {e:#}")) >= 9, "{ext}");
+            tools.run(&["-v".into(), "error".into(), "-i".into(), path_arg(&path), "-frames:v".into(), "1".into(), "-f".into(), "null".into(), "-".into()]).unwrap_or_else(|e| panic!("{ext}: {e:#}"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_that_leads_to_other_files_is_refused_by_probe_and_by_ffmpeg() {
+        let Some(tools) = real_tools("a_file_that_leads_to_other_files_is_refused_by_probe_and_by_ffmpeg") else { return };
+        let dir = room("refused");
+        let secret = dir.join("secret.mp4");
+        clip(&tools.ffmpeg, &secret, &["-c:v", "mpeg4", "-pix_fmt", "yuv420p"]);
+        let manifest = format!(
+            "<?xml version=\"1.0\"?><MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" type=\"static\" mediaPresentationDuration=\"PT1S\" minBufferTime=\"PT1S\" profiles=\"urn:mpeg:dash:profile:isoff-on-demand:2011\"><Period><AdaptationSet mimeType=\"video/mp4\"><Representation id=\"1\" bandwidth=\"1000\" width=\"176\" height=\"144\"><BaseURL>{}</BaseURL></Representation></AdaptationSet></Period></MPD>",
+            secret.display()
+        );
+        let playlist = "ffconcat version 1.0\nfile secret.mp4\nduration 1\n";
+        // Each was shown to work on the ffmpeg itself: the limits are what stops them.
+        for (name, text) in [("dash.mkv", manifest.as_str()), ("playlist.mkv", playlist)] {
+            let path = dir.join(name);
+            std::fs::write(&path, text).unwrap();
+            let free = Command::new(&tools.ffprobe).args(["-v", "error", "-show_format"]).arg(&path).output().unwrap();
+            assert!(free.status.success(), "{name} no longer opens without the limits: the test proves nothing");
+            let e = format!("{:#}", crate::probe::probe(&tools.ffprobe, &path, text.len() as u64).unwrap_err());
+            assert!(e.contains("not a video file in a format av1opt reads"), "{name}: {e}");
+            let e = format!("{:#}", tools.run(&["-v".into(), "error".into(), "-i".into(), path_arg(&path), "-f".into(), "null".into(), "-".into()]).unwrap_err());
+            assert!(e.contains("not on whitelist"), "{name}: {e}");
+            assert_eq!(tools.count_frames(&path).ok(), None, "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_list_of_own_clips_and_generated_pictures_still_open() {
+        let Some(tools) = real_tools("a_list_of_own_clips_and_generated_pictures_still_open") else { return };
+        let dir = room("own");
+        let (a, list) = (dir.join("a.mkv"), dir.join("list.txt"));
+        tools.run(&strings(&["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=64x64:r=10:d=1", "-c:v", "ffv1"]).into_iter().chain([path_arg(&a)]).collect::<Vec<_>>()).unwrap();
+        std::fs::write(&list, format!("file '{0}'\nfile '{0}'\n", a.display())).unwrap();
+        tools.run(&strings(&["-v", "error", "-f", "concat", "-safe", "0", "-i"]).into_iter().chain([path_arg(&list)]).chain(strings(&["-f", "null", "-"])).collect::<Vec<_>>()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

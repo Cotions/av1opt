@@ -1122,6 +1122,27 @@ fn a_name_that_is_not_text_is_refused_and_no_other_file_is_taken_for_it() {
 
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_file_that_leads_to_other_videos_is_not_encoded_even_when_forced() {
+    let c = Case::new("not-a-video");
+    let elsewhere = c.dir.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::rename(c.clip("secret.mp4", "320x180", 4), elsewhere.join("secret.mp4")).unwrap();
+    let secret = elsewhere.join("secret.mp4");
+    let manifest = format!(
+        "<?xml version=\"1.0\"?><MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" type=\"static\" mediaPresentationDuration=\"PT3S\" minBufferTime=\"PT1S\" profiles=\"urn:mpeg:dash:profile:isoff-on-demand:2011\"><Period><AdaptationSet mimeType=\"video/mp4\"><Representation id=\"1\" bandwidth=\"1000\" width=\"320\" height=\"180\"><BaseURL>{}</BaseURL></Representation></AdaptationSet></Period></MPD>",
+        secret.display()
+    );
+    std::fs::write(c.videos().join("dash.mkv"), manifest).unwrap();
+    std::fs::write(c.videos().join("list.mkv"), format!("ffconcat version 1.0\nfile {}\nduration 4\n", secret.display())).unwrap();
+    for name in ["dash.mkv", "list.mkv"] {
+        c.encode(&[&c.videos().join(name)], &["--force"]).has("failed 1").has("not a video file in a format av1opt reads");
+    }
+    let made: Vec<String> = c.outputs().into_iter().filter(|n| n != "av1opt-log.tsv").collect();
+    assert!(made.is_empty(), "{made:?}");
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn a_temp_folder_laid_out_ahead_of_the_run_is_not_used() {
     // What someone who can write to the output folder could do: the old folder name was the
     // process number, known here because the shell becomes av1opt under its own number.

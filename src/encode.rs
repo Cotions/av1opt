@@ -1173,7 +1173,9 @@ fn full_encode_args(
         let mut n = 1;
         for s in &c.subs {
             sub_inputs.push(s.as_ref().map(|p| {
-                a.extend(["-i".into(), path_arg(p)]);
+                // Written by `prepare_cut` as what its name ends in: `srt` or `ass`.
+                let format = p.extension().map_or("srt".into(), |e| e.to_string_lossy().into_owned());
+                a.extend(["-f".into(), format, "-i".into(), path_arg(p)]);
                 n += 1;
                 n - 1
             }));

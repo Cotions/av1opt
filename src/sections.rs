@@ -279,7 +279,7 @@ pub struct Chapter {
 
 /// Chapters of a file, from ffprobe.
 pub fn read_chapters(ffprobe: &str, path: &std::path::Path) -> Result<Vec<Chapter>> {
-    let mut command = std::process::Command::new(ffprobe);
+    let mut command = crate::tools::probe_command(ffprobe);
     command.args(["-v", "error", "-show_chapters", "-of", "json"]).arg(crate::tools::probe_arg(path));
     let out = crate::probe::run_ffprobe(command, crate::probe::Reads::Little)?;
     if !out.status.success() {

@@ -626,4 +626,249 @@ mod tests {
         r.target_vmaf = 97.0;
         assert_eq!(Model::fit(&[r], 93.0).samples, 0);
     }
+
+    fn video(secs: f64, bitrate: f64) -> MediaInfo {
+        MediaInfo { codec: "h264".into(), width: 1000, height: 1000, fps: 10.0, duration_s: secs, video_bitrate: bitrate, ..Default::default() }
+    }
+
+    /// A model that says `bpp` whatever the source.
+    fn says(bpp: f64) -> Model {
+        Model { beta: [bpp.ln(), 0.0, 0.0], sigma: 0.1, samples: 0 }
+    }
+
+    fn near(a: f64, b: f64) -> bool {
+        (a - b).abs() <= 1e-6 * b.abs().max(1.0)
+    }
+
+    #[test]
+    fn bits_per_pixel_are_nothing_when_the_frames_are_unknown() {
+        assert_eq!(bpp(1e6, 1000, 1000, 10.0), 0.1);
+        assert_eq!(bpp(1e6, 0, 1000, 10.0), 0.0);
+        assert_eq!(bpp(1e6, 1000, 0, 10.0), 0.0);
+        assert_eq!(bpp(1e6, 1000, 1000, 0.0), 0.0);
+        assert_eq!(bpp(1e6, 1000, 1000, f64::NAN), 0.0);
+    }
+
+    #[test]
+    fn what_cannot_be_encoded_is_said_before_what_it_would_save() {
+        let size = 12_500_000;
+        let verdict = |m: &MediaInfo| judge(m, size, 0.2, &says(0.01)).0;
+        let av1 = MediaInfo { codec: "av1".into(), dolby_vision: true, duration_s: 1.0, ..video(100.0, 1e6) };
+        assert_eq!(verdict(&av1), Verdict::AlreadyAv1);
+        let short_dolby = MediaInfo { dolby_vision: true, ..video(1.0, 1e6) };
+        assert_eq!(verdict(&short_dolby), Verdict::TooShort);
+        let dolby = MediaInfo { dolby_vision: true, ..video(100.0, 1e6) };
+        assert_eq!(verdict(&dolby), Verdict::DolbyVision);
+        assert_eq!(verdict(&video(100.0, 1e6)), Verdict::Candidate);
+        // A file that is skipped stays the size it is.
+        let (_, r) = judge(&dolby, size, 0.2, &says(0.01));
+        assert_eq!((r.low, r.likely, r.high), (size as f64, size as f64, size as f64));
+    }
+
+    #[test]
+    fn a_video_is_too_short_below_five_seconds_of_picture() {
+        let verdict = |m: &MediaInfo| judge(m, 625_000, 0.2, &says(0.001)).0;
+        assert_eq!(verdict(&video(5.0, 1e6)), Verdict::Candidate);
+        assert_eq!(verdict(&video(4.99, 1e6)), Verdict::TooShort);
+        // Sound that runs on does not make the picture longer.
+        assert_eq!(verdict(&MediaInfo { video_s: 3.0, ..video(100.0, 1e6) }), Verdict::TooShort);
+        assert_eq!(verdict(&MediaInfo { width: 0, ..video(100.0, 1e6) }), Verdict::TooShort);
+        assert_eq!(verdict(&MediaInfo { fps: 0.0, ..video(100.0, 1e6) }), Verdict::TooShort);
+    }
+
+    #[test]
+    fn savings_of_exactly_the_minimum_are_enough() {
+        let (m, size, model) = (video(100.0, 1e6), 12_500_000, says(0.05));
+        let (_, r) = judge(&m, size, 0.2, &model);
+        let saved = 1.0 - r.likely / size as f64;
+        assert!(near(saved, 0.5), "{saved}");
+        assert_eq!(judge(&m, size, saved, &model).0, Verdict::Candidate);
+        assert_eq!(judge(&m, size, saved + 1e-9, &model).0, Verdict::LowGain);
+    }
+
+    #[test]
+    fn only_the_video_stream_of_a_file_gets_smaller() {
+        // 12.5 MB of picture and 5 MB of sound; the picture halves.
+        let (_, r) = judge(&video(100.0, 1e6), 17_500_000, 0.2, &says(0.05));
+        assert!(near(r.likely, 11_250_000.0), "{}", r.likely);
+        assert!(r.low < r.likely && r.likely < r.high);
+    }
+
+    #[test]
+    fn the_estimate_never_says_a_video_stream_grows() {
+        let (v, r) = judge(&video(100.0, 1e6), 17_500_000, 0.2, &says(5.0));
+        assert_eq!(v, Verdict::LowGain);
+        assert_eq!((r.low, r.likely, r.high), (17_500_000.0, 17_500_000.0, 17_500_000.0));
+    }
+
+    #[test]
+    fn a_file_without_numbers_is_no_candidate_and_gives_no_nonsense() {
+        // Unknown bitrate: nothing known to save.
+        let (v, r) = judge(&video(100.0, 0.0), 1_000_000, 0.2, &says(0.05));
+        assert_eq!((v, r.likely), (Verdict::LowGain, 1_000_000.0));
+        // An empty file, with and without a bitrate.
+        assert_eq!(judge(&video(100.0, 0.0), 0, 0.2, &says(0.05)).0, Verdict::LowGain);
+        assert_eq!(judge(&video(100.0, 1e6), 0, 0.2, &says(0.05)).0, Verdict::LowGain);
+        // No height: the width alone does not make it a picture.
+        assert_ne!(judge(&MediaInfo { height: 0, ..video(100.0, 1e6) }, 1_000_000, 0.2, &Model::prior()).0, Verdict::Candidate);
+    }
+
+    #[test]
+    fn the_range_is_the_same_factor_either_side_of_the_likely_size() {
+        for m in [Model::prior(), says(0.03)] {
+            let (lo, mid, hi) = m.predict_bpp(0.1, PIXELS_1080P);
+            let factor = (Z80 * m.sigma).exp();
+            assert!(near(hi / mid, factor) && near(mid / lo, factor), "{lo} {mid} {hi}");
+        }
+    }
+
+    #[test]
+    fn the_first_guess_falls_with_the_picture_and_the_sources_bits() {
+        let m = Model::prior();
+        let at = |bpp: f64, px: f64| m.predict_bpp(bpp, px).1;
+        assert!(near(at(0.1, PIXELS_1080P * 4.0) / BPP_1080P, 4f64.powf(RES_EXPONENT)));
+        assert!(near(at(0.2, PIXELS_1080P) / BPP_1080P, 2f64.powf(SOURCE_EXPONENT)));
+        // A source of no known bits is taken as a very lean one, not as nothing.
+        assert!(near(at(0.0, PIXELS_1080P), at(1e-4, PIXELS_1080P)));
+        assert!(at(0.0, PIXELS_1080P).is_finite() && at(0.0, PIXELS_1080P) > 0.0);
+    }
+
+    #[test]
+    fn encodes_count_within_a_point_and_a_half_of_the_target() {
+        let at = |target: f64| Record { target_vmaf: target, ..rec(0.1, 0.07, 1920, 1080) };
+        assert_eq!(Model::fit(&[at(91.5), at(94.5), at(93.0)], 93.0).samples, 3);
+        assert_eq!(Model::fit(&[at(91.4), at(94.6)], 93.0).samples, 0);
+    }
+
+    #[test]
+    fn encodes_without_usable_numbers_teach_nothing() {
+        let bad = [
+            Record { source_bitrate: 0.0, ..rec(0.1, 0.07, 1920, 1080) },
+            Record { output_bitrate: 0.0, ..rec(0.1, 0.07, 1920, 1080) },
+            Record { fps: 0.0, ..rec(0.1, 0.07, 1920, 1080) },
+            Record { width: 0, ..rec(0.1, 0.07, 1920, 1080) },
+            Record { fps: f64::NAN, ..rec(0.1, 0.07, 1920, 1080) },
+        ];
+        let m = Model::fit(&bad, 93.0);
+        assert_eq!(m.samples, 0);
+        assert_eq!(m.beta, Model::prior().beta);
+        assert_eq!(m.sigma, PRIOR_SIGMA);
+    }
+
+    #[test]
+    fn encodes_that_agree_with_the_prior_leave_it_and_the_spread_has_a_floor() {
+        let prior = Model::prior();
+        let sizes = [(1280, 720), (1920, 1080), (3840, 2160)];
+        let recs: Vec<Record> = (0..300)
+            .map(|i| {
+                let (w, h) = sizes[i % 3];
+                let s = 0.02 + 0.001 * i as f64;
+                rec(s, prior.predict_bpp(s, w as f64 * h as f64).1, w, h)
+            })
+            .collect();
+        let m = Model::fit(&recs, 93.0);
+        assert_eq!(m.samples, 300);
+        assert!(m.beta.iter().zip(prior.beta).all(|(a, b)| (a - b).abs() < 1e-9), "{:?}", m.beta);
+        // However well they agree, a video can still surprise.
+        assert_eq!(m.sigma, 0.1);
+    }
+
+    #[test]
+    fn the_first_crf_stays_in_the_range_whatever_the_model_says() {
+        let info = MediaInfo { width: 1920, height: 1080, fps: 30.0, video_bitrate: 6e6, ..Default::default() };
+        let says_crf = |crf: f64| CrfModel { beta: [crf, 0.0, 0.0], samples: 0 };
+        assert_eq!(says_crf(100.0).start(&info, 20, 63), 63);
+        assert_eq!(says_crf(-5.0).start(&info, 20, 63), 20);
+        assert_eq!(says_crf(-5.0).start(&info, 0, 63), 0);
+        assert_eq!(says_crf(34.5).start(&info, 20, 63), 35);
+        assert_eq!(says_crf(f64::NAN).start(&info, 20, 63), 20);
+        // A range turned around gives its lower end rather than a panic.
+        assert_eq!(says_crf(35.0).start(&info, 40, 30), 40);
+    }
+
+    #[test]
+    fn a_video_of_unknown_size_starts_from_the_plain_guess() {
+        let m = CrfModel { beta: [30.0, 2.0, 3.0], samples: 1 };
+        assert_eq!(m.predict(0.0, PIXELS_1080P), 30.0);
+        assert_eq!(m.predict(0.1, 0.0), 30.0);
+        assert_eq!(m.predict(f64::NAN, PIXELS_1080P), 30.0);
+        assert!(near(m.predict(0.1 * std::f64::consts::E, PIXELS_1080P), 32.0));
+    }
+
+    #[test]
+    fn encodes_count_for_the_first_crf_within_three_points_of_the_target() {
+        let at = |target: f64| Record { target_vmaf: target, ..crf_rec(0.1, 1920, 1080, 30.0) };
+        assert_eq!(CrfModel::fit(&[at(90.0), at(96.0)], 93.0, "tune=0").samples, 2);
+        assert_eq!(CrfModel::fit(&[at(89.9), at(96.1)], 93.0, "tune=0").samples, 0);
+        assert_eq!(CrfModel::fit(&[Record { source_bitrate: 0.0, ..crf_rec(0.1, 1920, 1080, 30.0) }], 93.0, "tune=0").samples, 0);
+    }
+
+    #[test]
+    fn presets_get_faster_as_their_number_rises_and_stop_at_the_last() {
+        assert_eq!(preset_time(6), 1.0);
+        assert!((1..=13).all(|p| preset_time(p) < preset_time(p - 1)));
+        assert_eq!(preset_time(14), preset_time(13));
+        assert_eq!(preset_time(255), preset_time(13));
+    }
+
+    #[test]
+    fn an_encode_counts_for_the_speed_from_ten_seconds_on() {
+        let lasting = |secs: f64| Record { encode_secs: Some(secs), ..timed(1920, 1080, 6, 0.01) };
+        assert_eq!(TimeModel::fit(&[lasting(10.0)], 6).samples, 1);
+        assert_eq!(TimeModel::fit(&[lasting(9.99)], 6).samples, 0);
+        for bad in [Record { fps: 0.0, ..lasting(60.0) }, Record { duration_s: 0.0, ..lasting(60.0) }, Record { width: 0, ..lasting(60.0) }, Record { fps: f64::NAN, ..lasting(60.0) }] {
+            assert_eq!(TimeModel::fit(&[bad], 6).samples, 0);
+        }
+    }
+
+    #[test]
+    fn the_time_of_a_video_goes_by_its_picture_and_is_nothing_when_unknown() {
+        let m = TimeModel::fit(&[], 6);
+        let info = MediaInfo { width: 1920, height: 1080, fps: 30.0, duration_s: 1000.0, ..Default::default() };
+        // The sound runs on; 200 s of picture are what is encoded.
+        assert_eq!(m.secs(&MediaInfo { video_s: 200.0, ..info.clone() }), m.secs(&MediaInfo { duration_s: 200.0, ..info.clone() }));
+        assert_eq!(m.secs(&MediaInfo { fps: 0.0, ..info.clone() }), 0.0);
+        assert_eq!(m.secs(&MediaInfo { height: 0, ..info.clone() }), 0.0);
+        // Shorter than its sample clips: searched on all of it, twice.
+        let tiny = m.secs(&MediaInfo { duration_s: 4.0, ..info });
+        assert!(near(tiny, SPF_1080P * 30.0 * 12.0), "{tiny}");
+    }
+
+    #[test]
+    fn per_scene_encodes_without_both_times_teach_nothing_of_their_cost() {
+        let scene = |search: Option<f64>, encode: Option<f64>| Record { mode: "scenes".into(), search_secs: search, encode_secs: encode, ..rec(0.1, 0.03, 1920, 1080) };
+        let m = TimeModel::fit(&[scene(None, Some(600.0)), scene(Some(60.0), None), scene(Some(60.0), Some(9.0))], 6);
+        assert_eq!(m.scene_samples, 0);
+        assert!(near(m.scenes, SCENES_FACTOR));
+        assert_eq!(TimeModel::fit(&[scene(Some(60.0), Some(600.0))], 6).scene_samples, 1);
+    }
+
+    #[test]
+    fn the_share_of_auto_encodes_per_scene_moves_toward_what_was_seen() {
+        let made = |mode: &str| Record { scenes: Some("auto".into()), mode: mode.into(), ..rec(0.1, 0.03, 1920, 1080) };
+        let all = TimeModel::fit(&vec![made("scenes"); 997], 6);
+        assert!(near(all.auto_share, 998.0 / 1000.0), "{}", all.auto_share);
+        let none = TimeModel::fit(&vec![made("whole"); 997], 6);
+        assert!(near(none.auto_share, 1.0 / 1000.0), "{}", none.auto_share);
+        assert!(near(none.auto_factor(), 1.0 + 2.0 / 1000.0));
+    }
+
+    #[test]
+    fn three_equations_are_solved_whatever_their_order() {
+        let x = solve3([[2.0, 1.0, 1.0], [1.0, 3.0, 2.0], [1.0, 0.0, 0.0]], [4.0, 5.0, 6.0]).unwrap();
+        assert_eq!(x.map(|v| v.round()), [6.0, 15.0, -23.0]);
+        // A zero where the first pivot would be.
+        let x = solve3([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 2.0]], [3.0, 4.0, 10.0]).unwrap();
+        assert_eq!(x, [4.0, 3.0, 5.0]);
+        assert_eq!(solve3([[1.0, 2.0, 3.0], [2.0, 4.0, 6.0], [1.0, 0.0, 1.0]], [1.0, 2.0, 3.0]), None);
+        assert_eq!(solve3([[0.0; 3]; 3], [0.0; 3]), None);
+    }
+
+    #[test]
+    fn every_verdict_but_candidate_reads_as_a_skip() {
+        assert_eq!(Verdict::Candidate.label(), "candidate");
+        for v in [Verdict::AlreadyAv1, Verdict::LowGain, Verdict::DolbyVision, Verdict::TooShort, Verdict::Unreadable] {
+            assert!(v.label().starts_with("skip: "), "{v:?}");
+        }
+    }
 }

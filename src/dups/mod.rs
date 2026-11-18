@@ -493,4 +493,99 @@ mod tests {
         assert_eq!(media.iter().map(|x| x.identical).collect::<Vec<_>>(), vec![Some(0), Some(0), None, None]);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    fn report(kind: Kind, secs: &[f64]) -> (Report, Group) {
+        let file = |i: usize, d: f64| File {
+            path: format!("/v/{i}, été.mp4").into(),
+            root: "/v".into(),
+            size: 1000 + i as u64,
+            codec: "h264".into(),
+            width: 640,
+            height: 360,
+            fps: 24.0,
+            duration_s: d,
+            video_mbps: 1.5,
+            identical: (i == 0).then_some(4),
+        };
+        let g = Group { kind, score: 0.875, members: (0..secs.len()).collect(), reason: "largest file".into() };
+        let r = Report { files: secs.iter().enumerate().map(|(i, &d)| file(i, d)).collect(), groups: vec![g.clone()], ..Default::default() };
+        (r, g)
+    }
+
+    #[test]
+    fn only_copies_of_one_whole_video_are_called_spare() {
+        let (r, g) = report(Kind::Same, &[10.0, 10.0, 9.9]);
+        assert_eq!((0..3).map(|k| role(&r, &g, k)).collect::<Vec<_>>(), ["keep", "spare", "spare"]);
+        for kind in [Kind::SameStart, Kind::SameEnd] {
+            let (r, g) = report(kind, &[10.0, 90.0]);
+            assert_eq!((0..2).map(|k| role(&r, &g, k)).collect::<Vec<_>>(), ["short", "long"]);
+            // Of equal length, neither is the shorter.
+            let (r, g) = report(kind, &[10.0, 10.0]);
+            assert_eq!((0..2).map(|k| role(&r, &g, k)).collect::<Vec<_>>(), ["long", "long"]);
+        }
+    }
+
+    #[test]
+    fn sizes_are_written_in_megabytes_up_to_a_gigabyte() {
+        assert_eq!(gb(0), "0.0 MB");
+        assert_eq!(gb(999_999_999), "1000.0 MB");
+        assert_eq!(gb(1_000_000_000), "1.00 GB");
+        assert_eq!(gb(2_500_000_000), "2.50 GB");
+    }
+
+    #[test]
+    fn the_kinds_have_the_names_the_listing_uses() {
+        assert_eq!(kind_label(Kind::Same), "same video");
+        assert_eq!(kind_label(Kind::SameStart), "same start");
+        assert_eq!(kind_label(Kind::SameEnd), "same ending");
+    }
+
+    #[test]
+    fn the_csv_has_one_row_per_file_and_the_reason_only_on_the_first() {
+        let dir = std::env::temp_dir().join(format!("av1opt-dups-csv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dups.csv");
+        let (mut r, _) = report(Kind::Same, &[10.0, 10.0]);
+        r.unreadable.push(Unreadable { path: "/v/bad.mp4".into(), error: "first line\nmoov atom not found\n".into() });
+        write_csv(&r, &path).unwrap();
+        let rows: Vec<csv::StringRecord> = csv::Reader::from_path(&path).unwrap().records().map(Result::unwrap).collect();
+        let head = csv::Reader::from_path(&path).unwrap().headers().unwrap().clone();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(head.len(), 13);
+        let at = |row: &csv::StringRecord, name: &str| row[head.iter().position(|h| h == name).unwrap()].to_string();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|row| row.len() == 13));
+        assert_eq!((at(&rows[0], "group"), at(&rows[0], "kind"), at(&rows[0], "match")), ("1".into(), "same video".into(), "0.88".into()));
+        assert_eq!((at(&rows[0], "role"), at(&rows[0], "reason")), ("keep".into(), "largest file".into()));
+        assert_eq!((at(&rows[1], "role"), at(&rows[1], "reason")), ("spare".into(), String::new()));
+        // A path with a comma and accents comes back whole.
+        assert_eq!(at(&rows[1], "path"), "/v/1, été.mp4");
+        assert_eq!((at(&rows[0], "identical"), at(&rows[1], "identical")), ("4".into(), String::new()));
+        // A video that could not be compared says why, in its last line.
+        assert_eq!((at(&rows[2], "kind"), at(&rows[2], "reason"), at(&rows[2], "path")), ("not compared".into(), "moov atom not found".into(), "/v/bad.mp4".into()));
+    }
+
+    #[test]
+    fn only_files_of_one_size_and_the_same_samples_are_marked_identical() {
+        let dir = std::env::temp_dir().join(format!("av1opt-dups-same-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, data: &[u8]| {
+            let p = dir.join(name);
+            std::fs::write(&p, data).unwrap();
+            p
+        };
+        let (a, b, c, d) = (write("a", b"aaaa"), write("b", b"aaaa"), write("c", b"cccccc"), write("d", b"cccccc"));
+        let m = |p: &Path, size: u64| Media { path: p.into(), size, codec: "h264".into(), width: 1, height: 1, duration_s: 1.0, video_bitrate: 1.0, identical: None };
+        let mut media = vec![m(&c, 6), m(&a, 4), m(&d, 6), m(&b, 4), m(&dir.join("gone"), 4)];
+        // Each set gets its own number, the smaller size first; a file that cannot be read has none.
+        mark_identical(&mut media, &[0, 1, 2, 3, 4]);
+        assert_eq!(media.iter().map(|x| x.identical).collect::<Vec<_>>(), vec![Some(1), Some(0), Some(1), Some(0), None]);
+        // Files that are in no group are not looked at.
+        for x in &mut media {
+            x.identical = None;
+        }
+        mark_identical(&mut media, &[0, 1]);
+        assert!(media.iter().all(|x| x.identical.is_none()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

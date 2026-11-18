@@ -980,4 +980,222 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn cuts_outside_the_video_or_given_twice_count_for_nothing() {
+        assert_eq!(plan(&[650, 300, 300, 0, 1000, 5000], 1000, 100, 500), [0, 300, 650]);
+    }
+
+    #[test]
+    fn a_cut_may_lie_exactly_at_the_shortest_and_the_longest_distance() {
+        assert_eq!(plan(&[100], 1000, 100, 1000), [0, 100]);
+        assert_eq!(plan(&[99], 1000, 100, 1000), [0]);
+        assert_eq!(plan(&[900], 1000, 100, 1000), [0, 900]);
+        assert_eq!(plan(&[901], 1000, 100, 1000), [0]);
+        assert_eq!(plan(&[500], 600, 100, 500), [0, 500]);
+    }
+
+    #[test]
+    fn a_scene_too_long_is_split_evenly_up_to_its_cut() {
+        assert_eq!(plan(&[800], 1000, 100, 500), [0, 400, 800]);
+        // A cut too near the end does not count, and the rest is split as if it were not there.
+        assert_eq!(plan(&[950], 1000, 100, 500), [0, 500]);
+    }
+
+    #[test]
+    fn a_video_shorter_than_a_chunk_is_one_chunk() {
+        assert_eq!(plan(&[], 1, 100, 500), [0]);
+        assert_eq!(plan(&[50], 99, 100, 500), [0]);
+    }
+
+    #[test]
+    fn a_longest_chunk_below_the_shortest_is_raised_above_it() {
+        let starts = plan(&[], 1000, 100, 50);
+        assert_eq!(starts, (0..10).map(|i| i * 100).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn chunk_starts_rise_and_stay_inside_the_video_for_any_cuts() {
+        for total in [1, 2, 99, 100, 101, 777, 5000] {
+            for (min, max) in [(0, 0), (1, 1), (10, 30), (100, 500), (500, 100)] {
+                for step in [1, 2, 13, 250] {
+                    let cuts: Vec<u64> = (0..total + 5).step_by(step).collect();
+                    let starts = plan(&cuts, total, min, max);
+                    assert_eq!(starts[0], 0, "{total} {min} {max} {step}");
+                    assert!(starts.windows(2).all(|w| w[0] < w[1]), "{total} {min} {max} {step}: {starts:?}");
+                    assert!(*starts.last().unwrap() < total.max(1), "{total} {min} {max} {step}: {starts:?}");
+                }
+            }
+        }
+    }
+
+    fn fps30() -> MediaInfo {
+        MediaInfo { width: 1920, height: 1080, fps: 30.0, ..Default::default() }
+    }
+
+    #[test]
+    fn chunks_join_without_a_gap_and_the_outer_ends_stay_open() {
+        // Too long for one chunk at 20 s, no cuts: halves.
+        let (first, b) = bounds(&fps30(), &[], 1000);
+        assert_eq!(first, 0);
+        assert_eq!(b, [Bounds { start: None, end: Some(500) }, Bounds { start: Some(500), end: None }]);
+        let (_, one) = bounds(&fps30(), &[], 100);
+        assert_eq!(one, [Bounds { start: None, end: None }]);
+    }
+
+    #[test]
+    fn cuts_are_placed_from_where_the_video_starts() {
+        // The picture starts at 2 s, frame 60 of the grid. A cut before it means nothing.
+        let info = MediaInfo { video_start: 2.0, ..fps30() };
+        let (first, b) = bounds(&info, &[30, 360], 1000);
+        assert_eq!(first, 60);
+        assert_eq!(b, [Bounds { start: None, end: Some(360) }, Bounds { start: Some(360), end: Some(710) }, Bounds { start: Some(710), end: None }]);
+    }
+
+    #[test]
+    fn very_large_pictures_get_shorter_chunks_whichever_way_up() {
+        let longest = |width, height| Limits::for_video(&MediaInfo { width, height, ..Default::default() }).max_secs;
+        assert_eq!(longest(3840, 2160), 10.0);
+        assert_eq!(longest(2160, 3840), 10.0);
+        assert_eq!(longest(3200, 1800), 10.0);
+        assert_eq!(longest(3199, 1800), 20.0);
+        assert_eq!(longest(1920, 1080), 20.0);
+    }
+
+    /// Probes that are read from a straight line: `at_0 - slope * crf`.
+    fn line(at_0: f64, slope: f64) -> impl FnMut(u8) -> Result<f64> {
+        move |c| Ok(at_0 - slope * c as f64)
+    }
+
+    #[test]
+    fn a_probe_close_to_the_target_ends_the_search() {
+        let mut asked = Vec::new();
+        let e = estimate_crf(35, 20, 55, 20, 93.0, 3, |c| {
+            asked.push(c);
+            Ok(93.2)
+        })
+        .unwrap();
+        assert_eq!((asked, e.crf, e.out_of_reach), (vec![35], 35.0, false));
+    }
+
+    #[test]
+    fn at_least_one_probe_is_made_and_it_starts_inside_the_range() {
+        assert_eq!(estimate_crf(35, 20, 55, 20, 93.0, 0, |_| Ok(91.0)).unwrap().probes, [(35, 91.0)]);
+        assert_eq!(estimate_crf(10, 20, 55, 20, 93.0, 1, |_| Ok(93.0)).unwrap().probes, [(20, 93.0)]);
+        assert_eq!(estimate_crf(60, 20, 55, 20, 93.0, 1, |_| Ok(93.0)).unwrap().probes, [(55, 93.0)]);
+    }
+
+    #[test]
+    fn one_probe_below_the_target_steps_down_by_the_usual_slope_to_a_quarter() {
+        let at = |v: f64| estimate_crf(35, 20, 55, 20, 93.0, 1, move |_| Ok(v)).unwrap().crf;
+        assert_eq!(at(91.0), 31.0);
+        // 0.1 short is 0.2 of a CRF, the nearest quarter step being 34.75.
+        assert_eq!(at(92.9), 34.75);
+    }
+
+    #[test]
+    fn the_answer_lies_between_the_probes_either_side_of_the_target() {
+        let e = estimate_crf(35, 20, 55, 20, 93.0, 2, line(126.0, 1.0)).unwrap();
+        assert_eq!(e.probes, [(35, 91.0), (31, 95.0)]);
+        assert_eq!(e.crf, 33.0);
+    }
+
+    #[test]
+    fn the_answer_never_leaves_the_range() {
+        assert_eq!(estimate_crf(35, 30, 40, 20, 93.0, 3, |_| Ok(99.0)).unwrap().crf, 40.0);
+        let e = estimate_crf(35, 30, 40, 0, 93.0, 3, line(120.0, 1.0)).unwrap();
+        assert_eq!((e.crf, e.out_of_reach), (30.0, false));
+    }
+
+    #[test]
+    fn a_target_is_out_of_reach_only_when_the_lowest_crf_would_still_miss_it() {
+        // One probe at 35, floor 20: fifteen steps at the usual half point a step are 7.5.
+        let e = estimate_crf(35, 20, 55, 20, 93.0, 1, |_| Ok(85.4)).unwrap();
+        assert_eq!((e.crf, e.out_of_reach), (35.0, true));
+        let e = estimate_crf(35, 20, 55, 20, 93.0, 1, |_| Ok(85.5)).unwrap();
+        assert_eq!((e.crf, e.out_of_reach), (20.0, false));
+        // A probe that passes settles it.
+        assert!(!estimate_crf(35, 20, 55, 20, 93.0, 3, line(128.0, 1.0)).unwrap().out_of_reach);
+    }
+
+    #[test]
+    fn a_probe_that_fails_ends_the_estimate_with_its_error() {
+        let e = estimate_crf(35, 20, 55, 20, 93.0, 3, |_| anyhow::bail!("no such encoder"));
+        assert_eq!(e.err().unwrap().to_string(), "no such encoder");
+    }
+
+    #[test]
+    fn a_crf_never_probed_scores_nothing() {
+        assert_eq!(score_at(&[(30, 91.0)], 30), 91.0);
+        assert_eq!(score_at(&[(30, 91.0)], 31), 0.0);
+    }
+
+    #[test]
+    fn frame_lines_may_come_among_others_and_a_single_frame_will_do() {
+        let text = "header\nframe:0 pts:0 pts_time:0\nav1opt=1\nnoise pts:7 pts_time:1\nframe:1 pts:3000 pts_time:0.033333\n";
+        assert_eq!(Times::parse(text, (1, 90000)).unwrap().pts, [0, 3000]);
+        let one = Times::parse("frame:0 pts:0 pts_time:0\n", (1, 90000)).unwrap();
+        assert_eq!((one.pts.len(), one.rate()), (1, 0.0));
+        assert_eq!(Times::parse("frame:0 pts:N/A pts_time:N/A\n", (1, 90000)), None);
+        assert_eq!(Times::parse("frame:0 pts:5 pts_time:soon\n", (1, 90000)), None);
+    }
+
+    #[test]
+    fn half_and_one_and_a_half_steps_are_still_steady_and_one_in_a_hundred_may_be_odd() {
+        let steps = |list: &[(usize, i64)]| {
+            let mut pts = vec![0];
+            for &(n, step) in list {
+                for _ in 0..n {
+                    pts.push(pts[pts.len() - 1] + step);
+                }
+            }
+            Times { pts, tb: (1, 1000) }
+        };
+        assert!(steps(&[(100, 4), (50, 2), (50, 6)]).steady());
+        // 1 and 7 are beyond half and one and a half times 4.
+        assert!(steps(&[(200, 4), (2, 1)]).steady());
+        assert!(!steps(&[(200, 4), (3, 1)]).steady());
+        assert!(steps(&[(200, 4), (2, 7)]).steady());
+        assert!(!steps(&[(200, 4), (3, 7)]).steady());
+    }
+
+    #[test]
+    fn the_rate_is_frames_per_second_between_the_first_and_the_last() {
+        let t = Times { pts: (5..=35).map(|i| i * 3000).collect(), tb: (1, 90000) };
+        assert!((t.rate() - 30.0).abs() < 1e-9, "{}", t.rate());
+        assert_eq!(t.secs(90000), 1.0);
+    }
+
+    #[test]
+    fn a_handful_of_frames_off_the_grid_is_allowed_by_the_length_of_the_video() {
+        let uneven = |source_frames, dropped, repeated| Pace { source_frames, dropped, repeated }.uneven();
+        assert!(!uneven(0, 1, 1) && uneven(0, 2, 1));
+        assert!(!uneven(29_999, 1, 1) && uneven(29_999, 2, 1));
+        assert!(!uneven(30_000, 2, 1) && uneven(30_000, 2, 2));
+    }
+
+    #[test]
+    fn of_the_frame_rate_filters_lines_the_last_readable_one_counts() {
+        let log = "[Parsed_fps_0 @ 0x1] 9 frames in, 9 frames out; 1 frames dropped, 2 frames duplicated.\n[Parsed_fps_0 @ 0x2] something else\n";
+        assert_eq!(Pace::from_log(log), Some(Pace { source_frames: 9, dropped: 1, repeated: 2 }));
+        assert_eq!(Pace::from_log(""), None);
+    }
+
+    fn chunk(frames: u64, vmaf: f64) -> ChunkResult {
+        ChunkResult { index: 0, start_secs: 0.0, frames, crf: 30.0, probes: Vec::new(), vmaf, bytes: 0, corrected: false, out_of_reach: false }
+    }
+
+    #[test]
+    fn the_mean_over_chunks_weighs_them_by_their_frames() {
+        assert_eq!(mean_vmaf(&[]), 0.0);
+        assert_eq!(mean_vmaf(&[chunk(0, 90.0)]), 0.0);
+        assert_eq!(mean_vmaf(&[chunk(300, 90.0), chunk(100, 94.0)]), 91.0);
+    }
+
+    #[test]
+    fn the_name_hash_is_the_standard_one_so_work_folders_survive_an_update() {
+        assert_eq!(fnv1a(""), 0xcbf29ce484222325);
+        assert_eq!(fnv1a("a"), 0xaf63dc4c8601ec8c);
+        assert_eq!(fnv1a("foobar"), 0x85944171f73967e8);
+    }
 }

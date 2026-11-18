@@ -995,7 +995,9 @@ fn a_video_that_starts_late_is_measured_and_cut_from_where_it_starts() {
         let out = c.out().join(format!("{stem}.mp4"));
         assert_eq!(frames(&out), want, "{stem}");
         assert!((duration(&out) - 4.0).abs() < 0.2, "{stem}: {}", duration(&out));
-        assert!(c.report(stem)["duration_s"].as_f64().is_none_or(|d| (d - 4.0).abs() < 0.2), "{stem}");
+        // Read as 9 s long, its samples and checks would lie past the end of the picture.
+        let checks = c.report(stem)["verify_vmaf"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect::<Vec<_>>();
+        assert!(!checks.is_empty() && checks.iter().all(|v| *v > 80.0), "{stem}: {checks:?}");
     }
 }
 
@@ -1054,7 +1056,6 @@ fn a_picture_inside_longer_sound_keeps_its_place_in_every_container() {
         }
     }
 }
-
 
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]

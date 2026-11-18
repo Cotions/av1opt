@@ -122,4 +122,100 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert_eq!(crfs, [Some(30.0), Some(31.0)]);
     }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("av1opt-history-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A line with what every record has, plus `more`.
+    fn line(more: serde_json::Value) -> String {
+        let mut v = serde_json::json!({ "time": 1, "codec": "h264", "width": 640, "height": 360, "fps": 24.0, "duration_s": 60.0,
+            "source_bitrate": 1e6, "output_bitrate": 5e5, "target_vmaf": 93.0, "preset": 5, "mode": "whole" });
+        v.as_object_mut().unwrap().extend(more.as_object().unwrap().clone());
+        v.to_string()
+    }
+
+    /// What `read` makes of a file with these bytes.
+    fn read_bytes(name: &str, bytes: &[u8]) -> Vec<Record> {
+        let dir = scratch(name);
+        let path = dir.join("history.jsonl");
+        std::fs::write(&path, bytes).unwrap();
+        let records = read(&path);
+        std::fs::remove_dir_all(&dir).unwrap();
+        records
+    }
+
+    #[test]
+    fn a_new_record_holds_the_length_of_the_picture_and_no_times_yet() {
+        // The sound runs on for a minute after the picture ends.
+        let info = MediaInfo { codec: "hevc".into(), width: 1920, height: 1080, fps: 25.0, duration_s: 100.0, video_s: 40.0, video_bitrate: 4e6, ..Default::default() };
+        let r = Record::new(&info, 2e6, 93.0, 5, "scenes", 31.5, "tune=0");
+        assert_eq!((r.format, r.codec.as_str(), r.width, r.height, r.fps), (FORMAT, "hevc", 1920, 1080, 25.0));
+        assert_eq!((r.duration_s, r.source_bitrate, r.output_bitrate, r.target_vmaf), (40.0, 4e6, 2e6, 93.0));
+        assert_eq!((r.preset, r.mode.as_str(), r.crf, r.svt_params.as_deref()), (5, "scenes", Some(31.5), Some("tune=0")));
+        assert_eq!((r.search_secs, r.encode_secs, r.scenes), (None, None, None));
+        assert!(r.time > 1_700_000_000);
+    }
+
+    #[test]
+    fn lines_of_a_newer_version_are_left_out_and_old_ones_count_as_the_first() {
+        let file = [
+            line(serde_json::json!({ "format": FORMAT + 1, "preset": 1 })),
+            line(serde_json::json!({ "format": FORMAT, "preset": 2 })),
+            line(serde_json::json!({ "preset": 3 })),
+        ]
+        .join("\n");
+        let got = read_bytes("versions", file.as_bytes());
+        assert_eq!(got.iter().map(|r| (r.preset, r.format)).collect::<Vec<_>>(), [(2, FORMAT), (3, 1)]);
+    }
+
+    #[test]
+    fn what_a_line_does_not_say_stays_unknown_and_what_it_adds_is_passed_over() {
+        let got = read_bytes("fields", line(serde_json::json!({ "from_the_future": [1, 2] })).as_bytes());
+        assert_eq!(got.len(), 1);
+        let r = &got[0];
+        assert_eq!((r.crf, r.svt_params.as_deref(), r.search_secs, r.encode_secs, r.scenes.as_deref()), (None, None, None, None, None));
+    }
+
+    #[test]
+    fn times_not_known_are_not_written_and_known_ones_come_back() {
+        let info = MediaInfo { codec: "h264".into(), width: 640, height: 360, fps: 24.0, duration_s: 60.0, ..Default::default() };
+        let mut r = Record::new(&info, 1e6, 93.0, 5, "whole", 30.0, "tune=0");
+        let text = serde_json::to_string(&r).unwrap();
+        for absent in ["search_secs", "encode_secs", "scenes"] {
+            assert!(!text.contains(absent), "{text}");
+        }
+        (r.search_secs, r.encode_secs, r.scenes) = (Some(12.5), Some(600.0), Some("auto".into()));
+        let got = read_bytes("times", serde_json::to_string(&r).unwrap().as_bytes());
+        assert_eq!((got[0].search_secs, got[0].encode_secs, got[0].scenes.as_deref()), (Some(12.5), Some(600.0), Some("auto")));
+    }
+
+    #[test]
+    fn a_line_cut_short_by_a_crash_costs_that_line_and_others_may_end_in_any_way() {
+        let whole = line(serde_json::json!({ "preset": 7 }));
+        let file = format!("{whole}\r\n{}", &whole[..whole.len() / 2]);
+        assert_eq!(read_bytes("cut", file.as_bytes()).iter().map(|r| r.preset).collect::<Vec<_>>(), [7]);
+        assert_eq!(read_bytes("last", whole.as_bytes()).len(), 1);
+    }
+
+    #[test]
+    fn numbers_out_of_range_cost_their_line() {
+        for more in [serde_json::json!({ "preset": 300 }), serde_json::json!({ "width": -1 }), serde_json::json!({ "fps": "fast" }), serde_json::json!({ "format": -1 })] {
+            assert!(read_bytes("range", line(more.clone()).as_bytes()).is_empty(), "{more}");
+        }
+    }
+
+    #[test]
+    fn no_file_or_an_empty_one_is_an_empty_history() {
+        let dir = scratch("none");
+        assert!(read(&dir.join("not-there.jsonl")).is_empty());
+        // A folder where the file should be.
+        assert!(read(&dir).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(read_bytes("empty", b"").is_empty());
+        assert!(read_bytes("blank", b"\n\n\n").is_empty());
+    }
 }

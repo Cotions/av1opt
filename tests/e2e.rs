@@ -277,6 +277,40 @@ fn mtime(path: &Path) -> std::time::SystemTime {
 
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_source_changed_during_its_encode_leaves_no_output() {
+    let c = Case::new("source-changed");
+    let src = c.clip("a.mp4", "320x180", 6);
+    let mut child = c.command().arg("encode").arg("-o").arg(c.out()).args(FAST).arg(&src).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut stderr, &mut text).unwrap();
+        text
+    });
+    // The work folder appears once the encode is under way, and goes when it ends.
+    let started = std::time::Instant::now();
+    let working = || std::fs::read_dir(c.out()).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with(".av1opt-tmp-"));
+    while !working() {
+        assert!(child.try_wait().unwrap().is_none(), "the encode ended before its work folder was seen");
+        assert!(started.elapsed() < std::time::Duration::from_secs(120), "no work folder after two minutes");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    // What a download going on does to a file allocated ahead: same size, a new date.
+    let later = std::fs::metadata(&src).unwrap().modified().unwrap() + std::time::Duration::from_secs(5);
+    std::fs::File::options().write(true).open(&src).unwrap().set_modified(later).unwrap();
+    let status = child.wait().unwrap();
+    let err = reader.join().unwrap();
+    assert!(!status.success(), "the encode was taken as good:\n{err}");
+    assert!(err.contains("changed or went away while it was being encoded"), "{err}");
+    assert!(!c.out().join("a.mp4").exists() && !c.out().join("a.av1opt.json").exists());
+    // Left alone from here, the file encodes, and its report records the date it now has.
+    c.encode(&[&src], &[]).ok().has("encoded 1, skipped 0, failed 0, already done 0");
+    let seconds = later.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    assert_eq!(c.report("a")["source_mtime"].as_u64(), Some(seconds));
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn a_video_is_encoded_checked_reported_and_not_done_twice() {
     let c = Case::new("whole");
     let src = c.clip("a.mp4", "320x180", 6);

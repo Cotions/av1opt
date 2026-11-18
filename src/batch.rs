@@ -188,17 +188,28 @@ fn log_line(log: &Path, status: &str, input: &Path, size: u64, detail: &str, set
     Ok(crate::files::append_line(log, &line, false)?)
 }
 
-/// What an output's report says it was made from: the input, the sections left out, and
-/// the size the input had.
-type Made = (PathBuf, Vec<(f64, f64)>, Option<u64>);
+/// What an output's report says it was made from.
+struct Made {
+    /// The input, as an absolute path.
+    source: PathBuf,
+    /// The sections left out of the output.
+    removed: Vec<(f64, f64)>,
+    /// The size the input had.
+    bytes: Option<u64>,
+    /// When the input had last been changed, in seconds. Older reports do not say.
+    modified: Option<u64>,
+}
 
-/// Absolute input path recorded in an output's `.av1opt.json` report, the sections that
-/// output left out, and the size the input had.
 fn report_input(output: &Path) -> Option<Made> {
     let r: serde_json::Value = serde_json::from_slice(&std::fs::read(output.with_extension("av1opt.json")).ok()?).ok()?;
     let p = PathBuf::from(r["input"].as_str()?);
     let removed = serde_json::from_value(r["removed"].clone()).unwrap_or_default();
-    Some((std::fs::canonicalize(&p).ok().or_else(|| std::path::absolute(&p).ok())?, removed, r["source_bytes"].as_u64()))
+    Some(Made {
+        source: std::fs::canonicalize(&p).ok().or_else(|| std::path::absolute(&p).ok())?,
+        removed,
+        bytes: r["source_bytes"].as_u64(),
+        modified: r["source_mtime"].as_u64(),
+    })
 }
 
 /// Whether an earlier output left out the sections asked for now. The report holds them
@@ -298,18 +309,18 @@ enum Before {
     Refuse(String),
 }
 
-fn before_encoding(output: &Path, clash: Option<&Clash>, input: &Path, size: u64, o: &Options) -> Before {
+fn before_encoding(output: &Path, clash: Option<&Clash>, input: &Path, size: u64, modified: Option<u64>, o: &Options) -> Before {
     let exists = output.exists();
     let made = if exists { report_input(output) } else { None };
     match clash {
         Some(Clash::Own) => {
             return match made {
-                Some((source, ..)) if source != input => Before::Leave(format!("{} is the encode of {} from an earlier run", output.display(), source.display())),
+                Some(m) if m.source != input => Before::Leave(format!("{} is the encode of {} from an earlier run", output.display(), m.source.display())),
                 _ => Before::Refuse("the output would be written over this same video, so nothing was written; choose another output folder".into()),
             };
         }
         // Only an encode of this very input may stand there, and it is then not replaced.
-        Some(Clash::Input(other)) if o.overwrite || made.as_ref().is_none_or(|(source, ..)| source != input) => {
+        Some(Clash::Input(other)) if o.overwrite || made.as_ref().is_none_or(|m| m.source != input) => {
             return Before::Refuse(format!("its output would take the place of another input, {}", other.display()));
         }
         // Without --overwrite the first one's report settles it below: the second is a name
@@ -324,22 +335,27 @@ fn before_encoding(output: &Path, clash: Option<&Clash>, input: &Path, size: u64
     }
     // Only a report says what an output was made from: the same file name can come from two
     // input folders, or be a file that has nothing to do with this run.
-    match made {
+    let Some(made) = made else {
         // No report beside it: reports get tidied away, and a run that died between the file
         // and its report left one such. It is nobody's input (see above), so it is left alone
         // and counted as done, as it always was.
-        None => Before::Done,
-        Some((_, removed, _)) if !same_sections(&o.remove, &removed) => {
-            Before::Refuse(format!("{} exists but has other sections removed; move or delete it to encode again", output.display()))
-        }
-        Some((source, ..)) if source != input => Before::Refuse(format!("output name collision: {} was made from {}", output.display(), source.display())),
-        // The same name and another file: a download done again, an edit saved over it.
-        Some((_, _, Some(then))) if then != size => Before::Refuse(format!(
-            "{} was made from this file when it was another size ({then} bytes, now {size}); move or delete it to encode again",
-            output.display()
-        )),
-        Some(_) => Before::Done,
+        return Before::Done;
+    };
+    if !same_sections(&o.remove, &made.removed) {
+        return Before::Refuse(format!("{} exists but has other sections removed; move or delete it to encode again", output.display()));
     }
+    if made.source != input {
+        return Before::Refuse(format!("output name collision: {} was made from {}", output.display(), made.source.display()));
+    }
+    // The same name and another file: a download done again, an edit saved over it.
+    if let Some(then) = made.bytes.filter(|then| *then != size) {
+        return Before::Refuse(format!("{} was made from this file when it was another size ({then} bytes, now {size}); move or delete it to encode again", output.display()));
+    }
+    // The same goes at the same size: a download writes into a file allocated ahead.
+    if made.modified.is_some_and(|then| modified != Some(then)) {
+        return Before::Refuse(format!("{} was made from this file when it was last changed at another time; move or delete it to encode again", output.display()));
+    }
+    Before::Done
 }
 
 #[derive(Default)]
@@ -371,7 +387,9 @@ pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipp
     let mut sum = Summary::default();
     for (i, job) in jobs.iter().enumerate() {
         let abs = std::fs::canonicalize(&job.input).or_else(|_| std::path::absolute(&job.input))?;
-        let size = std::fs::metadata(&job.input).map_or(0, |m| m.len());
+        let meta = std::fs::metadata(&job.input).ok();
+        let size = meta.as_ref().map_or(0, |m| m.len());
+        let modified = meta.as_ref().and_then(crate::encode::modified_seconds);
         let output = output_of(job, o);
         eprintln!("\n[{}/{}] {}", i + 1, jobs.len(), job.input.display());
         if tools.check_cancel().is_err() {
@@ -386,7 +404,7 @@ pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipp
         // Checked before anything else: what is known about such a file goes by a name that
         // may be another file's.
         let named = [job.input.as_path(), &abs, &output].iter().all(|p| p.to_str().is_some());
-        let before = if named { before_encoding(&output, clashes[i].as_ref(), &abs, size, o) } else { Before::Refuse(crate::tools::NOT_TEXT.into()) };
+        let before = if named { before_encoding(&output, clashes[i].as_ref(), &abs, size, modified, o) } else { Before::Refuse(crate::tools::NOT_TEXT.into()) };
         match before {
             Before::Encode => {}
             Before::Done => {
@@ -628,6 +646,26 @@ mod tests {
         f.report("x.mp4", "x.mkv", 5);
         let (_, ends) = f.walk(&f.0, &Options { overwrite: true, ..options() });
         assert!(ends["x.mkv"].1.starts_with("its output would take the place of another input"), "{:?}", ends["x.mkv"]);
+    }
+
+    #[test]
+    fn an_output_made_when_its_source_was_last_changed_at_another_time_is_not_counted_as_done() {
+        let source = Folder::new("changed-in", &["c.mkv"]);
+        let out = Folder::new("changed-out", &["c.mp4"]);
+        let meta = std::fs::metadata(source.0.join("c.mkv")).unwrap();
+        let now = crate::encode::modified_seconds(&meta).unwrap();
+        let report = |fields: serde_json::Value| std::fs::write(out.0.join("c.av1opt.json"), fields.to_string()).unwrap();
+        let input = source.0.join("c.mkv");
+        report(serde_json::json!({"input": input, "source_bytes": 5, "source_mtime": now}));
+        assert_eq!(source.walk(&out.0, &options()).1["c.mkv"].0, "done_before");
+        // The size agrees, as it does for a file allocated ahead and filled in afterwards.
+        report(serde_json::json!({"input": input, "source_bytes": 5, "source_mtime": now - 60}));
+        let (status, detail) = source.walk(&out.0, &options()).1["c.mkv"].clone();
+        assert_eq!(status, "error");
+        assert!(detail.contains("when it was last changed at another time"), "{detail}");
+        // A report from before the time was kept judges by the size alone.
+        report(serde_json::json!({"input": input, "source_bytes": 5}));
+        assert_eq!(source.walk(&out.0, &options()).1["c.mkv"].0, "done_before");
     }
 
     #[test]

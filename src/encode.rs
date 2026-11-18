@@ -184,6 +184,9 @@ struct Report<'a> {
     input: &'a Path,
     output: &'a Path,
     source_bytes: u64,
+    /// When the source was last changed, in seconds since 1970. Reports from before this was
+    /// recorded have none, which their readers take as not known.
+    source_mtime: Option<u64>,
     output_bytes: u64,
     savings: f64,
     /// "whole" (one CRF) or "scenes" (CRF per chunk; `crf` is then the whole-file starting point).
@@ -214,6 +217,35 @@ struct Report<'a> {
     search_secs: f64,
     encode_secs: f64,
     notes: &'a [String],
+}
+
+/// A source as it stood at some moment, to tell whether it has been written to since.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SourceStamp {
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl SourceStamp {
+    fn of(input: &Path) -> std::io::Result<SourceStamp> {
+        let meta = std::fs::metadata(input)?;
+        Ok(SourceStamp { size: meta.len(), modified: meta.modified().ok() })
+    }
+}
+
+/// The time a file was last changed, in the whole seconds a report keeps.
+pub fn modified_seconds(meta: &std::fs::Metadata) -> Option<u64> {
+    seconds_since_1970(meta.modified().ok()?)
+}
+
+fn seconds_since_1970(time: std::time::SystemTime) -> Option<u64> {
+    Some(time.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs())
+}
+
+/// Whether the source is still what the encode began reading. A download that had only stalled
+/// goes on growing under the encode, and what comes out is then a copy of part of it.
+fn source_is_unchanged(input: &Path, before: SourceStamp) -> bool {
+    SourceStamp::of(input).is_ok_and(|now| now == before)
 }
 
 /// Deletes the temp folder when dropped, unless asked to keep it.
@@ -365,7 +397,8 @@ fn fits_beside_output(output: &Path, tmp: &Path) -> Result<()> {
 
 /// Re-encodes one file into `out_dir`. Returns the output path.
 pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Result<PathBuf> {
-    let size = std::fs::metadata(input).with_context(|| format!("cannot read {}", input.display()))?.len();
+    let source = SourceStamp::of(input).with_context(|| format!("cannot read {}", input.display()))?;
+    let size = source.size;
     let mut info = probe::probe(&tools.ffprobe, input, size)?;
     if o.audio == Audio::Shrink {
         // Matroska rarely says what a track spends; measure the ones it leaves open.
@@ -813,6 +846,16 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         notes.push(n);
     }
 
+    if !source_is_unchanged(input, source) {
+        // Chunks made from the earlier state of the file are of no use to the next run.
+        if let Some(w) = &work
+            && !o.keep_temp
+        {
+            let _ = std::fs::remove_dir_all(&w.path);
+        }
+        bail!("{} changed or went away while it was being encoded, so the result was thrown away; encode it again once it is complete", input.display());
+    }
+
     // What the samples promised is the video stream at one CRF; the file is that, the
     // stretches encoded again, the other streams and the container.
     let made = std::fs::metadata(&partial)?.len();
@@ -860,6 +903,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         input: &abs_input,
         output: &abs_output,
         source_bytes: size,
+        source_mtime: source.modified.and_then(seconds_since_1970),
         output_bytes,
         savings: 1.0 - output_bytes as f64 / size as f64,
         mode: if chunks.is_some() { "scenes" } else { "whole" },
@@ -1628,6 +1672,37 @@ pub(crate) fn free_bytes(dir: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_source_written_to_during_the_encode_is_noticed() {
+        use std::io::Write;
+        use std::time::{Duration, SystemTime};
+        let dir = std::env::temp_dir().join(format!("av1opt-source-stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("a.mkv");
+        std::fs::write(&input, b"video").unwrap();
+        let then = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        std::fs::File::options().write(true).open(&input).unwrap().set_modified(then).unwrap();
+        let before = SourceStamp::of(&input).unwrap();
+        assert!(source_is_unchanged(&input, before));
+        assert_eq!(before.modified.and_then(seconds_since_1970), Some(1_700_000_000));
+
+        // Grown, with its date put back: the size tells.
+        let mut file = std::fs::File::options().append(true).open(&input).unwrap();
+        file.write_all(b"more").unwrap();
+        file.set_modified(then).unwrap();
+        assert!(!source_is_unchanged(&input, before));
+
+        // Written in place at the same size, as into a file allocated ahead: the date tells.
+        let same_size = SourceStamp::of(&input).unwrap();
+        std::fs::File::options().write(true).open(&input).unwrap().set_modified(then + Duration::from_secs(1)).unwrap();
+        assert!(!source_is_unchanged(&input, same_size));
+
+        std::fs::remove_file(&input).unwrap();
+        assert!(!source_is_unchanged(&input, same_size));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn an_encode_asks_for_the_room_it_needs_itself() {

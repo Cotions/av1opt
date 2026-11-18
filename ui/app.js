@@ -94,7 +94,7 @@ function holdFocus(bg, onEscape, first) {
   const opener = document.activeElement;
   const box = bg.firstElementChild;
   box.setAttribute("tabindex", "-1");
-  const stops = () => [...box.querySelectorAll("a[href], button, input, select, textarea, summary")].filter((el) => !el.disabled && el.offsetParent !== null);
+  const stops = () => [...box.querySelectorAll("a[href], button, input, select, textarea, summary, [tabindex='0']")].filter((el) => !el.disabled && el.offsetParent !== null);
   const onKey = (e) => {
     const open = document.querySelectorAll(".modal-bg");
     if (open[open.length - 1] !== bg) return;
@@ -242,7 +242,17 @@ function pick({ title, mode = "dir", start }) {
       places.replaceChildren(...r.places.map((pl) => h("button", { class: "small", onclick: () => go(pl.path) }, pl.name)));
       const join = (n) => (r.path === "/" ? "/" : r.path + "/") + n;
       const items = [];
-      if (r.parent) items.push(h("li", { ondblclick: () => go(r.parent), onclick: () => go(r.parent) }, h("span", { class: "icon" }, "↰"), ".."));
+      // A row is reached with Tab and acts on Enter or space, as on a click.
+      const keyed = (li) => {
+        li.tabIndex = 0;
+        li.addEventListener("keydown", (e) => {
+          if (e.target !== li || (e.key !== "Enter" && e.key !== " ")) return;
+          e.preventDefault();
+          li.click();
+        });
+        return li;
+      };
+      if (r.parent) items.push(keyed(h("li", { onclick: () => go(r.parent) }, h("span", { class: "icon" }, "↰"), "..")));
       for (const d of r.dirs) {
         const full = join(d);
         const li = h("li", { class: selected.has(full) ? "sel" : "" }, h("span", { class: "icon" }, "▸"), h("span", { class: "grow" }, d));
@@ -255,7 +265,7 @@ function pick({ title, mode = "dir", start }) {
           li.prepend(cb);
         }
         li.addEventListener("click", () => go(full));
-        items.push(li);
+        items.push(keyed(li));
       }
       for (const f of r.files) {
         const full = join(f.name);
@@ -270,11 +280,15 @@ function pick({ title, mode = "dir", start }) {
           cb.addEventListener("click", (e) => { e.stopPropagation(); cb.checked = !cb.checked; toggle(); });
           li.addEventListener("click", toggle);
           li.prepend(cb);
+          keyed(li);
         } else li.classList.add("dim");
         items.push(li);
       }
       if (!r.dirs.length && !r.files.length) items.push(h("li", { class: "dim" }, "(empty)"));
+      // Opened with the keyboard, a folder leaves the focus on its first row.
+      const had = list.contains(document.activeElement);
       list.replaceChildren(...items);
+      if (had) { const first = list.querySelector("li[tabindex]"); if (first) first.focus(); }
       updateSel();
     }
 
@@ -531,6 +545,9 @@ function sectionsEditor(path) {
   const onKey = (e) => {
     if (!v.isConnected) { document.removeEventListener("keydown", onKey); return; }
     if (["INPUT", "SELECT", "TEXTAREA"].includes(e.target.tagName)) return;
+    // A dialog opened over this one has the keys.
+    const open = document.querySelectorAll(".modal-bg");
+    if (open.length && !open[open.length - 1].contains(v)) return;
     if (e.key === "i" || e.key === "I") markStart();
     else if (e.key === "o" || e.key === "O") markEnd();
     else if (e.key === ",") step(-1);
@@ -2663,6 +2680,8 @@ function comparePlayer(root, r) {
 
   const onKey = (e) => {
     if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
+    // A dialog over the player has the keys.
+    if (document.querySelector(".modal-bg")) return;
     if (e.key === " ") { e.preventDefault(); togglePlay(); }
     else if (e.key === ",") step(-1);
     else if (e.key === ".") step(1);

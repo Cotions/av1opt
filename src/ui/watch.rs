@@ -28,8 +28,14 @@ const FORGET_AFTER: u64 = 30 * 86400;
 const SAVE_EVERY: u64 = 86400;
 /// Version of `ui-watch.json`.
 const STATE_FORMAT: u64 = 1;
-/// Looks at which a video whose probe did not get through is tried, before it is left.
-const PROBE_TRIES: u8 = 3;
+/// Looks in a row at which a video whose probe did not get through is tried. After these it
+/// is tried at growing intervals, and never given up on: a mount with read errors says nothing
+/// about the video.
+const PROBE_TRIES: u32 = 3;
+/// The longest wait between two tries of such a video.
+const LONGEST_WAIT: u64 = 86400;
+/// How many of those videos the page is told of by name.
+const UNREAD_LISTED: usize = 20;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Watch {
@@ -39,6 +45,10 @@ pub struct Watch {
     pub options: jobs::JobOptions,
     #[serde(default = "yes")]
     pub enabled: bool,
+    /// The output folder was made for this watch once. After that a missing one means a drive
+    /// that is away. Watches saved before folders were made when added lack this.
+    #[serde(default)]
+    pub out_dir_made: bool,
 }
 
 fn yes() -> bool {
@@ -57,7 +67,7 @@ enum Mark {
     Before,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 struct Seen {
     size: u64,
     mtime: u64,
@@ -66,7 +76,24 @@ struct Seen {
     seen: u64,
     /// Probes of this file that could not run or were cut short.
     #[serde(default)]
-    tries: u8,
+    tries: u32,
+    /// Why the last of them did not get through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    why: Option<String>,
+    /// Not tried again before this time.
+    #[serde(default)]
+    next_try: u64,
+}
+
+impl Seen {
+    fn new(size: u64, mtime: u64, mark: Mark, seen: u64) -> Seen {
+        Seen { size, mtime, mark, seen, tries: 0, why: None, next_try: 0 }
+    }
+
+    /// Waiting to be read: no probe of it has got through yet.
+    fn unread(&self) -> bool {
+        self.mark == Mark::Fresh && self.tries > 0
+    }
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -108,17 +135,17 @@ fn settle(files: &mut BTreeMap<PathBuf, Seen>, found: Vec<(PathBuf, u64, u64)>, 
             Some(s) if s.size == size && s.mtime == mtime => {
                 s.seen = now;
                 // A date in the future (a clock that was wrong) would never be long ago.
-                if s.mark == Mark::Fresh && (mtime > now || now - mtime >= SETTLED_AFTER) {
+                if s.mark == Mark::Fresh && now >= s.next_try && (mtime > now || now - mtime >= SETTLED_AFTER) {
                     ready.push(path);
                 }
             }
             // Another file under the same name is a new video, whatever became of the old one.
             Some(s) => {
-                *s = Seen { size, mtime, mark: Mark::Fresh, seen: now, tries: 0 };
+                *s = Seen::new(size, mtime, Mark::Fresh, now);
                 changed = true;
             }
             None => {
-                files.insert(path, Seen { size, mtime, mark: first, seen: now, tries: 0 });
+                files.insert(path, Seen::new(size, mtime, first, now));
                 changed = true;
             }
         }
@@ -130,15 +157,33 @@ fn settle(files: &mut BTreeMap<PathBuf, Seen>, found: Vec<(PathBuf, u64, u64)>, 
     (ready, changed || files.len() != before)
 }
 
-/// Counts a probe that did not get through for each of these videos. They stay fresh, and so
-/// are tried again at the next look, until they have had their tries and are left.
-fn count_failed_probes(files: &mut BTreeMap<PathBuf, Seen>, paths: &[PathBuf]) {
-    for path in paths {
-        if let Some(s) = files.get_mut(path) {
+/// How long a video waits after its probe failed `tries` times: nothing for the first looks,
+/// then twice as long each time, up to [`LONGEST_WAIT`].
+fn wait_after(tries: u32) -> u64 {
+    match tries.checked_sub(PROBE_TRIES) {
+        None => 0,
+        Some(over) => LOOK_EVERY.saturating_mul(2u64.saturating_pow(over.saturating_add(1))).min(LONGEST_WAIT),
+    }
+}
+
+/// Counts a probe that did not get through for each of these videos, with the reason. They stay
+/// fresh, and are tried again when their wait is over.
+fn count_failed_probes(files: &mut BTreeMap<PathBuf, Seen>, failed: Vec<(PathBuf, String)>, now: u64) {
+    for (path, why) in failed {
+        if let Some(s) = files.get_mut(&path) {
             s.tries = s.tries.saturating_add(1);
-            if s.tries >= PROBE_TRIES {
-                s.mark = Mark::Left;
-            }
+            s.why = Some(why);
+            s.next_try = now + wait_after(s.tries);
+        }
+    }
+}
+
+/// Earlier versions left a video for good after its tries. It goes back to being tried.
+fn take_back_given_up(folders: &mut BTreeMap<u64, Folder>) {
+    for s in folders.values_mut().flat_map(|f| f.files.values_mut()) {
+        if s.mark == Mark::Left && s.tries >= PROBE_TRIES {
+            s.mark = Mark::Fresh;
+            s.next_try = 0;
         }
     }
 }
@@ -158,18 +203,17 @@ fn output_problem(watched: &Path, out_dir: &Path) -> Result<()> {
 }
 
 /// Every video below `root`, leaving out the output folder, hidden folders (temp and work
-/// folders, trash) and what a file system keeps for itself.
+/// folders, trash) and what a file system keeps for itself. A root inside the output folder
+/// does not get here: see [`output_problem`].
 fn videos(root: &Path, out_dir: &Path) -> Result<Vec<(PathBuf, u64, u64)>> {
     std::fs::read_dir(root).with_context(|| format!("cannot read {}", root.display()))?;
     let out_dir = crate::fsguard::resolved(out_dir).unwrap_or_else(|_| out_dir.to_path_buf());
-    // A folder being watched inside the output folder is not left out, nor is what is in it.
-    let inside_output = crate::fsguard::resolved(root).is_ok_and(|r| r.starts_with(&out_dir));
     let mut found = Vec::new();
     let walk = walkdir::WalkDir::new(root).into_iter().filter_entry(|e| {
         let name = e.file_name().to_string_lossy();
         let hidden = e.depth() > 0 && name.starts_with('.');
         let system = matches!(name.as_ref(), "System Volume Information" | "$RECYCLE.BIN" | "lost+found");
-        let output = !inside_output && e.path().starts_with(&out_dir);
+        let output = e.path().starts_with(&out_dir);
         !hidden && !(e.file_type().is_dir() && (system || output))
     });
     for e in walk.flatten() {
@@ -222,7 +266,8 @@ fn load(app: &App) {
         }
         return;
     }
-    if let Ok(folders) = serde_json::from_value::<BTreeMap<u64, Folder>>(doc["folders"].clone()) {
+    if let Ok(mut folders) = serde_json::from_value::<BTreeMap<u64, Folder>>(doc["folders"].clone()) {
+        take_back_given_up(&mut folders);
         *app.watch.folders.lock().unwrap() = folders;
     }
 }
@@ -236,9 +281,23 @@ fn find(app: &App, id: u64) -> Result<Watch> {
 struct Judged {
     worth: Vec<PathBuf>,
     left: Vec<PathBuf>,
-    /// Their probe did not get through, and the last reason why.
-    unjudged: Vec<PathBuf>,
-    why_unjudged: Option<String>,
+    /// Their probe did not get through, and why.
+    unjudged: Vec<(PathBuf, String)>,
+}
+
+/// Makes the output folder of a watch saved before folders were made when a watch was added.
+/// Once: from then on a missing folder means a drive that is away.
+fn make_output_once(app: &App, w: &Watch) -> Result<()> {
+    if w.out_dir_made {
+        return Ok(());
+    }
+    crate::fsguard::ensure_writable_location(&w.out_dir, false)?;
+    std::fs::create_dir_all(&w.out_dir).with_context(|| format!("cannot create {}", w.out_dir.display()))?;
+    if let Some(saved) = app.settings.lock().unwrap().watches.iter_mut().find(|s| s.id == w.id) {
+        saved.out_dir_made = true;
+    }
+    app.save_settings();
+    Ok(())
 }
 
 /// Sorts `ready` into the videos worth encoding, those to leave and those it cannot tell of yet.
@@ -259,8 +318,7 @@ fn judge(app: &App, w: &Watch, ready: Vec<PathBuf>) -> Result<Judged> {
     let mut judged = Judged::default();
     for r in results {
         if r.unjudged {
-            judged.why_unjudged = r.error;
-            judged.unjudged.push(r.path);
+            judged.unjudged.push((r.path, r.error.unwrap_or_else(|| "the probe did not finish".into())));
         } else if worth(r.verdict) {
             judged.worth.push(r.path);
         } else {
@@ -271,12 +329,13 @@ fn judge(app: &App, w: &Watch, ready: Vec<PathBuf>) -> Result<Judged> {
 }
 
 /// Looks at one folder now: notes what is new, and queues what has settled and is worth it.
-pub fn look(app: &App, id: u64) -> Result<()> {
+/// Asked for `by_hand`, videos waiting for their next try get it now.
+fn look(app: &App, id: u64, by_hand: bool) -> Result<()> {
     let _one = app.watch.looking.lock().unwrap();
     let w = find(app, id)?;
     let started = std::time::Instant::now();
     // Also for a watch saved before this was refused: it stays listed and says what is wrong.
-    let found = output_problem(&w.path, &w.out_dir).and_then(|()| videos(&w.path, &w.out_dir));
+    let found = output_problem(&w.path, &w.out_dir).and_then(|()| make_output_once(app, &w)).and_then(|()| videos(&w.path, &w.out_dir));
     let walk_secs = started.elapsed().as_secs_f64();
     let at = now();
     let (ready, mut changed) = {
@@ -290,6 +349,9 @@ pub fn look(app: &App, id: u64) -> Result<()> {
             Ok(found) => {
                 let first = if std::mem::take(&mut f.skip_existing) { Mark::Before } else { Mark::Fresh };
                 let had_error = f.error.take().is_some();
+                if by_hand {
+                    f.files.values_mut().for_each(|s| s.next_try = 0);
+                }
                 let (ready, changed) = settle(&mut f.files, found, at, first);
                 (ready, changed || had_error)
             }
@@ -313,7 +375,7 @@ pub fn look(app: &App, id: u64) -> Result<()> {
         let mut mark = |paths: Vec<PathBuf>, m: Mark| {
             for p in paths {
                 if let Some(s) = f.files.get_mut(&p) {
-                    s.mark = m;
+                    *s = Seen::new(s.size, s.mtime, m, s.seen);
                 }
             }
         };
@@ -322,10 +384,8 @@ pub fn look(app: &App, id: u64) -> Result<()> {
             Ok(judged) => {
                 mark(judged.worth, Mark::Queued);
                 mark(judged.left, Mark::Left);
-                count_failed_probes(&mut f.files, &judged.unjudged);
-                if let Some(why) = judged.why_unjudged {
-                    f.error = Some(format!("{} video(s) could not be read this time and will be tried again: {why}", judged.unjudged.len()));
-                }
+                // Listed with their reasons by `list`: nothing is wrong with the folder.
+                count_failed_probes(&mut f.files, judged.unjudged, at);
             }
             // They stay fresh and are tried again at the next look.
             Err(e) => f.error = Some(format!("{e:#}")),
@@ -349,7 +409,7 @@ pub fn start(app: Arc<App>) {
             for w in watches {
                 let is_due = due(app.watch.folders.lock().unwrap().get(&w.id), now());
                 if is_due && !jobs::shutting_down(&app) {
-                    let _ = look(&app, w.id);
+                    let _ = look(&app, w.id, false);
                 }
             }
             let (flag, cond) = &app.watch.wake;
@@ -375,13 +435,21 @@ pub fn list(app: &App) -> Value {
             let f = folders.get(&w.id);
             let count = |m: Mark| f.map_or(0, |f| f.files.values().filter(|s| s.mark == m).count());
             let every = f.map_or(LOOK_EVERY, |f| LOOK_EVERY.max((f.walk_secs * 10.0) as u64));
+            let next_look = f.and_then(|f| f.looked).map_or(at, |t| t + every);
+            let unread = || f.into_iter().flat_map(|f| f.files.iter()).filter(|(_, s)| s.unread());
+            // A try happens at the first look after its wait is over.
+            let unread_files: Vec<Value> = unread()
+                .take(UNREAD_LISTED)
+                .map(|(path, s)| json!({ "path": path, "tries": s.tries, "why": s.why, "next_secs": s.next_try.max(next_look).saturating_sub(at) }))
+                .collect();
             json!({
                 "id": w.id, "path": w.path, "out_dir": w.out_dir, "options": w.options, "enabled": w.enabled,
                 "looked": f.and_then(|f| f.looked),
                 "next_secs": f.and_then(|f| f.looked).map(|t| (t + every).saturating_sub(at)),
                 "error": f.and_then(|f| f.error.clone()),
                 "videos": f.map_or(0, |f| f.files.len()),
-                "fresh": count(Mark::Fresh), "queued": count(Mark::Queued), "left": count(Mark::Left), "before": count(Mark::Before),
+                "fresh": count(Mark::Fresh) - unread().count(), "unread": unread().count(), "unread_files": unread_files,
+                "queued": count(Mark::Queued), "left": count(Mark::Left), "before": count(Mark::Before),
             })
         })
         .collect();
@@ -427,7 +495,7 @@ pub fn add(app: &App, body: &Value) -> Result<Value> {
             bail!("{} is watched already", path.display());
         }
         let id = s.watches.iter().map(|w| w.id).max().unwrap_or(0) + 1;
-        s.watches.push(Watch { id, path, out_dir: r.out_dir, options, enabled: true });
+        s.watches.push(Watch { id, path, out_dir: r.out_dir, options, enabled: true, out_dir_made: true });
         id
     };
     app.watch.folders.lock().unwrap().insert(id, Folder { skip_existing: !r.existing, ..Default::default() });
@@ -462,9 +530,10 @@ pub fn set_enabled(app: &App, id: u64, body: &Value) -> Result<Value> {
     Ok(list(app))
 }
 
-/// Looks now, whatever the clock says, and answers when it has looked.
+/// Looks now, whatever the clock says, videos waiting for another try included, and answers
+/// when it has looked.
 pub fn look_now(app: &App, id: u64) -> Result<Value> {
-    look(app, id)?;
+    look(app, id, true)?;
     Ok(list(app))
 }
 
@@ -516,26 +585,56 @@ mod tests {
     }
 
     #[test]
-    fn a_video_whose_probe_failed_gets_three_looks_and_a_new_file_starts_over() {
+    fn a_video_whose_probe_fails_is_tried_less_and_less_often_and_never_left() {
         let path = PathBuf::from("/w/a.mp4");
         let found = || vec![(PathBuf::from("/w/a.mp4"), 5, 100)];
+        let failed = || vec![(PathBuf::from("/w/a.mp4"), "read error".to_string())];
         let mut known = BTreeMap::new();
         settle(&mut known, found(), 1000, Mark::Fresh);
+        // The first looks follow each other.
+        let mut at = 1000;
         for look in 1..PROBE_TRIES {
-            assert_eq!(settle(&mut known, found(), 1000 + 300 * u64::from(look), Mark::Fresh).0, std::slice::from_ref(&path), "look {look}");
-            count_failed_probes(&mut known, std::slice::from_ref(&path));
-            assert_eq!(files(&known), [("/w/a.mp4", Mark::Fresh)], "look {look}");
+            at += LOOK_EVERY;
+            assert_eq!(settle(&mut known, found(), at, Mark::Fresh).0, std::slice::from_ref(&path), "look {look}");
+            count_failed_probes(&mut known, failed(), at);
+            assert_eq!(known[&path].next_try, at, "look {look}");
         }
-        assert_eq!(settle(&mut known, found(), 5000, Mark::Fresh).0, std::slice::from_ref(&path));
-        count_failed_probes(&mut known, std::slice::from_ref(&path));
-        assert_eq!(files(&known), [("/w/a.mp4", Mark::Left)]);
-        assert!(settle(&mut known, found(), 6000, Mark::Fresh).0.is_empty());
+        // After them the waits grow, up to a day, and it is still there to be tried.
+        let mut waits = Vec::new();
+        for _ in 0..12 {
+            at += LOOK_EVERY;
+            while settle(&mut known, found(), at, Mark::Fresh).0.is_empty() {
+                at += LOOK_EVERY;
+            }
+            count_failed_probes(&mut known, failed(), at);
+            waits.push(known[&path].next_try - at);
+            assert!(known[&path].unread());
+            assert_eq!(known[&path].why.as_deref(), Some("read error"));
+        }
+        assert_eq!(waits[..4], [600, 1200, 2400, 4800]);
+        assert!(waits.is_sorted());
+        assert_eq!(*waits.last().unwrap(), LONGEST_WAIT);
+        assert_eq!(known[&path].tries, PROBE_TRIES - 1 + 12);
+        assert_eq!(wait_after(u32::MAX), LONGEST_WAIT);
         // Saved before tries were counted, it starts from none.
         let old: Seen = serde_json::from_value(json!({ "size": 1, "mtime": 2, "mark": "fresh", "seen": 3 })).unwrap();
-        assert_eq!(old.tries, 0);
+        assert_eq!((old.tries, old.next_try, old.why), (0, 0, None));
         // Another file under the name has its own tries.
-        settle(&mut known, vec![(path.clone(), 9, 7000)], 7100, Mark::Fresh);
-        assert_eq!(known[&path].tries, 0);
+        settle(&mut known, vec![(path.clone(), 9, at)], at + 100, Mark::Fresh);
+        assert_eq!((known[&path].tries, known[&path].next_try, known[&path].why.is_none()), (0, 0, true));
+    }
+
+    #[test]
+    fn videos_an_earlier_version_gave_up_on_are_tried_again() {
+        let seen = |mark, tries| Seen { tries, ..Seen::new(1, 2, mark, 3) };
+        let (a, b, c) = (PathBuf::from("/w/a.mp4"), PathBuf::from("/w/b.mp4"), PathBuf::from("/w/c.mp4"));
+        // Left after its tries, left for what it is, and left after a probe that got through.
+        let files = BTreeMap::from([(a.clone(), seen(Mark::Left, PROBE_TRIES)), (b.clone(), seen(Mark::Left, 0)), (c.clone(), seen(Mark::Left, 1))]);
+        let mut folders = BTreeMap::from([(1, Folder { files, ..Default::default() })]);
+        take_back_given_up(&mut folders);
+        let files = &folders[&1].files;
+        assert!(files[&a].unread());
+        assert_eq!((files[&b].mark, files[&c].mark), (Mark::Left, Mark::Left));
     }
 
     #[test]
@@ -551,8 +650,7 @@ mod tests {
             v.sort();
             v
         };
-        // The root lies in the output folder (a watch saved before that was refused).
-        assert_eq!(names(&dir.join("out")), ["a.mp4", "made/b.mp4"]);
+        assert_eq!(names(&dir.join("elsewhere")), ["a.mp4", "made/b.mp4"]);
         // The output folder lies below the root, however its path is written.
         assert_eq!(names(&root.join("made")), ["a.mp4"]);
         assert_eq!(names(&root.join("made/../made")), ["a.mp4"]);

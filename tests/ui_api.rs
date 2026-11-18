@@ -1050,19 +1050,28 @@ fn a_probe_that_was_cut_short_is_tried_again_and_a_rejected_file_is_not() {
     let r = s.post("/api/watch", &json!({ "path": dir, "out_dir": s.dir.join("out"), "options": {} }));
     assert_eq!(r.status, 200, "{}", r.body);
     let id = r.json()["id"].as_u64().unwrap();
+    let watch = || s.post(&format!("/api/watch/{id}/look"), &json!({})).json()["watches"][0].clone();
     let look = || {
-        let w = s.post(&format!("/api/watch/{id}/look"), &json!({})).json()["watches"][0].clone();
-        (w["fresh"].as_u64().unwrap(), w["left"].as_u64().unwrap())
+        let w = watch();
+        (w["fresh"].as_u64().unwrap(), w["left"].as_u64().unwrap(), w["unread"].as_u64().unwrap())
     };
     look();
     for name in ["rejected.mp4", "cut-short.mp4"] {
         std::fs::write(dir.join(name), b"xx").unwrap();
         age(&dir.join(name), 600);
     }
-    assert_eq!(look(), (2, 0), "seen, and not yet quiet for two looks");
-    assert_eq!(look(), (1, 1), "the rejected one is left at once, the other tried again");
-    assert_eq!(look(), (1, 1));
-    assert_eq!(look(), (0, 2), "three tries, and the other is left too");
+    assert_eq!(look(), (2, 0, 0), "seen, and not yet quiet for two looks");
+    assert_eq!(look(), (0, 1, 1), "the rejected one is left at once, the other tried again");
+    assert_eq!(look(), (0, 1, 1));
+    assert_eq!(look(), (0, 1, 1), "three tries, and it is still not given up on");
+    // The page is told what is true of it, and looking by hand tries it at once.
+    let w = watch();
+    let unread = &w["unread_files"][0];
+    assert!(w["error"].is_null(), "{w}");
+    assert!(unread["path"].as_str().unwrap().ends_with("cut-short.mp4"), "{w}");
+    assert_eq!(unread["tries"], 4, "{w}");
+    assert!(!unread["why"].as_str().unwrap_or_default().is_empty(), "{w}");
+    assert!(unread["next_secs"].as_u64().unwrap() >= 1000, "the wait grows: {w}");
 }
 
 /// Waits for something the server does just after what a test saw.
@@ -1201,6 +1210,47 @@ fn an_output_folder_nothing_has_made_yet_is_made_once() {
     let s = Server::start_in(&s.dir, &ffmpeg, &ffprobe);
     assert_eq!(heads(&s).len(), 1);
     assert!(!s.dir.join("first").exists());
+    drop(s);
+
+    // A watch saved by an earlier version, and one that cannot work: the output folder holds
+    // the watched folder. The second is said to be wrong and is not walked.
+    let s = Server::start_with_tools("once-watch", &ffmpeg, &ffprobe, |d| {
+        std::fs::create_dir_all(d.join("videos/in")).unwrap();
+        std::fs::create_dir_all(d.join("videos/inside")).unwrap();
+        std::fs::write(d.join("videos/inside/a.mkv"), b"x").unwrap();
+        let settings = json!({ "watches": [
+            { "id": 1, "path": d.join("videos/in"), "out_dir": d.join("second/out"), "options": {}, "enabled": false },
+            { "id": 2, "path": d.join("videos/inside"), "out_dir": d.join("videos"), "options": {}, "enabled": false, "out_dir_made": true },
+        ] });
+        std::fs::write(d.join("data/av1opt/ui.json"), settings.to_string()).unwrap();
+    });
+    let out = s.dir.join("second/out");
+    let look = |id: u64| s.post(&format!("/api/watch/{id}/look"), &json!({})).json()["watches"].as_array().unwrap().iter().find(|w| w["id"] == id).unwrap().clone();
+    let w = look(1);
+    assert!(w["error"].is_null(), "{w}");
+    assert!(out.is_dir());
+    let settings: Value = serde_json::from_slice(&std::fs::read(s.data("ui.json")).unwrap()).unwrap();
+    assert_eq!(settings["watches"][0]["out_dir_made"], true, "{settings}");
+    std::fs::remove_dir_all(s.dir.join("second")).unwrap();
+    look(1);
+    assert!(!s.dir.join("second").exists());
+    let w = look(2);
+    assert!(w["error"].as_str().unwrap_or_default().contains("contains the watched folder"), "{w}");
+    assert_eq!(w["videos"], 0, "{w}");
+}
+
+#[test]
+fn a_video_an_earlier_version_gave_up_on_is_tried_again() {
+    let s = Server::start("given-up", |d| {
+        std::fs::create_dir_all(d.join("videos/in")).unwrap();
+        let settings = json!({ "watches": [{ "id": 1, "path": d.join("videos/in"), "out_dir": d.join("out"), "options": {}, "enabled": false, "out_dir_made": true }] });
+        std::fs::write(d.join("data/av1opt/ui.json"), settings.to_string()).unwrap();
+        let video = d.join("videos/in/a.mkv");
+        let files = json!({ video.to_str().unwrap(): { "size": 1, "mtime": 2, "mark": "left", "seen": 3, "tries": 3 } });
+        std::fs::write(d.join("data/av1opt/ui-watch.json"), json!({ "format": 1, "folders": { "1": { "files": files } } }).to_string()).unwrap();
+    });
+    let w = s.get("/api/watch").json()["watches"][0].clone();
+    assert_eq!((w["unread"].as_u64(), w["left"].as_u64()), (Some(1), Some(0)), "{w}");
 }
 
 #[test]

@@ -1787,9 +1787,14 @@ views.queue = (root) => {
       const counts = [
         w.queued ? `${w.queued} queued` : null,
         w.fresh ? { text: `${w.fresh} new`, title: `Seen, not queued yet: a video is left alone until it has not changed for ${span(watched.settled_secs)} and two looks` } : null,
+        w.unread ? { text: `${w.unread} not read yet`, title: "Their probe did not get through. They are tried again, less and less often, at least once a day" } : null,
         w.left ? { text: `${w.left} left alone`, title: "AV1 already, too short, too little to gain, or unreadable" } : null,
         w.before ? { text: `${w.before} there before`, title: "In the folder when it was added; only new videos were asked for" } : null,
       ].filter(Boolean);
+      const unread = (w.unread_files || []).map((u) => h("div", { class: "warn sub", title: u.path },
+        `${basename(u.path)}: not read after ${u.tries} ${u.tries === 1 ? "try" : "tries"}${u.why ? ` (${u.why})` : ""}`,
+        w.enabled ? `; next try ${u.next_secs < 45 ? "in a moment" : "in " + span(u.next_secs)}` : ""));
+      if (w.unread > unread.length) unread.push(h("div", { class: "warn sub" }, `and ${w.unread - unread.length} more`));
       const state = !w.enabled ? h("span", { class: "pill warn" }, "Not watching") : w.error ? h("span", { class: "pill bad" }, "Problem") : h("span", { class: "pill ok" }, "Watching");
       return h("div", { class: "watch" },
         h("div", { class: "row" },
@@ -1810,6 +1815,7 @@ views.queue = (root) => {
           w.looked ? `looked ${ago(w.looked)}` : "not looked at yet",
           w.enabled && w.next_secs != null ? `, again ${w.next_secs < 45 ? "in a moment" : "in " + span(w.next_secs)}` : "",
           counts.map((c) => [" · ", typeof c === "string" ? c : h("span", { title: c.title }, c.text)])),
+        unread,
         w.error ? h("div", { class: "bad sub" }, w.error) : null);
     };
     watchBox.replaceChildren(h("div", { class: "panel watched" }, h("h3", {}, "Watched folders"), ws.map(row)));

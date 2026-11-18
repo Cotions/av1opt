@@ -650,12 +650,25 @@ and the benchmark's requests and tuned settings over HTTP (no ffmpeg needed).
 - **A stretch is judged where it sits.** The first version scored a stretch encoded again
   by itself. On a third video one group of pictures passed at every CRF tried (91.6 to
   92.5 over its own windows) while a window across its edge, part of it the neighbour's
-  frames, stayed at 88.5 to 88.9 through three rounds; the video then went to a
-  second search, which found that CRF 32 still left that window short at 91% of the
-  source's size, and it was skipped, where the build before had kept it 38% smaller. The
-  new frames are now set among the frames around them before they are scored, on the same
-  windows the whole video is judged by, and a window that ends up less than a point under
-  the line after three rounds no longer costs the video.
+  frames, stayed at 88.5 to 88.9 through three rounds; the video then went to a second
+  search, which found that CRF 32 still left that window short at 91% of the source's
+  size, and it was skipped, where the build before had kept it 38% smaller. The new
+  frames are now set among the frames around them before they are scored, on the same
+  windows the whole video is judged by. A stretch answers for its own part of a window
+  that lies across its edge: judged by the whole window, the stretch next to a weak one
+  was sent down to CRF 20.5 to make up for frames that were not its own, and
+  gained 1.3 VMAF for it. A stretch whose gain per CRF step puts the line below the lowest
+  CRF allowed is given up before the bytes are spent, and a window less than a point
+  under the line after three rounds no longer costs the video. That video now: six
+  stretches (65 seconds) encoded again in one round, lowest five seconds 89.5 where they
+  were 86.1, 12.6 MB of 430 MB, and 9 of its 30 minutes of encoding spent on the check
+  and the repairs.
+- **Samples miss the mean by about a point.** Scoring the whole video shows what the
+  search could not: at the CRF the samples chose for a mean of 93, three real videos came
+  out at 93.8, 94.0 and 90.7 over their whole length. The low one is lifted by the
+  stretches encoded again (90.7 became 92.8); the high ones keep the bytes they did not
+  need. A second encode at a corrected CRF would get them back for
+  twice the encoding time, and is not done.
 - **A key frame every 10 seconds, and quantization matrices.** SVT-AV1 puts a key frame
   about every 5 seconds and leaves quantization matrices off. At equal VMAF, 10 seconds
   took 3.3% less on eight 10-second clips and 2.6% less on four of 40 seconds (20 seconds:

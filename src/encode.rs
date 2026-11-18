@@ -1357,13 +1357,17 @@ fn verify_whole(
         eprintln!("note: {n}");
         tools.emit(Event::Note { text: n.clone() });
         notes.push(n);
-        let short: Vec<f64> = s.stretches.iter().filter(|x| x.out_of_reach).map(|x| x.vmaf).collect();
-        if let Some(lowest) = short.iter().copied().min_by(f64::total_cmp) {
-            let n = format!("{} of them stay below VMAF {floor:.0} at any CRF (lowest: {lowest:.1}): kept where more bits stop adding quality", short.len());
-            eprintln!("note: {n}");
-            tools.emit(Event::Note { text: n.clone() });
-            notes.push(n);
-        }
+    }
+    let short: Vec<f64> = s.stretches.iter().filter(|x| x.out_of_reach).map(|x| x.vmaf).chain(s.left.iter().copied()).collect();
+    if let Some(lowest) = short.iter().copied().min_by(f64::total_cmp) {
+        let n = format!(
+            "{} stretch{} below VMAF {floor:.0} at any CRF worth its bytes (lowest: {lowest:.1}): kept where more bits stop adding quality",
+            short.len(),
+            if short.len() == 1 { " stays" } else { "es stay" }
+        );
+        eprintln!("note: {n}");
+        tools.emit(Event::Note { text: n.clone() });
+        notes.push(n);
     }
     if s.near > 0 {
         let n = format!(

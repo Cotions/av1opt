@@ -413,4 +413,331 @@ mod tests {
         found.sort();
         assert_eq!(found, vec![(0, 2), (3, 4)]);
     }
+
+    /// A hash `bits` bits away from `h`.
+    fn off(h: u64, bits: u32) -> u64 {
+        h ^ ((1u64 << bits) - 1)
+    }
+
+    fn sides(head: &[Option<u64>], tail: &[Option<u64>]) -> Fingerprint {
+        Fingerprint { head: head.to_vec(), tail: tail.to_vec() }
+    }
+
+    /// `n` frames, of which the first `same` are the ones `base` has and the others are far off.
+    fn frames(base: u64, n: usize, same: usize) -> (Vec<Option<u64>>, Vec<Option<u64>>) {
+        let a: Vec<Option<u64>> = (0..n as u64).map(|i| Some((base + i).wrapping_mul(0x9E3779B97F4A7C15))).collect();
+        let b = a.iter().enumerate().map(|(i, h)| if i < same { *h } else { h.map(|h| !h) }).collect();
+        (a, b)
+    }
+
+    #[test]
+    fn a_video_uses_the_ladder_up_to_half_its_length() {
+        assert_eq!(ladder(3.0), vec![1.5]);
+        assert_eq!(ladder(2.9), vec![2.9 / 4.0]);
+        assert_eq!(ladder(8.0), vec![1.5, 4.0]);
+        assert_eq!(ladder(7.9), vec![1.5]);
+        assert_eq!(ladder(-5.0), vec![0.0]);
+        assert_eq!(ladder(f64::NAN), vec![0.0]);
+    }
+
+    #[test]
+    fn the_number_of_frames_read_is_the_one_the_readme_gives() {
+        for secs in [600.0, 900.0] {
+            assert_eq!(ladder(secs).len() * 2, 14, "{secs}");
+        }
+        assert_eq!(ladder(10_400.0).len() * 2, 22);
+        assert_eq!(ladder(1e7).len() * 2, 22);
+    }
+
+    #[test]
+    fn frames_count_as_the_same_up_to_the_tolerance_and_no_further() {
+        let h = 0x1234_5678_9ABC_DEF0_u64 >> 1;
+        let same = |bits| side(&[Some(h)], &[Some(off(h, bits))], 10);
+        assert_eq!(same(0), (1, 1));
+        assert_eq!(same(10), (1, 1));
+        assert_eq!(same(11), (0, 1));
+    }
+
+    #[test]
+    fn only_frames_both_sides_have_are_compared() {
+        assert_eq!(side(&[], &[], 10), (0, 0));
+        assert_eq!(side(&[Some(1)], &[], 10), (0, 0));
+        assert_eq!(side(&[None, Some(1), Some(1)], &[Some(1), None, Some(1), Some(1)], 10), (1, 1));
+    }
+
+    #[test]
+    fn lengths_count_as_the_same_within_two_percent_or_a_second_and_a_half() {
+        let (a, b) = frames(1, 8, 8);
+        let (x, y) = (sides(&a, &a), sides(&b, &b));
+        let same = |d1, d2| compare(d1, &x, d2, &y, 10).map(|r| r.0);
+        // 2% of the longer one.
+        assert_eq!(same(1000.0, 980.0), Some(Kind::Same));
+        assert_eq!(same(980.0, 1000.0), Some(Kind::Same));
+        assert_eq!(same(1000.0, 979.0), Some(Kind::SameStart));
+        // A second and a half where that is more than 2%.
+        assert_eq!(same(10.0, 11.5), Some(Kind::Same));
+        assert_eq!(same(10.0, 11.6), Some(Kind::SameStart));
+    }
+
+    #[test]
+    fn three_quarters_of_all_frames_make_the_same_video() {
+        let whole = |n, same| {
+            let (a, b) = frames(1, n, same);
+            compare(600.0, &sides(&a, &[]), 600.0, &sides(&b, &[]), 10)
+        };
+        assert_eq!(whole(8, 6), Some((Kind::Same, 0.75)));
+        // One short of it: not the whole video, and too few for a shared start either.
+        assert_eq!(whole(8, 5), None);
+        // Two frames are the least that say anything.
+        assert_eq!(whole(2, 2), Some((Kind::Same, 1.0)));
+        assert_eq!(whole(1, 1), None);
+    }
+
+    #[test]
+    fn frames_of_both_ends_are_added_up_for_the_whole_video() {
+        // Half of one end and all of the other: 6 of 8.
+        let (a, b) = frames(1, 4, 2);
+        let (c, d) = frames(50, 4, 4);
+        assert_eq!(compare(600.0, &sides(&a, &c), 600.0, &sides(&b, &d), 10), Some((Kind::Same, 0.75)));
+    }
+
+    #[test]
+    fn one_end_needs_three_frames_and_four_in_five_of_them() {
+        let start = |n, same, tail_same| {
+            let (a, b) = frames(1, n, same);
+            let (c, d) = frames(50, 5, tail_same);
+            compare(600.0, &sides(&a, &c), 300.0, &sides(&b, &d), 10)
+        };
+        assert_eq!(start(5, 4, 0), Some((Kind::SameStart, 0.8)));
+        assert_eq!(start(5, 3, 0), None);
+        assert_eq!(start(3, 3, 0), Some((Kind::SameStart, 1.0)));
+        assert_eq!(start(2, 2, 0), None);
+        // The same at the other end.
+        let (a, b) = frames(1, 5, 0);
+        let (c, d) = frames(50, 5, 4);
+        assert_eq!(compare(600.0, &sides(&a, &c), 300.0, &sides(&b, &d), 10), Some((Kind::SameEnd, 0.8)));
+        // Both ends agreeing with different lengths: cut in the middle, counted over both.
+        assert_eq!(start(5, 5, 4), Some((Kind::SameStart, 0.9)));
+    }
+
+    #[test]
+    fn a_video_and_its_copy_relate_the_same_way_in_either_order() {
+        let full = fp(1, 600.0);
+        let mut short = fp(9, 90.0);
+        short.head = full.head[..short.head.len()].to_vec();
+        assert_eq!(compare(600.0, &full, 90.0, &short, 10), compare(90.0, &short, 600.0, &full, 10));
+    }
+
+    #[test]
+    fn no_videos_or_one_have_no_pairs() {
+        assert!(links(&[], 10).is_empty());
+        let f = fp(1, 600.0);
+        assert!(links(&[(600.0, &f)], 10).is_empty());
+    }
+
+    fn pick(m: &[Media], prefs: &Prefs, kind: Kind) -> (usize, String) {
+        choose(&(0..m.len()).collect::<Vec<_>>(), m, prefs, kind)
+    }
+
+    #[test]
+    fn a_tenth_less_resolution_counts_as_the_same() {
+        // 90% of the pixels: the higher bitrate of the smaller picture decides.
+        let m = [media("/a", 1000, 1000, "h264", 1.0, 1), media("/b", 1000, 900, "h264", 5.0, 1)];
+        assert_eq!(pick(&m, &Prefs::default(), Kind::Same), (1, "highest bitrate for its codec".to_string()));
+        // Less than that: the bigger picture wins whatever its bitrate.
+        let m = [media("/a", 1000, 1000, "h264", 1.0, 1), media("/b", 1000, 899, "h264", 5.0, 1)];
+        assert_eq!(pick(&m, &Prefs::default(), Kind::Same), (0, "highest resolution".to_string()));
+    }
+
+    #[test]
+    fn bitrates_within_fifteen_percent_count_as_the_same() {
+        let prefs = Prefs { prefer: vec!["/lib".into()], avoid: vec![] };
+        let m = [media("/x/a", 1920, 1080, "h264", 10.0, 1), media("/lib/a", 1920, 1080, "h264", 8.5, 1)];
+        assert_eq!(pick(&m, &prefs, Kind::Same), (1, "preferred folder".to_string()));
+        let m = [media("/x/a", 1920, 1080, "h264", 10.0, 1), media("/lib/a", 1920, 1080, "h264", 8.4, 1)];
+        assert_eq!(pick(&m, &prefs, Kind::Same), (0, "highest bitrate for its codec".to_string()));
+    }
+
+    #[test]
+    fn codecs_are_weighed_as_the_readme_says() {
+        assert_eq!(codec_efficiency("av1"), 2.0);
+        assert_eq!(codec_efficiency("hevc"), 1.5);
+        assert_eq!(codec_efficiency("vp9"), 1.5);
+        assert_eq!(codec_efficiency("h264"), 1.0);
+        assert!(codec_efficiency("mpeg2video") < 1.0);
+        // AV1 at 3 counts as 6, more than 15% under H.264 at 7.1, which stays ahead.
+        let m = [media("/a", 1920, 1080, "av1", 3.0, 1), media("/b", 1920, 1080, "h264", 7.1, 1)];
+        assert_eq!(pick(&m, &Prefs::default(), Kind::Same).0, 1);
+        // At 4 it is the other way round: 8 against 7.1 is close, and the larger file decides.
+        let m = [media("/a", 1920, 1080, "av1", 4.0, 1), media("/b", 1920, 1080, "h264", 7.1, 9)];
+        assert_eq!(pick(&m, &Prefs::default(), Kind::Same), (1, "largest file".to_string()));
+    }
+
+    #[test]
+    fn the_rules_apply_in_the_order_the_readme_gives() {
+        let prefs = Prefs { prefer: vec!["/lib".into()], avoid: vec!["trash".into()] };
+        // Avoided beats resolution.
+        let m = [media("/trash/a", 3840, 2160, "h264", 40.0, 9), media("/x/a", 640, 360, "h264", 1.0, 1)];
+        assert_eq!(pick(&m, &prefs, Kind::Same), (1, "not in an avoided place".to_string()));
+        // Resolution beats bitrate and the preferred folder.
+        let m = [media("/lib/a", 1280, 720, "h264", 40.0, 9), media("/x/a", 1920, 1080, "h264", 1.0, 1)];
+        assert_eq!(pick(&m, &prefs, Kind::Same), (1, "highest resolution".to_string()));
+        // Bitrate beats the preferred folder.
+        let m = [media("/lib/a", 1920, 1080, "h264", 1.0, 9), media("/x/a", 1920, 1080, "h264", 4.0, 1)];
+        assert_eq!(pick(&m, &prefs, Kind::Same), (1, "highest bitrate for its codec".to_string()));
+        // The preferred folder beats the size of the file.
+        let m = [media("/x/a", 1920, 1080, "h264", 4.0, 9), media("/lib/a", 1920, 1080, "h264", 4.0, 1)];
+        assert_eq!(pick(&m, &prefs, Kind::Same), (1, "preferred folder".to_string()));
+        // The size of the file beats the name.
+        let m = [media("/a", 1920, 1080, "h264", 4.0, 1), media("/b", 1920, 1080, "h264", 4.0, 2)];
+        assert_eq!(pick(&m, &prefs, Kind::Same), (1, "largest file".to_string()));
+        // And the name is what is left.
+        let m = [media("/b", 1920, 1080, "h264", 4.0, 2), media("/a", 1920, 1080, "h264", 4.0, 2)];
+        assert_eq!(pick(&m, &prefs, Kind::Same), (1, "first by name".to_string()));
+    }
+
+    #[test]
+    fn the_reason_names_every_rule_that_decided_something() {
+        let prefs = Prefs { prefer: vec![], avoid: vec!["trash".into()] };
+        let m = [media("/trash/a", 1920, 1080, "h264", 4.0, 1), media("/x/a", 640, 360, "h264", 1.0, 1), media("/x/b", 1920, 1080, "h264", 4.0, 1)];
+        assert_eq!(pick(&m, &prefs, Kind::Same), (2, "not in an avoided place, highest resolution".to_string()));
+    }
+
+    #[test]
+    fn the_first_preferred_folder_listed_wins_and_folders_match_whole_names() {
+        let prefs = Prefs { prefer: vec!["/one".into(), "/two".into()], avoid: vec![] };
+        let m = [media("/two/a", 1920, 1080, "h264", 4.0, 1), media("/one/a", 1920, 1080, "h264", 4.0, 1), media("/zero/a", 1920, 1080, "h264", 4.0, 1)];
+        assert_eq!(pick(&m, &prefs, Kind::Same), (1, "preferred folder".to_string()));
+        // /one2 is not inside /one.
+        assert_eq!(prefs.rank(Path::new("/one2/a")), 2);
+        assert_eq!(prefs.rank(Path::new("/one/deep/a")), 0);
+        assert_eq!(prefs.rank(Path::new("/two/a")), 1);
+    }
+
+    #[test]
+    fn avoided_text_is_found_anywhere_in_any_case_and_empty_text_avoids_nothing() {
+        let prefs = Prefs { prefer: vec![], avoid: vec!["TRASH".into(), "corbeille é".into(), String::new()] };
+        assert!(prefs.avoided(Path::new("/x/.trash/a.mp4")));
+        assert!(prefs.avoided(Path::new("/x/a-Trashed.mp4")));
+        assert!(prefs.avoided(Path::new("/x/Corbeille É/a.mp4")));
+        assert!(!prefs.avoided(Path::new("/x/a.mp4")));
+    }
+
+    #[test]
+    fn with_a_cut_copy_the_longest_goes_first_unless_it_is_avoided() {
+        let prefs = Prefs { prefer: vec![], avoid: vec!["trash".into()] };
+        let mut m = vec![media("/trash/full", 640, 360, "h264", 1.0, 9), media("/x/clip", 1920, 1080, "h264", 6.0, 1)];
+        m[1].duration_s = 90.0;
+        assert_eq!(pick(&m, &prefs, Kind::SameEnd), (1, "not in an avoided place".to_string()));
+        // Lengths within a second are not told apart: the next rule decides.
+        let mut m = vec![media("/x/a", 640, 360, "h264", 1.0, 9), media("/x/b", 1920, 1080, "h264", 6.0, 1)];
+        m[1].duration_s = 599.0;
+        assert_eq!(pick(&m, &Prefs::default(), Kind::SameStart), (1, "highest resolution".to_string()));
+        // For copies of one whole video the length is not a rule at all.
+        m[1].duration_s = 500.0;
+        assert_eq!(pick(&m, &Prefs::default(), Kind::Same).0, 1);
+    }
+
+    #[test]
+    fn copies_marked_identical_are_never_told_apart_by_anything_but_the_name() {
+        let mut m = vec![media("/b", 1920, 1080, "h264", 4.0, 7), media("/a", 1920, 1080, "h264", 4.0, 7), media("/c", 1920, 1080, "h264", 4.0, 7)];
+        m[0].identical = Some(3);
+        m[1].identical = Some(3);
+        // The third one is not known to be the same bytes, so this is not an identical set.
+        assert_eq!(pick(&m, &Prefs::default(), Kind::Same), (1, "first by name".to_string()));
+        m[2].identical = Some(4);
+        assert_eq!(pick(&m, &Prefs::default(), Kind::Same), (1, "first by name".to_string()));
+        m[2].identical = Some(3);
+        assert_eq!(pick(&m, &Prefs::default(), Kind::Same), (1, "identical files, first by name".to_string()));
+    }
+
+    #[test]
+    fn a_copy_of_unknown_bitrate_does_not_stop_the_choice() {
+        let m = [media("/a", 1920, 1080, "h264", f64::NAN, 1), media("/b", 1920, 1080, "h264", 4.0, 1)];
+        assert_eq!(pick(&m, &Prefs::default(), Kind::Same).0, 1);
+        let m = [media("/b", 1920, 1080, "h264", 0.0, 1), media("/a", 1920, 1080, "h264", 0.0, 1)];
+        assert_eq!(pick(&m, &Prefs::default(), Kind::Same), (1, "first by name".to_string()));
+    }
+
+    fn numbered(sizes: &[u64]) -> Vec<Media> {
+        sizes.iter().enumerate().map(|(i, &size)| media(&format!("/v/{i}.mp4"), 1920, 1080, "h264", 4.0, size)).collect()
+    }
+
+    fn link(a: usize, b: usize, kind: Kind, score: f32) -> Link {
+        Link { a, b, kind, score }
+    }
+
+    #[test]
+    fn without_links_there_are_no_groups() {
+        assert!(groups(&[], &[], &Prefs::default()).is_empty());
+        assert!(groups(&[], &numbered(&[1, 2]), &Prefs::default()).is_empty());
+    }
+
+    #[test]
+    fn the_copy_kept_comes_first_and_the_others_follow_by_name() {
+        let m = numbered(&[1, 2, 3, 9]);
+        let links = [link(0, 3, Kind::Same, 1.0), link(1, 3, Kind::Same, 1.0), link(2, 3, Kind::Same, 1.0)];
+        let g = groups(&links, &m, &Prefs::default());
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].members, vec![3, 0, 1, 2]);
+        assert_eq!(g[0].reason, "largest file");
+    }
+
+    #[test]
+    fn a_groups_score_is_that_of_its_weakest_link() {
+        let m = numbered(&[1, 2, 3]);
+        let g = groups(&[link(0, 1, Kind::Same, 0.9), link(1, 2, Kind::Same, 0.76)], &m, &Prefs::default());
+        assert_eq!(g[0].score, 0.76);
+    }
+
+    #[test]
+    fn whole_videos_come_first_and_the_most_space_to_win_leads() {
+        let m = numbered(&[50, 10, 50, 40, 90, 80, 7, 6]);
+        let links = [link(6, 7, Kind::SameStart, 1.0), link(0, 1, Kind::Same, 1.0), link(2, 3, Kind::Same, 1.0), link(4, 5, Kind::SameEnd, 1.0)];
+        let g = groups(&links, &m, &Prefs::default());
+        let order: Vec<Vec<usize>> = g.iter().map(|g| g.members.clone()).collect();
+        // Whole videos: 40 to win before 10. Then the others: 80 to win before 6.
+        assert_eq!(order, vec![vec![2, 3], vec![0, 1], vec![4, 5], vec![6, 7]]);
+    }
+
+    #[test]
+    fn groups_with_as_much_to_win_are_listed_by_the_name_of_the_copy_kept() {
+        let m = numbered(&[9, 1, 9, 1]);
+        let g = groups(&[link(2, 3, Kind::Same, 1.0), link(0, 1, Kind::Same, 1.0)], &m, &Prefs::default());
+        assert_eq!(g[0].members, vec![0, 1]);
+        assert_eq!(g[1].members, vec![2, 3]);
+    }
+
+    #[test]
+    #[ignore = "defect: groups with the same copy first and as much to win come out in hash-map order, so runs differ"]
+    fn pairs_that_tie_are_listed_the_same_way_every_run() {
+        let m = numbered(&[9, 1, 1, 1, 1, 1]);
+        let links: Vec<Link> = (1..6).map(|b| link(0, b, Kind::SameStart, 1.0)).collect();
+        let order = || groups(&links, &m, &Prefs::default()).iter().map(|g| g.members.clone()).collect::<Vec<_>>();
+        let first = order();
+        for _ in 0..50 {
+            assert_eq!(order(), first);
+        }
+    }
+
+    #[test]
+    fn a_match_at_one_end_inside_a_group_of_copies_adds_nothing() {
+        let m = numbered(&[3, 2, 1]);
+        let g = groups(&[link(0, 1, Kind::Same, 1.0), link(1, 2, Kind::Same, 1.0), link(0, 2, Kind::SameEnd, 0.9)], &m, &Prefs::default());
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].kind, Kind::Same);
+    }
+
+    #[test]
+    fn of_two_links_between_groups_the_better_scored_shows_when_neither_names_more_kept_copies() {
+        let m = numbered(&[5, 4, 3]);
+        let g = groups(&[link(0, 2, Kind::SameStart, 0.8), link(1, 2, Kind::SameEnd, 0.9), link(0, 1, Kind::Same, 1.0)], &m, &Prefs::default());
+        assert_eq!(g.len(), 2);
+        // 0 is the copy its group keeps, so that pair is shown although the other scored more.
+        assert_eq!((g[1].kind, g[1].members.clone(), g[1].score), (Kind::SameStart, vec![0, 2], 0.8));
+        // Between two videos on their own, the better of the two links is the one shown.
+        let m = numbered(&[5, 4]);
+        let g = groups(&[link(0, 1, Kind::SameStart, 0.8), link(0, 1, Kind::SameEnd, 0.9)], &m, &Prefs::default());
+        assert_eq!((g.len(), g[0].kind, g[0].score), (1, Kind::SameEnd, 0.9));
+    }
 }

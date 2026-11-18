@@ -4,7 +4,7 @@
 use crate::probe::MediaInfo;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Version of a history line. Bump it when a field changes meaning or is removed (adding
 /// fields is fine); lines newer than this are ignored rather than misread. Lines from
@@ -95,6 +95,31 @@ pub fn append(r: &Record) -> Result<()> {
 
 /// All readable records; a missing or partly corrupt file just yields fewer.
 pub fn load() -> Vec<Record> {
-    let Some(text) = path().and_then(|p| std::fs::read_to_string(p).ok()) else { return Vec::new() };
-    text.lines().filter_map(|l| serde_json::from_str::<Record>(l).ok()).filter(|r| r.format <= FORMAT).collect()
+    path().map_or_else(Vec::new, |p| read(&p))
+}
+
+/// Read as bytes and line by line: one damaged line costs that line, not the whole history.
+fn read(path: &Path) -> Vec<Record> {
+    let Ok(bytes) = std::fs::read(path) else { return Vec::new() };
+    bytes.split(|b| *b == b'\n').filter_map(|l| serde_json::from_slice::<Record>(l).ok()).filter(|r| r.format <= FORMAT).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_damaged_line_costs_only_that_line() {
+        let info = MediaInfo { codec: "h264".into(), width: 640, height: 360, fps: 24.0, duration_s: 60.0, ..Default::default() };
+        let line = |crf| serde_json::to_vec(&Record::new(&info, 1e6, 93.0, 5, "whole", crf, "tune=0")).unwrap();
+        let mut file = line(30.0);
+        file.extend_from_slice(b"\n{\"format\":1,\"codec\":\"h\xff\"}\nnot json\n\n");
+        file.extend(line(31.0));
+        file.push(b'\n');
+        let path = std::env::temp_dir().join(format!("av1opt-history-{}.jsonl", std::process::id()));
+        std::fs::write(&path, file).unwrap();
+        let crfs: Vec<_> = read(&path).iter().map(|r| r.crf).collect();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(crfs, [Some(30.0), Some(31.0)]);
+    }
 }

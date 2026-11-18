@@ -412,6 +412,11 @@ struct CacheLine {
 
 /// The cache is tidied once it holds more lines than this: the newest half stays.
 const CACHE_MAX_LINES: usize = 40_000;
+/// Version of the way a trial is measured, part of every cache key. Raise it when the same
+/// file, clips and settings would now give another score or size: other clips cut from the
+/// positions, another way of scoring or averaging them. What was measured before then is
+/// measured again.
+const MEASURING_VERSION: u32 = 1;
 
 impl TrialCache {
     /// A cache that remembers nothing and writes nothing.
@@ -435,13 +440,15 @@ impl TrialCache {
         let mtime = std::fs::metadata(input).ok().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
         let abs = std::fs::canonicalize(input).unwrap_or_else(|_| input.to_path_buf());
         let clips: Vec<String> = positions.iter().map(|(start, secs)| format!("{start:.3}+{secs:.3}")).collect();
-        let file = format!("{}|{size}|{mtime}|{}|{encoder}", abs.display(), clips.join(","));
+        let file = format!("{}|{size}|{mtime}|{}|{encoder}|measured {MEASURING_VERSION}", abs.display(), clips.join(","));
         let mut known = std::collections::HashMap::new();
-        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        // Line by line from the bytes: a line that is not text is passed over, the rest count.
+        let bytes = std::fs::read(&path).unwrap_or_default();
+        let lines: Vec<&str> = bytes.split(|b| *b == b'\n').filter_map(|l| std::str::from_utf8(l).ok()).filter(|l| !l.is_empty()).collect();
         if reuse {
             // The file name is in every line; skip the JSON of the others.
             let needle = serde_json::to_string(&file).unwrap_or_default();
-            for l in text.lines().filter(|l| l.contains(&needle)) {
+            for l in lines.iter().filter(|l| l.contains(&needle)) {
                 if let Ok(c) = serde_json::from_str::<CacheLine>(l)
                     && c.file == file
                 {
@@ -449,8 +456,8 @@ impl TrialCache {
                 }
             }
         }
-        if text.lines().count() > CACHE_MAX_LINES {
-            let keep: Vec<&str> = text.lines().skip(text.lines().count() - CACHE_MAX_LINES / 2).collect();
+        if lines.len() > CACHE_MAX_LINES {
+            let keep = &lines[lines.len() - CACHE_MAX_LINES / 2..];
             let tmp = path.with_extension("jsonl.tmp");
             if std::fs::write(&tmp, keep.join("\n") + "\n").is_ok() {
                 let _ = std::fs::rename(&tmp, &path);
@@ -1340,6 +1347,35 @@ mod tests {
         off.put(&enc, Trial { crf: 30.0, mean_vmaf: 96.0, min_vmaf: 95.0, size_ratio: 0.6 });
         assert!(off.get(&enc, 30.0).is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_damaged_line_leaves_the_other_trials_and_another_way_of_measuring_starts_over() {
+        let dir = std::env::temp_dir().join(format!("av1opt-trial-lines-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (video, store) = (dir.join("v.mkv"), dir.join("t.jsonl"));
+        std::fs::write(&video, b"12345").unwrap();
+        let enc = EncodeSettings { preset: 6, pix_fmt_out: "yuv420p10le", params: "tune=0".into() };
+        let clips = [(1.0, 1.0)];
+        let open = || TrialCache::open_at(store.clone(), &video, 5, &clips, "ffmpeg 1", true);
+        let mut c = open();
+        c.put(&enc, Trial { crf: 35.0, mean_vmaf: 92.0, min_vmaf: 85.0, size_ratio: 0.4 });
+        c.put(&enc, Trial { crf: 36.0, mean_vmaf: 91.0, min_vmaf: 84.0, size_ratio: 0.3 });
+        let good = std::fs::read(&store).unwrap();
+        let cut = good.iter().position(|b| *b == b'\n').unwrap() + 1;
+        let damaged = [&good[..cut], b"\xff not text\n", &good[cut..]].concat();
+        std::fs::write(&store, damaged).unwrap();
+        let c = open();
+        assert!(c.get(&enc, 35.0).is_some() && c.get(&enc, 36.0).is_some());
+
+        // The same trials, as a former way of measuring wrote them, count for nothing.
+        let now = format!("|measured {MEASURING_VERSION}");
+        let earlier = String::from_utf8(good).unwrap().replace(&now, "|measured 0");
+        assert!(!earlier.contains(&now), "{earlier}");
+        std::fs::write(&store, earlier).unwrap();
+        assert!(open().get(&enc, 35.0).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

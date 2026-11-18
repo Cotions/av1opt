@@ -241,14 +241,47 @@ fn free_space(dir: &Path) -> Option<u64> {
     (unsafe { libc::statvfs(c.as_ptr(), &mut st) } == 0).then(|| st.f_bavail as u64 * st.f_frsize as u64)
 }
 
-/// The name a file has while it is on its way to `dest`: hidden, in the same folder, and
-/// never taken for a video by a scan or a batch.
+const STAGING_START: &str = ".av1opt-";
+const STAGING_END: &str = "part";
+
+/// The name a file has while it is on its way to `dest`: hidden, in the same folder, never
+/// taken for a video by a scan or a batch, and this copy's alone. Two long names can be cut
+/// to the same beginning, and two replaces at once must not write into one file.
 fn staging_name(dest: &Path) -> PathBuf {
-    let (start, end) = (".av1opt-", ".part");
-    let mut name = std::ffi::OsString::from(start);
-    name.push(crate::files::leave_room(crate::files::folder_of(dest), dest.file_name().unwrap_or_default(), start.len() + end.len()));
-    name.push(end);
+    let tail = crate::files::unique_tail(STAGING_END);
+    let mut name = std::ffi::OsString::from(STAGING_START);
+    name.push(crate::files::leave_room(crate::files::folder_of(dest), dest.file_name().unwrap_or_default(), STAGING_START.len() + tail.len()));
+    name.push(tail);
     dest.with_file_name(name)
+}
+
+/// Whether the file `name` is a copy on its way to `dest` that nobody is writing any more: one
+/// whose process is gone, or one from before copies had a process in their name.
+fn staging_left_behind(name: &std::ffi::OsStr, dest: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(wanted) = dest.file_name() else { return false };
+    let Some(rest) = name.as_bytes().strip_prefix(STAGING_START.as_bytes()) else { return false };
+    let Some(rest) = rest.strip_suffix(format!(".{STAGING_END}").as_bytes()) else { return false };
+    let room = STAGING_START.len() + STAGING_END.len() + 1;
+    if rest == crate::files::leave_room(crate::files::folder_of(dest), wanted, room).as_bytes() {
+        return true;
+    }
+    // "<name, cut to fit>.<process>.<count>"
+    let mut parts = rest.rsplitn(3, |b| *b == b'.');
+    let (Some(count), Some(process), Some(start)) = (parts.next(), parts.next(), parts.next()) else { return false };
+    let number = |b: &[u8]| std::str::from_utf8(b).ok().and_then(|t| t.parse::<u32>().ok());
+    let (true, Some(process)) = (number(count).is_some() && wanted.as_bytes().starts_with(start), number(process)) else { return false };
+    process != std::process::id() && !Path::new(&format!("/proc/{process}")).exists()
+}
+
+/// Removes what runs that were killed half-way left on their way to `dest`.
+fn clear_left_behind(dest: &Path) {
+    let Ok(entries) = std::fs::read_dir(crate::files::folder_of(dest)) else { return };
+    for entry in entries.flatten() {
+        if staging_left_behind(&entry.file_name(), dest) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Copies `from` to `to` (which must not exist), flushed to disk and with the same date.
@@ -282,8 +315,7 @@ fn move_new(from: &Path, to: &Path, bytes: u64) -> Result<()> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
             let part = staging_name(to);
-            // Ours by name: left by a run that was killed half-way.
-            let _ = std::fs::remove_file(&part);
+            clear_left_behind(to);
             copy_new(from, &part, bytes)?;
             trash::rename_new(&part, to).inspect_err(|_| drop(std::fs::remove_file(&part))).with_context(|| format!("cannot name the copy {}", to.display()))?;
             if let Err(e) = std::fs::remove_file(from) {
@@ -373,8 +405,8 @@ fn apply_with(report: &Path, allow_zfs: bool, to_trash: &dyn Fn(&Path) -> Result
     let in_place = p.dest == p.output;
     let staged = staging_name(&p.dest);
     let stage = || {
-        // Left by a run that was killed half-way; the output itself is still where it was.
-        let _ = std::fs::remove_file(&staged);
+        // The output itself is still where it was.
+        clear_left_behind(&p.dest);
         copy_new(&p.output, &staged, p.output_bytes)
     };
     let staged_first = !in_place && p.copy;
@@ -991,6 +1023,38 @@ mod tests {
         assert!(d.from.parent() == Some(&*f.dir.join("out")) && d.from != f.out(&output));
         let longest = crate::files::name_max(&f.dir);
         assert_eq!(staging_name(&f.lib(&"e".repeat(longest))).file_name().unwrap().len(), longest);
+    }
+
+    #[test]
+    fn two_long_names_that_begin_alike_are_copied_under_names_of_their_own() {
+        let f = Fix::new("staging");
+        let longest = crate::files::name_max(&f.dir);
+        let name = |end: &str| format!("{}{end}", "e".repeat(longest - end.len()));
+        let (a, b) = (staging_name(&f.lib(&name("1.mkv"))), staging_name(&f.lib(&name("2.mkv"))));
+        assert_ne!(a, b);
+        assert_eq!(a.file_name().unwrap().len(), longest);
+        // Nor do two copies to one place take each other's name.
+        assert_ne!(staging_name(&f.lib("x.mkv")), staging_name(&f.lib("x.mkv")));
+    }
+
+    #[test]
+    fn only_copies_nobody_is_writing_are_cleared_away() {
+        let f = Fix::new("left-behind");
+        let dest = f.lib("film.mkv");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        // A process number no process can have, and this very process.
+        let dead = u32::MAX;
+        let ours = staging_name(&dest);
+        let others = [".av1opt-film.mkv.part".to_string(), format!(".av1opt-film.mkv.{dead}.3.part"), format!(".av1opt-film.{dead}.3.part")];
+        let keep = [format!(".av1opt-other.mkv.{dead}.3.part"), ".av1opt-film.mkv.notes".to_string(), "film.mkv.part".to_string()];
+        std::fs::write(&ours, b"being written").unwrap();
+        for name in others.iter().chain(&keep) {
+            std::fs::write(f.lib(name), b"x").unwrap();
+        }
+        clear_left_behind(&dest);
+        assert!(ours.exists(), "the copy of this run stays");
+        assert!(others.iter().all(|n| !f.lib(n).exists()), "copies of runs that are gone");
+        assert!(keep.iter().all(|n| f.lib(n).exists()), "files that are something else");
     }
 
     #[test]

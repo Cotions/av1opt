@@ -56,11 +56,17 @@ pub fn folder_of(path: &Path) -> &Path {
     path.parent().unwrap_or(Path::new("."))
 }
 
+/// The end of a name no other save has: this process's number and a count of its saves, and
+/// then `ending`. Two names cut to fit can begin alike, so it is this that tells them apart.
+pub fn unique_tail(ending: &str) -> String {
+    static SAVES: AtomicU64 = AtomicU64::new(0);
+    format!(".{}.{}.{ending}", std::process::id(), SAVES.fetch_add(1, Ordering::Relaxed))
+}
+
 /// A name beside `path` for what is about to take its place, unique to this save. As much of
 /// the name as there is room for: one near the limit must still have a file beside it.
 pub fn save_name(path: &Path) -> PathBuf {
-    static SAVES: AtomicU64 = AtomicU64::new(0);
-    let tail = format!(".{}.{}.tmp", std::process::id(), SAVES.fetch_add(1, Ordering::Relaxed));
+    let tail = unique_tail("tmp");
     let mut name = leave_room(folder_of(path), path.file_name().unwrap_or_default(), tail.len());
     name.push(tail);
     path.with_file_name(name)

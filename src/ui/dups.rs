@@ -60,9 +60,6 @@ pub fn start(app: &Arc<App>, body: &Value) -> Result<Value> {
     if r.paths.is_empty() {
         bail!("add at least one folder");
     }
-    if r.tolerance > 20 {
-        bail!("tolerance must be 0-20");
-    }
     if super::jobs::shutting_down(app) {
         bail!("av1opt is shutting down");
     }

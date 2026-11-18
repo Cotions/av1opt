@@ -517,7 +517,7 @@ fn benchmark_requests_and_tuned_settings() {
     // Bad requests are refused before anything runs.
     for (body, why) in [
         (json!({ "paths": [] }), "folder"),
-        (json!({ "paths": [videos], "target_vmaf": 30 }), "VMAF"),
+        (json!({ "paths": [videos], "target_vmaf": 0 }), "target VMAF"),
         (json!({ "paths": [videos], "presets": [14] }), "presets"),
         (json!({ "paths": [videos], "presets": [] }), "presets"),
         (json!({ "paths": [videos], "max_videos": 0 }), "videos"),
@@ -1487,4 +1487,57 @@ fn watched_folders_are_kept_looked_at_and_never_queue_what_was_there() {
     assert!(saved.get("watches").is_none(), "{saved}");
     let state: Value = serde_json::from_slice(&std::fs::read(s.data("ui-watch.json")).unwrap()).unwrap();
     assert_eq!(state["folders"], json!({}));
+}
+
+/// What only the page decides is checked by tests/page_checks.js, on a stand-in for the browser.
+#[test]
+fn the_page_checks_pass() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let run = std::process::Command::new("node").arg(root.join("tests/page_checks.js")).arg(root.join("ui/app.js")).output();
+    let output = match run {
+        Ok(output) => output,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return eprintln!("the_page_checks_pass: skipped, node is not installed"),
+        Err(e) => panic!("cannot run node: {e}"),
+    };
+    let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("ok: "), "{text}");
+}
+
+#[test]
+fn numbers_out_of_range_are_refused_by_the_name_of_their_setting() {
+    let s = Server::start("number-ranges", |d| {
+        std::fs::create_dir_all(d.join("videos")).unwrap();
+    });
+    let videos = s.dir.join("videos");
+    let out = s.dir.join("out");
+    let job = |options: Value| json!({ "inputs": [videos], "out_dir": out, "options": options });
+    let watch = |options: Value| json!({ "path": videos, "out_dir": out, "options": options });
+    let scan = |extra: Value| {
+        let mut body = json!({ "paths": [videos] });
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        body
+    };
+    for (path, body, named) in [
+        ("/api/jobs", job(json!({ "target_vmaf": 0 })), "target VMAF"),
+        ("/api/jobs", job(json!({ "target_vmaf": null })), "target VMAF"),
+        ("/api/jobs", job(json!({ "preset": 14 })), "preset"),
+        ("/api/jobs", job(json!({ "workers": 0 })), "workers"),
+        ("/api/jobs", job(json!({ "min_savings": 2 })), "minimum savings"),
+        ("/api/watch", watch(json!({ "target_vmaf": 0 })), "target VMAF"),
+        ("/api/watch", watch(json!({ "workers": 9 })), "workers"),
+        ("/api/scans", scan(json!({ "target_vmaf": 0 })), "target VMAF"),
+        ("/api/scans", scan(json!({ "min_savings": -1 })), "minimum savings"),
+        ("/api/scans", scan(json!({ "preset": null })), "preset"),
+        ("/api/bench", scan(json!({ "sample_secs": 0 })), "clip length"),
+        ("/api/bench", scan(json!({ "presets": [1.5] })), "presets"),
+        ("/api/dups", scan(json!({ "tolerance": 21 })), "tolerance"),
+    ] {
+        let r = s.post(path, &body);
+        assert_eq!(r.status, 400, "{path} {body}: {}", r.body);
+        assert!(r.body.contains(named) && r.body.contains("must be"), "{path} {body}: {}", r.body);
+    }
+    // Nothing of it got anywhere.
+    assert!(s.get("/api/jobs").json()["jobs"].as_array().unwrap().is_empty());
+    assert_eq!(s.get("/api/watch").json()["watches"], json!([]));
 }

@@ -1,6 +1,6 @@
 //! Request handling: session check, routing, static files, the event stream and media ranges.
 
-use super::{App, bench, dups, err_json, hold, jobs, library, watch};
+use super::{App, bench, dups, err_json, fields, hold, jobs, library, watch};
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -197,17 +197,26 @@ fn api(app: &Arc<App>, m: &Method, path: &str, q: &[(String, String)], body: &Va
     match (m, seg.as_slice()) {
         (Method::Get, ["state"]) => Ok(library::state(app)),
         (Method::Get, ["browse"]) => library::browse(param(q, "path"), param(q, "hidden") == Some("1")),
-        (Method::Post, ["scans"]) => library::start_scan(app, body),
+        (Method::Post, ["scans"]) => {
+            fields::check(body, fields::SCAN)?;
+            library::start_scan(app, body)
+        }
         (Method::Get, ["scans", id]) => library::scan_result(app, id.parse()?),
         (Method::Post, ["scans", id, "pick"]) => library::scan_pick(app, id.parse()?, body),
         (Method::Get, ["dups"]) => Ok(dups::list(app)),
-        (Method::Post, ["dups"]) => dups::start(app, body),
+        (Method::Post, ["dups"]) => {
+            fields::check(body, fields::DUPS)?;
+            dups::start(app, body)
+        }
         (Method::Post, ["dups", "pair"]) => dups::pair(app, body),
         (Method::Get, ["dups", id]) => dups::get(app, id.parse()?),
         (Method::Post, ["dups", id, "cancel"]) => dups::cancel(app, id.parse()?),
         (Method::Post, ["dups", id, "trash"]) => dups::trash(app, id.parse()?, body),
         (Method::Get, ["bench"]) => bench::get(app),
-        (Method::Post, ["bench"]) => bench::start(app, body),
+        (Method::Post, ["bench"]) => {
+            fields::check(body, fields::BENCH)?;
+            bench::start(app, body)
+        }
         (Method::Post, ["bench", "cancel"]) => bench::cancel(app),
         (Method::Post, ["bench", "tuning"]) => bench::tune(app, body),
         (Method::Get, ["jobs"]) => Ok(jobs::list(app)),
@@ -216,7 +225,11 @@ fn api(app: &Arc<App>, m: &Method, path: &str, q: &[(String, String)], body: &Va
         (Method::Post, ["jobs", "unrestored", "forget"]) => jobs::unrestored_action(app, false),
         (Method::Get, ["jobs", id]) => jobs::get(app, id.parse()?),
         (Method::Get, ["jobs", id, "files", i]) => jobs::get_file(app, id.parse()?, i.parse()?),
-        (Method::Post, ["jobs"]) => jobs::add(app, body),
+        // Here and not in `jobs::add`: a watch queues through that with the options it saved.
+        (Method::Post, ["jobs"]) => {
+            fields::check(&body["options"], fields::JOB)?;
+            jobs::add(app, body)
+        }
         (Method::Post, ["jobs", id, "cancel"]) => jobs::cancel(app, id.parse()?),
         (Method::Post, ["jobs", id, "remove"]) => jobs::remove(app, id.parse()?),
         (Method::Post, ["jobs", id, "first"]) => jobs::first(app, id.parse()?),
@@ -226,7 +239,10 @@ fn api(app: &Arc<App>, m: &Method, path: &str, q: &[(String, String)], body: &Va
         (Method::Post, ["queue", "schedule"]) => hold::set_schedule(app, body),
         (Method::Post, ["queue", "run-now"]) => hold::run_now(app),
         (Method::Get, ["watch"]) => Ok(watch::list(app)),
-        (Method::Post, ["watch"]) => watch::add(app, body),
+        (Method::Post, ["watch"]) => {
+            fields::check(&body["options"], fields::JOB)?;
+            watch::add(app, body)
+        }
         (Method::Post, ["watch", id, "remove"]) => watch::remove(app, id.parse()?),
         (Method::Post, ["watch", id, "enabled"]) => watch::set_enabled(app, id.parse()?, body),
         (Method::Post, ["watch", id, "look"]) => watch::look_now(app, id.parse()?),

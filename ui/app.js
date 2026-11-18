@@ -87,6 +87,28 @@ function toast(msg, err) {
   toastTimer = setTimeout(() => (t.hidden = true), err ? 7000 : 3000);
 }
 
+// The numbers in `fields` ([input, label, whole?] each), or null after marking the first that
+// is empty or no number and saying which it is. Number("") is 0, which a field left empty must
+// not be sent as, and a number input whose text is no number reads as empty. Whether a number
+// is in range is the server's to say, with the same names.
+function readNumbers(fields) {
+  const numbers = [];
+  for (const [input, label, whole] of fields) {
+    const text = input.value.trim();
+    const n = text === "" ? NaN : Number(text);
+    if (!Number.isFinite(n) || (whole && !Number.isInteger(n))) {
+      input.classList.add("invalid");
+      input.addEventListener("input", () => input.classList.remove("invalid"), { once: true });
+      input.focus();
+      toast(`${label}: enter ${whole ? "a whole number" : "a number"}`, true);
+      return null;
+    }
+    input.classList.remove("invalid");
+    numbers.push(n);
+  }
+  return numbers;
+}
+
 // Keeps the keyboard in an open dialog: focus moves into it (to `first`, else to the dialog
 // itself), Tab stays inside, and Escape calls `onEscape`. Only the dialog on top listens.
 // Returns what to call when the dialog closes: focus goes back to where it was.
@@ -682,12 +704,21 @@ function encodeDialog(inputs, roots = [], watch = false, files = null) {
     let busy = false;
     const close = (v) => { if (cuts) cuts.stop(); bg.remove(); release(); resolve(v); };
     const go = h("button", { class: "primary", onclick: async () => {
-      // An empty preset field is the default, not preset 0.
-      const presetNum = preset.value.trim() === "" ? NaN : Number(preset.value);
+      const numbers = readNumbers([[vmaf, "Target VMAF"], [preset, "Preset", true], [minSav, "Skip if saving under"]]);
+      if (!numbers) return;
+      const [targetVmaf, presetNumber, minSavings] = numbers;
+      // Scenes at once is greyed out and means nothing with per-scene CRF off: what it holds
+      // then is no reason to refuse, and is not sent if it could not be taken.
+      let sceneWorkers = Number.isInteger(o.workers) && o.workers >= 1 && o.workers <= 8 ? o.workers : 1;
+      if (!workers.disabled) {
+        const read = readNumbers([[workers, "Scenes at once", true]]);
+        if (!read) return;
+        [sceneWorkers] = read;
+      }
       const options = {
-        container: container.value, target_vmaf: Number(vmaf.value), preset: isNaN(presetNum) ? 5 : presetNum, svt_params: svtParams.value.trim(),
+        container: container.value, target_vmaf: targetVmaf, preset: presetNumber, svt_params: svtParams.value.trim(),
         tuned: tuning.length > 0 && tuned.checked, scenes: scenes.value,
-        workers: Number(workers.value), min_savings: Number(minSav.value) / 100, force: force.checked, retry_skipped: !watch && retry.checked,
+        workers: sceneWorkers, min_savings: minSavings / 100, force: force.checked, retry_skipped: !watch && retry.checked,
         shrink_audio: shrinkAudio.checked,
         ...meta.get(),
       };
@@ -799,11 +830,15 @@ views.scan = (root) => {
   drawChips();
 
   start.onclick = async () => {
-    prefs.set("scanMinSavings", Number(minSav.value));
-    prefs.set("scanVmaf", Number(vmaf.value));
+    const numbers = readNumbers([[minSav, "Min savings %"], [vmaf, "Target VMAF"]]);
+    if (!numbers) return;
+    const [minSavings, targetVmaf] = numbers;
     start.disabled = true;
     try {
-      const r = await api("/api/scans", { paths: [...roots], min_savings: Number(minSav.value) / 100, target_vmaf: Number(vmaf.value), preset: Number(defaultOptions().preset) || 5 });
+      const r = await api("/api/scans", { paths: [...roots], min_savings: minSavings / 100, target_vmaf: targetVmaf, preset: Number(defaultOptions().preset) || 5 });
+      // Only now: values the server refused would come back at the next visit.
+      prefs.set("scanMinSavings", minSavings);
+      prefs.set("scanVmaf", targetVmaf);
       scanId = lastScanId = r.id;
       scanStatus = null;
       progText.textContent = "listing files…";
@@ -1018,11 +1053,14 @@ views.dups = (root) => {
 
   start.onclick = async () => {
     const avoidList = avoid.value.split(",").map((x) => x.trim()).filter(Boolean);
-    prefs.set("dupAvoid", avoid.value);
-    prefs.set("dupTolerance", Number(tol.value));
+    const numbers = readNumbers([[tol, "Tolerance", true]]);
+    if (!numbers) return;
+    const [tolerance] = numbers;
     start.disabled = true;
     try {
-      const r = await api("/api/dups", { paths: [...roots], prefer, avoid: avoidList, tolerance: Number(tol.value), refresh: refresh.checked });
+      const r = await api("/api/dups", { paths: [...roots], prefer, avoid: avoidList, tolerance, refresh: refresh.checked });
+      prefs.set("dupAvoid", avoid.value);
+      prefs.set("dupTolerance", tolerance);
       runId = lastDupId = r.id;
       dupStatus = null;
       dupMarks.clear();
@@ -1374,11 +1412,14 @@ views.bench = (root) => {
 
   start.onclick = async () => {
     const { presets, param_sets } = form();
-    prefs.set("benchForm", { presets, params: params.value, vmaf: Number(vmaf.value), videos: Number(videos.value), samples: Number(samples.value), secs: Number(secs.value) });
+    const numbers = readNumbers([[vmaf, "Target VMAF"], [videos, "Videos", true], [samples, "Clips per video", true], [secs, "Seconds per clip"]]);
+    if (!numbers) return;
+    const [targetVmaf, maxVideos, clips, clipSecs] = numbers;
     start.disabled = true;
     try {
-      await api("/api/bench", { paths: [...roots], presets, param_sets, target_vmaf: Number(vmaf.value), max_videos: Number(videos.value),
-        samples: Number(samples.value), sample_secs: Number(secs.value), refresh: refresh.checked });
+      await api("/api/bench", { paths: [...roots], presets, param_sets, target_vmaf: targetVmaf, max_videos: maxVideos,
+        samples: clips, sample_secs: clipSecs, refresh: refresh.checked });
+      prefs.set("benchForm", { presets, params: params.value, vmaf: targetVmaf, videos: maxVideos, samples: clips, secs: clipSecs });
       refresh.checked = false;
       etaStart = null;
       progress.firstChild.style.width = "0%";

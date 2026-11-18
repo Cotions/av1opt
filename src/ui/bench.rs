@@ -101,14 +101,9 @@ pub fn start(app: &Arc<App>, body: &Value) -> Result<Value> {
     if r.paths.is_empty() {
         bail!("add at least one folder or video");
     }
-    if !(50.0..=99.5).contains(&r.target_vmaf) {
-        bail!("target VMAF must be between 50 and 99.5");
-    }
-    if r.presets.is_empty() || r.presets.iter().any(|p| *p > 13) {
-        bail!("pick presets between 0 and 13");
-    }
-    if !(1..=50).contains(&r.max_videos) || !(1..=8).contains(&r.samples) || !(2.0..=30.0).contains(&r.sample_secs) {
-        bail!("videos must be 1-50, clips per video 1-8, clip length 2-30 s");
+    // The ranges of the numbers were checked on the way in (see `fields`).
+    if r.presets.is_empty() {
+        bail!("pick at least one of the presets");
     }
     let mut param_sets: Vec<String> = Vec::new();
     for p in r.param_sets.iter().map(|p| p.trim()).filter(|p| !p.is_empty()) {

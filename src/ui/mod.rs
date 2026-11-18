@@ -11,6 +11,7 @@
 
 mod bench;
 mod dups;
+mod fields;
 mod hold;
 mod http;
 mod jobs;

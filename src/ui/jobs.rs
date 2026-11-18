@@ -83,15 +83,9 @@ fn d_savings() -> f64 {
 
 impl JobOptions {
     fn to_options(&self) -> Result<Options> {
-        if !(50.0..=99.5).contains(&self.target_vmaf) {
-            bail!("target VMAF must be between 50 and 99.5");
-        }
-        if self.preset > 13 {
-            bail!("preset must be 0-13");
-        }
-        if !(1..=8).contains(&self.workers) {
-            bail!("workers must be 1-8");
-        }
+        super::fields::TARGET_VMAF.check(self.target_vmaf)?;
+        super::fields::PRESET.check(self.preset.into())?;
+        super::fields::WORKERS.check(self.workers.into())?;
         for &(a, b) in &self.remove {
             if !(a.is_finite() && b.is_finite() && a >= 0.0 && b > a) {
                 bail!("section {a}-{b} is not a valid range");

@@ -324,6 +324,29 @@ fn a_video_is_encoded_checked_reported_and_not_done_twice() {
 
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn the_search_takes_many_short_clips_where_the_whole_video_is_checked() {
+    let c = Case::new("samples");
+    let src = c.clip("a.mp4", "320x180", 20);
+    let run = |extra: &[&str]| {
+        let mut args: Vec<std::ffi::OsString> = vec!["encode".into(), "-o".into(), c.out().into(), "--preset".into(), "10".into(), "--overwrite".into()];
+        args.extend(extra.iter().map(Into::into));
+        args.push(src.clone().into());
+        c.av1opt(&args)
+    };
+    // One pass, checked along its whole length: the search wants the mean, from one-second
+    // clips over all of the video, its start and end too.
+    let r = run(&[]);
+    r.ok().has("sample 1/8 at 0:00:01 (1s)").has("sample 8/8 at 0:00:17 (1s)").has("verifying: the whole video against its source").has("encoded 1,");
+    assert_eq!(c.report("a")["mode"], "whole");
+    // A search that has to mind the worst stretch (scenes may be encoded apart) keeps clips
+    // long enough to score like one, as does a search told what clips to take.
+    run(&["--scenes=auto"]).ok().has("sample 2/2 at").has("(4s)");
+    run(&["--samples", "1"]).ok().has("sample 1/1 at").has("(4s)");
+    run(&["--sample-secs", "2"]).ok().has("sample 5/5 at").has("(2s)");
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn subtitles_chapters_and_languages_follow_the_container() {
     let c = Case::new("subs");
     c.clip("plain.mp4", "320x180", 6);

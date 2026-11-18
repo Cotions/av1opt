@@ -102,11 +102,15 @@ av1opt encode movie.mkv some/folder -o /out [--target-vmaf 93] [--preset 6] [--c
 
 For each file:
 
-1. **Sample** – cuts clips of 4 seconds spread through the video into lossless,
-   constant-frame-rate references (deinterlaced and cropped to even size when needed): 8 of
-   them up to a quarter of an hour, then one for every two minutes more, 32 at most, so that
-   two minutes harder than the rest can't lie between samples. `--samples` and
-   `--sample-secs` set both by hand.
+1. **Sample** – cuts clips spread through the video into lossless, constant-frame-rate
+   references (deinterlaced and cropped to even size when needed). Where the whole video is
+   scored afterwards (step 5, the usual case), the search only has to find the video's mean,
+   and what throws that off is where the clips lie, not how long they are: one clip of 1
+   second for every 8 seconds of video, 8 at least and 64 at most, spread evenly from the
+   first second to the last. Where one CRF has to carry its worst stretch (`--scenes`, HDR,
+   removed sections), clips of 4 seconds, long enough to show a stretch: 8 of them up to a
+   quarter of an hour, then one for every two minutes more, 32 at most. `--samples` and
+   `--sample-secs` set both by hand, and with them the 4-second scheme.
 2. **Search** – finds the highest CRF whose mean VMAF over the samples meets the target. The
    first CRF tried is a guess: 35 for VMAF 93, moved by what your own past encodes say about
    bits per pixel and frame size (the same history `scan` learns from). The second goes where

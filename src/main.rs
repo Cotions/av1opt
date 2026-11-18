@@ -232,13 +232,15 @@ enum Cmd {
         min_crf: u8,
         #[arg(long, default_value_t = 55, value_parser = clap::value_parser!(u8).range(1..=63))]
         max_crf: u8,
-        /// Number of sample clips the CRF search goes by. Without it: one for about every two
-        /// minutes of video, 8 at least and 32 at most.
+        /// Number of sample clips the CRF search goes by. Without it and --sample-secs: 1 s
+        /// clips, one for about every 8 seconds of video (8 at least, 64 at most), where the
+        /// whole video is checked after its encode; one 4 s clip for about every two minutes
+        /// (8 to 32) where it is not (--scenes, removed sections, HDR).
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..=200))]
         samples: Option<u64>,
-        /// Length of a sample clip in seconds.
-        #[arg(long, default_value_t = search::SAMPLE_SECS)]
-        sample_secs: f64,
+        /// Length of a sample clip in seconds (4 with --samples alone).
+        #[arg(long)]
+        sample_secs: Option<f64>,
         /// Skip the full encode if predicted video savings are below this (0-1).
         #[arg(long, default_value_t = 0.15)]
         min_savings: f64,

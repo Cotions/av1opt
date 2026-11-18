@@ -27,7 +27,8 @@ pub struct Options {
     /// Sample clips the CRF search goes by; `None` for as many as the video's length asks
     /// for ([`search::sample_count`]).
     pub samples: Option<usize>,
-    pub sample_secs: f64,
+    /// None: 4 s, or what a search for the mean alone takes (see `search::MEAN_SAMPLE_SECS`).
+    pub sample_secs: Option<f64>,
     pub min_savings: f64,
     pub force: bool,
     pub overwrite: bool,
@@ -398,6 +399,11 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         (p.key == w.key).then_some(p)
     });
 
+    // A one-pass encode that is checked along its whole length afterwards (see `whole_check`
+    // below) asks only the video's mean of the search: many short clips find that better than
+    // a few long ones (see `search::MEAN_SAMPLE_SECS`). Clips asked for by number or length
+    // are laid out as they always were.
+    let mean_only = o.scenes == Scenes::Off && cut.is_none() && !info.hdr && o.samples.is_none() && o.sample_secs.is_none();
     let t0 = tools.stopwatch();
     let (best, mut trials, mut lab, params, positions) = match &saved {
         Some(p) => {
@@ -413,16 +419,23 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
             let learned = if guess.samples == 0 { String::new() } else { format!(", going by {} past encode{}", guess.samples, if guess.samples == 1 { "" } else { "s" }) };
             eprintln!("searching CRF for VMAF >= {} ({model}, preset {preset}), from CRF {start_crf}{learned}", o.target_vmaf);
             let count = |secs: f64| o.samples.unwrap_or_else(|| search::sample_count(secs));
+            let secs = o.sample_secs.unwrap_or(search::SAMPLE_SECS);
+            // What a search that has to mind the worst stretch goes by.
+            let lasting = || search::sample_positions(info.picture_secs(), count(info.picture_secs()), secs);
             let pos = match &cut {
-                Some(c) => c.sample_positions(count(c.kept()), o.sample_secs),
-                None => search::sample_positions(info.picture_secs(), count(info.picture_secs()), o.sample_secs),
+                Some(c) => c.sample_positions(count(c.kept()), secs),
+                None if mean_only => search::mean_sample_positions(info.picture_secs(), search::mean_sample_count(info.picture_secs()), search::MEAN_SAMPLE_SECS),
+                None => lasting(),
             };
+            // A stretch that fails after all is searched for among samples long enough to
+            // score like it.
+            let again = if mean_only { lasting() } else { pos.clone() };
             let cache = search::TrialCache::open(input, size, &pos, tools.encoder_version(), !o.fresh_search);
             let mut lab = search::Lab::new(tools, input, &info, &tmp.path, pos.clone(), vmaf_threads, cache);
             let params = SearchParams { target_vmaf: o.target_vmaf, min_crf: o.min_crf, max_crf: o.max_crf, start_crf, max_size_ratio, worst_sample: None };
             tools.emit(Event::Phase { phase: "searching".into(), detail: format!("VMAF >= {} ({model}, preset {preset}), from CRF {start_crf}", o.target_vmaf) });
             let (best, trials) = search::search(&mut lab, &enc, &params)?;
-            (best, trials, Some(lab), Some(params), Some(pos))
+            (best, trials, Some(lab), Some(params), Some(again))
         }
     };
     // With sections removed the output is wanted anyway: settle for the best quality tried.
@@ -441,8 +454,10 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     };
     // Samples far apart at one CRF: stretches of a one-CRF encode fall well below the target
     // while others are better than they need to be.
+    // (Not asked of a search for the mean alone: its clips are too short to stand for a
+    // stretch, and the weak ones are found in the encode itself.)
     let gap = best.mean_vmaf - best.min_vmaf;
-    let uneven = gap >= UNEVEN_GAP;
+    let uneven = gap >= UNEVEN_GAP && !mean_only;
     let differs = format!("quality differs along the video (worst sample VMAF {:.1}, {:.1} below the samples' mean, at CRF {})", best.min_vmaf, gap, best.crf);
     // A run that had got to its chunks goes on with them.
     let scenes = match o.scenes {
@@ -808,7 +823,7 @@ fn work_dir(input: &Path, out_dir: &Path, size: u64, o: &Options, preset: u8, sv
         .map_or(0, |d| d.as_secs());
     let mut key = format!(
         "v{PLAN_FORMAT}|{}|{size}|{mtime}|{}|{preset}|{}|{}|{}|{}",
-        std::path::absolute(input)?.display(), o.target_vmaf, o.min_crf, o.max_crf, o.samples.map_or("auto".to_string(), |n| n.to_string()), o.sample_secs
+        std::path::absolute(input)?.display(), o.target_vmaf, o.min_crf, o.max_crf, o.samples.map_or("auto".to_string(), |n| n.to_string()), o.sample_secs.unwrap_or(search::SAMPLE_SECS)
     );
     // Only when they differ, so work folders from before this setting existed still resume.
     if svt_params != search::DEFAULT_PARAMS {

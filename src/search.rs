@@ -278,6 +278,36 @@ pub fn sample_positions(duration: f64, count: usize, secs: f64) -> Vec<(f64, f64
         .collect()
 }
 
+/// How long a sample clip is when the search only has to find the video's mean, which is
+/// when the whole video is checked after its encode (see [`crate::repair`]): the weak
+/// stretches are found there, so a sample need not be long enough to score like one.
+/// Measured on three 15-minute videos (2026-11-18): a sample encoded among others scores
+/// within 0.2 VMAF of the same frames in the encode of the whole video, at 1 s as at 4 s.
+/// What the samples' mean misses of the video's is where they lie, not how they are encoded:
+/// 8 clips of 4 s were off by 2.4 VMAF on one video (1.3 on average over where the grid can
+/// lie), 64 clips of 1 s by 0.3. So the same seconds go to many short clips.
+pub const MEAN_SAMPLE_SECS: f64 = 1.0;
+
+/// How many sample clips a search for the mean alone takes: one for about every 8 seconds
+/// of video, 8 at least and 64 at most.
+pub fn mean_sample_count(duration: f64) -> usize {
+    ((duration / 8.0).round() as usize).clamp(8, 64)
+}
+
+/// Sample start times for a search that only needs the video's mean: `count` clips of `secs`
+/// seconds, each in the middle of its share of the whole video. The start and the end are
+/// part of the mean like the rest (leaving 5% out at each end read 0.24 VMAF high on a
+/// video whose first minute was its hardest).
+pub fn mean_sample_positions(duration: f64, count: usize, secs: f64) -> Vec<(f64, f64)> {
+    if duration <= 0.0 {
+        return Vec::new();
+    }
+    let secs = secs.min(duration);
+    let n = ((duration / (secs * 2.0)) as usize).clamp(1, count.max(1));
+    let span = duration - secs;
+    (0..n).map(|i| (span * (i as f64 + 0.5) / n as f64, secs)).collect()
+}
+
 /// Cuts the sample clips at `pos` ((start, length) pairs in source seconds).
 pub fn extract_samples(tools: &Tools, input: &Path, info: &MediaInfo, tmp: &Path, pos: Vec<(f64, f64)>) -> Result<Vec<Sample>> {
     let n = pos.len();
@@ -1343,5 +1373,16 @@ mod tests {
         }
         // A short one gets what fits, with as much between two samples as they are long.
         assert_eq!(sample_positions(20.0, sample_count(20.0), SAMPLE_SECS).len(), 2);
+        // For the mean alone: many short clips over the whole length, apart from each other.
+        assert_eq!([10.0, 60.0, 240.0, 512.0, 900.0, 7200.0].map(mean_sample_count), [8, 8, 30, 64, 64, 64]);
+        for dur in [3.0, 10.0, 61.0, 900.0, 7200.0] {
+            let pos = mean_sample_positions(dur, mean_sample_count(dur), MEAN_SAMPLE_SECS);
+            assert_eq!(pos.len(), mean_sample_count(dur).min((dur / 2.0) as usize).max(1), "{dur}");
+            assert!(pos[0].0 >= 0.0 && pos.last().unwrap().0 + pos.last().unwrap().1 <= dur + 1e-9, "{dur}");
+            assert!(pos.windows(2).all(|w| w[0].0 + w[0].1 <= w[1].0), "{dur}: clips overlap");
+            // Each clip sits in the middle of its share.
+            let share = (dur - pos[0].1) / pos.len() as f64;
+            assert!(pos.iter().enumerate().all(|(i, p)| (p.0 - share * (i as f64 + 0.5)).abs() < 1e-9), "{dur}");
+        }
     }
 }

@@ -296,7 +296,7 @@ impl TimeModel {
             return 0.0;
         }
         // What the search's sample clips add up to, unless the video is shorter.
-        let clips = crate::search::sample_count(secs) as f64 * crate::search::SAMPLE_SECS;
+        let clips = crate::search::mean_sample_count(secs) as f64 * crate::search::MEAN_SAMPLE_SECS;
         let searched = secs.min(clips) * SEARCH_ENCODES;
         self.secs_per_frame(pixels) * m.fps * (secs + searched) * self.factor
     }
@@ -532,11 +532,11 @@ mod tests {
         assert!(TimeModel::fit(&[], 4).secs_per_frame(PIXELS_1080P) > 2.0 * SPF_1080P);
         assert!(TimeModel::fit(&[], 8).secs_per_frame(PIXELS_1080P) < 0.7 * SPF_1080P);
         let hour = guess.secs(&info(1920, 1080, 3600.0));
-        // Thirty sample clips of four seconds, encoded about twice.
-        assert!((hour / (SPF_1080P * 30.0 * 3600.0) - 1.0 - 240.0 / 3600.0).abs() < 1e-9, "{hour}");
-        // A short video is searched on all of it: the search outweighs the encode.
+        // 64 sample clips of a second, encoded about twice.
+        assert!((hour / (SPF_1080P * 30.0 * 3600.0) - 1.0 - 128.0 / 3600.0).abs() < 1e-9, "{hour}");
+        // A short video is searched on most of it: the search outweighs the encode.
         let short = guess.secs(&info(1920, 1080, 10.0));
-        assert!((short / (SPF_1080P * 300.0) - 3.0).abs() < 1e-9, "{short}");
+        assert!((short / (SPF_1080P * 300.0) - 2.6).abs() < 1e-9, "{short}");
         assert_eq!(guess.secs(&info(0, 0, 60.0)), 0.0);
         assert_eq!(guess.secs(&info(1920, 1080, 0.0)), 0.0);
 
@@ -612,11 +612,11 @@ mod tests {
         let learned = TimeModel::fit(&recs, 6);
         assert_eq!(learned.auto_samples, 60);
         assert!((learned.auto_share - 7.0 / 63.0).abs() < 1e-9, "{}", learned.auto_share);
-        // A longer video's search has more clips to encode.
+        // The search's clips are as many for a longer video: they weigh less on it.
         let long = MediaInfo { duration_s: 3600.0, ..info.clone() };
         let per_sec = |m: &MediaInfo| guess.secs(m) / m.duration_s;
-        assert!((per_sec(&info) - guess.secs_per_frame(PIXELS_1080P) * 30.0 * (900.0 + 64.0) / 900.0).abs() < 1e-9);
-        assert!((per_sec(&long) - guess.secs_per_frame(PIXELS_1080P) * 30.0 * (3600.0 + 240.0) / 3600.0).abs() < 1e-9);
+        assert!((per_sec(&info) - guess.secs_per_frame(PIXELS_1080P) * 30.0 * (900.0 + 128.0) / 900.0).abs() < 1e-9);
+        assert!((per_sec(&long) - guess.secs_per_frame(PIXELS_1080P) * 30.0 * (3600.0 + 128.0) / 3600.0).abs() < 1e-9);
     }
 
     #[test]

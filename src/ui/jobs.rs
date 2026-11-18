@@ -112,7 +112,7 @@ impl JobOptions {
             min_crf: 20,
             max_crf: 55,
             samples: None,
-            sample_secs: crate::search::SAMPLE_SECS,
+            sample_secs: None,
             min_savings: self.min_savings.clamp(0.0, 0.95),
             force: self.force,
             overwrite: false,

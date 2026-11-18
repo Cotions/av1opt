@@ -243,6 +243,42 @@ impl std::fmt::Display for Skip {
 
 impl std::error::Error for Skip {}
 
+/// What to do with a finished encode, going by its size (see [`size_verdict`]).
+#[derive(Debug, PartialEq)]
+enum SizeVerdict {
+    Keep,
+    /// Kept, with a note: smaller than the source, by less than was asked.
+    KeepShort(String),
+    /// Not kept, and why.
+    Drop(String),
+}
+
+/// A finished file against its source. The search skips what its samples say would save
+/// less than `min_savings`, but it only sees the video stream at one CRF: stretches encoded
+/// again, the other streams and the container come on top. A file no smaller than its
+/// source is not kept (replacing the original with it would lose quality for nothing); one
+/// that is smaller by less than was asked is, since the work is done and the bytes are real.
+/// `anyway`: the size was not what the encode was for (`--force`, removed sections).
+fn size_verdict(made: u64, source: u64, min_savings: f64, anyway: bool) -> SizeVerdict {
+    if anyway {
+        return SizeVerdict::Keep;
+    }
+    let pct = |part: f64| format!("{:.0}%", part * 100.0);
+    let savings = 1.0 - made as f64 / source.max(1) as f64;
+    // (A --min-savings below nothing says a larger file is welcome.)
+    if made >= source && min_savings >= 0.0 {
+        SizeVerdict::Drop(format!(
+            "the finished file is no smaller than its source ({:.1} MB against {:.1} MB): not kept",
+            made as f64 / 1e6,
+            source as f64 / 1e6
+        ))
+    } else if savings < min_savings {
+        SizeVerdict::KeepShort(format!("the finished file is {} smaller than its source, less than the --min-savings of {} the samples had promised", pct(savings), pct(min_savings)))
+    } else {
+        SizeVerdict::Keep
+    }
+}
+
 macro_rules! skip {
     ($($arg:tt)*) => { return Err(Skip(format!($($arg)*)).into()) };
 }
@@ -417,7 +453,11 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
             let guess = crate::estimate::CrfModel::fit(&history::load(), o.target_vmaf, svt_params);
             let start_crf = guess.start(&info, o.min_crf, o.max_crf);
             let learned = if guess.samples == 0 { String::new() } else { format!(", going by {} past encode{}", guess.samples, if guess.samples == 1 { "" } else { "s" }) };
-            eprintln!("searching CRF for VMAF >= {} ({model}, preset {preset}), from CRF {start_crf}{learned}", o.target_vmaf);
+            // The stretches below the floor are encoded again after a one-pass encode, which
+            // lifts its mean: the search aims at the mean there will be then.
+            let lift_to = mean_only.then_some(o.target_vmaf - VERIFY_SLACK + search::LIFT_ABOVE_FLOOR);
+            let counted = if mean_only { format!(" once stretches below {} are encoded again", o.target_vmaf - VERIFY_SLACK) } else { String::new() };
+            eprintln!("searching CRF for VMAF >= {}{counted} ({model}, preset {preset}), from CRF {start_crf}{learned}", o.target_vmaf);
             let count = |secs: f64| o.samples.unwrap_or_else(|| search::sample_count(secs));
             let secs = o.sample_secs.unwrap_or(search::SAMPLE_SECS);
             // What a search that has to mind the worst stretch goes by.
@@ -430,8 +470,8 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
             // A stretch that fails after all is searched for among samples long enough to
             // score like it.
             let again = if mean_only { lasting() } else { pos.clone() };
-            let cache = search::TrialCache::open(input, size, &pos, tools.encoder_version(), !o.fresh_search);
-            let mut lab = search::Lab::new(tools, input, &info, &tmp.path, pos.clone(), vmaf_threads, cache);
+            let cache = search::TrialCache::open(input, size, &pos, tools.encoder_version(), !o.fresh_search, lift_to);
+            let mut lab = search::Lab::new(tools, input, &info, &tmp.path, pos.clone(), vmaf_threads, cache).lifting(lift_to);
             let params = SearchParams { target_vmaf: o.target_vmaf, min_crf: o.min_crf, max_crf: o.max_crf, start_crf, max_size_ratio, worst_sample: None };
             tools.emit(Event::Phase { phase: "searching".into(), detail: format!("VMAF >= {} ({model}, preset {preset}), from CRF {start_crf}", o.target_vmaf) });
             let (best, trials) = search::search(&mut lab, &enc, &params)?;
@@ -637,6 +677,8 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
 
     let floor_for = |best: &search::Trial| o.target_vmaf.min(best.mean_vmaf) - VERIFY_SLACK;
     let remux = |video: &Path, out: &Path| mux_args(video, false, input, &info, o.container, o.audio, &covers, &meta, &o.meta, out, &mut Vec::new()).0;
+    // The CRF of a search that counted weak samples as encoded again (see `search::lifted_mean`).
+    let lifted_crf = mean_only.then_some(best.crf);
     // The whole video where it can be gone by, spot checks where not.
     let check = |best: &search::Trial, notes: &mut Vec<String>| -> Result<(Vec<f64>, MediaInfo, Option<repair::Summary>)> {
         if whole_check {
@@ -646,6 +688,17 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
                 verify_whole(tools, input, &info, &partial, &streams, &enc, best.crf, floor_for(best), o.min_crf, vmaf_threads, &tmp.path, &remux, notes)?
             {
                 return Ok((scores, out_info, Some(summary)));
+            }
+            // The search had counted its weak samples as encoded again, and they were not.
+            if lifted_crf == Some(best.crf) {
+                let n = format!(
+                    "the CRF was chosen for the mean the video would have with its stretches below VMAF {:.0} encoded again, which could not be done here: its mean may be below {}",
+                    floor_for(best),
+                    o.target_vmaf
+                );
+                eprintln!("note: {n}");
+                tools.emit(Event::Note { text: n.clone() });
+                notes.push(n);
             }
         }
         eprintln!("verifying");
@@ -674,7 +727,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         tools.emit(Event::Phase { phase: "searching".into(), detail: format!("again, with the stretch at {} (VMAF {lowest:.2}) as a sample", hms(at)) });
         let mut pos = pos.clone();
         pos.extend(low.windows.iter().map(|w| (w.0, w.1)));
-        let cache = search::TrialCache::open(input, size, &pos, tools.encoder_version(), !o.fresh_search);
+        let cache = search::TrialCache::open(input, size, &pos, tools.encoder_version(), !o.fresh_search, None);
         let mut lab = search::Lab::new(tools, input, &info, &tmp.path, pos, vmaf_threads, cache);
         let start_crf = (best.crf - ((aim - lowest) / search::VMAF_PER_CRF).max(1.0)).floor().max(o.min_crf as f64) as u8;
         let (found, all) = search::search(&mut lab, &enc, &SearchParams { worst_sample: Some(aim), start_crf, ..params })?;
@@ -696,6 +749,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
                 );
                 eprintln!("note: {n}");
                 tools.emit(Event::Note { text: n.clone() });
+                notes.retain(|n| !n.starts_with("the CRF was chosen for the mean"));
                 notes.push(n);
                 best = b;
                 trials = all;
@@ -730,6 +784,19 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         eprintln!("note: {n}");
         tools.emit(Event::Note { text: n.clone() });
         notes.push(n);
+    }
+
+    // What the samples promised is the video stream at one CRF; the file is that, the
+    // stretches encoded again, the other streams and the container.
+    let made = std::fs::metadata(&partial)?.len();
+    match size_verdict(made, size, o.min_savings, o.force || cut.is_some()) {
+        SizeVerdict::Keep => {}
+        SizeVerdict::KeepShort(n) => {
+            eprintln!("note: {n}");
+            tools.emit(Event::Note { text: n.clone() });
+            notes.push(n);
+        }
+        SizeVerdict::Drop(why) => skip!("{why}"),
     }
 
     // The place was free when the encode began, hours ago perhaps. A file that has turned up
@@ -1432,6 +1499,20 @@ fn free_bytes(dir: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_no_smaller_than_its_source_is_not_kept() {
+        assert_eq!(size_verdict(700, 1000, 0.15, false), SizeVerdict::Keep);
+        assert_eq!(size_verdict(850, 1000, 0.15, false), SizeVerdict::Keep);
+        // Smaller, by less than asked: the stretches encoded again were not in the forecast.
+        assert!(matches!(size_verdict(900, 1000, 0.15, false), SizeVerdict::KeepShort(n) if n.contains("10% smaller") && n.contains("15%")));
+        assert!(matches!(size_verdict(1000, 1000, 0.15, false), SizeVerdict::Drop(_)));
+        assert!(matches!(size_verdict(1200, 1000, 0.0, false), SizeVerdict::Drop(_)));
+        // Asked for whatever the size: --force, removed sections, a --min-savings below zero.
+        assert_eq!(size_verdict(1200, 1000, 0.15, true), SizeVerdict::Keep);
+        assert_eq!(size_verdict(1200, 1000, -1.0, false), SizeVerdict::Keep);
+        assert!(matches!(size_verdict(1, 0, 0.15, false), SizeVerdict::Drop(_)));
+    }
 
     #[test]
     fn spot_checks_do_not_look_at_the_same_stretch_twice() {

@@ -394,10 +394,15 @@ impl TrialCache {
     }
 
     /// Opens the cache for one video and its sample positions. `reuse` false starts empty
-    /// (trials are measured again) but still records what is measured.
-    pub fn open(input: &Path, size: u64, positions: &[(f64, f64)], encoder: &str, reuse: bool) -> Self {
+    /// (trials are measured again) but still records what is measured. `lift_to` is the mark
+    /// of [`lifted_mean`]: a mean counted that way is another number, kept apart.
+    pub fn open(input: &Path, size: u64, positions: &[(f64, f64)], encoder: &str, reuse: bool, lift_to: Option<f64>) -> Self {
         let Ok(dir) = crate::bench::cache_dir() else { return Self::off() };
-        Self::open_at(dir.join("trials-v1.jsonl"), input, size, positions, encoder, reuse)
+        let encoder = match lift_to {
+            Some(mark) => format!("{encoder}|lifted to {mark}"),
+            None => encoder.to_string(),
+        };
+        Self::open_at(dir.join("trials-v1.jsonl"), input, size, positions, &encoder, reuse)
     }
 
     fn open_at(path: PathBuf, input: &Path, size: u64, positions: &[(f64, f64)], encoder: &str, reuse: bool) -> Self {
@@ -471,11 +476,20 @@ pub struct Lab<'a> {
     cache: TrialCache,
     /// CRFs (in quarter steps) of the trials a search has listed.
     shown: std::collections::HashSet<u32>,
+    /// Samples below this count as this in a trial's mean (see [`lifted_mean`]).
+    lift_to: Option<f64>,
 }
 
 impl<'a> Lab<'a> {
     pub fn new(tools: &'a Tools, input: &'a Path, info: &'a MediaInfo, tmp: &'a Path, positions: Vec<(f64, f64)>, vmaf_threads: usize, cache: TrialCache) -> Self {
-        Lab { tools, info, input, tmp, positions, samples: Vec::new(), vmaf_threads, cache, shown: Default::default() }
+        Lab { tools, info, input, tmp, positions, samples: Vec::new(), vmaf_threads, cache, shown: Default::default(), lift_to: None }
+    }
+
+    /// Trials whose mean is the one expected after the weak stretches are encoded again.
+    /// The cache has to have been opened for the same mark ([`TrialCache::open`]).
+    pub fn lifting(mut self, lift_to: Option<f64>) -> Self {
+        self.lift_to = lift_to;
+        self
     }
 
     /// The trial at `crf`, and whether it was known from an earlier run.
@@ -486,7 +500,7 @@ impl<'a> Lab<'a> {
         if self.samples.is_empty() {
             self.samples = extract_samples(self.tools, self.input, self.info, self.tmp, self.positions.clone())?;
         }
-        let t = trial(self.tools, self.info, &self.samples, self.tmp, enc, crf, self.vmaf_threads, self.info.video_bitrate / 8.0)?;
+        let t = trial(self.tools, self.info, &self.samples, self.tmp, enc, crf, self.vmaf_threads, self.info.video_bitrate / 8.0, self.lift_to)?;
         self.cache.put(enc, t);
         Ok((t, false))
     }
@@ -830,6 +844,7 @@ pub fn trial(
     crf: f64,
     threads: usize,
     source_bps: f64,
+    lift_to: Option<f64>,
 ) -> Result<Trial> {
     if samples.is_empty() {
         bail!("no samples");
@@ -840,10 +855,39 @@ pub fn trial(
         None => trial_each(tools, info, samples, tmp, enc, crf, threads)?,
     };
     let secs: f64 = samples.iter().map(|s| s.secs).sum();
-    let mean = scores.iter().sum::<f64>() / scores.len() as f64;
+    let mean = lifted_mean(&scores, lift_to);
     let min = scores.iter().copied().fold(f64::INFINITY, f64::min);
     let ratio = if source_bps > 0.0 { bytes as f64 / secs / source_bps } else { 1.0 };
     Ok(Trial { crf, mean_vmaf: mean, min_vmaf: min, size_ratio: ratio })
+}
+
+/// How far above the floor of the whole-video check a sample is counted when it scores
+/// below that: see [`lifted_mean`].
+pub const LIFT_ABOVE_FLOOR: f64 = 1.5;
+
+/// The mean a video will have once its weak stretches have been encoded again, as far as
+/// its samples can tell: every sample below `lift_to` counts as `lift_to`.
+///
+/// A one-pass encode is scored along its whole length afterwards and the stretches below
+/// the floor are encoded again at a lower CRF ([`crate::repair`]). That lifts the mean: a
+/// search that aims the plain mean of the samples at the target ends above it by as much,
+/// and on a video whose quality is uneven that is a lot. Measured on a 15-minute video with
+/// a hard first minute: aimed at 93, the encode scored 93.8 before and 94.6 after 4:28 of
+/// it had been encoded again, 196 MB; an earlier build that happened to aim lower made
+/// 167 MB of it at 92.8 with the same floor held. The cheapest encode that holds both the
+/// mean and the floor is the one whose mean reaches the target after the repairs: counted
+/// this way the same video came to 185 MB at 93.8, and another to 373 MB at 93.2 where it
+/// had been 430 MB at 94.2, the lowest five seconds of both where they were.
+///
+/// What the samples can know of that was checked on three videos encoded whole at one CRF
+/// with every frame scored, repairs imitated on those scores (a ten-second stretch around
+/// any five seconds below the floor rises until those are 0.7 above it; that predicted the
+/// stretches and the mean of real runs to 0.3). Counting samples of one second below
+/// floor + 1.5 as floor + 1.5 foretold lifts of 2.4, 0.3 and 0.3 as 1.7, 0.2 and 0.3: a
+/// little short where the lift is large, which errs towards quality.
+pub fn lifted_mean(scores: &[f64], lift_to: Option<f64>) -> f64 {
+    let floor = lift_to.unwrap_or(f64::NEG_INFINITY);
+    scores.iter().map(|s| s.max(floor)).sum::<f64>() / scores.len().max(1) as f64
 }
 
 /// Each sample encoded and scored by itself: the score of each, and the bytes of all.
@@ -1394,6 +1438,29 @@ mod tests {
             }
         }
         assert!(sample_positions(0.0, 4, 8.0).is_empty());
+    }
+
+    #[test]
+    fn samples_below_the_mark_count_as_the_mark() {
+        let scores = [96.0, 95.0, 93.0, 90.0, 86.0, 80.0];
+        assert_eq!(lifted_mean(&scores, None), 90.0);
+        // 90 stays, 86 and 80 count as 90.5: (96 + 95 + 93 + 90.5 * 3) / 6.
+        assert!((lifted_mean(&scores, Some(90.5)) - 92.583333).abs() < 1e-5);
+        // Nothing below the mark: the plain mean.
+        assert_eq!(lifted_mean(&scores, Some(70.0)), 90.0);
+        assert_eq!(lifted_mean(&[], Some(90.0)), 0.0);
+        // A mean counted that way is not taken for a plain one from an earlier run.
+        let dir = std::env::temp_dir().join(format!("av1opt-lift-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let video = dir.join("v.mkv");
+        std::fs::write(&video, b"12345").unwrap();
+        let enc = EncodeSettings { preset: 6, pix_fmt_out: "yuv420p10le", params: "tune=0".into() };
+        let clips = [(1.0, 1.0)];
+        let mut plain = TrialCache::open_at(dir.join("t.jsonl"), &video, 5, &clips, "ffmpeg 1", true);
+        plain.put(&enc, Trial { crf: 35.0, mean_vmaf: 92.0, min_vmaf: 85.0, size_ratio: 0.4 });
+        assert!(TrialCache::open_at(dir.join("t.jsonl"), &video, 5, &clips, "ffmpeg 1", true).get(&enc, 35.0).is_some());
+        assert!(TrialCache::open_at(dir.join("t.jsonl"), &video, 5, &clips, "ffmpeg 1|lifted to 90.5", true).get(&enc, 35.0).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

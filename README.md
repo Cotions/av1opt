@@ -121,7 +121,11 @@ For each file:
    88 to 97) that is 2.2 trial encodes on average from the fixed guess and 2.0 from a guess
    within 3 CRF of the answer, never more than 4, and the CRF chosen is never more than 0.05
    VMAF short of the target. A trial encodes the samples end to end as one clip and scores
-   them in one pass. The answer is in SVT-AV1's quarter-step CRF. 4K uses the
+   them in one pass. Where the whole video is checked afterwards, its stretches more than 4
+   below the target are going to be encoded again (step 5), which lifts the mean; so a
+   sample that scores below that line counts as 1.5 above it, about where such a stretch
+   ends up, and the search aims at the mean the video will have when it is done. The
+   answer is in SVT-AV1's quarter-step CRF. 4K uses the
    `vmaf_4k` model. A sample 4 or more below the samples' mean gets a note that quality
    differs along the video (see [per-scene CRF](#per-scene-crf---scenes)). Where the whole
    video can't be scored afterwards (step 5: HDR, removed sections), one CRF has to carry
@@ -132,6 +136,10 @@ For each file:
 3. **Decide** – skips files that are already AV1, Dolby Vision, can't reach the target, or would
    save less than `--min-savings` (15%). The search stops at the first trial that misses the
    target while already larger than that: the CRF the target needs would be larger still.
+   The samples speak for the video stream at one CRF; the finished file (with its
+   stretches encoded again, its other streams and the container) is weighed once more:
+   no smaller than its source, it is not kept; smaller by less than `--min-savings`, it is
+   kept with a note.
    HDR10 and HLG are encoded with their colour signalling
    and mastering/light-level metadata intact (VMAF is then measured on the HDR signal, which
    tracks encoding damage but is not calibrated like SDR scores).
@@ -677,12 +685,28 @@ and the benchmark's requests and tuned settings over HTTP (no ffmpeg needed).
   stretches (65 seconds) encoded again in one round, lowest five seconds 89.5 where they
   were 86.1, 12.6 MB of 430 MB, and 9 of its 30 minutes of encoding spent on the check
   and the repairs.
-- **Samples miss the mean by about a point.** Scoring the whole video shows what the
-  search could not: at the CRF the samples chose for a mean of 93, three real videos came
-  out at 93.8, 94.0 and 90.7 over their whole length. The low one is lifted by the
-  stretches encoded again (90.7 became 92.8); the high ones keep the bytes they did not
-  need. A second encode at a corrected CRF would get them back for
-  twice the encoding time, and is not done.
+- **Samples miss the mean by where they lie, not by how long they are.** Scoring the whole
+  video shows what the search could not: at the CRF eight clips of 4 seconds chose for a
+  mean of 93, three real videos came out at 93.8, 94.0 and 90.7 over their whole length.
+  Taken apart on those videos (every frame of a whole encode scored, the clips' own frames
+  set against the rest), a clip's score is within 0.2 of the same frames in the whole
+  encode at any length down to one second; the error is all in which seconds were looked
+  at. Eight clips of 4 seconds read 2.5 high, 0.9 low and 0.6 low; 64 of one second, for
+  the same seconds of encoding, 0.5 low, 0.2 high and 0.1 high, and 0.26 off (root mean
+  square) wherever the grid happens to start, where the eight were 0.5 to 1.3 off. Skipping
+  the first and last 5% read 0.1 to 0.4 high and was dropped. Correcting the clips' mean by
+  how many bits the source spends near each one did nothing: a source encoded at a flat
+  rate says nothing about where AV1 will have it hard.
+- **The stretches encoded again lift the mean, so the search counts on them.** With the
+  mean found that closely, a video with a hard stretch still ended well above its target:
+  aimed at 93, one 15-minute video scored 93.8 after its one pass and 94.6 once 4:28 of it
+  had been encoded again, at 196 MB. A search that counts every sample below the line as
+  1.5 above it (repairs imitated on the per-frame scores of three videos said that is
+  about where they end, a little short where much is lifted) picks the CRF whose mean
+  reaches the target after the repairs: the same video 184.7 MB at a mean of 93.8 (CRF
+  38.75 instead of 37; 92.5 before 5:52 of it was encoded again), and a second 373.3 MB
+  at 93.2 instead of 429.7 MB at 94.2 (CRF 39 instead of 37, 1:56 encoded again instead
+  of 1:05). The lowest five seconds stayed at 89.3 and 89.5.
 - **A key frame every 10 seconds, and quantization matrices.** SVT-AV1 puts a key frame
   about every 5 seconds and leaves quantization matrices off. At equal VMAF, 10 seconds
   took 3.3% less on eight 10-second clips and 2.6% less on four of 40 seconds (20 seconds:
@@ -690,9 +714,22 @@ and the benchmark's requests and tuned settings over HTTP (no ffmpeg needed).
   seeking quick and the stretches that can be encoded again short). Matrices took another
   1.1%, less on every clip. Both together: 4.4% on the eight clips they were chosen on and
   2.1% on six they were not (less on each of the six, by VMAF NEG and SSIMULACRA2 too),
-  with encoding time within 2% either way. Tried the same way and left out: `tune=2` and `tune=5`, variance
-  boost, encoding at a reduced resolution, and `tune=1` (better on some clips, worse on
-  others).
+  with encoding time within 2% either way. Tried the same way and left out: `tune=2`, variance
+  boost, encoding at a reduced resolution, film grain synthesis (3 to 8% larger at equal
+  scores, which is all these metrics can say about it), and `tune=1` (better on some clips,
+  worse on others).
+- **`tune=5` wins by VMAF and by nothing else.** SVT-AV1 4.2's VMAF tune sharpens the
+  picture before encoding it. At equal VMAF it is 21 to 33% smaller on three sets of clips;
+  at equal VMAF NEG (which takes enhancement out) 6 to 12%; at equal SSIMULACRA2 0 to 4%
+  *larger*, at equal PSNR-HVS 2.5% larger, at equal MS-SSIM 2.3% smaller. At the same VMAF
+  its NEG is 1.1 to 1.5 lower and its SSIMULACRA2 4 to 5 lower: most of the gain is the
+  sharpening VMAF rewards. It is not the default; `--svt-params tune=5` has it.
+- **A slower preset is the one sure gain left, and it costs time.** Against preset 6 at
+  equal VMAF: preset 5 is 6.0%, 5.5% and 4.9% smaller on three sets of clips (eight of 10
+  seconds, six others, four of 40 seconds), preset 4 9.1%, 9.7% and 8.1%, on every clip and
+  by VMAF NEG, XPSNR and SSIMULACRA2 alike, for about 27% and 60% more processor time
+  (measured on a busy machine). The default stays 6; `--preset 5` or `4` is there for a
+  library that can wait.
 - **A container's length is not the picture's.** One recording had 7:40 of video under 17:32
   of sound. Samples and spot checks were placed along the 17:32 and asked for frames that
   don't exist. They go by the video stream's own length now.
@@ -726,7 +763,8 @@ new one worth encoding, one in AV1 and one still being written). It needs an ffm
 `cargo test` covers the CRF search (exactness against brute force, trial count and misses on
 the measured curves of eight real clips, starting from scores known beforehand), where clips are cut relative to frames, the first-CRF guess and what it learns from past encodes, the
 encode time estimate (the first guess, learning a faster machine, other presets), the
-trial cache (what counts as the same file, clips and settings), which sound tracks are copied
+trial cache (what counts as the same file, clips and settings), the mean that counts on
+weak stretches being encoded again, what is done with a finished file by its size, which sound tracks are copied
 or shrunk, chunk CRF
 estimation, scene chunk planning, sample placement, frame-rate snapping and source filters, plus
 the duplicate finder's hashes (scaling, noise, black bars, flat frames), pair rules and keep

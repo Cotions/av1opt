@@ -593,7 +593,7 @@ fn main() -> Result<()> {
                 let clips = search::extract_samples(&tools, &input, &info, &dir, pos)?;
                 for crf in list {
                     let started = std::time::Instant::now();
-                    let t = search::trial(&tools, &info, &clips, &dir, &enc, crf, vmaf_threads, info.video_bitrate / 8.0)?;
+                    let t = search::trial(&tools, &info, &clips, &dir, &enc, crf, vmaf_threads, info.video_bitrate / 8.0, None)?;
                     println!(
                         "{}",
                         serde_json::json!({

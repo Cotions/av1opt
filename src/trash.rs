@@ -8,8 +8,18 @@ use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+thread_local! {
+    /// Stands in for the user's trash in the tests of this thread.
+    pub(crate) static TEST_HOME_TRASH: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
 /// The user's own trash: `$XDG_DATA_HOME/Trash`.
 fn home_trash() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(p) = TEST_HOME_TRASH.with(|h| h.borrow().clone()) {
+        return Some(p);
+    }
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
@@ -171,6 +181,52 @@ pub fn rename_new(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
+/// The reverse of [`encode_path`]. None for text that is not such an encoding.
+fn decode_path(s: &str) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let (b, mut out, mut i) = (s.as_bytes(), Vec::new(), 0);
+    while i < b.len() {
+        if b[i] == b'%' {
+            out.push(u8::from_str_radix(s.get(i + 1..i + 3)?, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    Some(PathBuf::from(std::ffi::OsString::from_vec(out)))
+}
+
+/// Whether `trashed` is a file in a trash whose info file says it came from `original`.
+///
+/// What says so has to be worth believing: a report on disk names both paths, and
+/// [`restore`] moves the one to the other. An absolute `Path=` counts in the user's own trash
+/// only. In any other trash folder the path counts from the folder the trash is in, as the
+/// specification has it, so a `.Trash-1000` somebody put into a folder of downloads can only
+/// ever give files back to that folder.
+pub fn holds(trashed: &Path, original: &Path) -> bool {
+    let inner = || -> Option<bool> {
+        let files = trashed.parent().filter(|d| d.file_name().is_some_and(|n| n == "files"))?;
+        let bin = files.parent()?;
+        let mut info_name = trashed.file_name()?.to_os_string();
+        info_name.push(".trashinfo");
+        let info = std::fs::read_to_string(bin.join("info").join(info_name)).ok()?;
+        let recorded = decode_path(info.lines().find_map(|l| l.strip_prefix("Path="))?)?;
+        if recorded.is_absolute() {
+            let home = std::fs::canonicalize(home_trash()?).ok()?;
+            return Some(std::fs::canonicalize(bin).ok()? == home && recorded == original);
+        }
+        // `.Trash-<uid>` lies at the top itself, `.Trash/<uid>` one folder below it.
+        let top = match bin.parent()? {
+            shared if shared.file_name().is_some_and(|n| n == ".Trash") => shared.parent()?,
+            top => top,
+        };
+        let plain = recorded.components().all(|c| matches!(c, std::path::Component::Normal(_)));
+        Some(plain && top.join(recorded) == original)
+    };
+    inner().unwrap_or(false)
+}
+
 /// Puts a file `trash` moved away back at `to` and drops its info file. Nothing at `to` is
 /// replaced.
 pub fn restore(trashed: &Path, to: &Path) -> Result<()> {
@@ -194,6 +250,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_trash_is_believed_only_about_what_it_can_know() {
+        let dir = scratch("holds");
+        let home = dir.join("data/Trash");
+        TEST_HOME_TRASH.with(|h| *h.borrow_mut() = Some(home.clone()));
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        let a = dir.join("lib/vidéo #1.mkv");
+        std::fs::write(&a, b"first").unwrap();
+        let dest = trash_with(&a, Some(&home), 1000, "2026-11-10T22:15:03".into()).unwrap();
+        assert!(holds(&dest, &a));
+        assert!(!holds(&dest, &dir.join("lib/other.mkv")));
+        assert!(!holds(&a, &a));
+        assert_eq!(decode_path(&encode_path(&a)), Some(a.clone()));
+        assert_eq!(decode_path("a%2"), None);
+        assert_eq!(decode_path("a%zz"), None);
+
+        // The trash at the top of a drive: paths count from that top, and only plain ones.
+        let top = dir.join("drive");
+        let bin = top.join(".Trash-1000");
+        std::fs::create_dir_all(bin.join("files")).unwrap();
+        std::fs::create_dir_all(bin.join("info")).unwrap();
+        let put = |name: &str, path: &str| {
+            std::fs::write(bin.join("files").join(name), b"x").unwrap();
+            std::fs::write(bin.join("info").join(format!("{name}.trashinfo")), format!("[Trash Info]\nPath={path}\nDeletionDate=2026-11-10T22:15:03\n")).unwrap();
+            bin.join("files").join(name)
+        };
+        assert!(holds(&put("in.mkv", "films/in.mkv"), &top.join("films/in.mkv")));
+        assert!(!holds(&put("abs.mkv", "/etc/abs.mkv"), Path::new("/etc/abs.mkv")));
+        assert!(!holds(&put("up.mkv", "../lib/up.mkv"), &top.join("../lib/up.mkv")));
+        assert!(!holds(&put("up.mkv", "../lib/up.mkv"), &dir.join("lib/up.mkv")));
+        // Shared trash folders keep one folder per user.
+        let shared = top.join(".Trash/1000");
+        std::fs::create_dir_all(shared.join("files")).unwrap();
+        std::fs::create_dir_all(shared.join("info")).unwrap();
+        std::fs::write(shared.join("files/s.mkv"), b"x").unwrap();
+        std::fs::write(shared.join("info/s.mkv.trashinfo"), "[Trash Info]\nPath=films/s.mkv\n").unwrap();
+        assert!(holds(&shared.join("files/s.mkv"), &top.join("films/s.mkv")));
+        // No info file, no say.
+        std::fs::write(bin.join("files/bare.mkv"), b"x").unwrap();
+        assert!(!holds(&bin.join("files/bare.mkv"), &top.join("bare.mkv")));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

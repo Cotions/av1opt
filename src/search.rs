@@ -841,6 +841,10 @@ fn concat_line(path: &Path) -> String {
 fn trial_joined(tools: &Tools, info: &MediaInfo, samples: &[Sample], tmp: &Path, enc: &EncodeSettings, crf: f64, threads: usize) -> Result<Option<(Vec<f64>, u64)>> {
     // Absolute: a relative name in a concat list counts from the list's folder.
     let list = tmp.join("samples.txt");
+    // A list is read line by line: a folder with a line break in its name cannot be listed.
+    if samples.iter().any(|s| s.reference.to_string_lossy().contains(['\n', '\r'])) {
+        return Ok(None);
+    }
     let lines = samples.iter().map(|s| Ok(concat_line(&std::path::absolute(&s.reference)?))).collect::<Result<String>>()?;
     std::fs::write(&list, lines)?;
     let out = tmp.join(format!("samples.crf{crf}.mkv"));

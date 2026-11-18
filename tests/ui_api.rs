@@ -197,6 +197,12 @@ fn files_from_a_newer_version_are_not_overwritten() {
 fn settings_tools_validation() {
     let s = Server::start("tools", |_| {});
     assert_eq!(s.post("/api/settings/tools", &json!({ "ffmpeg": "relative/ffmpeg" })).status, 400);
+    // The page starts these programs: only ones named like the tools they stand for.
+    for bad in [json!({ "ffmpeg": "/bin/sh" }), json!({ "ffmpeg": "rm" }), json!({ "ffprobe": "/usr/bin/ffmpeg" }), json!({ "ffmpeg": "/usr/bin/ffprobe" })] {
+        let r = s.post("/api/settings/tools", &bad);
+        assert_eq!(r.status, 400, "{bad}: {}", r.body);
+    }
+    assert_eq!(s.post("/api/settings/tools", &json!({ "ffmpeg": "ffmpeg7", "ffprobe": "/opt/x/ffprobe-7.1" })).status, 200);
     let r = s.post("/api/settings/tools", &json!({ "ffmpeg": "/nonexistent/ffmpeg", "ffprobe": "" }));
     assert_eq!(r.status, 200, "{}", r.body);
     let ui: Value = serde_json::from_slice(&std::fs::read(s.data("ui.json")).unwrap()).unwrap();

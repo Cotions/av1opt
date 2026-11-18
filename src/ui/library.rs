@@ -106,6 +106,11 @@ pub fn set_tools(app: &App, body: &Value) -> Result<Value> {
         match body.get(k).and_then(Value::as_str).map(str::trim) {
             None | Some("") => Ok(None),
             Some(p) if p.contains('/') && !Path::new(p).is_absolute() => bail!("{k}: use an absolute path or a program name"),
+            // This page starts what is named here. Whoever can reach the page can already
+            // encode and trash; running any program of the machine is not part of that.
+            Some(p) if !Path::new(p).file_name().and_then(|n| n.to_str()).is_some_and(|n| n.to_ascii_lowercase().starts_with(k)) => {
+                bail!("{k}: the program's name has to start with {k}")
+            }
             Some(p) => Ok(Some(p.to_string())),
         }
     };
@@ -364,7 +369,7 @@ fn allow_video(app: &App, p: &Path) {
 fn replace_state(report: &Path) -> Value {
     match replace::check(report) {
         Check::Ready(p) => json!({ "state": "ready", "dest": p.dest, "copy": p.copy, "zfs": p.zfs, "removed": p.removed }),
-        Check::Replaced(d) => json!({ "state": "replaced", "trash": d.trash, "from": d.from, "can_undo": d.can_undo }),
+        Check::Replaced(d) => json!({ "state": "replaced", "trash": d.trash, "from": d.from, "can_undo": d.can_undo, "zfs": d.zfs }),
         Check::No(why) => json!({ "state": "no", "why": why }),
     }
 }
@@ -377,7 +382,9 @@ fn source_of(app: &App, report: &Path, r: &Value) -> PathBuf {
         allow_video(app, &input);
         return input;
     };
-    if is_video(&input) && trash.is_file() && std::fs::metadata(&trash).is_ok_and(|m| Some(m.len()) == r["source_bytes"].as_u64()) {
+    // Only a file the trash itself says came from the original: the report alone could name
+    // any file of the right size.
+    if is_video(&input) && crate::trash::holds(&trash, &input) && std::fs::symlink_metadata(&trash).is_ok_and(|m| m.is_file() && Some(m.len()) == r["source_bytes"].as_u64()) {
         app.allow(&trash);
     }
     trash

@@ -107,7 +107,7 @@ pub fn one_line(message: &str) -> &str {
 pub fn probe(ffprobe: &str, path: &Path, file_size: u64) -> Result<MediaInfo> {
     let out = Command::new(ffprobe)
         .args(["-v", "error", "-show_format", "-show_streams", "-of", "json"])
-        .arg(path)
+        .arg(crate::tools::probe_arg(path))
         .output()
         .with_context(|| format!("failed to run {ffprobe}"))?;
     if !out.status.success() {
@@ -240,7 +240,7 @@ pub fn audio_bitrate(ffprobe: &str, path: &Path, index: usize) -> Option<f64> {
     let out = Command::new(ffprobe)
         .args(["-v", "error", "-read_intervals", "%+120", "-select_streams", &format!("a:{index}")])
         .args(["-show_entries", "packet=pts_time,duration_time,size", "-of", "csv=p=0"])
-        .arg(path)
+        .arg(crate::tools::probe_arg(path))
         .output()
         .ok()?;
     let (mut bytes, mut first, mut last) = (0.0, f64::INFINITY, f64::NEG_INFINITY);

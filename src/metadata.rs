@@ -225,6 +225,9 @@ fn field_text(v: &Value) -> Option<String> {
         Value::Array(a) => a.iter().filter_map(field_text).collect::<Vec<_>>().join(", "),
         _ => return None,
     };
+    // Tags travel as program arguments and end up in players' lists: a NUL would stop ffmpeg
+    // from starting at all (after the whole encode), other control characters are noise.
+    let s: String = s.chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\t')).collect();
     Some(s).filter(|s| !s.trim().is_empty())
 }
 

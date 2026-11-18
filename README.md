@@ -359,6 +359,9 @@ single output files.
   output must be there with the sizes the encode recorded, and the output must be the smaller
   one. Originals that are links, reports without full paths (very old ones) and a new name
   that is already taken in the original's folder are refused too.
+- A report is a file like any other, so it is only followed where `encode` writes one: next
+  to its output, under the output's name. Both files it names have to be videos. A report
+  that turns up in some other folder and points at files elsewhere moves nothing.
 - Nothing is deleted and no file is written over. The original goes to the trash of the drive
   it is on (as in the duplicates view), and the space is freed when you empty the trash. If the
   output can't be put in place after that, the original is taken back out of the trash.
@@ -372,8 +375,10 @@ single output files.
 - The report stays in the output folder and records where both files went (`replaced`: the
   time, the output's old path, the place in the trash). `--undo` uses that to put things back
   while the original is still in the trash: the AV1 file returns to the output folder, the
-  original to its place. After the trash is emptied there is nothing to undo.
-- Originals on ZFS are left alone unless `--allow-zfs` is given.
+  original to its place. After the trash is emptied there is nothing to undo. The trash has
+  to agree: a file goes back only if the trash's own record says it came from that place.
+- Originals on ZFS are left alone unless `--allow-zfs` is given, and are put back there by
+  `--undo` only with it.
 - A later `encode` or `scan` over the library sees the replaced files as AV1 and skips them.
 
 ## ui (optional)
@@ -455,6 +460,8 @@ The server listens on 127.0.0.1 only and prints a sign-in link with a random tok
 gets it as a cookie). Requests with a foreign Host or Origin are refused, and media are only
 served for files you picked in the app. Output folders on ZFS are refused (no override in the UI);
 replacing an original that is on ZFS needs a tick in the dialog, or the confirmation in Compare, which says so.
+Putting one back there, and moving duplicates on ZFS to the trash, ask in a dialog of their own.
+The ffmpeg and ffprobe programs set in Settings have to be named like that (`ffmpeg`, `/opt/x/ffprobe-7`).
 `AV1OPT_UI_TOKEN` sets the token (for a desktop wrapper loading the same page);
 `AV1OPT_UI_DEV=<repo>/ui` serves the page files from disk while working on them.
 
@@ -500,6 +507,8 @@ environment, so set the ffmpeg path once in Settings.
 - `encode` never modifies, moves or deletes an input. Only `replace` (and the two buttons for
   it in the UI) moves originals, and only to the trash.
 - Refuses to write to ZFS unless `--allow-zfs` is passed.
+- An output file that appears in the output folder while its encode runs is not written
+  over: the finished encode is kept next to it under another name, and the run says where.
 - Each ffmpeg run gets a memory cap (`--memory-limit`, default 40% of RAM) and low CPU priority
   (`--nice 10`), so a 4K encode can't freeze the desktop.
 - Temp files live in a hidden folder in the output directory and are removed afterwards; leftovers

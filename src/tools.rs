@@ -446,7 +446,7 @@ impl Tools {
     pub fn key_packets(&self, path: &Path) -> Result<Vec<bool>> {
         let out = Command::new(&self.ffprobe)
             .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=flags", "-of", "csv=p=0"])
-            .arg(path)
+            .arg(probe_arg(path))
             .output()
             .context("failed to run ffprobe")?;
         if !out.status.success() {
@@ -459,7 +459,7 @@ impl Tools {
     pub fn count_frames(&self, path: &Path) -> Result<u64> {
         let out = Command::new(&self.ffprobe)
             .args(["-v", "error", "-select_streams", "v:0", "-count_packets", "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0"])
-            .arg(path)
+            .arg(probe_arg(path))
             .output()
             .context("failed to run ffprobe")?;
         String::from_utf8_lossy(&out.stdout)
@@ -474,6 +474,12 @@ impl Tools {
 /// a relative name for a protocol (`a:b/x.mkv`: "Protocol not found").
 pub fn path_arg(p: &Path) -> String {
     std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().into_owned()
+}
+
+/// A path as an ffprobe argument: absolute for the same reason, and so that a name that
+/// starts with a dash (`-i.mp4`, given after `--` or found in a folder) is not an option.
+pub fn probe_arg(p: &Path) -> std::ffi::OsString {
+    std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()).into_os_string()
 }
 
 pub fn hms(secs: f64) -> String {

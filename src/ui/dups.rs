@@ -166,6 +166,9 @@ pub fn get(app: &App, id: u64) -> Result<Value> {
 #[derive(Deserialize)]
 struct TrashRequest {
     paths: Vec<PathBuf>,
+    /// Also trash files stored on ZFS (asked for in a dialog of its own, per request).
+    #[serde(default)]
+    allow_zfs: bool,
 }
 
 /// Whether `paths` may go to the trash: only files of the result that are still as the search
@@ -219,6 +222,14 @@ pub fn trash(app: &App, id: u64, body: &Value) -> Result<Value> {
     paths.dedup();
     let present = |f: &File| std::fs::symlink_metadata(&f.path).is_ok_and(|m| m.is_file() && m.len() == f.size);
     check_trash(&report, &gone, &paths, &present)?;
+    // A trash on ZFS is a write to the pool like any other: asked about first, and nothing
+    // is moved before the answer.
+    if !r.allow_zfs {
+        let on_zfs: Vec<&PathBuf> = paths.iter().filter(|p| crate::fsguard::on_zfs(p)).collect();
+        if !on_zfs.is_empty() {
+            return Ok(json!({ "needs_zfs": on_zfs, "trashed": [], "failed": [], "bytes": 0 }));
+        }
+    }
 
     let (mut trashed, mut failed, mut bytes) = (Vec::new(), Vec::new(), 0u64);
     for p in &paths {

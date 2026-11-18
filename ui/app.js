@@ -1041,7 +1041,20 @@ function renderDups(out, run, reload) {
     if (!ok) return;
     trashBtn.disabled = true;
     try {
-      const r = await api(`/api/dups/${run.id}/trash`, { paths: m });
+      let r = await api(`/api/dups/${run.id}/trash`, { paths: m });
+      if (r.needs_zfs) {
+        const z = r.needs_zfs;
+        const yes = await confirmDialog({
+          title: `${plural(z.length, "file")} on ZFS`,
+          action: "Move to trash on ZFS too",
+          body: [
+            h("p", { class: "warn" }, `${plural(z.length, "file")} of these ${z.length === 1 ? "is" : "are"} stored on ZFS, which av1opt writes to only when asked. The trash of that drive is on it too. Nothing has been moved yet.`),
+            h("div", { class: "mono trash-list" }, z.slice(0, 12).join("\n")),
+            z.length > 12 ? h("p", { class: "dim" }, `… and ${z.length - 12} more`) : null],
+        });
+        if (!yes) { trashBtn.disabled = false; return; }
+        r = await api(`/api/dups/${run.id}/trash`, { paths: m, allow_zfs: true });
+      }
       for (const p of r.trashed) dupMarks.delete(p);
       toast(`${plural(r.trashed.length, "file")} moved to the trash (${bytes(r.bytes)})`, r.failed.length > 0);
       if (r.failed.length) pendingTrashFailures = r.failed;
@@ -2448,7 +2461,15 @@ function comparePlayer(root, r) {
       } }, "Replace original…"))]
     : rp.state === "replaced" ? [
       h("p", { class: "dim" }, "The AV1 file is where the original was. ", rp.can_undo ? "The original is in the trash." : "The original is no longer in the trash (or one of the two files changed), so this can't be undone here."),
-      rp.can_undo ? h("div", { class: "row" }, h("button", { title: `Original back to ${r.input}\nAV1 file back to ${rp.from}`, onclick: () => act("/api/replace/undo", { report: r.report_path }, "Original back in its place") }, "Put original back")) : null]
+      rp.can_undo ? h("div", { class: "row" }, h("button", { title: `Original back to ${r.input}\nAV1 file back to ${rp.from}`, onclick: async () => {
+        if (rp.zfs && !await confirmDialog({
+          title: "Put the original back on ZFS?",
+          action: "Put original back",
+          body: [h("p", { class: "warn" }, "The original's folder is on ZFS, which av1opt writes to only when asked. Putting it back here is asking."),
+            h("div", { class: "mono trash-list" }, r.input)],
+        })) return;
+        act("/api/replace/undo", { report: r.report_path, allow_zfs: !!rp.zfs }, "Original back in its place");
+      } }, "Put original back")) : null]
     : h("p", { class: "dim" }, `The AV1 file can't take the original's place: ${rp.why}.`));
 
   const side = h("div", {},

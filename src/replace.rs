@@ -50,6 +50,8 @@ pub struct Replaced {
     pub output_bytes: u64,
     /// The original is still in the trash and the AV1 file where it was put, both unchanged.
     pub can_undo: bool,
+    /// The original's folder is on ZFS: it goes back there only when asked.
+    pub zfs: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -84,6 +86,17 @@ fn full_path(r: &Value, key: &str) -> Result<PathBuf, String> {
     Ok(p)
 }
 
+/// Whether `report` is the report `encode` wrote for an output at `output`: the same folder,
+/// the output's name with `.av1opt.json` for its extension. A report is only a file, and what
+/// it names gets moved; one that turns up somewhere else (in a folder of downloads, say) and
+/// points at files elsewhere is not followed.
+fn beside(report: &Path, output: &Path) -> bool {
+    let folder = |p: &Path| std::path::absolute(p).ok().and_then(|p| std::fs::canonicalize(p.parent()?).ok());
+    report.file_name().is_some()
+        && report.file_name() == output.with_extension("av1opt.json").file_name()
+        && folder(report).is_some_and(|d| Some(d) == folder(output))
+}
+
 /// Looks at one report and the two files it names. Changes nothing.
 pub fn check(report: &Path) -> Check {
     match check_inner(report) {
@@ -101,11 +114,24 @@ fn check_inner(report: &Path) -> Result<Check, String> {
     if let Some(done) = r.get("replaced").filter(|d| d.is_object()) {
         let from = full_path(done, "from")?;
         let trash = full_path(done, "trash")?;
-        let can_undo = file_size(&trash) == Some(source_bytes) && file_size(&output) == Some(output_bytes);
-        return Ok(Check::Replaced(Replaced { report: report.to_path_buf(), source, dest: output, from, trash, source_bytes, output_bytes, can_undo }));
+        if !beside(report, &from) {
+            return Err("the report is not the one next to where the output was".into());
+        }
+        if !crate::scan::is_video(&source) || !crate::scan::is_video(&output) {
+            return Err("the report names a file that is not a video".into());
+        }
+        let can_undo = file_size(&trash) == Some(source_bytes) && file_size(&output) == Some(output_bytes) && trash::holds(&trash, &source);
+        let zfs = source.parent().is_some_and(crate::fsguard::on_zfs);
+        return Ok(Check::Replaced(Replaced { report: report.to_path_buf(), source, dest: output, from, trash, source_bytes, output_bytes, can_undo, zfs }));
     }
     if source == output {
         return Err("output and original are the same file".into());
+    }
+    if !beside(report, &output) {
+        return Err("the report is not the one next to its output".into());
+    }
+    if !crate::scan::is_video(&source) || !crate::scan::is_video(&output) {
+        return Err("the report names a file that is not a video".into());
     }
     match std::fs::symlink_metadata(&source) {
         Err(_) => return Err("the original is gone".into()),
@@ -364,6 +390,11 @@ pub fn undo(report: &Path, allow_zfs: bool) -> Result<Replaced> {
         Some(n) if n != d.source_bytes => bail!("the file in the trash is not the original"),
         Some(_) => {}
     }
+    if !trash::holds(&d.trash, &d.source) {
+        bail!("the trash does not say that {} came from {}", d.trash.display(), d.source.display());
+    }
+    // The original goes back to its folder: the same rule as when it left.
+    crate::fsguard::ensure_writable_location(d.source.parent().context("the original has no folder")?, allow_zfs)?;
     if file_size(&d.dest) != Some(d.output_bytes) {
         bail!("the AV1 file is gone or has changed");
     }
@@ -454,9 +485,16 @@ pub fn run(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool) -> Result<(
 
     if back {
         let (can, cannot): (Vec<_>, Vec<_>) = replaced.into_iter().partition(|d| d.can_undo);
+        let (can, on_zfs): (Vec<_>, Vec<_>) = can.into_iter().partition(|d| !d.zfs || allow_zfs);
         println!("{} can go back to their place", plural(can.len(), "original", "originals"));
         for d in &can {
             println!("  {}  (AV1 file back to {})", d.source.display(), d.from.display());
+        }
+        if !on_zfs.is_empty() {
+            println!("{} on ZFS (--allow-zfs puts back there too)", plural(on_zfs.len(), "original was", "originals were"));
+            for d in &on_zfs {
+                println!("  {}", d.source.display());
+            }
         }
         if !cannot.is_empty() {
             println!("{} cannot: no longer in the trash, or the AV1 file changed", plural(cannot.len(), "original", "originals"));
@@ -554,6 +592,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(dir.join("lib")).unwrap();
             std::fs::create_dir_all(dir.join("out")).unwrap();
+            trash::TEST_HOME_TRASH.with(|h| *h.borrow_mut() = Some(dir.join("Trash")));
             Fix { dir }
         }
 
@@ -786,6 +825,68 @@ mod tests {
         assert_eq!(state(&f), before);
     }
 
+    /// A report is a file anybody can write. One that is not next to its output, names files
+    /// that are no videos, or points at a trash file that never was the original moves nothing.
+    #[test]
+    fn a_report_is_only_followed_next_to_its_output_and_for_videos() {
+        let f = Fix::new("forged");
+        let state = |f: &Fix| {
+            let mut names: Vec<String> = walkdir::WalkDir::new(&f.dir).into_iter().flatten().filter(|e| e.file_type().is_file() && e.path().extension().is_none_or(|x| x != "lock")).map(|e| e.path().display().to_string()).collect();
+            names.sort();
+            names
+        };
+        // The report of one output, copied to another folder (with an output of that size).
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        std::fs::create_dir_all(f.dir.join("downloads")).unwrap();
+        let stray = f.dir.join("downloads/a.av1opt.json");
+        std::fs::copy(&report, &stray).unwrap();
+        assert_eq!(no(&stray), "the report is not the one next to its output");
+        // Next to the output, under another name.
+        let renamed = f.out("other.av1opt.json");
+        std::fs::copy(&report, &renamed).unwrap();
+        assert_eq!(no(&renamed), "the report is not the one next to its output");
+        // Files that are no videos.
+        let doc = f.encode("letter.odt", "letter.mkv", 1000, 400);
+        assert_eq!(no(&doc), "the report names a file that is not a video");
+        let out_doc = f.encode("b.mp4", "b.txt", 1000, 400);
+        assert_eq!(no(&out_doc), "the report names a file that is not a video");
+        let before = state(&f);
+        for r in [&stray, &renamed, &doc, &out_doc] {
+            assert!(f.apply(r).is_err());
+            assert!(undo(r, true).is_err());
+        }
+        assert_eq!(state(&f), before);
+
+        // A replaced report whose trash file is some other file of the right size: no undo.
+        let done = f.apply(&report).unwrap();
+        let victim = f.dir.join("elsewhere.mp4");
+        std::fs::write(&victim, vec![b'v'; 1000]).unwrap();
+        let honest = std::fs::read(&report).unwrap();
+        let mut r: Value = serde_json::from_slice(&honest).unwrap();
+        r["replaced"]["trash"] = json!(victim);
+        std::fs::write(&report, serde_json::to_vec(&r).unwrap()).unwrap();
+        let Check::Replaced(d) = check(&report) else { panic!() };
+        assert!(!d.can_undo);
+        assert!(undo(&report, true).unwrap_err().to_string().starts_with("the trash does not say that"));
+        assert!(victim.exists() && f.lib("a.mkv").exists());
+        // A trash folder of somebody else's making, whose info file names the original by
+        // its full path: only the user's own trash is believed about that.
+        let fake = f.dir.join("downloads/.Trash-1000");
+        std::fs::create_dir_all(fake.join("files")).unwrap();
+        std::fs::create_dir_all(fake.join("info")).unwrap();
+        std::fs::write(fake.join("files/a.mp4"), vec![b'v'; 1000]).unwrap();
+        std::fs::write(fake.join("info/a.mp4.trashinfo"), format!("[Trash Info]\nPath={}\nDeletionDate=2026-11-10T22:15:03\n", f.lib("a.mp4").display())).unwrap();
+        r["replaced"]["trash"] = json!(fake.join("files/a.mp4"));
+        std::fs::write(&report, serde_json::to_vec(&r).unwrap()).unwrap();
+        assert!(undo(&report, true).unwrap_err().to_string().starts_with("the trash does not say that"));
+        // The honest report still undoes.
+        std::fs::write(&report, honest).unwrap();
+        let Check::Replaced(d) = check(&report) else { panic!() };
+        assert!(d.can_undo && d.trash == done.trash);
+        undo(&report, false).unwrap();
+        assert!(f.lib("a.mp4").exists() && f.out("a.mkv").exists());
+    }
+
     #[test]
     fn undo_needs_the_original_in_the_trash_and_a_free_place() {
         let f = Fix::new("undo");
@@ -831,6 +932,9 @@ mod tests {
         std::fs::File::options().write(true).open(&o).unwrap().set_modified(old).unwrap();
         let mut r: Value = serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
         r["output"] = json!(o);
+        // The report lives next to its output, there too.
+        std::fs::remove_file(&report).unwrap();
+        let report = out.join("far.av1opt.json");
         std::fs::write(&report, serde_json::to_vec(&r).unwrap()).unwrap();
 
         let Check::Ready(plan) = check(&report) else { panic!() };
@@ -853,7 +957,8 @@ mod tests {
         assert_eq!(std::fs::read(&o).unwrap(), vec![b'o'; 2000]);
         assert_eq!(std::fs::read(f.lib("far.mp4")).unwrap(), vec![b's'; 5000]);
         assert!(!f.lib("far.mkv").exists());
-        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1);
+        let videos = std::fs::read_dir(&out).unwrap().flatten().filter(|e| !e.file_name().to_string_lossy().contains(".av1opt.json")).count();
+        assert_eq!(videos, 1);
         let _ = std::fs::remove_dir_all(&out);
     }
 

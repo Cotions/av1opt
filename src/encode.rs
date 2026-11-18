@@ -732,7 +732,18 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         notes.push(n);
     }
 
-    std::fs::rename(&partial, &output).or_else(|_| std::fs::copy(&partial, &output).map(|_| ()))?;
+    // The place was free when the encode began, hours ago perhaps. A file that has turned up
+    // there since is not this run's to write over: the encode is kept under another name.
+    if o.overwrite {
+        std::fs::rename(&partial, &output).or_else(|_| std::fs::copy(&partial, &output).map(|_| ()))?;
+    } else if let Err(e) = crate::trash::rename_new(&partial, &output) {
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(e).with_context(|| format!("cannot put the encode at {}", output.display()));
+        }
+        let aside = out_dir.join(format!("{stem}.av1opt-{}.{}", std::process::id(), o.container.ext()));
+        crate::trash::rename_new(&partial, &aside).with_context(|| format!("{} appeared during the encode, and the encode could not be kept", output.display()))?;
+        bail!("{} appeared during the encode; the finished encode is at {}", output.display(), aside.display());
+    }
     if o.meta.keep_dates
         && let Err(e) = metadata::copy_mtime(input, &output)
     {

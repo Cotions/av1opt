@@ -557,8 +557,10 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     // Needs room for the encode plus slack; predicted size can be off for unusual content.
     // Scene mode holds the chunks, the joined stream and the final file at once.
     // Lossless chunk references add up to ~4 GB each (4K) per worker.
-    let copies = if scenes { 3.0 } else { 1.5 };
-    let refs = if scenes { o.workers as u64 * 4_000_000_000 } else { 0 };
+    // The check of a whole video holds the encode, its video stream alone, that stream with
+    // stretches replaced and the file joined anew, and a lossless stretch of the source.
+    let copies = if scenes || whole_check { 3.0 } else { 1.5 };
+    let refs = if scenes { o.workers as u64 * 4_000_000_000 } else if whole_check { 1_000_000_000 } else { 0 };
     let need = (size as f64 * best.size_ratio.max(0.3) * copies) as u64 + 500_000_000 + refs;
     if let Some(free) = free_bytes(out_dir)
         && free < need
@@ -872,10 +874,23 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         encode_secs,
         notes: &notes,
     };
-    std::fs::write(output.with_extension("av1opt.json"), serde_json::to_vec_pretty(&report)?)?;
+    let report_at = output.with_extension("av1opt.json");
+    // A report that says where an original went (it is in the trash, and can be put back) is
+    // the only record of that: it is set aside, not written over.
+    let records_original = std::fs::read(&report_at).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).is_some_and(|r| r.get("replaced").is_some_and(|v| !v.is_null()));
+    if records_original {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let aside = output.with_extension(format!("av1opt.json.replaced-{now}"));
+        if std::fs::rename(&report_at, &aside).is_ok() {
+            eprintln!("note: the report of an earlier encode, which says where its original is, was kept as {}", aside.display());
+        }
+    }
+    crate::files::write_new(&report_at, &serde_json::to_vec_pretty(&report)?)?;
     // Chunk sizes are exact; container-reported bitrates can include audio (Matroska).
     let video_bitrate = match &chunks {
         Some(c) => c.iter().map(|r| r.bytes).sum::<u64>() as f64 * 8.0 / info.picture_secs(),
+        None if o.container == Container::Mkv => probe::stream_bytes(&tools.ffprobe, &output, out_info.video_index)
+            .map_or(out_info.video_bitrate, |bytes| bytes as f64 * 8.0 / out_info.picture_secs().max(0.001)),
         None => out_info.video_bitrate,
     };
     let mut record = history::Record::new(&info, video_bitrate, o.target_vmaf, preset, report.mode, best.crf, svt_params);
@@ -1102,11 +1117,18 @@ fn stream_args(
 ) -> Streams {
     let mut a = Vec::new();
     let mut meta_from = Vec::new();
+    if !info.other_streams.is_empty() {
+        notes.push(format!("left out: {} (the video, its sound, subtitles, covers and attachments are what is kept)", info.other_streams.join(", ")));
+    }
+    // What a track is marked as (the default one, forced subtitles) comes along with a track
+    // that is mapped from the source; one that comes out of the cut has to be told.
+    let marked = |marks: Option<&String>| marks.filter(|m| !m.is_empty()).map_or("0".to_string(), String::clone);
     for (i, s) in info.audio.iter().enumerate() {
         let kbps = (s.channels.max(1) * 64).clamp(64, 384);
         if cut_subs.is_some() {
             a.extend(["-map".into(), format!("[ao{i}]")]);
             a.extend([format!("-c:a:{i}"), "libopus".into(), format!("-b:a:{i}"), format!("{kbps}k")]);
+            a.extend([format!("-disposition:a:{i}"), marked(Some(&s.disposition))]);
             notes.push(format!("audio {i}: {} -> Opus {kbps} kbps (cut audio is re-encoded)", s.codec));
             meta_from.push((format!("a:{i}"), format!("a:{i}")));
         } else if COPY_AUDIO.contains(&s.codec.as_str()) {
@@ -1147,6 +1169,9 @@ fn stream_args(
         };
         a.extend(["-map".into(), from]);
         a.extend([format!("-c:s:{kept_subs}"), codec.into()]);
+        if cut_subs.is_some() {
+            a.extend([format!("-disposition:s:{kept_subs}"), marked(info.subtitle_dispositions.get(i))]);
+        }
         meta_from.push((format!("s:{kept_subs}"), format!("s:{i}")));
         kept_subs += 1;
     }
@@ -1300,7 +1325,9 @@ fn check_layout(tools: &Tools, info: &MediaInfo, out: &Path, streams: &Streams, 
     if out_info.codec != "av1" {
         bail!("verify: output video is {}, expected av1", out_info.codec);
     }
-    let tolerance = (duration * 0.005).max(1.0);
+    // (A share of the length, for containers that round it; never so much that a film could
+    // lose its last half minute unnoticed.)
+    let tolerance = (duration * 0.005).clamp(1.0, 5.0);
     if (out_info.duration_s - duration).abs() > tolerance {
         bail!("verify: duration {:.1}s, expected {:.1}s", out_info.duration_s, duration);
     }
@@ -1471,13 +1498,25 @@ fn verify_whole(
             ends.push(&s.stretches[s.stretches.len() - 1]);
         }
         for (i, st) in ends.into_iter().enumerate() {
-            let secs = st.secs.min(repair::WINDOW_SECS);
-            let Some(alone) = outcome.at(st.start_secs, secs) else { continue };
-            let at = (st.start_secs + search::first_frame(&out_info), st.start_secs + search::first_frame(info), secs);
+            // Half the clip before the stretch and half in it (or, for a stretch the video
+            // begins with, across its end): were the stretch's frames a step off, no one shift
+            // of the clip would set both halves right, as it would a clip from inside it.
+            let half = repair::WINDOW_SECS / 2.0;
+            let across = if st.start_secs >= half { st.start_secs - half } else { (st.start_secs + st.secs - half).max(0.0) };
+            let span = repair::WINDOW_SECS.min(outcome.length() - across);
+            let (begin, secs, alone) = match outcome.at(across, span).filter(|_| span >= half) {
+                Some(alone) => (across, span, alone),
+                None => {
+                    let secs = st.secs.min(repair::WINDOW_SECS);
+                    let Some(alone) = outcome.at(st.start_secs, secs) else { continue };
+                    (st.start_secs, secs, alone)
+                }
+            };
+            let at = (begin + search::first_frame(&out_info), begin + search::first_frame(info), secs);
             let v = spot_check(tools, input, info, out, &out_info, at, alone - JOIN_SLACK, threads, tmp, &format!("joined{i}"))?;
             eprintln!("  joined video at {}: VMAF {v:.2} ({alone:.2} by itself)", hms(at.0));
             if v < alone - JOIN_SLACK {
-                bail!("verify: the stretch at {} encoded again reads VMAF {v:.2} in the joined video, {alone:.2} by itself; keeping nothing", hms(at.0));
+                bail!("verify: the video around the stretch at {} encoded again reads VMAF {v:.2} once joined, {alone:.2} by its frames; keeping nothing", hms(st.start_secs));
             }
         }
         let (count, total) = (s.stretches.len(), s.stretches.iter().map(|x| x.secs).sum::<f64>());
@@ -1625,9 +1664,32 @@ mod tests {
             video_bitrate: 5e6, pix_fmt: "yuv420p".into(), hdr: false, dolby_vision: false, color_transfer: String::new(), interlaced: false, vfr: false,
             start_time: 0.0, video_start: 0.0, covers: vec![], attachments: 0, tags: Default::default(), video_s: 0.0, nominal_fps: 0.0, time_base: (0, 0),
             audio_streams: audio.len() as u32, subtitle_streams: 0,
-            audio: audio.iter().map(|&(codec, channels, bitrate)| AudioInfo { codec: codec.into(), channels, bitrate }).collect(),
-            subtitle_codecs: vec![],
+            audio: audio.iter().map(|&(codec, channels, bitrate)| AudioInfo { codec: codec.into(), channels, bitrate, disposition: String::new() }).collect(),
+            subtitle_codecs: vec![], subtitle_dispositions: vec![], other_streams: vec![],
         }
+    }
+
+    #[test]
+    fn a_cut_keeps_what_tracks_are_marked_as_and_says_what_is_left_out() {
+        let mut i = info(&[("aac", 2, 128_000.0), ("aac", 2, 128_000.0)]);
+        i.audio[1].disposition = "default+original".into();
+        i.subtitle_codecs = vec!["subrip".into(), "hdmv_pgs_subtitle".into(), "ass".into()];
+        i.subtitle_dispositions = vec![String::new(), "default".into(), "forced".into()];
+        i.other_streams = vec!["data (tmcd)".into(), "video (h264)".into()];
+        let value = |s: &Streams, key: &str| s.args.iter().position(|a| a == key).map(|p| s.args[p + 1].clone());
+        // Mapped from the source, tracks keep their marks without being told.
+        let mut notes = Vec::new();
+        let plain = stream_args(&i, 0, Container::Mkv, Audio::Keep, &[], None, &mut notes);
+        assert!(!plain.args.iter().any(|a| a.starts_with("-disposition")), "{:?}", plain.args);
+        assert!(notes.iter().any(|n| n.starts_with("left out: data (tmcd), video (h264)")), "{notes:?}");
+        // Out of a cut they are told: the second sound track is the default one, and the
+        // third subtitle track (the second kept: the image one cannot be cut) is forced.
+        let cut = stream_args(&i, 0, Container::Mkv, Audio::Keep, &[], Some(&[Some(1), None, Some(2)]), &mut Vec::new());
+        assert_eq!(value(&cut, "-disposition:a:0").as_deref(), Some("0"));
+        assert_eq!(value(&cut, "-disposition:a:1").as_deref(), Some("default+original"));
+        assert_eq!(value(&cut, "-disposition:s:0").as_deref(), Some("0"));
+        assert_eq!(value(&cut, "-disposition:s:1").as_deref(), Some("forced"));
+        assert_eq!(cut.subs, 2);
     }
 
     /// The codec and bitrate arguments of each audio stream, e.g. "copy" or "libopus 96k".

@@ -257,7 +257,9 @@ fn write_report(report: &Path, r: &Value) -> Result<()> {
     let date = std::fs::metadata(report).and_then(|m| m.modified()).ok();
     let part = report.with_extension("json.part");
     let write = || -> Result<()> {
-        let mut f = std::fs::File::create(&part)?;
+        // (Made anew: a link left at that name is not written through.)
+        let _ = std::fs::remove_file(&part);
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&part)?;
         std::io::Write::write_all(&mut f, &serde_json::to_vec_pretty(r)?)?;
         if let Some(date) = date {
             let _ = f.set_modified(date);

@@ -111,10 +111,7 @@ fn cache_file() -> Result<PathBuf> {
 }
 
 fn save_cache(path: &Path, cache: &HashMap<PathBuf, CacheEntry>) -> Result<()> {
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec(cache)?)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    Ok(crate::files::replace_with(path, &serde_json::to_vec(cache)?)?)
 }
 
 /// One ffmpeg run that seeks to each of `times` and returns the frames as square grayscale

@@ -77,7 +77,11 @@ fn media_serves_only_picked_files() {
         std::fs::write(d.join("videos/a.mkv"), b"not really a video").unwrap();
         std::fs::write(d.join("videos/b.mkv"), b"x").unwrap();
         // A file in a job counts as picked (here a job saved by an earlier session).
-        let saved = json!({ "format": 1, "jobs": [{ "inputs": [d.join("videos/a.mkv")], "roots": [], "out_dir": d.join("out"), "options": {} }] });
+        // A job can name any file, and a link can be named like a video: neither is one.
+        std::fs::write(d.join("videos/notes.txt"), b"private").unwrap();
+        std::os::unix::fs::symlink(d.join("videos/notes.txt"), d.join("videos/link.mkv")).unwrap();
+        let inputs = [d.join("videos/a.mkv"), d.join("videos/notes.txt"), d.join("videos/link.mkv")];
+        let saved = json!({ "format": 1, "jobs": [{ "inputs": inputs, "roots": [], "out_dir": d.join("out"), "options": {} }] });
         std::fs::write(d.join("data/av1opt/ui-queue.json"), saved.to_string()).unwrap();
     });
     let a = s.dir.join("videos/a.mkv");
@@ -93,6 +97,8 @@ fn media_serves_only_picked_files() {
     // The same file through `..` is still that file; a sibling that was never picked is not.
     assert_eq!(s.get(&q(&s.dir.join("videos/../videos/a.mkv"))).status, 200);
     assert_eq!(s.get(&q(&s.dir.join("videos/b.mkv"))).status, 403);
+    assert_eq!(s.get(&q(&s.dir.join("videos/notes.txt"))).status, 403);
+    assert_eq!(s.get(&q(&s.dir.join("videos/link.mkv"))).status, 403);
 }
 
 #[test]
@@ -184,9 +190,9 @@ fn files_from_a_newer_version_are_not_overwritten() {
         std::fs::write(d.join("data/av1opt/ui-queue.json"), r#"{"format":99,"jobs":[{"anything":1}]}"#).unwrap();
     });
     // Settings change in this session but the file stays as the newer version wrote it.
-    assert_eq!(s.post("/api/settings/tools", &json!({ "ffmpeg": "/usr/bin/ffmpeg" })).status, 200);
+    assert_eq!(s.post("/api/settings/tools", &json!({ "ffmpeg": "ffmpeg9" })).status, 200);
     let ui = std::fs::read_to_string(s.data("ui.json")).unwrap();
-    assert!(ui.contains("future_field") && !ui.contains("/usr/bin/ffmpeg"), "{ui}");
+    assert!(ui.contains("future_field") && !ui.contains("ffmpeg9"), "{ui}");
     // The queue is set aside, not restored and not overwritten.
     assert!(!s.data("ui-queue.json").exists() || std::fs::read_to_string(s.data("ui-queue.json")).unwrap().contains("\"format\": 1"));
     assert!(std::fs::read_to_string(s.data("ui-queue.format99.json")).unwrap().contains("anything"));
@@ -202,12 +208,32 @@ fn settings_tools_validation() {
         let r = s.post("/api/settings/tools", &bad);
         assert_eq!(r.status, 400, "{bad}: {}", r.body);
     }
-    assert_eq!(s.post("/api/settings/tools", &json!({ "ffmpeg": "ffmpeg7", "ffprobe": "/opt/x/ffprobe-7.1" })).status, 200);
+    // A path has to lead to a file that is there: one that is not could be put there later
+    // by anyone who can write to the folder.
     let r = s.post("/api/settings/tools", &json!({ "ffmpeg": "/nonexistent/ffmpeg", "ffprobe": "" }));
+    assert!(r.status == 400 && r.body.contains("is not there"), "{}", r.body);
+    use std::os::unix::fs::PermissionsExt;
+    let bin = s.dir.join("bin");
+    std::fs::create_dir_all(bin.join("open")).unwrap();
+    for f in ["ffprobe-7.1", "open/ffmpeg"] {
+        std::fs::write(bin.join(f), b"not a program").unwrap();
+    }
+    std::os::unix::fs::symlink(bin.join("ffprobe-7.1"), bin.join("ffprobe")).unwrap();
+    // In a folder anyone can write to, the file can be swapped for another.
+    std::fs::set_permissions(bin.join("open"), std::fs::Permissions::from_mode(0o777)).unwrap();
+    let r = s.post("/api/settings/tools", &json!({ "ffmpeg": bin.join("open/ffmpeg") }));
+    assert!(r.status == 400 && r.body.contains("can be changed by others"), "{}", r.body);
+    std::fs::set_permissions(bin.join("open"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::create_dir_all(bin.join("ffmpeg.d")).unwrap();
+    let r = s.post("/api/settings/tools", &json!({ "ffmpeg": bin.join("ffmpeg.d") }));
+    assert!(r.status == 400 && r.body.contains("is not a program"), "{}", r.body);
+    // What is kept is the file the path led to, not the link.
+    let r = s.post("/api/settings/tools", &json!({ "ffmpeg": "ffmpeg7", "ffprobe": bin.join("ffprobe") }));
     assert_eq!(r.status, 200, "{}", r.body);
     let ui: Value = serde_json::from_slice(&std::fs::read(s.data("ui.json")).unwrap()).unwrap();
     assert_eq!(ui["format"], 1);
-    assert_eq!(ui["ffmpeg"], "/nonexistent/ffmpeg");
+    assert_eq!(ui["ffmpeg"], "ffmpeg7");
+    assert_eq!(ui["ffprobe"], json!(std::fs::canonicalize(bin.join("ffprobe-7.1")).unwrap()));
     assert!(s.get("/api/state").json()["tools"]["problem"].is_string());
 }
 

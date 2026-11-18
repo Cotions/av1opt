@@ -155,14 +155,22 @@ impl Tools {
     /// say). Measurements kept between runs only count for the build that made them.
     pub fn encoder_version(&self) -> &str {
         self.version.get_or_init(|| {
-            Command::new(&self.ffmpeg)
+            let ffmpeg = Command::new(&self.ffmpeg)
                 .args(["-hide_banner", "-version"])
                 .stdin(Stdio::null())
                 .stderr(Stdio::null())
                 .output()
                 .ok()
                 .and_then(|o| String::from_utf8_lossy(&o.stdout).lines().next().map(str::to_owned))
-                .unwrap_or_default()
+                .unwrap_or_default();
+            // An ffmpeg that loads the encoder from the system stays the same ffmpeg when
+            // the encoder is updated; the encoder names itself when it is started.
+            let one_frame = ["-hide_banner", "-f", "lavfi", "-i", "color=black:s=64x64:r=1", "-frames:v", "1", "-c:v", "libsvtav1", "-preset", "13", "-f", "null", "-"];
+            let svt = Command::new(&self.ffmpeg).args(one_frame).stdin(Stdio::null()).stdout(Stdio::null()).output().ok().and_then(|o| svt_version(&String::from_utf8_lossy(&o.stderr)));
+            match svt {
+                Some(v) => format!("{ffmpeg} | {v}"),
+                None => ffmpeg,
+            }
         })
     }
 
@@ -505,4 +513,24 @@ fn systemd_scope_works() -> bool {
             .stderr(Stdio::null())
             .status()
             .is_ok_and(|s| s.success())
+}
+
+/// What SVT-AV1 calls itself in what ffmpeg prints as it starts the encoder
+/// (`Svt[info]: SVT [version]:\tSVT-AV1 Encoder Lib v4.2.0`).
+fn svt_version(log: &str) -> Option<String> {
+    let v = log.lines().find_map(|l| l.split_once("SVT [version]:"))?.1.trim();
+    (!v.is_empty()).then(|| v.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_encoder_names_itself() {
+        let log = "Svt[info]: -------------------------------------------\nSvt[info]: SVT [version]:\tSVT-AV1 Encoder Lib v4.2.0-210-gf2c3fb786\nSvt[info]: SVT [build]  :\tGCC 16.2.0\t 64 bit\n";
+        assert_eq!(svt_version(log).as_deref(), Some("SVT-AV1 Encoder Lib v4.2.0-210-gf2c3fb786"));
+        assert_eq!(svt_version("Unknown encoder 'libsvtav1'\n"), None);
+        assert_eq!(svt_version("Svt[info]: SVT [version]:\n"), None);
+    }
 }

@@ -56,6 +56,13 @@ pub struct MediaInfo {
     pub audio: Vec<AudioInfo>,
     #[serde(default)]
     pub subtitle_codecs: Vec<String>,
+    /// What each subtitle track is marked as (see [`AudioInfo::disposition`]).
+    #[serde(default)]
+    pub subtitle_dispositions: Vec<String>,
+    /// Streams an encode has no place for: a second video, a camera's timecode or sensor
+    /// track. Each as "kind (format)".
+    #[serde(default)]
+    pub other_streams: Vec<String>,
     /// Cover images: attached pictures, and still-image streams next to the real video.
     #[serde(default)]
     pub covers: Vec<Cover>,
@@ -89,6 +96,10 @@ pub struct AudioInfo {
     /// Bits per second; 0 when the file doesn't say.
     #[serde(default)]
     pub bitrate: f64,
+    /// What the track is marked as, the way ffmpeg's `-disposition` takes it
+    /// ("default+forced"); empty for no mark.
+    #[serde(default)]
+    pub disposition: String,
 }
 
 /// What ffprobe said in the end, on one line: the lines before it are the
@@ -148,11 +159,17 @@ pub fn probe(ffprobe: &str, path: &Path, file_size: u64) -> Result<MediaInfo> {
     let video_start = num(&video["start_time"]).unwrap_or(start_time);
 
     let audio: Vec<&Value> = streams.iter().filter(|s| s["codec_type"] == "audio").collect();
-    let audio_bitrate: f64 = audio.iter().filter_map(|s| num(&s["bit_rate"])).sum();
     let total_bitrate = if duration_s > 0.0 { file_size as f64 * 8.0 / duration_s } else { 0.0 };
+    // Matroska has no field for a stream's rate; mkvmerge writes it as a tag. A file encoded
+    // again by a program that copies tags carries the tag of what it was made from, which
+    // shows where the tags ask for more than the file holds.
+    let tagged = |s: &Value| num(&s["tags"]["BPS"]).or_else(|| num(&s["tags"]["BPS-eng"])).filter(|r| *r > 0.0);
+    let tags_hold = streams.iter().filter_map(tagged).sum::<f64>() <= total_bitrate;
+    let rate = |s: &Value| num(&s["bit_rate"]).or_else(|| tagged(s).filter(|_| tags_hold));
+    let audio_bitrate: f64 = audio.iter().filter_map(|s| rate(s)).sum();
     // Without a stated rate: the bytes that aren't sound, over the seconds that have picture.
     let picture_s = if video_s > 0.0 && video_s < duration_s { video_s } else { duration_s };
-    let video_bitrate = num(&video["bit_rate"]).unwrap_or_else(|| {
+    let video_bitrate = rate(video).unwrap_or_else(|| {
         let spread = if picture_s > 0.0 { duration_s / picture_s } else { 1.0 };
         (total_bitrate - audio_bitrate).max(total_bitrate * 0.5) * spread
     });
@@ -174,7 +191,7 @@ pub fn probe(ffprobe: &str, path: &Path, file_size: u64) -> Result<MediaInfo> {
     }
 
     let main_index = video["index"].as_u64().unwrap_or(0);
-    let covers = streams
+    let covers: Vec<Cover> = streams
         .iter()
         .filter(|s| s["codec_type"] == "video" && s["index"].as_u64() != Some(main_index))
         .filter(|s| s["disposition"]["attached_pic"].as_i64() == Some(1) || STILL_IMAGE.contains(&s["codec_name"].as_str().unwrap_or("")))
@@ -182,6 +199,21 @@ pub fn probe(ffprobe: &str, path: &Path, file_size: u64) -> Result<MediaInfo> {
             index: s["index"].as_u64().unwrap_or(0) as usize,
             codec: s["codec_name"].as_str().unwrap_or("unknown").to_string(),
             filename: s["tags"]["filename"].as_str().map(String::from),
+        })
+        .collect();
+
+    // The marks a player goes by to pick a track.
+    const MARKS: &[&str] = &["default", "dub", "original", "comment", "lyrics", "karaoke", "forced", "hearing_impaired", "visual_impaired", "clean_effects", "captions", "descriptions"];
+    let marks = |s: &Value| MARKS.iter().filter(|m| s["disposition"][**m].as_i64() == Some(1)).copied().collect::<Vec<_>>().join("+");
+    let cover_at: Vec<usize> = covers.iter().map(|c| c.index).collect();
+    let other_streams = streams
+        .iter()
+        .filter(|s| !matches!(s["codec_type"].as_str(), Some("audio" | "subtitle" | "attachment")))
+        .filter(|s| s["index"].as_u64().is_some_and(|i| i != main_index && !cover_at.contains(&(i as usize))))
+        .map(|s| {
+            let kind = s["codec_type"].as_str().unwrap_or("unknown");
+            let format = s["codec_name"].as_str().or(s["codec_tag_string"].as_str()).filter(|f| !f.is_empty() && !f.starts_with('['));
+            format.map_or(kind.to_string(), |f| format!("{kind} ({f})"))
         })
         .collect();
 
@@ -218,6 +250,7 @@ pub fn probe(ffprobe: &str, path: &Path, file_size: u64) -> Result<MediaInfo> {
                 channels: s["channels"].as_u64().unwrap_or(2) as u32,
                 // Matroska has no per-stream bitrate field; mkvmerge writes it as a tag.
                 bitrate: num(&s["bit_rate"]).or_else(|| num(&s["tags"]["BPS"])).unwrap_or(0.0),
+                disposition: marks(s),
             })
             .collect(),
         subtitle_codecs: streams
@@ -225,6 +258,8 @@ pub fn probe(ffprobe: &str, path: &Path, file_size: u64) -> Result<MediaInfo> {
             .filter(|s| s["codec_type"] == "subtitle")
             .map(|s| s["codec_name"].as_str().unwrap_or("unknown").to_string())
             .collect(),
+        subtitle_dispositions: streams.iter().filter(|s| s["codec_type"] == "subtitle").map(marks).collect(),
+        other_streams,
         covers,
         attachments: streams.iter().filter(|s| s["codec_type"] == "attachment").count() as u32,
         tags: j["format"]["tags"]
@@ -252,6 +287,20 @@ pub fn audio_bitrate(ffprobe: &str, path: &Path, index: usize) -> Option<f64> {
         last = last.max(pts + dur.unwrap_or(0.0));
     }
     (last - first > 1.0).then(|| bytes * 8.0 / (last - first))
+}
+
+/// Bytes of stream number `index` of a file, counted from its packets: what the picture
+/// takes in a container that states no rate for it (Matroska), where going by the size of
+/// the file would count the sound in.
+pub fn stream_bytes(ffprobe: &str, path: &Path, index: usize) -> Option<u64> {
+    let out = Command::new(ffprobe)
+        .args(["-v", "error", "-select_streams", &index.to_string(), "-show_entries", "packet=size", "-of", "csv=p=0"])
+        .arg(crate::tools::probe_arg(path))
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let bytes: u64 = String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.trim().trim_end_matches(',').parse::<u64>().ok()).sum();
+    (bytes > 0).then_some(bytes)
 }
 
 /// Parses ffprobe rates like "30000/1001".

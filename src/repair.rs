@@ -385,6 +385,11 @@ pub struct Outcome {
 
 impl Outcome {
     /// Mean VMAF of the `secs` seconds starting `start` seconds after the first frame.
+    /// How long the video is, in seconds from its first frame to the end of its last.
+    pub fn length(&self) -> f64 {
+        self.secs.last().copied().unwrap_or(0.0)
+    }
+
     pub fn at(&self, start: f64, secs: f64) -> Option<f64> {
         let n = self.secs.len() - 1;
         let frame = |t: f64| self.secs[..n].partition_point(|&s| s < t - 1e-9);
@@ -479,8 +484,11 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
         if todo.is_empty() {
             break;
         }
-        if let Some(r) = todo.iter().find(|r| secs[r.end] - secs[r.start] > MAX_GOP_SECS.max(max_secs)) {
-            bail!("a stretch of {:.0} s between two key frames is too long to encode again", secs[r.end] - secs[r.start]);
+        // (By its frames: a hole in the source's timestamps makes a stretch long on the
+        // clock without making it any more to encode.)
+        let most = MAX_GOP_SECS.max(max_secs) * c.info.fps.max(1.0);
+        if let Some(r) = todo.iter().find(|r| (r.end - r.start) as f64 > most) {
+            bail!("a stretch of {} frames between two key frames is too long to encode again", r.end - r.start);
         }
         let total: f64 = todo.iter().map(|r| secs[r.end] - secs[r.start]).sum();
         let detail = format!("{} stretch{} ({}) below VMAF {:.0}{}", todo.len(), if todo.len() == 1 { "" } else { "es" }, hms(total), c.floor, if round > 0 { ", again" } else { "" });
@@ -550,6 +558,11 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
         .map(|w| (secs[w.start], secs[w.end] - secs[w.start], w.vmaf))
         .collect();
     if still.iter().any(|w| w.2 < c.floor - NEAR) {
+        // What was made here is of no use to the search and the encode that follow.
+        let _ = std::fs::remove_file(&plain);
+        for f in &fixed {
+            let _ = std::fs::remove_file(&f.file);
+        }
         return Err(StillLow { windows: still }.into());
     }
 

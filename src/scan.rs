@@ -118,10 +118,8 @@ pub fn collect(
         let c = cache.lock().unwrap();
         files.iter().any(|(path, _, size, mtime)| !c.get(path).is_some_and(|e| e.size == *size && e.mtime == *mtime))
     };
-    if unknown {
-        if std::process::Command::new(ffprobe).arg("-version").stdin(std::process::Stdio::null()).output().is_err() {
-            anyhow::bail!("cannot run ffprobe ({ffprobe}); nothing was scanned");
-        }
+    if unknown && std::process::Command::new(ffprobe).arg("-version").stdin(std::process::Stdio::null()).output().is_err() {
+        anyhow::bail!("cannot run ffprobe ({ffprobe}); nothing was scanned");
     }
 
     let results: Vec<FileResult> = pool.install(|| {
@@ -221,13 +219,27 @@ pub fn best_within(items: &[(f64, f64)], budget_secs: f64) -> Vec<usize> {
         }
     }
     // What rounding up left unused may still hold a short video or two.
-    for i in by_rate(usable) {
-        if items[i].1 <= left && !chosen.contains(&i) {
+    let in_order = by_rate(usable);
+    let picked: std::collections::HashSet<usize> = chosen.iter().copied().collect();
+    for &i in &in_order {
+        if items[i].1 <= left && !picked.contains(&i) {
             chosen.push(i);
             left -= items[i].1;
         }
     }
-    by_rate(chosen)
+    // With more videos than slots, each short one counts as a whole slot and the slots go
+    // to those that save the most apiece, not per second: there, taking the best value per
+    // second until the time is full does better.
+    let mut plain = Vec::new();
+    let mut left = budget_secs;
+    for &i in &in_order {
+        if items[i].1 <= left {
+            plain.push(i);
+            left -= items[i].1;
+        }
+    }
+    let saved = |v: &[usize]| v.iter().map(|&i| items[i].0).sum::<f64>();
+    if saved(&plain) > saved(&chosen) { plain } else { by_rate(chosen) }
 }
 
 /// The candidates of a scan to encode in `budget_secs`: see [`best_within`].
@@ -249,14 +261,12 @@ fn cache_file() -> Result<PathBuf> {
     let dir = base.join("av1opt");
     std::fs::create_dir_all(&dir)?;
     // Bump the version when MediaInfo gains fields that change verdicts, so old entries are re-probed.
-    Ok(dir.join("probe-cache-v2.json"))
+    let _ = std::fs::remove_file(dir.join("probe-cache-v2.json"));
+    Ok(dir.join("probe-cache-v3.json"))
 }
 
 fn save_cache(path: &Path, cache: &HashMap<PathBuf, CacheEntry>) -> Result<()> {
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec(cache)?)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    Ok(crate::files::replace_with(path, &serde_json::to_vec(cache)?)?)
 }
 
 #[cfg(test)]
@@ -320,6 +330,20 @@ mod tests {
             // Lengths are rounded up to slots, which may cost a sliver of the best choice.
             assert!(value >= most * 0.99, "round {round}: saves {value}, {most} was possible");
         }
+    }
+
+    #[test]
+    fn many_short_videos_are_not_rounded_up_to_a_slot_each() {
+        // Twenty-second clips that save 1 GB and three-minute ones that save 2: per second
+        // the clips are worth four times as much, per slot of the time half.
+        let items: Vec<(f64, f64)> = (0..30_000).map(|i| if i % 3 == 0 { (1e9, 20.0) } else { (2e9, 170.0) }).collect();
+        let budget = 100.0 * 3600.0;
+        let picked = best_within(&items, budget);
+        let (value, secs) = totals(&items, &picked);
+        assert!(secs <= budget);
+        // All ten thousand clips, and the rest of the time in the longer ones.
+        assert_eq!(picked.iter().filter(|&&i| i % 3 == 0).count(), 10_000);
+        assert!(value >= 10_000.0 * 1e9 + 940.0 * 2e9, "{value}");
     }
 
     #[test]

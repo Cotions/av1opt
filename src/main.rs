@@ -4,6 +4,7 @@ mod dups;
 mod encode;
 mod estimate;
 mod events;
+mod files;
 mod fsguard;
 mod history;
 mod metadata;

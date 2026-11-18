@@ -128,7 +128,7 @@ pub fn start(app: &Arc<App>, body: &Value) -> Result<Value> {
                 match result {
                     Ok(report) => {
                         for f in &report.files {
-                            app.allow(&f.path);
+                            app.allow_video(&f.path);
                         }
                         run.report = Some(Arc::new(report));
                         run.status = "done".into();

@@ -119,6 +119,18 @@ impl App {
         }
     }
 
+    /// As [`App::allow`], for a path that only says it is a video: the file it leads to in
+    /// the end has to be one by its name too. (A job can name any file, and a link named
+    /// like a video can lead to any; neither should make the file readable through the page.)
+    pub fn allow_video(&self, p: &Path) {
+        if let Ok(c) = std::fs::canonicalize(p)
+            && c.is_file()
+            && crate::scan::is_video(&c)
+        {
+            self.allowed.lock().unwrap().insert(c);
+        }
+    }
+
     pub fn is_allowed(&self, p: &Path) -> Option<PathBuf> {
         let c = std::fs::canonicalize(p).ok()?;
         if c.starts_with(&self.preview_dir) || self.allowed.lock().unwrap().contains(&c) { Some(c) } else { None }
@@ -169,7 +181,7 @@ impl App {
         s.format = SETTINGS_FORMAT;
         if let Some(p) = library::settings_path() {
             let _ = p.parent().map(std::fs::create_dir_all);
-            let _ = std::fs::write(&p, serde_json::to_vec_pretty(&s).unwrap_or_default());
+            let _ = crate::files::replace_with(&p, &serde_json::to_vec_pretty(&s).unwrap_or_default());
         }
     }
 }
@@ -181,13 +193,25 @@ pub fn run(cfg: Config) -> Result<()> {
         Ok(_) => anyhow::bail!("AV1OPT_UI_TOKEN must be at least 16 letters or digits"),
         Err(_) => (random_hex(16)?, false),
     };
+    // The programs started from here (ffmpeg, the browser) have no use for it.
+    // SAFETY: the environment is changed before any other thread is started.
+    unsafe { std::env::remove_var("AV1OPT_UI_TOKEN") };
     let server = tiny_http::Server::http(("127.0.0.1", cfg.port)).map_err(|e| anyhow::anyhow!("cannot listen on 127.0.0.1:{}: {e}", cfg.port))?;
     let port = server.server_addr().to_ip().context("not an IP listener")?.port();
     let preview_dir = library::preview_dir()?;
-    let settings: Settings = library::settings_path()
+    let mut settings: Settings = library::settings_path()
         .and_then(|p| std::fs::read(p).ok())
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default();
+    // A program chosen on the page was safe to start when it was chosen; it has to be still.
+    for (name, tool) in [("ffmpeg", &mut settings.ffmpeg), ("ffprobe", &mut settings.ffprobe)] {
+        if let Some(p) = tool.as_deref().map(Path::new).filter(|p| p.is_absolute())
+            && let Err(why) = library::safe_program(p)
+        {
+            note(&format!("{name}: {} {why}; using the default", p.display()));
+            *tool = None;
+        }
+    }
     let open = cfg.open;
     let app = Arc::new(App {
         cfg,

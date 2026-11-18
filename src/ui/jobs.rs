@@ -438,7 +438,7 @@ fn add_unchecked(app: &App, body: &Value) -> Result<Value> {
         .map(|(j, abs)| {
             let stem = j.input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             let output = j.out_dir.join(format!("{stem}.{}", opts.container.ext()));
-            app.allow(&abs);
+            app.allow_video(&abs);
             FileState {
                 report: output.with_extension("av1opt.json"),
                 est_secs: known.get(&abs).map(|i| time.secs(i)).filter(|s| *s > 0.0),
@@ -799,8 +799,8 @@ fn run_job(app: &Arc<App>, id: u64, opts: Result<Options>, retry: bool, out_dir:
                 if let Event::FileEnd { status, .. } = &e
                     && (status == "ok" || status == "done_before")
                 {
-                    sink_app.allow(&j.files[i].output);
-                    sink_app.allow(&j.files[i].input);
+                    sink_app.allow_video(&j.files[i].output);
+                    sink_app.allow_video(&j.files[i].input);
                 }
                 Some(i)
             })

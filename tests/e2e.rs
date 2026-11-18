@@ -614,6 +614,40 @@ fn files_not_worth_it_are_skipped_once_and_bad_ones_fail_alone() {
 
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn an_encode_never_lands_on_its_source_and_a_changed_source_is_noticed() {
+    let c = Case::new("alias");
+    let src = c.clip("film.mp4", "320x180", 4);
+    let before = std::fs::read(&src).unwrap();
+    // The source under the name the output would get: a second name for the same file.
+    std::fs::hard_link(&src, c.out().join("film.mp4")).unwrap();
+    let r = c.encode(&[&src], &["--overwrite"]);
+    assert_eq!(r.code, Some(2), "{}", r.err);
+    r.has("output would overwrite the input");
+    assert_eq!(std::fs::read(&src).unwrap(), before);
+    // An output folder that is the folder of the videos by another way.
+    let link = c.dir.join("same");
+    std::os::unix::fs::symlink(c.videos(), &link).unwrap();
+    for out in [link.clone(), c.videos().join("../videos")] {
+        let r = c.encode_into(&out, &[&src], &["--overwrite"]);
+        assert_eq!(r.code, Some(2), "{}", r.err);
+        r.has("output would overwrite the input");
+        assert_eq!(std::fs::read(&src).unwrap(), before);
+    }
+
+    // Encoded for real; then the same name holds another video.
+    std::fs::remove_file(c.out().join("film.mp4")).unwrap();
+    c.encode(&[&src], &[]).ok().has("encoded 1, skipped 0, failed 0");
+    let made = std::fs::read(c.out().join("film.mp4")).unwrap();
+    c.encode(&[&src], &[]).ok().has("already done 1");
+    c.clip("film.mp4", "320x180", 6);
+    let r = c.encode(&[&src], &[]);
+    assert_eq!(r.code, Some(2), "{}", r.err);
+    r.has("was made from this file when it was another size");
+    assert_eq!(std::fs::read(c.out().join("film.mp4")).unwrap(), made);
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn folders_are_mirrored_and_same_names_do_not_collide_silently() {
     let c = Case::new("layout");
     let one = c.clip("one.mp4", "320x180", 4);

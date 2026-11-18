@@ -70,7 +70,16 @@ fn bin_for(path: &Path, dev: u64, home: Option<&Path>, uid: u32) -> Result<Bin> 
     let candidates = [shared_ok.then(|| shared.join(uid.to_string())), Some(top.join(format!(".Trash-{uid}")))];
     let mut last = None;
     for dir in candidates.into_iter().flatten() {
-        match make_private(&dir) {
+        // On a drive others write to, a folder of that name can be someone's link to
+        // anywhere, or their own folder: only a real folder that is this user's will do.
+        // SAFETY: getuid has no failure mode and touches no memory.
+        let me = unsafe { libc::getuid() };
+        let own = |dir: &Path| match std::fs::symlink_metadata(dir) {
+            Ok(m) if m.is_dir() && m.uid() == me => Ok(()),
+            Ok(_) => Err(std::io::Error::other(format!("{} is not a folder of this user's", dir.display()))),
+            Err(e) => Err(e),
+        };
+        match make_private(&dir).and_then(|()| own(&dir)) {
             Ok(()) => return Ok(Bin { dir, relative_to: Some(top.to_path_buf()) }),
             Err(e) => last = Some(e),
         }
@@ -378,6 +387,16 @@ mod tests {
         let info = std::fs::read_to_string(bin.join("info/clip.mp4.trashinfo")).unwrap();
         assert!(info.contains(&format!("Path=av1opt-trash-test-{}/sub/clip.mp4\n", std::process::id())), "{info}");
         assert!(!home.join("files/clip.mp4").exists());
+        // A trash of that name that is a link to somewhere else is someone's trap, not a trash.
+        let (uid, f) = (uid + 1, dir.join("sub/other.mp4"));
+        let trap = shm.join(format!(".Trash-{uid}"));
+        std::fs::write(&f, b"x").unwrap();
+        std::fs::create_dir_all(dir.join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(dir.join("elsewhere"), &trap).unwrap();
+        let e = trash_with(&f, Some(&home), uid, "x".into()).unwrap_err().to_string();
+        assert!(e.contains("is not a folder of this user's"), "{e}");
+        assert!(f.exists() && std::fs::read_dir(dir.join("elsewhere")).unwrap().count() == 0);
+        let _ = std::fs::remove_file(&trap);
         for d in [&bin, &dir, &home_dir] {
             let _ = std::fs::remove_dir_all(d);
         }

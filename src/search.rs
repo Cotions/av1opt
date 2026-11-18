@@ -458,9 +458,8 @@ impl TrialCache {
         let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let line = CacheLine { file: self.file.clone(), preset: enc.preset, pix_fmt: enc.pix_fmt_out.to_string(), params: enc.full_params(), time, trial: t };
         // Losing the memory of one trial is not worth failing the encode for.
-        if let (Ok(json), Ok(mut f)) = (serde_json::to_string(&line), std::fs::OpenOptions::new().create(true).append(true).open(path)) {
-            use std::io::Write;
-            let _ = writeln!(f, "{json}");
+        if let Ok(json) = serde_json::to_string(&line) {
+            let _ = crate::files::append_line(path, &json, true);
         }
     }
 }
@@ -1372,7 +1371,7 @@ mod tests {
             video_index: 0, codec: "h264".into(), width: 1920, height: 1080, fps, duration_s: 60.0,
             video_bitrate: 5e6, pix_fmt: "yuv420p".into(), hdr: false, dolby_vision: false, color_transfer: String::new(), interlaced: false, vfr: false,
             start_time: 0.0, video_start: 0.0, covers: vec![], attachments: 0, tags: Default::default(), video_s: 0.0, nominal_fps: 0.0, time_base: (0, 0),
-            audio_streams: 0, subtitle_streams: 0, audio: vec![], subtitle_codecs: vec![],
+            audio_streams: 0, subtitle_streams: 0, audio: vec![], subtitle_codecs: vec![], subtitle_dispositions: vec![], other_streams: vec![],
         }
     }
 

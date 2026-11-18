@@ -6,7 +6,6 @@ use crate::events::{self, Event};
 use crate::tools::Tools;
 use anyhow::Result;
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -155,18 +154,17 @@ fn read_skips(log: &Path, settings: &str) -> HashMap<(PathBuf, u64), String> {
 fn log_line(log: &Path, status: &str, input: &Path, size: u64, detail: &str, settings: &str) -> Result<()> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let clean = |s: &str| s.replace(['\t', '\n'], " ");
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(log)?;
-    writeln!(f, "{now}\t{status}\t{}\t{size}\t{}\t{settings}", clean(&input.display().to_string()), clean(detail))?;
-    Ok(())
+    let line = format!("{now}\t{status}\t{}\t{size}\t{}\t{settings}", clean(&input.display().to_string()), clean(detail));
+    Ok(crate::files::append_line(log, &line, false)?)
 }
 
-/// Absolute input path recorded in an output's `.av1opt.json` report, and the sections
-/// that output left out.
-fn report_input(output: &Path) -> Option<(PathBuf, Vec<(f64, f64)>)> {
+/// Absolute input path recorded in an output's `.av1opt.json` report, the sections that
+/// output left out, and the size the input had.
+fn report_input(output: &Path) -> Option<(PathBuf, Vec<(f64, f64)>, Option<u64>)> {
     let r: serde_json::Value = serde_json::from_slice(&std::fs::read(output.with_extension("av1opt.json")).ok()?).ok()?;
     let p = PathBuf::from(r["input"].as_str()?);
     let removed = serde_json::from_value(r["removed"].clone()).unwrap_or_default();
-    Some((std::fs::canonicalize(&p).ok().or_else(|| std::path::absolute(&p).ok())?, removed))
+    Some((std::fs::canonicalize(&p).ok().or_else(|| std::path::absolute(&p).ok())?, removed, r["source_bytes"].as_u64()))
 }
 
 /// Whether an earlier output left out the sections asked for now. The report holds them
@@ -221,15 +219,26 @@ pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipp
             // Same file name from two input folders would map to one output; only count it as
             // done if its report says it came from this input.
             match report_input(&output) {
-                Some((_, removed)) if !same_sections(&o.remove, &removed) => {
+                Some((_, removed, _)) if !same_sections(&o.remove, &removed) => {
                     let msg = format!("{} exists but has other sections removed; move or delete it to encode again", output.display());
                     eprintln!("FAILED: {msg}");
                     end("error", &msg, 0);
                     sum.failed += 1;
                     log_line(&log, "error", &abs, size, &msg, &settings)?;
                 }
-                Some((src, _)) if src != abs => {
+                Some((src, _, _)) if src != abs => {
                     let msg = format!("output name collision: {} was made from {}", output.display(), src.display());
+                    eprintln!("FAILED: {msg}");
+                    end("error", &msg, 0);
+                    sum.failed += 1;
+                    log_line(&log, "error", &abs, size, &msg, &settings)?;
+                }
+                // The same name and another file: a download done again, an edit saved over it.
+                Some((_, _, Some(then))) if then != size => {
+                    let msg = format!(
+                        "{} was made from this file when it was another size ({then} bytes, now {size}); move or delete it to encode again",
+                        output.display()
+                    );
                     eprintln!("FAILED: {msg}");
                     end("error", &msg, 0);
                     sum.failed += 1;
@@ -300,6 +309,7 @@ pub(crate) fn guarded<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn a_bug_fails_one_file_not_the_run() {

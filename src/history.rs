@@ -4,7 +4,6 @@
 use crate::probe::MediaInfo;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
 use std::path::PathBuf;
 
 /// Version of a history line. Bump it when a field changes meaning or is removed (adding
@@ -91,9 +90,7 @@ pub fn append(r: &Record) -> Result<()> {
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&p)?;
-    writeln!(f, "{}", serde_json::to_string(r)?)?;
-    Ok(())
+    Ok(crate::files::append_line(&p, &serde_json::to_string(r)?, true)?)
 }
 
 /// All readable records; a missing or partly corrupt file just yields fewer.

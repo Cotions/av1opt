@@ -66,6 +66,29 @@ fn has_session(app: &App, req: &Request) -> bool {
     get_header(req, "Cookie").is_some_and(|c| c.split(';').any(|kv| ct_eq(kv.trim().as_bytes(), want.as_bytes())))
 }
 
+/// The user whose program holds the other end of a connection, from the kernel's list of
+/// TCP sockets (`tcp` is the text of `/proc/net/tcp`): the row whose own address is the
+/// client's and whose far address is this server's. `None` where there is no such row.
+fn socket_owner(tcp: &str, client: std::net::SocketAddrV4, port: u16) -> Option<u32> {
+    // Addresses there are the four bytes as the machine holds them, in hex, then the port.
+    let hex = |ip: &std::net::Ipv4Addr, port: u16| format!("{:08X}:{port:04X}", u32::from_ne_bytes(ip.octets()));
+    let (own, far) = (hex(client.ip(), client.port()), hex(&std::net::Ipv4Addr::LOCALHOST, port));
+    tcp.lines().map(|l| l.split_whitespace().collect::<Vec<&str>>()).find(|f| f.len() > 7 && f[1] == own && f[2] == far)?[7].parse().ok()
+}
+
+/// Whether the request comes from a program of the user who started this server (or the
+/// system's). The cookie alone does not say so: a browser sends it to every port of this
+/// host, and a server another user runs on one of them would learn the token from a page
+/// opened there. Where the kernel's list cannot be read or has no such row, the cookie has
+/// to do.
+fn same_user(app: &App, req: &Request) -> bool {
+    let Some(std::net::SocketAddr::V4(client)) = req.remote_addr().copied() else { return true };
+    let Ok(tcp) = std::fs::read_to_string("/proc/net/tcp") else { return true };
+    // SAFETY: getuid has no failure mode and touches no memory.
+    let me = unsafe { libc::getuid() };
+    socket_owner(&tcp, client, app.port).is_none_or(|uid| uid == me || uid == 0)
+}
+
 /// Constant-time comparison for the session token.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
@@ -74,6 +97,9 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 pub fn handle(app: &Arc<App>, mut req: Request) {
     if !same_host(app, &req) {
         return reply(req, 403, "text/plain", "forbidden: av1opt only answers to http://127.0.0.1");
+    }
+    if !same_user(app, &req) {
+        return reply(req, 403, "text/plain", "forbidden: this page is for the user who started av1opt");
     }
     let url = req.url().to_string();
     let (path, query) = url.split_once('?').unwrap_or((&url, ""));
@@ -314,6 +340,22 @@ fn percent_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_other_end_of_a_connection_has_an_owner() {
+        let tcp = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   \
+            0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 24653 1 0000000000000000 100 0 0 10 0\n   \
+            1: 0100007F:1F90 0100007F:C3A2 01 00000000:00000000 00:00000000 00000000  1000        0 31001 1 0000000000000000 20 4 30 10 -1\n   \
+            2: 0100007F:C3A2 0100007F:1F90 01 00000000:00000000 00:00000000 00000000  1001        0 31000 1 0000000000000000 20 4 30 10 -1\n";
+        let client = |port| std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, port);
+        if cfg!(target_endian = "little") {
+            // The client's own row, not the server's row of the same connection.
+            assert_eq!(socket_owner(tcp, client(0xC3A2), 0x1F90), Some(1001));
+        }
+        assert_eq!(socket_owner(tcp, client(0xC3A3), 0x1F90), None);
+        assert_eq!(socket_owner(tcp, client(0xC3A2), 0x1F91), None);
+        assert_eq!(socket_owner("", client(0xC3A2), 0x1F90), None);
+    }
 
     #[test]
     fn ranges() {

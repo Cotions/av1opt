@@ -104,7 +104,70 @@ fn mine_alone(m: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     // SAFETY: getuid has no failure mode and touches no memory.
     let uid = unsafe { libc::getuid() };
-    (m.uid() == 0 || m.uid() == uid) && m.mode() & 0o022 == 0
+    // (Where each user has a group to themselves, their files are made writable by it.)
+    let group_ok = m.mode() & 0o020 == 0 || (m.uid() == uid && group_is_mine_alone(m.gid(), uid));
+    (m.uid() == 0 || m.uid() == uid) && m.mode() & 0o002 == 0 && group_ok
+}
+
+/// Whether the system's own lists name nobody but this user as a member of group `gid`.
+fn group_is_mine_alone(gid: u32, uid: u32) -> bool {
+    let (Ok(passwd), Ok(group)) = (std::fs::read_to_string("/etc/passwd"), std::fs::read_to_string("/etc/group")) else { return false };
+    alone_in_group(&passwd, &group, gid, uid)
+}
+
+/// The same from the text of `/etc/passwd` and `/etc/group`.
+fn alone_in_group(passwd: &str, group: &str, gid: u32, uid: u32) -> bool {
+    let mut me = None;
+    for line in passwd.lines() {
+        let f: Vec<&str> = line.split(':').collect();
+        if f.len() < 4 {
+            continue;
+        }
+        if f[2].parse() == Ok(uid) {
+            me = Some(f[0]);
+        } else if f[3].parse() == Ok(gid) {
+            return false;
+        }
+    }
+    group
+        .lines()
+        .map(|l| l.split(':').collect::<Vec<&str>>())
+        .filter(|f| f.len() >= 4 && f[2].parse() == Ok(gid))
+        .all(|f| f[3].split(',').map(str::trim).filter(|m| !m.is_empty()).all(|m| Some(m) == me))
+}
+
+/// The file a program's path leads to in the end, where nobody but the user or the system
+/// could put another in its place: the file is theirs, and so is every folder on the way to
+/// it. (The path as given could go through a link in a folder of someone else's, who then
+/// points it elsewhere after the check; what is kept and run is the path the links led to.)
+pub(super) fn safe_program(p: &Path) -> std::result::Result<PathBuf, &'static str> {
+    use std::os::unix::fs::MetadataExt;
+    const OTHERS: &str = "belongs to another user or can be changed by others";
+    let real = std::fs::canonicalize(p).map_err(|_| "is not there")?;
+    let m = std::fs::metadata(&real).map_err(|_| "is not there")?;
+    if !m.is_file() {
+        return Err("is not a program");
+    }
+    if !mine_alone(&m) {
+        return Err(OTHERS);
+    }
+    for dir in real.ancestors().skip(1) {
+        let m = std::fs::metadata(dir).map_err(|_| "is not there")?;
+        // A folder the system set up for a group (/usr/local on some systems) or one with
+        // the sticky bit (/tmp), where a name can only be changed by who owns it, is the
+        // system's doing; a folder of the user's own has to be theirs alone.
+        // SAFETY: getuid has no failure mode and touches no memory.
+        let uid = unsafe { libc::getuid() };
+        let ok = match m.uid() {
+            0 => m.mode() & 0o002 == 0 || m.mode() & 0o1000 != 0,
+            u if u == uid => mine_alone(&m),
+            _ => false,
+        };
+        if !ok {
+            return Err(OTHERS);
+        }
+    }
+    Ok(real)
 }
 
 /// Sets the ffmpeg and ffprobe programs (empty = back to the command-line default) and
@@ -120,9 +183,10 @@ pub fn set_tools(app: &App, body: &Value) -> Result<Value> {
             Some(p) if !Path::new(p).file_name().and_then(|n| n.to_str()).is_some_and(|n| n.to_ascii_lowercase().starts_with(k)) => {
                 bail!("{k}: the program's name has to start with {k}")
             }
-            Some(p) if Path::new(p).is_absolute() && std::fs::metadata(p).is_ok_and(|m| !mine_alone(&m)) => {
-                bail!("{k}: {p} belongs to another user or can be changed by others")
-            }
+            Some(p) if Path::new(p).is_absolute() => match safe_program(Path::new(p)) {
+                Ok(real) => Ok(Some(real.to_string_lossy().into_owned())),
+                Err(why) => bail!("{k}: {p} {why}"),
+            },
             Some(p) => Ok(Some(p.to_string())),
         }
     };
@@ -277,7 +341,7 @@ pub fn start_scan(app: &Arc<App>, body: &Value) -> Result<Value> {
                 match r {
                     Ok((results, _)) => {
                         for f in &results {
-                            app.allow(&f.path);
+                            app.allow_video(&f.path);
                         }
                         s.results = results;
                         s.status = "done".into();
@@ -372,9 +436,7 @@ fn resolve(report: &Path, p: &str, same_dir: bool) -> PathBuf {
 
 /// Reports are plain JSON on disk; only let them unlock video files, never arbitrary ones.
 fn allow_video(app: &App, p: &Path) {
-    if is_video(p) && p.is_file() {
-        app.allow(p);
-    }
+    app.allow_video(p);
 }
 
 /// What `replace` would do with a report, for the history table and the compare view.
@@ -641,4 +703,50 @@ fn percent_encode(s: &str) -> String {
             _ => format!("%{b:02X}"),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_group_is_the_users_own_when_nobody_else_is_in_it() {
+        let passwd = "root:x:0:0:root:/root:/bin/bash\nme:x:1000:1000:Me:/home/me:/bin/bash\nyou:x:1001:1001::/home/you:/bin/sh\nshared:x:1002:100::/home/shared:/bin/sh\n";
+        let group = "root:x:0:\nusers:x:100:me\nme:x:1000:\nyou:x:1001:\nmedia:x:1500:me,you\nmine:x:1600:me\n";
+        // A group to oneself, by being its only user or its only member.
+        assert!(alone_in_group(passwd, group, 1000, 1000));
+        assert!(alone_in_group(passwd, group, 1600, 1000));
+        // Another member, another user whose group it is, someone else's group.
+        assert!(!alone_in_group(passwd, group, 1500, 1000));
+        assert!(!alone_in_group(passwd, group, 100, 1000));
+        assert!(!alone_in_group(passwd, group, 1001, 1000));
+    }
+
+    #[test]
+    fn a_program_is_safe_where_nobody_else_can_swap_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("av1opt-program-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("mine")).unwrap();
+        std::fs::create_dir_all(dir.join("open")).unwrap();
+        for f in ["mine/ffmpeg", "open/ffmpeg"] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+            std::fs::set_permissions(dir.join(f), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::set_permissions(dir.join("mine"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(dir.join("open"), std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::os::unix::fs::symlink(dir.join("mine/ffmpeg"), dir.join("open/link")).unwrap();
+        // (The folder the test is in is the system's sticky one, or the user's own.)
+        let real = std::fs::canonicalize(dir.join("mine/ffmpeg")).unwrap();
+        assert_eq!(safe_program(&dir.join("mine/ffmpeg")), Ok(real.clone()));
+        // A link in a folder open to all leads to a safe file: the file is what is kept.
+        assert_eq!(safe_program(&dir.join("open/link")), Ok(real));
+        assert!(safe_program(&dir.join("open/ffmpeg")).is_err());
+        assert_eq!(safe_program(&dir.join("mine/nothing")), Err("is not there"));
+        assert_eq!(safe_program(&dir.join("mine")), Err("is not a program"));
+        // A file others can write to is not safe wherever it lies.
+        std::fs::set_permissions(dir.join("mine/ffmpeg"), std::fs::Permissions::from_mode(0o757)).unwrap();
+        assert!(safe_program(&dir.join("mine/ffmpeg")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -1340,7 +1340,8 @@ fn check_layout(tools: &Tools, info: &MediaInfo, out: &Path, streams: &Streams, 
     let whole = (out_info.duration_s - info.duration_s).abs() <= (info.duration_s * 0.005).clamp(1.0, 5.0);
     let understated = cut.is_none() && length > expected && whole;
     if (length - expected).abs() > tolerance && !understated {
-        bail!("verify: duration {length:.1}s, expected {expected:.1}s");
+        let hint = if length < expected { ": the source may be cut off or damaged" } else { "" };
+        bail!("verify: duration {length:.1}s, expected {expected:.1}s{hint}");
     }
     if out_info.audio_streams as usize != streams.audio || out_info.subtitle_streams as usize != streams.subs {
         bail!(

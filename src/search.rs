@@ -240,15 +240,34 @@ pub fn extract_reference(
     // decoding (output-side -ss), so the decoder has a clean run-in.
     let preroll = start.min(PREROLL_SECS);
     let seek = snap_seek(start - preroll, cfr_value(info), first_frame);
-    let args: Vec<String> = [
-        "-y", "-v", "error", "-ss", &format!("{seek:.4}"), "-i", &path_arg(input),
-        "-ss", &format!("{preroll:.3}"), "-t", &format!("{secs:.3}"),
-        "-map", &format!("0:{}", if is_source { info.video_index } else { 0 }), "-an", "-sn",
-        "-vf", &vf.join(","), "-c:v", REFERENCE_CODEC, "-pix_fmt", reference_pix_fmt(info), &path_arg(out),
-    ]
-    .map(String::from)
-    .to_vec();
-    tools.run(&args).map(|_| ())
+    let cut = |seek: Option<f64>, skip: f64| -> Result<bool> {
+        let mut args: Vec<String> = vec!["-y".into(), "-v".into(), "error".into()];
+        if let Some(seek) = seek {
+            args.extend(["-ss".into(), format!("{seek:.4}")]);
+        }
+        args.extend(
+            [
+                "-i", &path_arg(input),
+                "-ss", &format!("{skip:.3}"), "-t", &format!("{secs:.3}"),
+                "-map", &format!("0:{}", if is_source { info.video_index } else { 0 }), "-an", "-sn",
+                "-vf", &vf.join(","), "-c:v", REFERENCE_CODEC, "-pix_fmt", reference_pix_fmt(info), &path_arg(out),
+            ]
+            .map(String::from),
+        );
+        tools.run(&args)?;
+        // ffmpeg ends without complaint when it has nothing to write.
+        Ok(tools.count_frames(out).is_ok_and(|frames| frames > 0))
+    };
+    if cut(Some(seek), preroll)? {
+        return Ok(());
+    }
+    // A seek can land past the place it was sent to, where key frames are far apart or the
+    // file has no index (MPEG-TS most of all). Decoding from the start finds the place. The
+    // times of the filters count from the first frame.
+    if seek > 0.0 && cut(None, (start - first_frame).max(0.0))? {
+        return Ok(());
+    }
+    bail!("no picture at {} in {}: the video ends earlier than it says, or is damaged", crate::tools::hms(start), input.display())
 }
 
 /// When a file's first video frame is shown, counted from the start of the file (other

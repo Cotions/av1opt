@@ -946,6 +946,44 @@ fn very_short_videos_are_encoded_or_refused_cleanly() {
 
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_video_that_starts_late_is_measured_and_cut_from_where_it_starts() {
+    // Matroska states when such a file ends, not how long it is, and an MPEG-TS seek lands
+    // past the place it was sent to and gives no frames, without an error.
+    let c = Case::new("late");
+    let base = c.clip("base.mkv", "320x180", 4);
+    for (name, format) in [("late-mkv.mkv", "matroska"), ("late-ts.ts", "mpegts")] {
+        c.ffmpeg(&["-i", "base.mkv", "-c", "copy", "-output_ts_offset", "5", "-f", format, name]);
+    }
+    let want = frames(&base);
+    std::fs::remove_file(&base).unwrap();
+    c.encode(&[&c.videos()], &[]).ok().has("encoded 2, skipped 0, failed 0");
+    for stem in ["late-mkv", "late-ts"] {
+        let out = c.out().join(format!("{stem}.mp4"));
+        assert_eq!(frames(&out), want, "{stem}");
+        assert!((duration(&out) - 4.0).abs() < 0.2, "{stem}: {}", duration(&out));
+        assert!(c.report(stem)["duration_s"].as_f64().is_none_or(|d| (d - 4.0).abs() < 0.2), "{stem}");
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_file_cut_off_is_refused_with_the_reason_and_leaves_nothing() {
+    let c = Case::new("cutoff");
+    // Far before its stated end: the samples have no frames to come from.
+    let long = c.clip("long.mkv", "320x180", 60);
+    let bytes = std::fs::read(&long).unwrap();
+    std::fs::write(&long, &bytes[..bytes.len() / 10]).unwrap();
+    c.encode(&[&long], &[]).has("failed 1").has("no picture at").has("ends earlier than it says");
+    // Near it: the samples are fine, and the encode comes out too short.
+    let short = c.clip("short.mkv", "320x180", 4);
+    let bytes = std::fs::read(&short).unwrap();
+    std::fs::write(&short, &bytes[..bytes.len() * 6 / 10]).unwrap();
+    c.encode(&[&short], &[]).has("failed 1").has("the source may be cut off or damaged");
+    assert_eq!(c.outputs(), ["av1opt-log.tsv"]);
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn a_name_with_no_room_for_its_report_is_refused_before_the_work() {
     let c = Case::new("longname");
     let clip = c.clip("clip.mkv", "320x180", 2);

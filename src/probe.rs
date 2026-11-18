@@ -144,18 +144,20 @@ pub fn probe(ffprobe: &str, path: &Path, file_size: u64) -> Result<MediaInfo> {
     let num = |v: &Value| -> Option<f64> {
         v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
     };
-    let duration_s = num(&j["format"]["duration"])
+    let start_time = num(&j["format"]["start_time"]).unwrap_or(0.0);
+    let matroska = j["format"]["format_name"].as_str().is_some_and(|f| f.contains("matroska"));
+    let from_end = |end: f64| if matroska { length_from_end(end, start_time) } else { end };
+    let duration_s = num(&j["format"]["duration"]).map(from_end)
         .or_else(|| num(&video["duration"]))
         .unwrap_or(0.0);
     // Matroska keeps a stream's length in a tag ("00:07:39.966000000"), MP4 in the stream.
     let video_s = num(&video["duration"])
-        .or_else(|| video["tags"]["DURATION"].as_str().and_then(clock_secs))
+        .or_else(|| video["tags"]["DURATION"].as_str().and_then(clock_secs).map(from_end))
         .unwrap_or(0.0);
     let avg_rate = parse_rate(video["avg_frame_rate"].as_str());
     let nominal_rate = parse_rate(video["r_frame_rate"].as_str());
     let fps = avg_rate.or(nominal_rate).unwrap_or(0.0);
     let vfr = matches!((avg_rate, nominal_rate), (Some(a), Some(r)) if (a - r).abs() / r > 0.005);
-    let start_time = num(&j["format"]["start_time"]).unwrap_or(0.0);
     let video_start = num(&video["start_time"]).unwrap_or(start_time);
 
     let audio: Vec<&Value> = streams.iter().filter(|s| s["codec_type"] == "audio").collect();
@@ -311,6 +313,13 @@ fn parse_rate(s: Option<&str>) -> Option<f64> {
 }
 
 /// Seconds in a "hh:mm:ss.fraction" clock time.
+/// How long a Matroska file is, from what it calls its duration: the time its last frame
+/// ends, which for a file that starts at 5 s is 5 s more than it holds. Samples placed along
+/// that length would fall past the end.
+fn length_from_end(end: f64, start: f64) -> f64 {
+    if start > 0.0 && end > start { end - start } else { end }
+}
+
 fn clock_secs(s: &str) -> Option<f64> {
     let mut parts = s.trim().split(':');
     let (h, m, sec) = (parts.next()?, parts.next()?, parts.next()?);
@@ -324,6 +333,15 @@ fn clock_secs(s: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_matroska_length_is_counted_from_where_the_file_starts() {
+        assert_eq!(length_from_end(9.0, 5.0), 4.0);
+        assert_eq!(length_from_end(9.0, 0.0), 9.0);
+        // Early timestamps, or an end that makes no sense: the file's word stands.
+        assert_eq!(length_from_end(9.0, -0.5), 9.0);
+        assert_eq!(length_from_end(3.0, 5.0), 3.0);
+    }
 
     #[test]
     fn picture_length_is_the_video_streams_own_when_sound_runs_on() {

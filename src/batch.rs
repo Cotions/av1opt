@@ -228,7 +228,7 @@ pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipp
         }
 
         encode::clean_stale_temp(&job.out_dir);
-        match encode::optimize(tools, &job.input, &job.out_dir, o) {
+        match guarded(|| encode::optimize(tools, &job.input, &job.out_dir, o)) {
             Ok(out) => {
                 let out_size = std::fs::metadata(&out).map_or(0, |m| m.len());
                 sum.ok += 1;
@@ -261,9 +261,36 @@ pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipp
     Ok(sum)
 }
 
+/// Runs the work on one file so that a bug in av1opt itself (a panic) fails that file and
+/// not the hundred queued behind it. What the encode had open is closed on the way out as
+/// after any other error: temporary folders go, child processes are stopped.
+pub(crate) fn guarded<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+        Ok(r) => r,
+        Err(p) => {
+            let what = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "no message".into());
+            Err(anyhow::anyhow!("av1opt itself went wrong here (a bug in the program, not in the file): {what}"))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bug_fails_one_file_not_the_run() {
+        let quiet = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let by_text = guarded(|| -> Result<()> { panic!("index {} out of range", 7) });
+        let by_unwrap = guarded(|| -> Result<u8> { Ok([1u8][std::hint::black_box(4)]) });
+        std::panic::set_hook(quiet);
+        let e = by_text.unwrap_err().to_string();
+        assert!(e.starts_with("av1opt itself went wrong here") && e.ends_with("index 7 out of range"), "{e}");
+        assert!(by_unwrap.is_err());
+        assert_eq!(guarded(|| Ok(3)).unwrap(), 3);
+        assert_eq!(guarded(|| -> Result<()> { anyhow::bail!("plain") }).unwrap_err().to_string(), "plain");
+    }
 
     #[test]
     fn jobs_are_ordered_by_worth_and_ties_keep_their_place() {

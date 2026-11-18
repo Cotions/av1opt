@@ -749,7 +749,8 @@ pub fn start_worker(app: Arc<App>) {
                 drop(app.jobs.wake.wait_timeout(jobs, std::time::Duration::from_secs(30)).unwrap());
             };
             app.broadcast(json!({ "kind": "jobs" }));
-            let result = run_job(&app, id, opts, retry, &out_dir, workers);
+            // A bug anywhere under a job fails that job; the queue goes on.
+            let result = batch::guarded(|| run_job(&app, id, opts, retry, &out_dir, workers));
             let mut jobs = app.jobs.jobs.lock().unwrap();
             let mut done = None;
             if let Some(j) = jobs.iter_mut().find(|j| j.id == id) {

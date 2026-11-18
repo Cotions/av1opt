@@ -256,20 +256,35 @@ fn save(app: &App, force: bool) {
 }
 
 fn load(app: &App) {
-    let Some(doc) = state_path().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice::<Value>(&b).ok()) else { return };
-    // A file from a newer av1opt is set aside and not used: what it means may have changed.
-    let format = doc["format"].as_u64().unwrap_or(0);
-    if format > STATE_FORMAT {
-        eprintln!("warning: ui-watch.json is from a newer av1opt; watched folders start from what is in them now");
-        if let Some(p) = state_path() {
-            let _ = std::fs::rename(&p, p.with_file_name(format!("ui-watch.format{format}.json")));
-        }
-        return;
-    }
-    if let Ok(mut folders) = serde_json::from_value::<BTreeMap<u64, Folder>>(doc["folders"].clone()) {
-        take_back_given_up(&mut folders);
-        *app.watch.folders.lock().unwrap() = folders;
-    }
+    let Some(path) = state_path() else { return };
+    let why = match std::fs::read(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => e.to_string(),
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Err(e) => e.to_string(),
+            Ok(doc) => {
+                // A file from a newer av1opt is set aside and not used: what it means may have changed.
+                let format = doc["format"].as_u64().unwrap_or(0);
+                if format > STATE_FORMAT {
+                    eprintln!("warning: ui-watch.json is from a newer av1opt; watched folders start from what is in them now");
+                    let _ = std::fs::rename(&path, path.with_file_name(format!("ui-watch.format{format}.json")));
+                    return;
+                }
+                match serde_json::from_value::<BTreeMap<u64, Folder>>(doc["folders"].clone()) {
+                    Ok(mut folders) => {
+                        take_back_given_up(&mut folders);
+                        *app.watch.folders.lock().unwrap() = folders;
+                        return;
+                    }
+                    Err(e) => e.to_string(),
+                }
+            }
+        },
+    };
+    // Without it the first look takes what is in the folders for what was there before, so
+    // nothing gets queued for this; videos that were waiting to be queued are passed over.
+    let told = super::set_aside(&path, "the record of what is in the watched folders", &why, "the videos now in them count as seen before and are not queued");
+    app.notices.lock().unwrap().push(told);
 }
 
 fn find(app: &App, id: u64) -> Result<Watch> {

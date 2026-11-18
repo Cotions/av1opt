@@ -1541,3 +1541,30 @@ fn numbers_out_of_range_are_refused_by_the_name_of_their_setting() {
     assert!(s.get("/api/jobs").json()["jobs"].as_array().unwrap().is_empty());
     assert_eq!(s.get("/api/watch").json()["watches"], json!([]));
 }
+
+#[test]
+fn a_watch_record_that_cannot_be_read_is_kept_aside_and_nothing_gets_queued() {
+    let s = Server::start("watch-unreadable", |d| {
+        let folder = d.join("videos/in");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("old.mkv"), b"x").unwrap();
+        let settings = json!({ "watches": [{ "id": 1, "path": folder, "out_dir": d.join("out"), "options": {} }] });
+        std::fs::write(d.join("data/av1opt/ui.json"), settings.to_string()).unwrap();
+        std::fs::write(d.join("data/av1opt/ui-watch.json"), b"{ not what was written").unwrap();
+    });
+    let notices = s.get("/api/state").json()["notices"].clone();
+    let told = notices[0].as_str().unwrap_or_default();
+    assert!(told.contains("watched folders") && told.contains("seen before"), "{notices}");
+    assert!(!s.data("ui-watch.json").exists() || std::fs::read(s.data("ui-watch.json")).unwrap() != b"{ not what was written");
+    let kept: Vec<_> = std::fs::read_dir(s.data("")).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with("ui-watch.unreadable-")).collect();
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(std::fs::read(s.data(&kept[0])).unwrap(), b"{ not what was written");
+    assert!(told.contains(&kept[0]), "{told}");
+
+    // The video in the folder counts as there before, and stays out of the queue.
+    let r = s.post("/api/watch/1/look", &json!({}));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let w = r.json()["watches"][0].clone();
+    assert_eq!((w["videos"].as_u64(), w["before"].as_u64(), w["fresh"].as_u64()), (Some(1), Some(1), Some(0)), "{w}");
+    assert_eq!(s.get("/api/jobs").json()["jobs"], json!([]));
+}

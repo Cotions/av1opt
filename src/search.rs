@@ -308,20 +308,52 @@ pub fn mean_sample_positions(duration: f64, count: usize, secs: f64) -> Vec<(f64
     (0..n).map(|i| (span * (i as f64 + 0.5) / n as f64, secs)).collect()
 }
 
-/// Cuts the sample clips at `pos` ((start, length) pairs in source seconds).
+/// Cuts the sample clips at `pos` ((start, length) pairs in source seconds), a few at a time:
+/// a cut is a seek, a second or so of decoding and a small lossless encode, and a search for
+/// the mean wants up to 64 of them.
 pub fn extract_samples(tools: &Tools, input: &Path, info: &MediaInfo, tmp: &Path, pos: Vec<(f64, f64)>) -> Result<Vec<Sample>> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     let n = pos.len();
-    pos.into_iter()
-        .enumerate()
-        .map(|(i, (start, secs))| {
-            let reference = tmp.join(format!("sample{i}.ref.mkv"));
-            eprintln!("  sample {}/{n} at {} ({secs:.0}s)", i + 1, crate::tools::hms(start));
-            tools.emit(crate::events::Event::Phase { phase: "sampling".into(), detail: format!("sample {}/{n} at {}", i + 1, crate::tools::hms(start)) });
-            extract_reference(tools, input, info, true, first_frame(info), start, secs, &reference)?;
-            let frames = tools.count_frames(&reference)?;
-            Ok(Sample { reference, secs, frames })
-        })
-        .collect()
+    let workers = (std::thread::available_parallelism().map_or(4, |c| c.get()) / 3).clamp(1, 4);
+    let (next, failed) = (AtomicUsize::new(0), AtomicBool::new(false));
+    let done: Vec<std::sync::Mutex<Option<Result<Sample>>>> = (0..n).map(|_| std::sync::Mutex::new(None)).collect();
+    let first = first_frame(info);
+    std::thread::scope(|s| {
+        for _ in 0..workers.min(n) {
+            s.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::SeqCst);
+                    if i >= n || failed.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let (start, secs) = pos[i];
+                    let reference = tmp.join(format!("sample{i}.ref.mkv"));
+                    eprintln!("  sample {}/{n} at {} ({secs:.0}s)", i + 1, crate::tools::hms(start));
+                    tools.emit(crate::events::Event::Phase { phase: "sampling".into(), detail: format!("sample {}/{n} at {}", i + 1, crate::tools::hms(start)) });
+                    let cut = extract_reference(tools, input, info, true, first, start, secs, &reference)
+                        .and_then(|_| tools.count_frames(&reference))
+                        .map(|frames| Sample { reference, secs, frames });
+                    if cut.is_err() {
+                        failed.store(true, Ordering::SeqCst);
+                    }
+                    *done[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(cut);
+                }
+            });
+        }
+    });
+    // In order, and the first failure as it is; clips never started after one are not missed.
+    let mut samples = Vec::with_capacity(n);
+    for slot in done {
+        match slot.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            Some(Ok(sample)) => samples.push(sample),
+            Some(Err(e)) => return Err(e),
+            None => {}
+        }
+    }
+    if samples.len() != n {
+        bail!("the sample clips could not all be cut");
+    }
+    Ok(samples)
 }
 
 /// CRF trials measured in earlier runs, kept in `$XDG_CACHE_HOME/av1opt/trials-v1.jsonl`: an

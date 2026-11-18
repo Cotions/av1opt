@@ -69,7 +69,7 @@ pub fn start(app: &Arc<App>, body: &Value) -> Result<Value> {
     let paths: Vec<PathBuf> = r
         .paths
         .iter()
-        .map(|p| std::fs::canonicalize(p).with_context(|| format!("cannot open {}", p.display())))
+        .map(|p| std::fs::canonicalize(p).with_context(|| format!("cannot open {}", p.display())).and_then(super::text_path))
         .collect::<Result<_>>()?;
     let prefs = Prefs { prefer: r.prefer.clone(), avoid: r.avoid.iter().map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect() };
     let hooks = Arc::new(Hooks::new(|_| {}));

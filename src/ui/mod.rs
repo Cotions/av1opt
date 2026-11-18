@@ -109,6 +109,16 @@ pub struct App {
     caps: Mutex<Option<(String, String, Capabilities)>>,
 }
 
+/// `p`, if the page can be told it. What goes to the page is JSON, which holds text and has no
+/// way to write other bytes: a request can only arrive at such a path through a link, and
+/// answering it would end the thread that answers, with whatever lock it holds.
+pub fn text_path(p: PathBuf) -> anyhow::Result<PathBuf> {
+    match p.to_str() {
+        Some(_) => Ok(p),
+        None => anyhow::bail!("{}: {}", p.display(), crate::tools::NOT_TEXT),
+    }
+}
+
 impl App {
     /// Sends one message to every open event stream.
     pub fn broadcast(&self, msg: Value) {

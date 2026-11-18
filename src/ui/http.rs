@@ -351,7 +351,12 @@ fn percent_decode(s: &str) -> String {
         }
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    // Bytes that are not text name nothing the page was ever given. Made text they would name
+    // another file, so they get a character that no name holds, and so find nothing.
+    match String::from_utf8(out) {
+        Ok(text) => text,
+        Err(e) => format!("{}\0", String::from_utf8_lossy(e.as_bytes())),
+    }
 }
 
 #[cfg(test)]
@@ -412,5 +417,6 @@ mod tests {
         assert_eq!(percent_decode("a%20b+c%2Fd"), "a b c/d");
         assert_eq!(percent_decode("%C3%A9%"), "é%");
         assert_eq!(percent_decode("%4"), "%4");
+        assert_eq!(percent_decode("a%FFb"), "a\u{fffd}b\0");
     }
 }

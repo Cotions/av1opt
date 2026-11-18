@@ -946,6 +946,22 @@ fn very_short_videos_are_encoded_or_refused_cleanly() {
 
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_name_that_is_not_text_is_refused_and_no_other_file_is_taken_for_it() {
+    use std::os::unix::ffi::OsStrExt;
+    let c = Case::new("nottext");
+    // What the name turns into when it is made text: another video, there to be opened.
+    let other = c.clip("w\u{fffd}.mkv", "320x180", 2);
+    let odd = c.videos().join(std::ffi::OsStr::from_bytes(b"w\xff.mkv"));
+    std::fs::copy(&other, &odd).unwrap();
+    c.encode(&[&odd], &[]).has("failed 1").has("not valid UTF-8");
+    assert_eq!(c.outputs(), ["av1opt-log.tsv"]);
+    // A scan of the folder goes through and lists both.
+    let r = c.av1opt(&[std::ffi::OsStr::new("scan"), c.videos().as_os_str()]);
+    r.ok().has("found 2 video files");
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn sound_that_runs_on_after_the_picture_is_kept_whole() {
     // A recording left running: 12 s of picture under 30 s of sound. The container says 30 s,
     // so samples and spot checks used to be asked of seconds that have no frames.
@@ -1769,6 +1785,23 @@ mod queue {
         let r = s.post("/api/jobs", &json!({ "inputs": [input], "roots": [], "out_dir": s.dir.join("out"), "options": options }));
         assert_eq!(r.status, 200, "{}", r.body);
         r.json()["id"].as_u64().unwrap()
+    }
+
+    #[test]
+    #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+    fn a_folder_queued_with_a_name_that_is_not_text_loses_only_that_file() {
+        use std::os::unix::ffi::OsStrExt;
+        let s = Server::start_with_tools("e2e-nottext", &ffmpeg_bin(), &ffprobe_bin(), |d| {
+            small_clip(&d.join("videos/good.mp4"), &H264, 3600);
+            std::fs::copy(d.join("videos/good.mp4"), d.join("videos").join(std::ffi::OsStr::from_bytes(b"w\xff.mp4"))).unwrap();
+        });
+        let id = add(&s, &s.dir.join("videos"), json!({ "preset": 12 }));
+        let job = s.get(&format!("/api/jobs/{id}")).json();
+        let files = job["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1, "{job}");
+        assert!(files[0]["input"].as_str().unwrap().ends_with("/good.mp4"), "{job}");
+        assert_eq!(s.post(&format!("/api/jobs/{id}/cancel"), &json!({})).status, 200);
+        assert_eq!(s.get("/api/state").status, 200);
     }
 
     #[test]

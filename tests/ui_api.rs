@@ -102,6 +102,78 @@ fn media_serves_only_picked_files() {
 }
 
 #[test]
+fn names_that_are_not_text_stay_off_the_page_and_take_nothing_down() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let s = Server::start("nottext", |d| {
+        let v = d.join("videos");
+        for name in [&b"ok.mkv"[..], "w\u{fffd}.mkv".as_bytes(), b"w\xff.mkv"] {
+            std::fs::write(v.join(OsStr::from_bytes(name)), b"x").unwrap();
+        }
+        let inside = v.join(OsStr::from_bytes(b"d\xff"));
+        std::fs::create_dir(&inside).unwrap();
+        std::fs::write(inside.join("in.mkv"), b"x").unwrap();
+        // The one way a request can get to such a path. And the folder the broken name would be.
+        std::os::unix::fs::symlink(&inside, v.join("link")).unwrap();
+        std::fs::create_dir(v.join("d\u{fffd}")).unwrap();
+    });
+    let v = s.dir.join("videos");
+    let esc = |t: &str| t.bytes().map(|b| if b.is_ascii_alphanumeric() || b"/._-".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect::<String>();
+    let vs = esc(v.to_str().unwrap());
+
+    // Listed: what has a name that can be shown and asked for again, and how much has not.
+    let r = s.get(&format!("/api/browse?path={vs}"));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let list = r.json();
+    let names = |key: &str, field: Option<&str>| -> Vec<String> {
+        let mut n: Vec<String> = list[key].as_array().unwrap().iter().map(|e| field.map_or(e, |f| &e[f]).as_str().unwrap().to_string()).collect();
+        n.sort();
+        n
+    };
+    assert_eq!(names("files", Some("name")), ["ok.mkv", "w\u{fffd}.mkv"]);
+    assert_eq!(names("dirs", None), ["d\u{fffd}", "link"]);
+    assert_eq!(list["not_listed"], 2);
+
+    // Bytes that are not text do not become the file or folder they would look like.
+    assert_eq!(s.get(&format!("/api/browse?path={vs}/d%FF")).status, 400);
+    // A link to such a folder or file is refused, with a reason.
+    let r = s.get(&format!("/api/browse?path={vs}/link"));
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert!(r.json()["error"].as_str().unwrap().contains("not valid UTF-8"), "{}", r.body);
+    assert_eq!(s.post("/api/source", &json!({ "path": v.join("link/in.mkv") })).status, 400);
+    assert_eq!(s.post("/api/scans", &json!({ "paths": [v.join("link")] })).status, 400);
+    assert_eq!(s.post("/api/history/dirs", &json!({ "path": v.join("link") })).status, 400);
+
+    // A scan of the folder finishes, twice over, and lists the rest.
+    for _ in 0..2 {
+        let id = s.post("/api/scans", &json!({ "paths": [v] })).json()["id"].as_u64().unwrap();
+        let started = Instant::now();
+        let done = loop {
+            let r = s.get(&format!("/api/scans/{id}"));
+            assert_eq!(r.status, 200, "{}", r.body);
+            let scan = r.json();
+            if scan["status"] != "running" {
+                break scan;
+            }
+            assert!(started.elapsed() < Duration::from_secs(30), "the scan does not end");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(done["status"], "done", "{done}");
+        assert_eq!(done["not_listed"], 2, "{done}");
+        let rows: Vec<&str> = done["rows"].as_array().unwrap().iter().map(|r| r["path"].as_str().unwrap()).collect();
+        assert!(rows.iter().all(|p| Path::new(p).exists()), "{rows:?}");
+        for name in ["ok.mkv", "w\u{fffd}.mkv"] {
+            assert!(rows.contains(&v.join(name).to_str().unwrap()), "{name} is missing from {rows:?}");
+        }
+    }
+
+    // The scan made the real file playable; the broken name still does not reach it.
+    assert_eq!(s.get(&format!("/media?path={vs}/{}", esc("w\u{fffd}.mkv"))).status, 200);
+    assert_eq!(s.get(&format!("/media?path={vs}/w%FF.mkv")).status, 403);
+    assert_eq!(s.get("/api/state").status, 200);
+}
+
+#[test]
 fn jobs_wait_while_tools_are_missing_and_survive_a_restart() {
     let mut s = Server::start("jobs", |d| {
         std::fs::write(d.join("videos/a.mkv"), b"x").unwrap();

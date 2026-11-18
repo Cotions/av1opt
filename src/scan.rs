@@ -265,8 +265,19 @@ fn cache_file() -> Result<PathBuf> {
     Ok(dir.join("probe-cache-v3.json"))
 }
 
+/// Leaves out the files whose paths are not text and says how many there were, for what has
+/// to name its files in JSON or have ffmpeg read them.
+pub fn drop_unnamed(found: &mut Vec<FileResult>) -> usize {
+    let before = found.len();
+    found.retain(|f| f.path.to_str().is_some());
+    before - found.len()
+}
+
+/// A path that is not text has no place in a JSON file: such a file is probed on every scan,
+/// and the scan does not stop for it.
 fn save_cache(path: &Path, cache: &HashMap<PathBuf, CacheEntry>) -> Result<()> {
-    Ok(crate::files::replace_with(path, &serde_json::to_vec(cache)?)?)
+    let text: HashMap<&PathBuf, &CacheEntry> = cache.iter().filter(|(p, _)| p.to_str().is_some()).collect();
+    Ok(crate::files::replace_with(path, &serde_json::to_vec(&text)?)?)
 }
 
 #[cfg(test)]
@@ -285,6 +296,21 @@ mod tests {
             .filter(|(_, t)| *t <= budget)
             .map(|(v, _)| v)
             .fold(0.0, f64::max)
+    }
+
+    #[test]
+    fn a_name_that_is_not_text_does_not_stop_the_cache_being_saved() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join(format!("av1opt-scancache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = CacheEntry { size: 1, mtime: 2, info: None, error: Some("x".into()) };
+        let odd = PathBuf::from(std::ffi::OsStr::from_bytes(b"/v/a\xff.mkv"));
+        let cache = HashMap::from([(odd, entry.clone()), (PathBuf::from("/v/b.mkv"), entry)]);
+        let at = dir.join("cache.json");
+        save_cache(&at, &cache).unwrap();
+        let back: HashMap<PathBuf, CacheEntry> = serde_json::from_slice(&std::fs::read(&at).unwrap()).unwrap();
+        assert_eq!(back.keys().collect::<Vec<_>>(), [Path::new("/v/b.mkv")]);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

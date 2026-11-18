@@ -221,7 +221,11 @@ impl Tools {
     /// Starts a child that a cancel request can kill.
     fn spawn(&self, cmd: &mut Command) -> Result<Child> {
         self.check_cancel()?;
-        let child = cmd.spawn().context("failed to start ffmpeg")?;
+        let child = cmd.spawn().map_err(|e| match e.kind() {
+            // What `path_arg` makes of a name that cannot be passed on.
+            std::io::ErrorKind::InvalidInput => anyhow::anyhow!("{NOT_TEXT}"),
+            _ => anyhow::Error::new(e).context("failed to start ffmpeg"),
+        })?;
         if let Some(h) = &self.hooks {
             h.track(child.id());
         }
@@ -478,10 +482,21 @@ impl Tools {
     }
 }
 
+/// Why a file cannot be worked on, where its name is not text.
+pub const NOT_TEXT: &str = "its path is not valid UTF-8, which av1opt cannot pass on; rename it";
+
 /// A path as an ffmpeg argument. Absolute, because ffmpeg takes what stands before a colon in
 /// a relative name for a protocol (`a:b/x.mkv`: "Protocol not found").
+///
+/// Arguments are text here. A name that is not cannot be written as text without becoming
+/// another name, possibly that of another file; it gets a NUL, which no file name holds and
+/// no program can be started with, so that ffmpeg never opens the wrong file (see `spawn`).
 pub fn path_arg(p: &Path) -> String {
-    std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().into_owned()
+    let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    match abs.to_str() {
+        Some(s) => s.to_owned(),
+        None => format!("{}\0", abs.to_string_lossy()),
+    }
 }
 
 /// A path as an ffprobe argument: absolute for the same reason, and so that a name that
@@ -525,6 +540,20 @@ fn svt_version(log: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_that_is_not_text_never_reaches_ffmpeg_as_another_name() {
+        use std::os::unix::ffi::OsStrExt;
+        let odd = Path::new(std::ffi::OsStr::from_bytes(b"/v/a\xff.mkv"));
+        assert_eq!(path_arg(Path::new("/v/a b.mkv")), "/v/a b.mkv");
+        assert_ne!(path_arg(odd), "/v/a\u{fffd}.mkv");
+        let tools = Tools::new("true".into(), "true".into(), None);
+        let e = tools.run(&["-i".into(), path_arg(odd)]).unwrap_err();
+        assert_eq!(e.to_string(), NOT_TEXT);
+        // An ffmpeg that is not there is still reported as that.
+        let none = Tools::new("/nonexistent/ffmpeg".into(), "true".into(), None);
+        assert!(none.run(&[]).unwrap_err().to_string().contains("failed to start ffmpeg"));
+    }
 
     #[test]
     fn the_encoder_names_itself() {

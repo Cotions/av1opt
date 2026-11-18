@@ -392,9 +392,9 @@ fn add_unchecked(app: &App, body: &Value) -> Result<Value> {
     // Same safety rule as the command line, without the override.
     crate::fsguard::ensure_writable_location(&r.out_dir, false)?;
     // Canonical paths: no `..` tricks when output folders are derived from scan roots.
-    let canon = |p: &PathBuf| std::fs::canonicalize(p).with_context(|| format!("{} does not exist", p.display()));
+    let canon = |p: &PathBuf| std::fs::canonicalize(p).with_context(|| format!("{} does not exist", p.display())).and_then(super::text_path);
     let inputs: Vec<PathBuf> = r.inputs.iter().map(canon).collect::<Result<_>>()?;
-    let roots: Vec<PathBuf> = r.roots.iter().filter_map(|p| std::fs::canonicalize(p).ok()).collect();
+    let roots: Vec<PathBuf> = r.roots.iter().filter_map(|p| canon(p).ok()).collect();
     let mut batch_jobs = Vec::new();
     for input in &inputs {
         let root = roots.iter().filter(|root| input.starts_with(root) && input != *root).max_by_key(|p| p.as_os_str().len());
@@ -411,6 +411,11 @@ fn add_unchecked(app: &App, body: &Value) -> Result<Value> {
     }
     if batch_jobs.is_empty() {
         bail!("no video files in the selection");
+    }
+    // The queue is kept as JSON, and a folder can hold names that cannot go there.
+    batch_jobs.retain(|j| j.input.to_str().is_some() && std::fs::canonicalize(&j.input).map_or(true, |c| c.to_str().is_some()));
+    if batch_jobs.is_empty() {
+        bail!("no video in the selection can be encoded: {}", crate::tools::NOT_TEXT);
     }
     if !opts.remove.is_empty() && batch_jobs.len() > 1 {
         bail!("sections can only be removed when encoding a single video");

@@ -77,6 +77,8 @@ pub struct Stats {
     /// Files that are a spare copy in a whole-video group, and their total size.
     pub spare_files: usize,
     pub spare_bytes: u64,
+    /// Videos left out because their paths are not text.
+    pub not_text: usize,
 }
 
 #[derive(Serialize, Clone, Debug, Default)]
@@ -226,8 +228,12 @@ fn mark_identical(media: &mut [Media], linked: &[usize]) {
 pub fn find(paths: &[PathBuf], tools: &Tools, o: &Options, progress: &(dyn Fn(Progress) + Sync)) -> Result<Report> {
     // The verdicts of `scan` aren't used here, so the built-in size model will do.
     let model = Model::fit(&[], 93.0);
-    let (found, _) = scan::collect(paths, &tools.ffprobe, o.jobs, 0.2, &model, &|done, total| progress(Progress::Probing { done, total }))?;
+    let (mut found, _) = scan::collect(paths, &tools.ffprobe, o.jobs, 0.2, &model, &|done, total| progress(Progress::Probing { done, total }))?;
     tools.check_cancel()?;
+    let not_text = scan::drop_unnamed(&mut found);
+    if not_text > 0 {
+        eprintln!("note: {not_text} videos left out: {}", crate::tools::NOT_TEXT);
+    }
 
     let mut unreadable: Vec<Unreadable> = Vec::new();
     let mut videos: Vec<(&scan::FileResult, &MediaInfo)> = Vec::new();
@@ -361,6 +367,7 @@ pub fn find(paths: &[PathBuf], tools: &Tools, o: &Options, progress: &(dyn Fn(Pr
         partial_groups: groups.len() - same.len(),
         spare_files: same.iter().map(|g| g.members.len() - 1).sum(),
         spare_bytes: same.iter().flat_map(|g| &g.members[1..]).map(|&i| files[i].size).sum(),
+        not_text,
     };
     unreadable.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(Report { files, groups, unreadable, stats })

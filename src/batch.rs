@@ -383,7 +383,11 @@ pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipp
             tools.emit(Event::FileEnd { index: i, status: status.into(), detail: detail.into(), input_bytes: size, output_bytes: out_bytes });
         };
 
-        match before_encoding(&output, clashes[i].as_ref(), &abs, size, o) {
+        // Checked before anything else: what is known about such a file goes by a name that
+        // may be another file's.
+        let named = [job.input.as_path(), &abs, &output].iter().all(|p| p.to_str().is_some());
+        let before = if named { before_encoding(&output, clashes[i].as_ref(), &abs, size, o) } else { Before::Refuse(crate::tools::NOT_TEXT.into()) };
+        match before {
             Before::Encode => {}
             Before::Done => {
                 eprintln!("already done: {}", output.display());
@@ -750,6 +754,20 @@ mod tests {
         // A backslash in the log of an earlier version stays what it was.
         assert_eq!(unescape_name("/v/back\\slash.mkv"), "/v/back\\slash.mkv");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_name_that_is_not_text_is_refused_before_anything_is_looked_up() {
+        use std::os::unix::ffi::OsStrExt;
+        let f = Folder::new("nottext", &[]);
+        let out = Folder::new("nottext-out", &[]);
+        let odd = f.0.join(std::ffi::OsStr::from_bytes(b"a\xff.mkv"));
+        std::fs::write(&odd, b"video").unwrap();
+        // What the name would be as text: an encode of another file, which must not count.
+        std::fs::write(out.0.join("a\u{fffd}.mp4"), b"other").unwrap();
+        let (sum, ends) = f.walk(&out.0, &options());
+        assert_eq!((sum.failed, sum.already_done), (1, 0));
+        assert_eq!(ends["a\u{fffd}.mkv"], ("error".to_string(), crate::tools::NOT_TEXT.to_string()));
     }
 
     #[test]

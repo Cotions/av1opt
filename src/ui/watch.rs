@@ -331,7 +331,7 @@ struct AddRequest {
 
 pub fn add(app: &App, body: &Value) -> Result<Value> {
     let r: AddRequest = serde_json::from_value(body.clone())?;
-    let path = std::fs::canonicalize(&r.path).with_context(|| format!("{} does not exist", r.path.display()))?;
+    let path = std::fs::canonicalize(&r.path).with_context(|| format!("{} does not exist", r.path.display())).and_then(super::text_path)?;
     if !path.is_dir() {
         bail!("{} is not a folder", path.display());
     }

@@ -1,6 +1,6 @@
 //! Folder browsing, scans, encode history (the `.av1opt.json` reports) and playback previews.
 
-use super::{App, now};
+use super::{App, now, text_path};
 use crate::estimate::{Model, TimeModel, Verdict};
 use crate::history;
 use crate::replace::{self, Check};
@@ -69,7 +69,7 @@ struct MetaPreviewRequest {
 /// The tags an encode of `input` would write with these options, next to the source's own.
 pub fn meta_preview(app: &App, body: &Value) -> Result<Value> {
     let r: MetaPreviewRequest = serde_json::from_value(body.clone())?;
-    let input = std::fs::canonicalize(&r.input).with_context(|| format!("{} does not exist", r.input.display()))?;
+    let input = std::fs::canonicalize(&r.input).with_context(|| format!("{} does not exist", r.input.display())).and_then(text_path)?;
     if !input.is_file() || !is_video(&input) {
         bail!("not a video file");
     }
@@ -221,15 +221,21 @@ pub fn browse(path: Option<&str>, hidden: bool) -> Result<Value> {
         Some(p) if !p.is_empty() => PathBuf::from(p),
         _ => home(),
     };
-    let dir = std::fs::canonicalize(&dir).with_context(|| format!("cannot open {}", dir.display()))?;
+    let dir = std::fs::canonicalize(&dir).with_context(|| format!("cannot open {}", dir.display())).and_then(text_path)?;
     let mut dirs = Vec::new();
     let mut files = Vec::new();
+    let mut not_listed = 0;
     for e in std::fs::read_dir(&dir).with_context(|| format!("cannot list {}", dir.display()))?.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         if name.starts_with('.') && !hidden {
             continue;
         }
         let Ok(meta) = std::fs::metadata(e.path()) else { continue };
+        // Shown as text it would be another name, which picking it would then ask for.
+        if (meta.is_dir() || meta.is_file() && is_video(&e.path())) && e.file_name().to_str().is_none() {
+            not_listed += 1;
+            continue;
+        }
         if meta.is_dir() {
             dirs.push(name);
         } else if meta.is_file() && is_video(&e.path()) {
@@ -241,12 +247,12 @@ pub fn browse(path: Option<&str>, hidden: bool) -> Result<Value> {
     let mut places = vec![json!({ "name": "Home", "path": home() })];
     for base in ["/mnt", "/media"] {
         if let Ok(rd) = std::fs::read_dir(base) {
-            let mut v: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+            let mut v: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_dir() && p.to_str().is_some()).collect();
             v.sort();
             places.extend(v.into_iter().map(|p| json!({ "name": p.display().to_string(), "path": p })));
         }
     }
-    Ok(json!({ "path": dir, "parent": dir.parent(), "dirs": dirs, "files": files, "places": places }))
+    Ok(json!({ "path": dir, "parent": dir.parent(), "dirs": dirs, "files": files, "not_listed": not_listed, "places": places }))
 }
 
 pub struct Scan {
@@ -261,6 +267,8 @@ pub struct Scan {
     /// How long encodes take here, for the preset the scan was asked about.
     time: TimeModel,
     results: Vec<FileResult>,
+    /// Videos found whose paths are not text, which the page cannot show or name.
+    not_listed: usize,
 }
 
 #[derive(Deserialize)]
@@ -294,7 +302,7 @@ pub fn start_scan(app: &Arc<App>, body: &Value) -> Result<Value> {
     let paths: Vec<PathBuf> = r
         .paths
         .iter()
-        .map(|p| std::fs::canonicalize(p).with_context(|| format!("cannot open {}", p.display())))
+        .map(|p| std::fs::canonicalize(p).with_context(|| format!("cannot open {}", p.display())).and_then(text_path))
         .collect::<Result<_>>()?;
     if r.preset > 13 {
         bail!("preset must be 0-13");
@@ -320,6 +328,7 @@ pub fn start_scan(app: &Arc<App>, body: &Value) -> Result<Value> {
             model_samples: model.samples,
             time,
             results: Vec::new(),
+            not_listed: 0,
         });
         id
     };
@@ -351,7 +360,8 @@ pub fn start_scan(app: &Arc<App>, body: &Value) -> Result<Value> {
             let mut scans = app.scans.lock().unwrap();
             if let Some(s) = scans.iter_mut().find(|s| s.id == id) {
                 match r {
-                    Ok((results, _)) => {
+                    Ok((mut results, _)) => {
+                        s.not_listed = scan::drop_unnamed(&mut results);
                         for f in &results {
                             app.allow_video(&f.path);
                         }
@@ -428,7 +438,7 @@ pub fn scan_result(app: &App, id: u64) -> Result<Value> {
     }
     Ok(json!({
         "id": s.id, "paths": s.paths, "status": s.status, "error": s.error, "done": s.done, "total": s.total,
-        "started": s.started, "model_samples": s.model_samples, "time_samples": s.time.samples, "scenes_factor": s.time.scenes, "scene_samples": s.time.scene_samples, "auto_factor": s.time.auto_factor(), "auto_share": s.time.auto_share, "auto_samples": s.time.auto_samples, "preset": s.time.preset, "totals": totals, "rows": rows,
+        "started": s.started, "model_samples": s.model_samples, "time_samples": s.time.samples, "scenes_factor": s.time.scenes, "scene_samples": s.time.scene_samples, "auto_factor": s.time.auto_factor(), "auto_share": s.time.auto_share, "auto_samples": s.time.auto_samples, "preset": s.time.preset, "totals": totals, "rows": rows, "not_listed": s.not_listed,
     }))
 }
 
@@ -481,6 +491,7 @@ pub fn history(app: &App) -> Value {
     let mut rows: Vec<Value> = replace::report_files(&dirs)
         .into_iter()
         .filter_map(|p| {
+            p.to_str()?;
             let r: Value = serde_json::from_slice(&std::fs::read(&p).ok()?).ok()?;
             // Reports from before versioning have no `format`; newer layouts are skipped.
             if r["format"].as_u64().unwrap_or(1) > u64::from(crate::encode::REPORT_FORMAT) {
@@ -525,7 +536,7 @@ struct DirRequest {
 
 pub fn add_history_dir(app: &App, body: &Value) -> Result<Value> {
     let r: DirRequest = serde_json::from_value(body.clone())?;
-    let p = std::fs::canonicalize(&r.path).with_context(|| format!("cannot open {}", r.path.display()))?;
+    let p = std::fs::canonicalize(&r.path).with_context(|| format!("cannot open {}", r.path.display())).and_then(text_path)?;
     if !p.is_dir() {
         bail!("{} is not a folder", p.display());
     }
@@ -548,7 +559,7 @@ pub fn remove_history_dir(app: &App, body: &Value) -> Result<Value> {
 
 /// A report the user can reach: inside a history folder or written by a queued job.
 fn known_report(app: &App, p: &Path) -> Result<PathBuf> {
-    let c = std::fs::canonicalize(p).with_context(|| format!("not found: {}", p.display()))?;
+    let c = std::fs::canonicalize(p).with_context(|| format!("not found: {}", p.display())).and_then(text_path)?;
     if !c.to_string_lossy().ends_with(".av1opt.json") {
         bail!("not a report");
     }
@@ -683,7 +694,7 @@ pub fn preview(app: &App, body: &Value) -> Result<Value> {
 /// URL the player can stream it from.
 pub fn source(app: &App, body: &Value) -> Result<Value> {
     let r: DirRequest = serde_json::from_value(body.clone())?;
-    let p = std::fs::canonicalize(&r.path).with_context(|| format!("not found: {}", r.path.display()))?;
+    let p = std::fs::canonicalize(&r.path).with_context(|| format!("not found: {}", r.path.display())).and_then(text_path)?;
     if !p.is_file() || !is_video(&p) {
         bail!("{} is not a video file", p.display());
     }

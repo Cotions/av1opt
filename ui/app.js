@@ -254,6 +254,7 @@ function pick({ title, mode = "dir", start }) {
         return li;
       };
       if (r.parent) items.push(keyed(h("li", { onclick: () => go(r.parent) }, h("span", { class: "icon" }, "↰"), "..")));
+      if (r.not_listed) items.push(h("li", { class: "dim" }, `${plural(r.not_listed, "item")} not shown: the name is not valid UTF-8`));
       for (const d of r.dirs) {
         const full = join(d);
         const li = h("li", { class: selected.has(full) ? "sel" : "" }, h("span", { class: "icon" }, "▸"), h("span", { class: "grow" }, d));
@@ -832,7 +833,7 @@ views.scan = (root) => {
     }
     progress.firstChild.style.width = "100%";
     if (r.status === "failed") { progText.textContent = "failed"; out.replaceChildren(h("div", { class: "panel bad" }, r.error)); return; }
-    progText.textContent = `${r.rows.length} videos · estimates from ${r.model_samples ? r.model_samples + " past encodes" : "the built-in model (encode a few files to calibrate)"}`;
+    progText.textContent = `${r.rows.length} videos · estimates from ${r.model_samples ? r.model_samples + " past encodes" : "the built-in model (encode a few files to calibrate)"}${r.not_listed ? ` · ${plural(r.not_listed, "video")} left out: the path is not valid UTF-8` : ""}`;
     renderScan(out, r);
   }
 
@@ -1066,7 +1067,7 @@ views.dups = (root) => {
     if (r.status === "failed") { progText.textContent = "failed"; out.replaceChildren(h("div", { class: "panel bad" }, r.error)); return; }
     if (r.status === "cancelled") { progText.textContent = "stopped (frames read so far are remembered)"; out.replaceChildren(); return; }
     const s = r.report.stats;
-    progText.textContent = `${s.compared} of ${s.videos} videos compared · ${s.fresh} read now, the rest remembered`;
+    progText.textContent = `${s.compared} of ${s.videos} videos compared · ${s.fresh} read now, the rest remembered${s.not_text ? ` · ${plural(s.not_text, "video")} left out: the path is not valid UTF-8` : ""}`;
     renderDups(out, r, () => showResult(id));
   }
 

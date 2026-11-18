@@ -7,6 +7,7 @@
 //! land on an existing file. Space is only freed when the trash is emptied.
 
 use crate::encode::REPORT_FORMAT;
+use crate::source::Verdict;
 use crate::trash;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -205,6 +206,19 @@ fn check_inner(report: &Path) -> Result<Check, String> {
     }
     if output_bytes >= source_bytes {
         return Err("the output is not smaller than the original".into());
+    }
+    // The original goes to the trash on the strength of this: it has to be the file that was
+    // encoded, not one that took over its name and size since.
+    match crate::source::compare(&crate::source::Recorded::in_report(&r), &source) {
+        Verdict::Same => {}
+        Verdict::OtherSize { .. } | Verdict::Changed => return Err("the original changed since the encode".into()),
+        Verdict::CannotTell => {
+            return Err(format!(
+                "the original was last changed at another time than when it was encoded, and this report is from a version that cannot tell whether only the date differs; to go on, delete {} and encode the original again",
+                output.display()
+            ));
+        }
+        Verdict::Unreadable(e) => return Err(format!("the original cannot be read to check that it is the file that was encoded: {e}")),
     }
     let dir = source.parent().ok_or("the original has no folder")?;
     let dest = match output.extension() {
@@ -731,6 +745,43 @@ mod tests {
             Check::No(why) => why,
             other => panic!("expected a refusal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_original_rewritten_at_its_size_is_not_replaced_and_one_only_touched_is() {
+        let f = Fix::new("rewritten");
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        let source = f.lib("a.mp4");
+        let (_, then) = crate::source::Recorded::of(&source).unwrap();
+        let rewrite_report = |extra: Value| {
+            let mut r: Value = serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+            for key in ["source_mtime", "source_fingerprint"] {
+                r.as_object_mut().unwrap().remove(key);
+                r[key] = extra[key].clone();
+            }
+            std::fs::write(&report, r.to_string()).unwrap();
+        };
+        let set_time = |seconds: u64| std::fs::File::options().write(true).open(&source).unwrap().set_modified(UNIX_EPOCH + std::time::Duration::from_secs(seconds)).unwrap();
+        let recorded = json!({ "source_mtime": then.modified, "source_fingerprint": then.fingerprint });
+        rewrite_report(recorded.clone());
+        assert!(matches!(check(&report), Check::Ready(_)));
+
+        // Only the date moved: the file is the one encoded.
+        set_time(1_500_000_000);
+        assert!(matches!(check(&report), Check::Ready(_)));
+        // The download finished into its allocated space: same size, other contents.
+        std::fs::write(&source, vec![b't'; 1000]).unwrap();
+        set_time(1_500_000_500);
+        assert_eq!(no(&report), "the original changed since the encode");
+        assert!(f.apply(&report).is_err());
+        assert!(source.exists());
+        // A report that holds the time and no fingerprint cannot tell, and says what to do.
+        rewrite_report(json!({ "source_mtime": then.modified }));
+        let why = no(&report);
+        assert!(why.contains("cannot tell") && why.contains(&format!("delete {}", f.out("a.mkv").display())), "{why}");
+        // One that holds neither goes by the size, as it always did.
+        rewrite_report(json!({}));
+        assert!(matches!(check(&report), Check::Ready(_)));
     }
 
     #[test]

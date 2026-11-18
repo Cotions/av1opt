@@ -17,7 +17,6 @@ use phash::THUMB;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -177,21 +176,8 @@ pub fn fingerprint(tools: &Tools, path: &Path, info: &MediaInfo) -> Result<Finge
     Ok(Fingerprint { head: hashes[..lad.len()].to_vec(), tail: hashes[lad.len()..].to_vec() })
 }
 
-/// Hash of the first, middle and last 64 KiB: enough to tell same-size files apart without
-/// reading gigabytes from a slow drive.
-fn sample_digest(path: &Path, size: u64) -> Option<u64> {
-    const CHUNK: u64 = 64 * 1024;
-    let mut f = std::fs::File::open(path).ok()?;
-    let mut h = 0xcbf29ce484222325_u64;
-    let mut buf = Vec::with_capacity(CHUNK as usize);
-    for start in [0, (size / 2).saturating_sub(CHUNK / 2), size.saturating_sub(CHUNK)] {
-        f.seek(SeekFrom::Start(start)).ok()?;
-        buf.clear();
-        f.by_ref().take(CHUNK).read_to_end(&mut buf).ok()?;
-        h = buf.iter().fold(h, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3));
-    }
-    Some(h)
-}
+/// How much of a file's start, middle and end is compared.
+const IDENTICAL_SAMPLE: u64 = 64 * 1024;
 
 /// Numbers the sets of files that have the same size and the same sampled bytes.
 fn mark_identical(media: &mut [Media], linked: &[usize]) {
@@ -209,7 +195,7 @@ fn mark_identical(media: &mut [Media], linked: &[usize]) {
         }
         let mut by_digest: HashMap<u64, Vec<usize>> = HashMap::new();
         for &i in set {
-            if let Some(d) = sample_digest(&media[i].path, *size) {
+            if let Ok(d) = crate::files::sample_digest(&media[i].path, *size, IDENTICAL_SAMPLE) {
                 by_digest.entry(d).or_default().push(i);
             }
         }
@@ -496,6 +482,7 @@ mod tests {
         };
         let (a, b, c, d) = (write("a", &big(1, 9)), write("b", &big(1, 9)), write("c", &big(1, 8)), write("d", b"tiny"));
         let size = 300_000;
+        let sample_digest = |path: &Path, size| crate::files::sample_digest(path, size, IDENTICAL_SAMPLE).ok();
         assert_eq!(sample_digest(&a, size), sample_digest(&b, size));
         assert_ne!(sample_digest(&a, size), sample_digest(&c, size));
         assert!(sample_digest(&d, 4).is_some());

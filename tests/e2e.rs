@@ -295,9 +295,18 @@ fn a_source_changed_during_its_encode_leaves_no_output() {
         assert!(started.elapsed() < std::time::Duration::from_secs(120), "no work folder after two minutes");
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    // What a download going on does to a file allocated ahead: same size, a new date.
+    // What a download going on does to a file allocated ahead: same size, other contents, a new
+    // date. The last byte of this file is in a tag, so the clip still plays.
     let later = std::fs::metadata(&src).unwrap().modified().unwrap() + std::time::Duration::from_secs(5);
-    std::fs::File::options().write(true).open(&src).unwrap().set_modified(later).unwrap();
+    let file = std::fs::File::options().read(true).write(true).open(&src).unwrap();
+    {
+        use std::os::unix::fs::FileExt;
+        let end = file.metadata().unwrap().len() - 1;
+        let mut last = [0u8];
+        file.read_exact_at(&mut last, end).unwrap();
+        file.write_all_at(&[last[0] ^ 1], end).unwrap();
+    }
+    file.set_modified(later).unwrap();
     let status = child.wait().unwrap();
     let err = reader.join().unwrap();
     assert!(!status.success(), "the encode was taken as good:\n{err}");

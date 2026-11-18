@@ -1105,7 +1105,7 @@ fn what_a_command_was_asked_to_write_is_written_though_nobody_reads_its_output()
         writer
     };
     let run = |what: &str, name: &str, args: &[&str], files: &[&str]| {
-        let mut c = scan_command(name);
+        let c = scan_command(name);
         let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("ui-{name}"));
         std::fs::write(dir.join("videos/a.mkv"), b"xx").unwrap();
         let video_args: Vec<_> = c.get_args().skip(1).map(|a| a.to_owned()).collect();

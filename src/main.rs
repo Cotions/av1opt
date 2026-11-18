@@ -20,6 +20,7 @@ mod scan;
 mod scenes;
 mod search;
 mod sections;
+mod source;
 mod tools;
 mod trash;
 mod tuning;

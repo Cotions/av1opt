@@ -7,6 +7,7 @@ use crate::repair;
 use crate::metadata::{self, MetaOptions, Resolved};
 use crate::scenes;
 use crate::sections::{self, Sections};
+use crate::source::{Recorded, Verdict};
 use crate::search::{self, EncodeSettings, SearchParams, Trial};
 use crate::tools::{FAILED_INSIDE, NOT_WRITTEN, Tools, hms, path_arg};
 use anyhow::{Context, Result, bail};
@@ -187,6 +188,9 @@ struct Report<'a> {
     /// When the source was last changed, in seconds since 1970. Reports from before this was
     /// recorded have none, which their readers take as not known.
     source_mtime: Option<u64>,
+    /// A hash of the source's size and of samples of its contents: what tells a file only
+    /// touched from one written to. See `source`.
+    source_fingerprint: Option<&'a str>,
     output_bytes: u64,
     savings: f64,
     /// "whole" (one CRF) or "scenes" (CRF per chunk; `crf` is then the whole-file starting point).
@@ -219,33 +223,24 @@ struct Report<'a> {
     notes: &'a [String],
 }
 
-/// A source as it stood at some moment, to tell whether it has been written to since.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct SourceStamp {
-    size: u64,
-    modified: Option<std::time::SystemTime>,
-}
-
-impl SourceStamp {
-    fn of(input: &Path) -> std::io::Result<SourceStamp> {
-        let meta = std::fs::metadata(input)?;
-        Ok(SourceStamp { size: meta.len(), modified: meta.modified().ok() })
-    }
-}
-
-/// The time a file was last changed, in the whole seconds a report keeps.
-pub fn modified_seconds(meta: &std::fs::Metadata) -> Option<u64> {
-    seconds_since_1970(meta.modified().ok()?)
-}
-
-fn seconds_since_1970(time: std::time::SystemTime) -> Option<u64> {
-    Some(time.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs())
-}
-
 /// Whether the source is still what the encode began reading. A download that had only stalled
-/// goes on growing under the encode, and what comes out is then a copy of part of it.
-fn source_is_unchanged(input: &Path, before: SourceStamp) -> bool {
-    SourceStamp::of(input).is_ok_and(|now| now == before)
+/// goes on growing under the encode, and what comes out is then a copy of part of it. Chunks
+/// made from the earlier state are of no use to the next run and go with it, but only when the
+/// file was seen to have changed: a drive that dropped out says nothing about the file, and
+/// the chunks may be days of work.
+fn check_source_unchanged(input: &Path, before: &Recorded, work: Option<&Path>, keep_temp: bool) -> Result<()> {
+    match crate::source::compare(before, input) {
+        Verdict::Same => Ok(()),
+        Verdict::Unreadable(e) => {
+            bail!("{} could not be looked at after its encode ({e}), so the result was thrown away; its drive may have dropped out. Finished chunks are kept, and encoding it again goes on from them", input.display())
+        }
+        _ => {
+            if let Some(work) = work.filter(|_| !keep_temp) {
+                let _ = std::fs::remove_dir_all(work);
+            }
+            bail!("{} changed or went away while it was being encoded, so the result was thrown away; encode it again once it is complete", input.display())
+        }
+    }
 }
 
 /// Deletes the temp folder when dropped, unless asked to keep it.
@@ -397,8 +392,7 @@ fn fits_beside_output(output: &Path, tmp: &Path) -> Result<()> {
 
 /// Re-encodes one file into `out_dir`. Returns the output path.
 pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Result<PathBuf> {
-    let source = SourceStamp::of(input).with_context(|| format!("cannot read {}", input.display()))?;
-    let size = source.size;
+    let (size, source) = Recorded::of(input).with_context(|| format!("cannot read {}", input.display()))?;
     let mut info = probe::probe(&tools.ffprobe, input, size)?;
     if o.audio == Audio::Shrink {
         // Matroska rarely says what a track spends; measure the ones it leaves open.
@@ -846,15 +840,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         notes.push(n);
     }
 
-    if !source_is_unchanged(input, source) {
-        // Chunks made from the earlier state of the file are of no use to the next run.
-        if let Some(w) = &work
-            && !o.keep_temp
-        {
-            let _ = std::fs::remove_dir_all(&w.path);
-        }
-        bail!("{} changed or went away while it was being encoded, so the result was thrown away; encode it again once it is complete", input.display());
-    }
+    check_source_unchanged(input, &source, work.as_ref().map(|w| w.path.as_path()), o.keep_temp)?;
 
     // What the samples promised is the video stream at one CRF; the file is that, the
     // stretches encoded again, the other streams and the container.
@@ -903,7 +889,8 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         input: &abs_input,
         output: &abs_output,
         source_bytes: size,
-        source_mtime: source.modified.and_then(seconds_since_1970),
+        source_mtime: source.modified,
+        source_fingerprint: source.fingerprint.as_deref(),
         output_bytes,
         savings: 1.0 - output_bytes as f64 / size as f64,
         mode: if chunks.is_some() { "scenes" } else { "whole" },
@@ -1677,33 +1664,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_source_written_to_during_the_encode_is_noticed() {
+    fn a_source_written_to_during_the_encode_is_noticed_and_one_only_touched_is_not() {
         use std::io::Write;
         use std::time::{Duration, SystemTime};
         let dir = std::env::temp_dir().join(format!("av1opt-source-stamp-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let input = dir.join("a.mkv");
+        let work = dir.join(".av1opt-work-1");
+        let chunks = || std::fs::create_dir_all(&work).unwrap();
         std::fs::write(&input, b"video").unwrap();
         let then = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         std::fs::File::options().write(true).open(&input).unwrap().set_modified(then).unwrap();
-        let before = SourceStamp::of(&input).unwrap();
-        assert!(source_is_unchanged(&input, before));
-        assert_eq!(before.modified.and_then(seconds_since_1970), Some(1_700_000_000));
+        let before = Recorded::of(&input).unwrap().1;
+        chunks();
+        let check = |keep| check_source_unchanged(&input, &before, Some(work.as_path()), keep).map_err(|e| e.to_string());
+        check(false).unwrap();
+        assert_eq!(before.modified, Some(1_700_000_000));
+
+        // A new date alone, far off or within the two seconds a filesystem may round to.
+        for off in [1, 3600] {
+            std::fs::File::options().write(true).open(&input).unwrap().set_modified(then + Duration::from_secs(off)).unwrap();
+            check(false).unwrap();
+        }
+        assert!(work.is_dir());
+
+        // Written in place at the same size, as into a file allocated ahead: the fingerprint
+        // tells. Asked to keep its work, the encode keeps its chunks.
+        std::fs::write(&input, b"VIDEO").unwrap();
+        std::fs::File::options().write(true).open(&input).unwrap().set_modified(then + Duration::from_secs(60)).unwrap();
+        assert!(check(true).unwrap_err().contains("changed or went away"));
+        assert!(work.is_dir());
+        assert!(check(false).unwrap_err().contains("changed or went away"));
+        assert!(!work.exists());
 
         // Grown, with its date put back: the size tells.
+        chunks();
         let mut file = std::fs::File::options().append(true).open(&input).unwrap();
         file.write_all(b"more").unwrap();
         file.set_modified(then).unwrap();
-        assert!(!source_is_unchanged(&input, before));
+        assert!(check(false).unwrap_err().contains("changed or went away"));
+        assert!(!work.exists());
 
-        // Written in place at the same size, as into a file allocated ahead: the date tells.
-        let same_size = SourceStamp::of(&input).unwrap();
-        std::fs::File::options().write(true).open(&input).unwrap().set_modified(then + Duration::from_secs(1)).unwrap();
-        assert!(!source_is_unchanged(&input, same_size));
-
+        // Out of reach, as on a drive that dropped out: nothing shows that it changed, so
+        // the encode fails and the chunks stay.
+        chunks();
         std::fs::remove_file(&input).unwrap();
-        assert!(!source_is_unchanged(&input, same_size));
+        let e = check(false).unwrap_err();
+        assert!(e.contains("could not be looked at") && e.contains("kept"), "{e}");
+        assert!(work.is_dir());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

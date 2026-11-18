@@ -3,6 +3,7 @@
 
 use crate::encode::{self, Options, Skip};
 use crate::events::{self, Event};
+use crate::source::Verdict;
 use crate::tools::Tools;
 use anyhow::Result;
 use std::cell::Cell;
@@ -197,10 +198,8 @@ struct Made {
     source: PathBuf,
     /// The sections left out of the output.
     removed: Vec<(f64, f64)>,
-    /// The size the input had.
-    bytes: Option<u64>,
-    /// When the input had last been changed, in seconds. Older reports do not say.
-    modified: Option<u64>,
+    /// The input as it was then.
+    then: crate::source::Recorded,
 }
 
 fn report_input(output: &Path) -> Option<Made> {
@@ -210,8 +209,7 @@ fn report_input(output: &Path) -> Option<Made> {
     Some(Made {
         source: std::fs::canonicalize(&p).ok().or_else(|| std::path::absolute(&p).ok())?,
         removed,
-        bytes: r["source_bytes"].as_u64(),
-        modified: r["source_mtime"].as_u64(),
+        then: crate::source::Recorded::in_report(&r),
     })
 }
 
@@ -318,7 +316,7 @@ enum Before {
     Refuse(String),
 }
 
-fn before_encoding(output: &Path, clash: Option<&Clash>, input: &Path, size: u64, modified: Option<u64>, o: &Options) -> Before {
+fn before_encoding(output: &Path, clash: Option<&Clash>, input: &Path, o: &Options) -> Before {
     let exists = output.exists();
     let made = if exists { report_input(output) } else { None };
     match clash {
@@ -356,15 +354,18 @@ fn before_encoding(output: &Path, clash: Option<&Clash>, input: &Path, size: u64
     if made.source != input {
         return Before::Refuse(format!("output name collision: {} was made from {}", output.display(), made.source.display()));
     }
-    // The same name and another file: a download done again, an edit saved over it.
-    if let Some(then) = made.bytes.filter(|then| *then != size) {
-        return Before::Refuse(format!("{} was made from this file when it was another size ({then} bytes, now {size}); move or delete it to encode again", output.display()));
+    // The same name and another file: a download done again, an edit saved over it, or a
+    // download that wrote into a file allocated ahead.
+    let shown = output.display();
+    match crate::source::compare(&made.then, input) {
+        Verdict::Same => Before::Done,
+        Verdict::OtherSize { then, now } => Before::Refuse(format!("{shown} was made from this file when it was another size ({then} bytes, now {now}); move or delete it to encode again")),
+        Verdict::Changed => Before::Refuse(format!("{shown} was made from this file before it changed: it is the same size but holds something else now; move or delete {shown} to encode it again")),
+        Verdict::CannotTell => Before::Refuse(format!(
+            "{shown} was made from this file when it was last changed at another time, and its report is from a version that cannot tell whether only the date differs; if the file did change, or to be sure, delete {shown} to encode it again"
+        )),
+        Verdict::Unreadable(e) => Before::Refuse(format!("cannot tell whether {shown} is the encode of this file as it is now, because the file cannot be read: {e}")),
     }
-    // The same goes at the same size: a download writes into a file allocated ahead.
-    if made.modified.is_some_and(|then| modified != Some(then)) {
-        return Before::Refuse(format!("{} was made from this file when it was last changed at another time; move or delete it to encode again", output.display()));
-    }
-    Before::Done
 }
 
 #[derive(Default)]
@@ -396,9 +397,7 @@ pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipp
     let mut sum = Summary::default();
     for (i, job) in jobs.iter().enumerate() {
         let abs = std::fs::canonicalize(&job.input).or_else(|_| std::path::absolute(&job.input))?;
-        let meta = std::fs::metadata(&job.input).ok();
-        let size = meta.as_ref().map_or(0, |m| m.len());
-        let modified = meta.as_ref().and_then(crate::encode::modified_seconds);
+        let size = std::fs::metadata(&job.input).map_or(0, |m| m.len());
         let output = output_of(job, o);
         eprintln!("\n[{}/{}] {}", i + 1, jobs.len(), job.input.display());
         if tools.check_cancel().is_err() {
@@ -413,7 +412,7 @@ pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipp
         // Checked before anything else: what is known about such a file goes by a name that
         // may be another file's.
         let named = [job.input.as_path(), &abs, &output].iter().all(|p| p.to_str().is_some());
-        let before = if named { before_encoding(&output, clashes[i].as_ref(), &abs, size, modified, o) } else { Before::Refuse(crate::tools::NOT_TEXT.into()) };
+        let before = if named { before_encoding(&output, clashes[i].as_ref(), &abs, o) } else { Before::Refuse(crate::tools::NOT_TEXT.into()) };
         match before {
             Before::Encode => {}
             Before::Done => {
@@ -658,20 +657,29 @@ mod tests {
     }
 
     #[test]
-    fn an_output_made_when_its_source_was_last_changed_at_another_time_is_not_counted_as_done() {
+    fn an_output_counts_for_a_source_only_touched_and_not_for_one_rewritten() {
         let source = Folder::new("changed-in", &["c.mkv"]);
         let out = Folder::new("changed-out", &["c.mp4"]);
-        let meta = std::fs::metadata(source.0.join("c.mkv")).unwrap();
-        let now = crate::encode::modified_seconds(&meta).unwrap();
-        let report = |fields: serde_json::Value| std::fs::write(out.0.join("c.av1opt.json"), fields.to_string()).unwrap();
         let input = source.0.join("c.mkv");
+        let meta = std::fs::metadata(&input).unwrap();
+        let now = crate::source::modified_seconds(&meta).unwrap();
+        let print = crate::source::Recorded::of(&input).unwrap().1.fingerprint.unwrap();
+        let report = |fields: serde_json::Value| std::fs::write(out.0.join("c.av1opt.json"), fields.to_string()).unwrap();
         report(serde_json::json!({"input": input, "source_bytes": 5, "source_mtime": now}));
         assert_eq!(source.walk(&out.0, &options()).1["c.mkv"].0, "done_before");
-        // The size agrees, as it does for a file allocated ahead and filled in afterwards.
+        // Another time and the same contents: touched, or copied without its dates.
+        report(serde_json::json!({"input": input, "source_bytes": 5, "source_mtime": now - 60, "source_fingerprint": print}));
+        assert_eq!(source.walk(&out.0, &options()).1["c.mkv"].0, "done_before");
+        // Another time and other contents, as for a file allocated ahead and filled in later.
+        report(serde_json::json!({"input": input, "source_bytes": 5, "source_mtime": now - 60, "source_fingerprint": "0000000000000000"}));
+        let (status, detail) = source.walk(&out.0, &options()).1["c.mkv"].clone();
+        assert_eq!(status, "error");
+        assert!(detail.contains("before it changed"), "{detail}");
+        // A report with the time and no fingerprint cannot tell, and says what can be done.
         report(serde_json::json!({"input": input, "source_bytes": 5, "source_mtime": now - 60}));
         let (status, detail) = source.walk(&out.0, &options()).1["c.mkv"].clone();
         assert_eq!(status, "error");
-        assert!(detail.contains("when it was last changed at another time"), "{detail}");
+        assert!(detail.contains("when it was last changed at another time") && detail.contains(&format!("delete {}", out.0.join("c.mp4").display())), "{detail}");
         // A report from before the time was kept judges by the size alone.
         report(serde_json::json!({"input": input, "source_bytes": 5}));
         assert_eq!(source.walk(&out.0, &options()).1["c.mkv"].0, "done_before");

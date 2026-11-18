@@ -1,7 +1,7 @@
 //! Writing files where another program, or another user, may be writing too.
 
 use std::ffi::{OsStr, OsString};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -93,6 +93,23 @@ pub fn append_line(path: &Path, line: &str, follow: bool) -> std::io::Result<()>
     }
     let start = if last[0] == b'\n' { "" } else { "\n" };
     file.write_all(format!("{start}{line}\n").as_bytes())
+}
+
+/// A hash (FNV-1a, the same in every build) of a file's size and of `chunk` bytes at its start,
+/// its middle and its end: enough to tell files of one size apart without reading gigabytes
+/// from a slow drive.
+pub fn sample_digest(path: &Path, size: u64, chunk: u64) -> std::io::Result<u64> {
+    let add = |hash: u64, bytes: &[u8]| bytes.iter().fold(hash, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100000001b3));
+    let mut file = std::fs::File::open(path)?;
+    let mut hash = add(0xcbf29ce484222325, &size.to_le_bytes());
+    let mut buffer = Vec::with_capacity(chunk as usize);
+    for start in [0, (size / 2).saturating_sub(chunk / 2), size.saturating_sub(chunk)] {
+        file.seek(SeekFrom::Start(start))?;
+        buffer.clear();
+        (&file).take(chunk).read_to_end(&mut buffer)?;
+        hash = add(hash, &buffer);
+    }
+    Ok(hash)
 }
 
 /// Writes a shell script for a test to run, and returns once it can be run. While the file

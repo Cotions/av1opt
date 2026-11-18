@@ -638,7 +638,7 @@ function encodeDialog(inputs, roots = [], watch = false) {
           h("h3", {}, "Settings"),
           h("div", { class: "form-grid" },
             setting("Target VMAF", vmaf, "Quality to match: 93 looks like the source, higher keeps more and saves less"),
-            setting("Preset", preset, "0–13: lower makes smaller files but encodes slower"),
+            setting("Preset", preset, "0–13: lower makes smaller files but encodes slower. Measured against 6 at the same quality: 5 is about 5% smaller for a quarter more time, 4 about 9% smaller for 60% more"),
             setting("Encoder parameters", svtParams, "SVT-AV1 options as name=value:name=value; the Benchmark page finds good ones"),
             tuning.length ? setting("Tuned settings", h("label", { class: "check" }, tuned, "Use the benchmark's settings by video size"),
               tuning.map((x) => `${x.label}: ${configLabel(x.choice)}`).join("; ") + ". Other sizes use the preset and parameters above") : null,

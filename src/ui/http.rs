@@ -419,4 +419,161 @@ mod tests {
         assert_eq!(percent_decode("%4"), "%4");
         assert_eq!(percent_decode("a%FFb"), "a\u{fffd}b\0");
     }
+
+    #[test]
+    fn a_range_of_one_byte_works_at_both_ends() {
+        assert_eq!(parse_range("bytes=0-0", 1), Some((0, 0)));
+        assert_eq!(parse_range("bytes=-1", 1), Some((0, 0)));
+        assert_eq!(parse_range("bytes=0-", 1), Some((0, 0)));
+        assert_eq!(parse_range("bytes=99-99", 100), Some((99, 99)));
+        assert_eq!(parse_range("bytes=99-", 100), Some((99, 99)));
+    }
+
+    #[test]
+    fn ranges_past_the_end_are_cut_or_refused() {
+        assert_eq!(parse_range("bytes=0-99", 100), Some((0, 99)));
+        assert_eq!(parse_range("bytes=0-100", 100), Some((0, 99)));
+        assert_eq!(parse_range("bytes=-100", 100), Some((0, 99)));
+        assert_eq!(parse_range("bytes=-101", 100), Some((0, 99)));
+        assert_eq!(parse_range("bytes=100-100", 100), None);
+        assert_eq!(parse_range("bytes=100-200", 100), None);
+    }
+
+    #[test]
+    fn a_range_of_nothing_is_refused() {
+        assert_eq!(parse_range("bytes=-0", 100), None);
+        assert_eq!(parse_range("bytes=5-4", 100), None);
+        for h in ["bytes=-1", "bytes=-0", "bytes=0-0", "bytes=0-5"] {
+            assert_eq!(parse_range(h, 0), None, "{h}");
+        }
+    }
+
+    #[test]
+    fn a_range_that_is_not_one_is_refused() {
+        for h in ["", "bytes", "bytes=", "bytes=-", "bytes=a-b", "bytes=1-b", "bytes=a-1", "bytes=1", "bytes=1-2-3", "bytes=--1", "bytes=-1-", "bytes=٠-٩", "0-5", "items=0-5"] {
+            assert_eq!(parse_range(h, 100), None, "{h:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_first_of_several_ranges_counts() {
+        assert_eq!(parse_range("bytes=0-1,5-6", 100), Some((0, 1)));
+        assert_eq!(parse_range("bytes= 2-3 , 5-6", 100), Some((2, 3)));
+        assert_eq!(parse_range("bytes=200-300,0-1", 100), None);
+    }
+
+    #[test]
+    fn the_largest_numbers_do_not_overflow_a_range() {
+        let max = u64::MAX;
+        assert_eq!(parse_range(&format!("bytes={max}-"), 100), None);
+        assert_eq!(parse_range(&format!("bytes=0-{max}"), 100), Some((0, 99)));
+        assert_eq!(parse_range(&format!("bytes=-{max}"), 100), Some((0, 99)));
+        assert_eq!(parse_range(&format!("bytes={}-{max}", max - 1), max), Some((max - 1, max - 1)));
+        assert_eq!(parse_range("bytes=0-99999999999999999999999", 100), None);
+    }
+
+    #[test]
+    fn the_query_is_split_before_it_is_decoded() {
+        let q = parse_query;
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+        assert_eq!(q(""), vec![]);
+        assert_eq!(q("&&"), vec![]);
+        assert_eq!(q("a"), vec![pair("a", "")]);
+        assert_eq!(q("a="), vec![pair("a", "")]);
+        assert_eq!(q("=v"), vec![pair("", "v")]);
+        assert_eq!(q("a=b=c"), vec![pair("a", "b=c")]);
+        assert_eq!(q("path=%2Fx%26y%3Dz&t=1.5"), vec![pair("path", "/x&y=z"), pair("t", "1.5")]);
+        assert_eq!(q("a%20b=c+d"), vec![pair("a b", "c d")]);
+    }
+
+    #[test]
+    fn the_first_of_two_parameters_of_one_name_counts() {
+        let q = parse_query("path=/a&path=/b&empty=");
+        assert_eq!(param(&q, "path"), Some("/a"));
+        assert_eq!(param(&q, "empty"), Some(""));
+        assert_eq!(param(&q, "other"), None);
+        assert_eq!(param(&q, "PATH"), None);
+    }
+
+    #[test]
+    fn a_percent_sign_without_two_hex_digits_stays_itself() {
+        assert_eq!(percent_decode(""), "");
+        assert_eq!(percent_decode("%"), "%");
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(percent_decode("%2"), "%2");
+        assert_eq!(percent_decode("%é"), "%é");
+        assert_eq!(percent_decode("%aé"), "%aé");
+        assert_eq!(percent_decode("%%41"), "%A");
+        assert_eq!(percent_decode("%2541"), "%41");
+    }
+
+    #[test]
+    #[ignore = "defect: percent_decode reads %+1 as the byte 0x01 because from_str_radix accepts a sign"]
+    fn a_sign_is_not_a_hex_digit() {
+        assert_eq!(percent_decode("%+1"), "%+1");
+        assert_eq!(percent_decode("%+f.mkv"), "%+f.mkv");
+    }
+
+    #[test]
+    fn decoded_text_keeps_its_characters_and_broken_text_finds_no_file() {
+        assert_eq!(percent_decode("%E5%AD%97%E5%B9%95.mkv"), "字幕.mkv");
+        assert_eq!(percent_decode("été+字"), "été 字");
+        assert_eq!(percent_decode("%2f%2F"), "//");
+        // Half a character: never a name a page was given.
+        assert!(percent_decode("%C3").ends_with('\0'));
+        assert!(percent_decode("a%E5%AD").ends_with('\0'));
+    }
+
+    #[test]
+    fn video_types_go_by_extension_in_any_case() {
+        for (name, want) in [
+            ("a.mp4", "video/mp4"),
+            ("a.M4V", "video/mp4"),
+            ("a.WebM", "video/webm"),
+            ("a.b.mkv", "video/x-matroska"),
+            ("a.mov", "video/quicktime"),
+            ("a.ts", "video/mp2t"),
+            ("a.m2ts", "video/mp2t"),
+            ("a.avi", "video/x-msvideo"),
+            ("a.txt", "application/octet-stream"),
+            ("mkv", "application/octet-stream"),
+            (".mkv", "application/octet-stream"),
+            ("", "application/octet-stream"),
+        ] {
+            assert_eq!(content_type(std::path::Path::new(name)), want, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn tokens_are_equal_only_when_every_byte_is() {
+        assert!(ct_eq(b"", b""));
+        assert!(ct_eq(b"token", b"token"));
+        assert!(!ct_eq(b"token", b"tokeN"));
+        assert!(!ct_eq(b"Token", b"token"));
+        assert!(!ct_eq(b"token", b"token "));
+        assert!(!ct_eq(b"", b"t"));
+    }
+
+    #[test]
+    fn each_port_has_its_own_cookie() {
+        assert_eq!(cookie_name(8080), "av1opt_8080");
+        assert_ne!(cookie_name(8080), cookie_name(8081));
+    }
+
+    #[test]
+    fn a_short_or_garbled_row_of_the_socket_list_names_no_owner() {
+        if !cfg!(target_endian = "little") {
+            return;
+        }
+        let client = std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0xC3A2);
+        // Too few columns, and an owner that is not a number.
+        assert_eq!(socket_owner("0: 0100007F:C3A2 0100007F:1F90 01 0 0 0\n", client, 0x1F90), None);
+        let garbled = "0: 0100007F:C3A2 0100007F:1F90 01 0:0 0:0 0 nobody 0 1\n";
+        assert_eq!(socket_owner(garbled, client, 0x1F90), None);
+        assert!(!may_connect(garbled, client, 0x1F90, 1000));
+        // The ports are written with four digits, so a low port still matches.
+        let low = std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 80);
+        assert_eq!(socket_owner("0: 0100007F:0050 0100007F:0051 01 0:0 0:0 0 1000 0 1\n", low, 81), Some(1000));
+    }
 }

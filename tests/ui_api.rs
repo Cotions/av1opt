@@ -752,13 +752,25 @@ fn stand_in_tools(name: &str, on_a_file: &str) -> (String, String) {
     let bin = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("tools-{name}"));
     let _ = std::fs::remove_dir_all(&bin);
     std::fs::create_dir_all(&bin).unwrap();
-    let ffmpeg = "#!/bin/sh\ncase \"$2\" in\n-version) echo 'ffmpeg version 8.0';;\n-encoders) echo ' V....D libsvtav1 SVT-AV1';;\n-filters) echo ' ... libvmaf VV->V VMAF';;\nesac\n".to_string();
-    let ffprobe = format!("#!/bin/sh\nif [ \"$2\" = -version ]; then echo 'ffprobe version 8.0'; exit 0; fi\n{on_a_file}\n");
+    let ffmpeg = "#!/bin/sh\n[ \"$1\" = --ready ] && exit 0\ncase \"$2\" in\n-version) echo 'ffmpeg version 8.0';;\n-encoders) echo ' V....D libsvtav1 SVT-AV1';;\n-filters) echo ' ... libvmaf VV->V VMAF';;\nesac\n".to_string();
+    let ffprobe = format!("#!/bin/sh\n[ \"$1\" = --ready ] && exit 0\nif [ \"$2\" = -version ]; then echo 'ffprobe version 8.0'; exit 0; fi\n{on_a_file}\n");
     let write = |file: &str, text: &str| {
         use std::os::unix::fs::PermissionsExt;
         let path = bin.join(file);
         std::fs::write(&path, text).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // While it was open for writing, a program this process started at that moment may
+        // have got a copy of it, and until that program is under way the system answers
+        // `Text file busy`. Once it runs here it runs for the server too.
+        loop {
+            match std::process::Command::new(&path).arg("--ready").status() {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => std::thread::sleep(Duration::from_millis(5)),
+                done => {
+                    done.unwrap();
+                    break;
+                }
+            }
+        }
         path.to_str().unwrap().to_string()
     };
     (write("ffmpeg", &ffmpeg), write("ffprobe", &ffprobe))
@@ -1078,6 +1090,50 @@ fn a_closed_stdout_ends_a_command_as_a_closed_pipe_does() {
     assert_eq!(out.status.signal(), Some(libc::SIGPIPE), "{out:?}");
     let said = String::from_utf8_lossy(&out.stderr);
     assert!(!said.contains("panicked"), "{said}");
+}
+
+#[test]
+fn what_a_command_was_asked_to_write_is_written_though_nobody_reads_its_output() {
+    use std::os::unix::process::ExitStatusExt;
+    let (ffmpeg, ffprobe) = stand_in_tools(
+        "unread",
+        r#"echo '{"format":{"duration":"60","size":"2","bit_rate":"8000000"},"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":640,"height":360,"avg_frame_rate":"24/1","r_frame_rate":"24/1","pix_fmt":"yuv420p"}]}'"#,
+    );
+    let closed = || {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        writer
+    };
+    let run = |what: &str, name: &str, args: &[&str], files: &[&str]| {
+        let mut c = scan_command(name);
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("ui-{name}"));
+        std::fs::write(dir.join("videos/a.mkv"), b"xx").unwrap();
+        let video_args: Vec<_> = c.get_args().skip(1).map(|a| a.to_owned()).collect();
+        let mut command = std::process::Command::new(c.get_program());
+        command.envs(c.get_envs().filter_map(|(k, v)| Some((k.to_owned(), v?.to_owned())))).env("XDG_CONFIG_HOME", dir.join("config"));
+        command.arg(what).args(video_args).args(["--ffprobe", &ffprobe]);
+        if what != "scan" {
+            command.args(["--ffmpeg", &ffmpeg]);
+        }
+        for a in args {
+            command.arg(a);
+        }
+        for f in files {
+            command.arg(dir.join(f));
+        }
+        let out = command.stdin(std::process::Stdio::null()).stdout(closed()).stderr(std::process::Stdio::piped()).output().unwrap();
+        assert_eq!(out.status.signal(), Some(libc::SIGPIPE), "{what}: {out:?}");
+        for f in files {
+            assert!(dir.join(f).is_file(), "{what}: {f} was not written: {}", String::from_utf8_lossy(&out.stderr));
+        }
+    };
+    run("scan", "unread-scan", &["--csv"], &["list.csv"]);
+    let dups = |name, flag, file| run("dups", name, &[flag], &[file]);
+    dups("unread-dups-csv", "--csv", "groups.csv");
+    dups("unread-dups-json", "--json", "groups.json");
+    let bench = |name, flag, file| run("bench", name, &["--presets", "8", "--params", "tune=0", flag], &[file]);
+    bench("unread-bench-csv", "--csv", "results.csv");
+    bench("unread-bench-json", "--json", "results.json");
 }
 
 /// Sets a file's modification time `secs` in the past.

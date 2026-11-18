@@ -439,16 +439,20 @@ fn main() -> Result<()> {
                 _ => {}
             };
             let report = dups::find(&paths, &tools, &opts, &progress)?;
+            // The files first: printing ends the program once nobody reads standard output.
+            let written = (|| -> Result<()> {
+                if let Some(csv) = csv {
+                    dups::write_csv(&report, &csv)?;
+                    eprintln!("wrote {}", csv.display());
+                }
+                if let Some(json) = json {
+                    std::fs::write(&json, serde_json::to_vec_pretty(&report)?)?;
+                    eprintln!("wrote {}", json.display());
+                }
+                Ok(())
+            })();
             dups::print(&report, top);
-            if let Some(csv) = csv {
-                dups::write_csv(&report, &csv)?;
-                eprintln!("wrote {}", csv.display());
-            }
-            if let Some(json) = json {
-                std::fs::write(&json, serde_json::to_vec_pretty(&report)?)?;
-                eprintln!("wrote {}", json.display());
-            }
-            Ok(())
+            written
         }
         Cmd::Replace { paths, apply, undo, allow_zfs } => {
             let paths: Vec<PathBuf> = paths.iter().map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone())).collect();
@@ -499,28 +503,37 @@ fn main() -> Result<()> {
                 bench::Progress::VideoDone { .. } => {}
             };
             let report = bench::run(&paths, &tools, &opts, &progress)?;
+            // The files and the tuning first: printing ends the program once nobody reads
+            // standard output, and hours of measuring would be lost with them.
+            let mut said = Vec::new();
+            let written = (|| -> Result<()> {
+                if let Some(csv) = csv {
+                    bench::write_csv(&report, &csv)?;
+                    eprintln!("wrote {}", csv.display());
+                }
+                if let Some(json) = json {
+                    std::fs::write(&json, serde_json::to_vec_pretty(&report)?)?;
+                    eprintln!("wrote {}", json.display());
+                }
+                if let Some(pick) = save {
+                    let picks = bench::tuning_picks(&report, pick);
+                    if picks.is_empty() {
+                        anyhow::bail!("--save: nothing was measured under every setting, so there is nothing to save");
+                    }
+                    let mut t = tuning::Tuning::load()?;
+                    for (class, c) in picks {
+                        said.push(format!("tuned, {}: preset {}, {} ({} video{})", class.label(), c.preset, c.params, c.videos, if c.videos == 1 { "" } else { "s" }));
+                        t.classes.insert(class, c);
+                    }
+                    said.push(format!("saved to {}; `av1opt encode --tuned` uses these", t.save()?.display()));
+                }
+                Ok(())
+            })();
             bench::print(&report);
-            if let Some(csv) = csv {
-                bench::write_csv(&report, &csv)?;
-                eprintln!("wrote {}", csv.display());
+            for line in said {
+                println!("{line}");
             }
-            if let Some(json) = json {
-                std::fs::write(&json, serde_json::to_vec_pretty(&report)?)?;
-                eprintln!("wrote {}", json.display());
-            }
-            if let Some(pick) = save {
-                let picks = bench::tuning_picks(&report, pick);
-                if picks.is_empty() {
-                    anyhow::bail!("--save: nothing was measured under every setting, so there is nothing to save");
-                }
-                let mut t = tuning::Tuning::load()?;
-                for (class, c) in picks {
-                    println!("tuned, {}: preset {}, {} ({} video{})", class.label(), c.preset, c.params, c.videos, if c.videos == 1 { "" } else { "s" });
-                    t.classes.insert(class, c);
-                }
-                println!("saved to {}; `av1opt encode --tuned` uses these", t.save()?.display());
-            }
-            Ok(())
+            written
         }
         Cmd::Tuning { clear } => {
             let mut t = tuning::Tuning::load()?;
@@ -769,28 +782,32 @@ fn scan(
     } else {
         eprintln!("estimates: learned from {} past encodes (spread x{:.2})", model.samples, (1.28 * model.sigma).exp());
     }
-    report::print(&results, top, time, sort);
-    if let Some((hours, list)) = pick {
-        let picked = scan::pick_for_time(&results, time, hours * 3600.0);
-        report::print_pick(&picked, hours, &results, time);
-        if let Some(list) = list {
+    // The files first: printing ends the program once nobody reads standard output.
+    let picked = pick.as_ref().map(|(hours, _)| scan::pick_for_time(&results, time, hours * 3600.0));
+    let written = (|| -> Result<()> {
+        if let (Some(picked), Some((_, Some(list)))) = (&picked, &pick) {
             let mut text = String::new();
-            for r in &picked {
+            for r in picked {
                 // A line break in a name would make two paths of one.
                 match r.path.to_str().filter(|p| !p.contains('\n')) {
                     Some(p) => text += &format!("{p}\n"),
                     None => eprintln!("warning: left out of {}: {}", list.display(), r.path.display()),
                 }
             }
-            std::fs::write(&list, text).map_err(|e| anyhow::anyhow!("writing {}: {e}", list.display()))?;
+            std::fs::write(list, text).map_err(|e| anyhow::anyhow!("writing {}: {e}", list.display()))?;
             eprintln!("wrote {}", list.display());
         }
+        if let Some(csv) = csv {
+            report::write_csv(&results, csv, time)?;
+            eprintln!("wrote {}", csv.display());
+        }
+        Ok(())
+    })();
+    report::print(&results, top, time, sort);
+    if let (Some(picked), Some((hours, _))) = (&picked, &pick) {
+        report::print_pick(picked, *hours, &results, time);
     }
-    if let Some(csv) = csv {
-        report::write_csv(&results, csv, time)?;
-        eprintln!("wrote {}", csv.display());
-    }
-    Ok(())
+    written
 }
 
 #[cfg(test)]

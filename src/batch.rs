@@ -272,9 +272,12 @@ enum Clash {
 /// first is the second.
 fn clashes(jobs: &[Job], o: &Options) -> Vec<Option<Clash>> {
     let inputs: Vec<Identity> = jobs.iter().map(|j| Identity::of(&j.input)).collect();
+    // A job refused for its name writes nothing, and what its name becomes as text may be the
+    // name of a real file: it stands in nobody's way.
+    let refused = |i: usize| jobs[i].input.to_str().is_none() || inputs[i].path.to_str().is_none();
     let mut by_path = HashMap::new();
     let mut by_inode = HashMap::new();
-    for (i, input) in inputs.iter().enumerate() {
+    for (i, input) in inputs.iter().enumerate().filter(|(i, _)| !refused(*i)) {
         by_path.entry(input.path.as_path()).or_insert(i);
         if let Some(inode) = input.inode {
             by_inode.entry(inode).or_insert(i);
@@ -285,6 +288,9 @@ fn clashes(jobs: &[Job], o: &Options) -> Vec<Option<Clash>> {
         .zip(&inputs)
         .enumerate()
         .map(|(i, (job, input))| {
+            if refused(i) {
+                return None;
+            }
             let output = Identity::of(&output_of(job, o));
             if output.is(input) {
                 return Some(Clash::Own);
@@ -806,6 +812,22 @@ mod tests {
         let (sum, ends) = f.walk(&out.0, &options());
         assert_eq!((sum.failed, sum.already_done), (1, 0));
         assert_eq!(ends["a\u{fffd}.mkv"], ("error".to_string(), crate::tools::NOT_TEXT.to_string()));
+    }
+
+    #[test]
+    fn a_name_that_is_not_text_stands_in_no_real_files_way() {
+        use std::os::unix::ffi::OsStrExt;
+        let f = Folder::new("nottext-clash", &["a\u{fffd}.mkv"]);
+        std::fs::write(f.0.join(std::ffi::OsStr::from_bytes(b"a\x80.mkv")), b"video").unwrap();
+        let out = Folder::new("nottext-clash-out", &[]);
+        let o = Options { overwrite: true, ..options() };
+        let jobs = expand(std::slice::from_ref(&f.0), &out.0, |p| p.extension().is_some());
+        assert_eq!(jobs.len(), 2);
+        assert!(clashes(&jobs, &o).iter().all(Option::is_none));
+        // And the run says so: both fail, neither for sharing an output with the other.
+        let (sum, ends) = f.walk(&out.0, &o);
+        assert_eq!(sum.failed, 2);
+        assert!(ends.values().all(|e| !e.1.contains("another input")), "{ends:?}");
     }
 
     #[test]

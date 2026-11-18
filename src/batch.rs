@@ -158,9 +158,13 @@ fn log_line(log: &Path, status: &str, input: &Path, size: u64, detail: &str, set
     Ok(crate::files::append_line(log, &line, false)?)
 }
 
+/// What an output's report says it was made from: the input, the sections left out, and
+/// the size the input had.
+type Made = (PathBuf, Vec<(f64, f64)>, Option<u64>);
+
 /// Absolute input path recorded in an output's `.av1opt.json` report, the sections that
 /// output left out, and the size the input had.
-fn report_input(output: &Path) -> Option<(PathBuf, Vec<(f64, f64)>, Option<u64>)> {
+fn report_input(output: &Path) -> Option<Made> {
     let r: serde_json::Value = serde_json::from_slice(&std::fs::read(output.with_extension("av1opt.json")).ok()?).ok()?;
     let p = PathBuf::from(r["input"].as_str()?);
     let removed = serde_json::from_value(r["removed"].clone()).unwrap_or_default();

@@ -285,12 +285,14 @@ Folders are walked recursively and their layout is mirrored under `--out-dir`: o
 contents directly below it, several folders each below a folder of their own name
 (`encode -o out lib/Kay lib/Sofia` writes `out/Kay/...` and `out/Sofia/...`). Every result is
 appended to `av1opt-log.tsv` there; re-running the same command resumes: finished files are
-skipped, and files skipped for a reason (low savings, ...) are not searched again with the same settings (target, preset, CRF range, `--min-savings`, `--force`) unless
-`--retry-skipped` is given. `--order per-hour` encodes the files with the largest estimated
+skipped, and files skipped for a reason (low savings, ...) are not searched again with the same settings (target, preset, CRF range, `--min-savings`, `--force`, and `--scenes`, `--audio` and the samples where set) unless
+`--retry-skipped` is given. A finished file counts only for the source it was made from: one of
+the same name and another size is reported, not passed over. An output is never written where
+its own source is, whatever name leads there (`--overwrite` included). `--order per-hour` encodes the files with the largest estimated
 saving per hour of encoding first (`--order savings`: the largest saving first), going by the
 same estimates as `scan`, so a long run stopped early has saved the most for its time; in the
 web UI files are queued in the order of the scan table. Trial encodes are remembered in `~/.cache/av1opt/trials-v1.jsonl`
-for the same file (path, size, date), sample clips, settings and ffmpeg build: an encode that
+for the same file (path, size, date), sample clips, settings, ffmpeg build and SVT-AV1 version: an encode that
 was stopped or failed, or is run again with another target, container or `--min-savings`,
 starts from the scores it already has and often measures nothing new. `--fresh-search`
 measures everything again. If two inputs would produce the same output name (same file name
@@ -465,12 +467,15 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
   that is still in the encode queue is refused.
 
 The server listens on 127.0.0.1 only and prints a sign-in link with a random token (the browser
-gets it as a cookie). Requests with a foreign Host or Origin are refused, and media are only
-served for files you picked in the app. Output folders on ZFS are refused (no override in the UI);
+gets it as a cookie). Requests with a foreign Host or Origin are refused, so are requests from
+a program of another user of the machine (a browser sends the cookie to every port of the host,
+so the cookie alone would not keep them out), and media are only
+served for video files you picked in the app. Output folders on ZFS are refused (no override in the UI);
 replacing an original that is on ZFS needs a tick in the dialog, or the confirmation in Compare, which says so.
 Putting one back there, and moving duplicates on ZFS to the trash, ask in a dialog of their own.
-The ffmpeg and ffprobe programs set in Settings have to be named like that (`ffmpeg`, `/opt/x/ffprobe-7`)
-and be yours or the system's, writable by nobody else.
+The ffmpeg and ffprobe programs set in Settings have to be named like that (`ffmpeg`, `/opt/x/ffprobe-7`),
+be there, and be yours or the system's, writable by nobody else, in folders of which the same holds.
+What is kept is the file the path leads to, links followed.
 `AV1OPT_UI_TOKEN` sets the token (for a desktop wrapper loading the same page);
 `AV1OPT_UI_DEV=<repo>/ui` serves the page files from disk while working on them.
 

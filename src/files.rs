@@ -73,17 +73,46 @@ pub fn save_name(path: &Path) -> PathBuf {
 }
 
 /// Adds `line` and a line end to the file at `path` in one write, so that two programs
-/// adding at once do not cut into each other's lines. `follow` says whether a link at that
+/// adding at once do not cut into each other's lines. A last line left without its line end
+/// (a program stopped while writing it) gets one first: the new line would otherwise join it,
+/// and readers that skip damaged lines would lose both. `follow` says whether a link at that
 /// name is gone through (a file of the user's own, which they may keep elsewhere) or
 /// refused (a file in a folder others can write to).
 pub fn append_line(path: &Path, line: &str, follow: bool) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{FileExt, OpenOptionsExt};
     let mut o = std::fs::OpenOptions::new();
-    o.create(true).append(true);
+    o.read(true).create(true).append(true);
     if !follow {
         o.custom_flags(libc::O_NOFOLLOW);
     }
-    o.open(path)?.write_all(format!("{line}\n").as_bytes())
+    let mut file = o.open(path)?;
+    let size = file.metadata()?.len();
+    let mut last = [b'\n'];
+    if size > 0 {
+        file.read_exact_at(&mut last, size - 1)?;
+    }
+    let start = if last[0] == b'\n' { "" } else { "\n" };
+    file.write_all(format!("{start}{line}\n").as_bytes())
+}
+
+/// Writes a shell script for a test to run, and returns once it can be run. While the file
+/// was open for writing, another thread of the tests may have started a program, which holds
+/// a copy of everything open until it has started: until then the system refuses to run the
+/// script (`Text file busy`). The script answers `--ready` by doing nothing, for this.
+#[cfg(test)]
+pub fn write_script(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, format!("#!/bin/sh\n[ \"$1\" = --ready ] && exit 0\n{body}")).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    loop {
+        match std::process::Command::new(path).arg("--ready").status() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => std::thread::sleep(std::time::Duration::from_millis(5)),
+            done => {
+                done.unwrap();
+                return;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -161,7 +190,38 @@ mod tests {
         assert!(append_line(&link, "x", false).is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"keep me");
         append_line(&link, "x", true).unwrap();
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep mex\n");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep me\nx\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_line_cut_short_does_not_take_the_next_one_with_it() {
+        let dir = std::env::temp_dir().join(format!("av1opt-files-torn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("log.jsonl");
+        std::fs::write(&log, b"{\"whole\":1}\n{\"cut sh").unwrap();
+        append_line(&log, "{\"next\":2}", true).unwrap();
+        append_line(&log, "{\"last\":3}", true).unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "{\"whole\":1}\n{\"cut sh\n{\"next\":2}\n{\"last\":3}\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_script_is_ready_once_nobody_holds_it_open_for_writing() {
+        let dir = std::env::temp_dir().join(format!("av1opt-files-script-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("tool");
+        // Held open by someone else for a moment, as by a program being started.
+        let held = std::fs::File::create(&script).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(held);
+        });
+        write_script(&script, "exit 3\n");
+        release.join().unwrap();
+        assert_eq!(std::process::Command::new(&script).status().unwrap().code(), Some(3));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

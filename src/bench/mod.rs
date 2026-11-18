@@ -16,7 +16,6 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use stats::{Measure, Point, Summary};
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -182,6 +181,13 @@ struct Line {
     m: Measure,
 }
 
+/// The remembered sample encodes. Read as bytes and line by line: one damaged line costs that
+/// measurement, not all the others.
+fn read_lines(path: &Path) -> Vec<Line> {
+    let Ok(bytes) = std::fs::read(path) else { return Vec::new() };
+    bytes.split(|b| *b == b'\n').filter_map(|l| serde_json::from_slice(l).ok()).collect()
+}
+
 pub fn cache_dir() -> Result<PathBuf> {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
@@ -306,11 +312,7 @@ pub fn run(paths: &[PathBuf], tools: &Tools, o: &Options, progress: &(dyn Fn(Pro
     progress(Progress::Plan { videos: chosen.len(), configs: o.configs.len() });
 
     let cache_path = cache_dir()?.join("bench-v2.jsonl");
-    let lines: Vec<Line> = if o.refresh {
-        Vec::new()
-    } else {
-        std::fs::read_to_string(&cache_path).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
-    };
+    let lines = if o.refresh { Vec::new() } else { read_lines(&cache_path) };
     let work = WorkDir::new(&match &o.work_dir {
         Some(d) => d.clone(),
         None => cache_dir()?,
@@ -356,9 +358,7 @@ pub fn run(paths: &[PathBuf], tools: &Tools, o: &Options, progress: &(dyn Fn(Pro
                             encoder: measured_with.clone(), preset: c.preset, params: c.params.clone(), m,
                         };
                         // Losing the memory of one encode is not worth failing the run for.
-                        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&cache_path) {
-                            let _ = writeln!(file, "{}", serde_json::to_string(&line)?);
-                        }
+                        let _ = crate::files::append_line(&cache_path, &serde_json::to_string(&line)?, true);
                         known.insert(key, m);
                         (m, false)
                     }
@@ -557,6 +557,24 @@ pub fn write_csv(r: &Report, path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_damaged_line_costs_only_that_measurement() {
+        let line = |crf: u8| {
+            let m = serde_json::json!({ "path": "/v/a.mkv", "size": 1, "mtime": 2, "samples": 2, "sample_secs": 6.0, "encoder": "e", "preset": 6, "params": "tune=0",
+                "crf": crf, "vmaf": 93.0, "vmaf_min": 92.0, "bytes": 1000, "clip_secs": 12.0, "encode_secs": 3.0 });
+            serde_json::to_vec(&m).unwrap()
+        };
+        let mut file = line(30);
+        file.extend_from_slice(b"\n{\"path\":\"/v/\xff.mkv\"}\nnot json\n");
+        file.extend(line(31));
+        file.push(b'\n');
+        let path = std::env::temp_dir().join(format!("av1opt-bench-lines-{}.jsonl", std::process::id()));
+        std::fs::write(&path, file).unwrap();
+        let crfs: Vec<u8> = read_lines(&path).iter().map(|l| l.m.crf).collect();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(crfs, [30, 31]);
+    }
 
     #[test]
     fn matrix_starts_with_the_baseline_and_has_no_repeats() {

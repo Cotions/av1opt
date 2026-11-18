@@ -139,12 +139,15 @@ fn settings_key(o: &Options) -> String {
 }
 
 /// Previous skip decisions, keyed by absolute input path and size (a changed file is retried).
-/// Lines from older versions carry no settings and count for any settings.
+/// Lines from older versions carry no settings and count for any settings. Read as bytes and
+/// line by line: one damaged line costs that line, not what the rest of the log remembers.
 fn read_skips(log: &Path, settings: &str) -> HashMap<(PathBuf, u64), String> {
-    let Ok(text) = std::fs::read_to_string(log) else { return HashMap::new() };
-    text.lines()
+    let Ok(bytes) = std::fs::read(log) else { return HashMap::new() };
+    bytes
+        .split(|b| *b == b'\n')
         .filter_map(|l| {
-            let f: Vec<&str> = l.split('\t').collect();
+            let l = std::str::from_utf8(l).ok()?;
+            let f: Vec<&str> = l.trim_end_matches('\r').split('\t').collect();
             if f.len() < 5 || f[1] != "skip" || f.get(5).is_some_and(|s| *s != settings) {
                 return None;
             }
@@ -844,6 +847,13 @@ mod tests {
         assert!(same.contains_key(&(p.to_path_buf(), 10)));
         assert!(!other.contains_key(&(p.to_path_buf(), 10)));
         assert!(other.contains_key(&(PathBuf::from("/videos/b.mp4"), 20)));
+
+        // A byte that is not text costs its own line and no other.
+        std::fs::OpenOptions::new().append(true).open(&log).map(|mut f| f.write_all(b"1\tskip\t/videos/\xff.mp4\t30\told\n")).unwrap().unwrap();
+        log_line(&log, "skip", Path::new("/videos/c.mp4"), 40, "too lean", "s").unwrap();
+        let after = read_skips(&log, "s");
+        assert!(after.contains_key(&(PathBuf::from("/videos/b.mp4"), 20)) && after.contains_key(&(PathBuf::from("/videos/c.mp4"), 40)));
+        assert_eq!(after.len(), 2);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

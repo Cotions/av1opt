@@ -38,23 +38,68 @@ async function api(path, body) {
   return j;
 }
 
+// ---------- numbers and names ----------
+// Nothing from here to the end marker touches the page: tests/page_numbers.mjs runs this part alone.
+
+function isNumber(x) { return x != null && isFinite(x); }
+const BYTE_UNITS = [["B", 1, 0], ["kB", 1e3, 0], ["MB", 1e6, 1], ["GB", 1e9, 1], ["TB", 1e12, 2], ["PB", 1e15, 2]];
+// The unit and the sign are chosen from the rounded number, so that 999.6 MB is "1.0 GB" and
+// not "1000 MB", and half a byte below zero is "0 B".
 function bytes(n) {
-  if (n == null || isNaN(n)) return "–";
-  const a = Math.abs(n);
-  if (a >= 1e12) return (n / 1e12).toFixed(2) + " TB";
-  if (a >= 1e9) return (n / 1e9).toFixed(a >= 1e11 ? 0 : 1) + " GB";
-  if (a >= 1e6) return (n / 1e6).toFixed(a >= 1e8 ? 0 : 1) + " MB";
-  if (a >= 1e3) return (n / 1e3).toFixed(0) + " kB";
-  return n + " B";
+  if (!isNumber(n)) return "–";
+  const size = Math.abs(n);
+  for (const [k, [unit, scale, digits]] of BYTE_UNITS.entries()) {
+    const v = size / scale;
+    let text = v.toFixed(digits);
+    if (Number(text) >= 100) text = v.toFixed(0);
+    if (Number(text) < 1000 || k === BYTE_UNITS.length - 1) return (n < 0 && Number(text) !== 0 ? "−" : "") + text + " " + unit;
+  }
 }
-function pct(x, digits = 0) { return x == null || isNaN(x) ? "–" : (x * 100).toFixed(digits) + "%"; }
+function pct(x, digits = 0) {
+  if (!isNumber(x)) return "–";
+  const text = (x * 100).toFixed(digits);
+  return (Number(text) === 0 ? text.replace("-", "") : text) + "%";
+}
+// For what must not look finished before it is: rounds down, and says 100% only when complete.
+function floorPct(x, digits = 0, complete = x >= 1) {
+  if (!isNumber(x)) return "–";
+  if (complete) return (100).toFixed(digits) + "%";
+  const scale = 10 ** digits;
+  // The small addition keeps 0.29, which multiplies to just under 29, at 29.
+  const steps = Math.min(Math.floor(x * 100 * scale + 1e-9), 100 * scale - 1);
+  return (Math.max(steps, 0) / scale).toFixed(digits) + "%";
+}
 // What an encode saved, as a change in size: 0.12 is "−12%", and an output 12% larger than
-// its source is "+12%".
-function sizeChange(x, digits = 0) { return x == null || isNaN(x) ? "–" : (x < 0 ? "+" : "−") + pct(Math.abs(x), digits); }
+// its source is "+12%". What rounds to nothing has no sign.
+function sizeChange(x, digits = 0) {
+  if (!isNumber(x)) return "–";
+  const text = pct(Math.abs(x), digits);
+  return (parseFloat(text) === 0 ? "" : x < 0 ? "+" : "−") + text;
+}
 // The same under a "Saved" heading: "12%", or "12% larger". Green is for what shrank.
-function savedPct(x, digits = 0) { return x < 0 ? pct(-x, digits) + " larger" : pct(x, digits); }
+function savedPct(x, digits = 0) {
+  if (!isNumber(x)) return "–";
+  const text = pct(Math.abs(x), digits);
+  return x < 0 && parseFloat(text) !== 0 ? text + " larger" : text;
+}
+function num(x, d = 2) { return isNumber(x) ? Number(x).toFixed(d) : "–"; }
+// A size or time ratio against the default as a change: 0.94 is "−6.0%".
+function rel(x, d = 1) {
+  if (!isNumber(x)) return "–";
+  const v = (x - 1) * 100, t = Math.abs(v).toFixed(d);
+  return (Number(t) === 0 ? "" : v > 0 ? "+" : "−") + t + "%";
+}
+// A ratio with nothing to compare against (a base of zero) has no value to show.
+function times(x) {
+  if (!isNumber(x)) return "–";
+  const text = x.toFixed(2);
+  return (Number(text) >= 10 ? x.toFixed(0) : text) + "×";
+}
+function plural(n, word) { return `${n} ${word}${n === 1 ? "" : "s"}`; }
+
+// ---------- end of the part that runs alone ----------
+
 function savedClass(x) { return x < 0 ? "warn" : "ok"; }
-function num(x, d = 2) { return x == null || isNaN(x) ? "–" : Number(x).toFixed(d); }
 function hms(sec) {
   if (sec == null || isNaN(sec)) return "–";
   sec = Math.max(0, Math.round(sec));
@@ -1283,7 +1328,7 @@ function renderDups(out, run, reload) {
     });
     sync();
     return h("div", { class: "dup-group" },
-      h("div", { class: "head" }, h("span", { class: "pill " + cls }, label), h("span", {}, `${pct(g.score)} of the compared frames match`),
+      h("div", { class: "head" }, h("span", { class: "pill " + cls }, label), h("span", {}, `${floorPct(g.score)} of the compared frames match`),
         g.kind === "same" && g.reason && !g.keepGone ? h("span", { class: "dim" }, `keep: ${g.reason}`) : null, allMarked,
         h("span", { class: "spacer" }), spare ? h("span", { class: "ok" }, `frees ${bytes(spare)}`) : null),
       g.look_first ? h("div", { class: "warn" }, "Look before removing any of these: they are not marked as spare copies") : null,
@@ -1326,15 +1371,6 @@ function renderDups(out, run, reload) {
 
 const CLASS_LABEL = { sd: "720p and below", hd: "1080p", uhd: "above 1080p" };
 function configLabel(c) { return c ? `preset ${c.preset} · ${c.params || "SVT-AV1 defaults"}` : "–"; }
-// A size or time ratio against the default as a change: 0.94 is "−6.0%".
-function rel(x, d = 1) {
-  if (x == null || isNaN(x)) return "–";
-  const v = (x - 1) * 100, t = Math.abs(v).toFixed(d);
-  return (Number(t) === 0 ? "" : v > 0 ? "+" : "−") + t + "%";
-}
-function times(x) { return x == null || isNaN(x) ? "–" : x.toFixed(x >= 10 ? 0 : 2) + "×"; }
-function plural(n, word) { return `${n} ${word}${n === 1 ? "" : "s"}`; }
-
 views.bench = (root) => {
   const st = (STATE && STATE.settings) || {};
   const roots = new Set(prefs.get("benchRoots", st.bench_paths && st.bench_paths.length ? st.bench_paths : st.scan_paths || []));
@@ -2086,7 +2122,8 @@ views.queue = (root) => {
     const update = (p) => {
       if (!p) { bar.firstChild.style.width = "0%"; progText.textContent = ""; return; }
       bar.firstChild.style.width = (p.frac * 100).toFixed(1) + "%";
-      progText.textContent = `${(p.frac * 100).toFixed(1)}%${p.fps ? " · " + num(p.fps, 1) + " fps" : ""} · ETA ${hms(p.eta_secs)}`;
+      // A running file is not done, however close its last frames are.
+      progText.textContent = `${floorPct(p.frac, 1, false)}${p.fps ? " · " + num(p.fps, 1) + " fps" : ""} · ETA ${hms(p.eta_secs)}`;
     };
     update(f.progress);
     return { el, update };

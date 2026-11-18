@@ -48,6 +48,12 @@ function bytes(n) {
   return n + " B";
 }
 function pct(x, digits = 0) { return x == null || isNaN(x) ? "–" : (x * 100).toFixed(digits) + "%"; }
+// What an encode saved, as a change in size: 0.12 is "−12%", and an output 12% larger than
+// its source is "+12%".
+function sizeChange(x, digits = 0) { return x == null || isNaN(x) ? "–" : (x < 0 ? "+" : "−") + pct(Math.abs(x), digits); }
+// The same under a "Saved" heading: "12%", or "12% larger". Green is for what shrank.
+function savedPct(x, digits = 0) { return x < 0 ? pct(-x, digits) + " larger" : pct(x, digits); }
+function savedClass(x) { return x < 0 ? "warn" : "ok"; }
 function num(x, d = 2) { return x == null || isNaN(x) ? "–" : Number(x).toFixed(d); }
 function hms(sec) {
   if (sec == null || isNaN(sec)) return "–";
@@ -81,6 +87,45 @@ function toast(msg, err) {
   toastTimer = setTimeout(() => (t.hidden = true), err ? 7000 : 3000);
 }
 
+// Keeps the keyboard in an open dialog: focus moves into it (to `first`, else to the dialog
+// itself), Tab stays inside, and Escape calls `onEscape`. Only the dialog on top listens.
+// Returns what to call when the dialog closes: focus goes back to where it was.
+function holdFocus(bg, onEscape, first) {
+  const opener = document.activeElement;
+  const box = bg.firstElementChild;
+  box.setAttribute("tabindex", "-1");
+  const stops = () => [...box.querySelectorAll("a[href], button, input, select, textarea, summary")].filter((el) => !el.disabled && el.offsetParent !== null);
+  const onKey = (e) => {
+    const open = document.querySelectorAll(".modal-bg");
+    if (open[open.length - 1] !== bg) return;
+    if (e.key === "Escape") { onEscape(); return; }
+    if (e.key !== "Tab") return;
+    const f = stops(), cur = document.activeElement;
+    if (!f.length) { e.preventDefault(); box.focus(); return; }
+    const from = e.shiftKey ? f[0] : f[f.length - 1], to = e.shiftKey ? f[f.length - 1] : f[0];
+    if (cur === from || !box.contains(cur) || (e.shiftKey && cur === box)) { e.preventDefault(); to.focus(); }
+  };
+  document.addEventListener("keydown", onKey);
+  (first || box).focus();
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    document.removeEventListener("keydown", onKey);
+    if (opener && opener.isConnected && opener !== document.body) opener.focus();
+  };
+}
+
+// The extensions the server takes for videos.
+const VIDEO_EXTS = ["mp4", "mkv", "m4v", "mov", "webm", "avi", "wmv", "flv", "ts", "m2ts", "mpg", "mpeg", "3gp"];
+// Whether `p` is a video file and not a folder. `files` is the set of paths known to be
+// files, from whoever listed them; without it the name has to do.
+function isVideoFile(p, files) {
+  if (files) return files.has(p);
+  const m = /\.([A-Za-z0-9]+)$/.exec(basename(p));
+  return !!m && VIDEO_EXTS.includes(m[1].toLowerCase());
+}
+
 const prefs = {
   get(k, d) { try { const v = localStorage.getItem("av1opt." + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
   set(k, v) { localStorage.setItem("av1opt." + k, JSON.stringify(v)); },
@@ -94,8 +139,13 @@ function onEvent(fn) { listeners.add(fn); return () => listeners.delete(fn); }
 function connect() {
   const es = new EventSource("/api/events");
   const dot = document.getElementById("conn");
-  es.onopen = () => { dot.classList.add("on"); dot.title = "Live updates connected"; };
-  es.onerror = () => { dot.classList.remove("on"); dot.title = "Reconnecting…"; };
+  // Events sent while the connection was down are lost: views are told when it is back.
+  let dropped = false;
+  es.onopen = () => {
+    dot.classList.add("on"); dot.title = "Live updates connected";
+    if (dropped) { dropped = false; for (const fn of [...listeners]) fn({ kind: "reopened" }); }
+  };
+  es.onerror = () => { dot.classList.remove("on"); dot.title = "Reconnecting…"; dropped = true; };
   es.onmessage = (m) => {
     let msg;
     try { msg = JSON.parse(m.data); } catch { return; }
@@ -116,7 +166,7 @@ async function refreshBadge() {
     b.title = !queue.hold ? "" : queue.hold.why === "paused" ? "Paused" : "Outside encoding hours";
   } catch { /* offline */ }
 }
-onEvent((m) => { if (m.kind === "jobs") refreshBadge(); });
+onEvent((m) => { if (m.kind === "jobs" || m.kind === "reopened") refreshBadge(); });
 // Desktop app: tell the user when a job ends while the window is in the background.
 onEvent((m) => {
   if (m.kind !== "job_done" || !desktop) return;
@@ -146,7 +196,8 @@ function renderBanner() {
 // ---------- folder / file picker ----------
 
 // Resolves to an array of absolute paths, or null if cancelled.
-// mode: "dir" picks one folder; "multi" picks any mix of folders and video files.
+// mode: "dir" picks one folder; "multi" picks any mix of folders and video files, and the
+// array then says which of them are files in its `files` (a Set).
 // In the desktop app, folders come from the system's own dialog. Files and folders mixed
 // ("multi") stay with the in-page picker, which can select both at once.
 const desktop = window.av1optDesktop || null;
@@ -157,22 +208,24 @@ function pick({ title, mode = "dir", start }) {
       if (!p) return null;
       prefs.set("pickerDir", p);
       return [p];
-    });
+    }).catch(() => null);
   }
   return new Promise((resolve) => {
     const selected = new Set();
+    const files = new Set();
     let cur = start || prefs.get("pickerDir", null) || (STATE && STATE.home) || "/";
     let hidden = false;
     const pathEl = h("div", { class: "picker-path" });
     const list = h("ul", { class: "picker-list" });
     const places = h("div", { class: "places" });
     const selInfo = h("span", { class: "dim grow" });
-    const close = (v) => { bg.remove(); document.removeEventListener("keydown", onKey); resolve(v); };
-    const onKey = (e) => { if (e.key === "Escape") close(null); };
+    const close = (v) => { bg.remove(); release(); resolve(v); };
     const choose = h("button", { class: "primary", onclick: () => {
       prefs.set("pickerDir", cur);
-      if (mode === "dir") close([cur]);
-      else close(selected.size ? [...selected] : [cur]);
+      if (mode === "dir") { close([cur]); return; }
+      const out = selected.size ? [...selected] : [cur];
+      out.files = new Set(out.filter((p) => files.has(p)));
+      close(out);
     } }, mode === "dir" ? "Use this folder" : "Add selected");
 
     const updateSel = () => {
@@ -206,6 +259,7 @@ function pick({ title, mode = "dir", start }) {
       }
       for (const f of r.files) {
         const full = join(f.name);
+        files.add(full);
         const li = h("li", { class: selected.has(full) ? "sel" : "" }, h("span", { class: "icon" }, "▶"), h("span", { class: "grow" }, f.name), h("span", { class: "dim" }, bytes(f.size)));
         if (mode === "multi") {
           const cb = h("input", { type: "checkbox", checked: selected.has(full) });
@@ -231,7 +285,7 @@ function pick({ title, mode = "dir", start }) {
         h("div", { class: "body" }, places, h("div", { class: "row" }, pathEl), h("hr", { class: "dim" }), list),
         h("div", { class: "foot" }, selInfo, h("button", { onclick: () => close(null) }, "Cancel"), choose)));
     document.body.append(bg);
-    document.addEventListener("keydown", onKey);
+    const release = holdFocus(bg, () => close(null));
     go(cur);
   });
 }
@@ -270,8 +324,9 @@ function defaultOptions() {
 }
 
 // Tag editor for the encode dialog: preset picker, name/template rows, and (for one file)
-// a preview of what would be written. `get()` returns the current option fields.
-function metaEditor(o, inputs) {
+// a preview of what would be written. `one` is that file, or null for several inputs or a
+// folder. `get()` returns the current option fields.
+function metaEditor(o, one) {
   const presets = (STATE && STATE.meta_presets) || [];
   const keep = h("input", { type: "checkbox", checked: o.keep_metadata });
   const dates = h("input", { type: "checkbox", checked: o.keep_dates });
@@ -304,7 +359,6 @@ function metaEditor(o, inputs) {
       .filter(([k, v]) => k && v.trim());
     return { keep_metadata: keep.checked, keep_dates: dates.checked, info_json: infoJson.checked, meta_preset: presetSel.value || null, meta_tags };
   }
-  const one = inputs.length === 1 && /\.[A-Za-z0-9]{2,5}$/.test(inputs[0]) ? inputs[0] : null;
   const previewBtn = one && h("button", { class: "small", onclick: async () => {
     previewBtn.disabled = true;
     try {
@@ -383,6 +437,9 @@ function sectionsEditor(path) {
   // Source time of the player's 0: non-zero when playing a preview clip.
   let offset = 0, clipEnd = Infinity;
   let pending = null;
+  // Set when the dialog closes; a preview asked for before that is then dropped, and so is
+  // one that a later request has overtaken.
+  let closed = false, clipRun = 0;
   const v = h("video", { preload: "metadata", playsinline: true, controls: true });
   const stage = h("div", { class: "cut-stage" }, v);
   const status = h("div", { class: "dim" }, "Loading the video…");
@@ -493,18 +550,23 @@ function sectionsEditor(path) {
   }
   // For sources the browser can't decode: a 2-minute near-lossless H.264 clip from `at`.
   async function makeClip(at) {
-    if (!info) return;
+    if (!info || closed) return;
+    const run = ++clipRun;
+    const late = () => closed || run !== clipRun;
     const start = Math.max(0, Math.min(at, duration - 2));
     v.pause();
     clipBtn.disabled = true;
     status.textContent = `Making a playable 2-minute preview from ${fmtTime(start)}…`;
     try {
       const p = await api("/api/preview", { path, kind: "transcode", start, secs: 120 });
+      if (late()) return;
       await load(p.url);
+      if (late()) return;
       offset = p.start; clipEnd = p.start + p.secs;
       status.textContent = `Preview of ${fmtTime(offset)}–${fmtTime(Math.min(clipEnd, duration))} (this browser can't play ${info.codec} directly). Click the bar outside it for another part.`;
       v.currentTime = Math.max(0, at - offset);
     } catch (e) {
+      if (late()) return;
       status.textContent = "Could not make a preview: " + e.message + ". You can still type the times.";
     }
     clipBtn.disabled = false;
@@ -513,21 +575,26 @@ function sectionsEditor(path) {
 
   (async () => {
     try {
-      info = await api("/api/source", { path });
+      const got = await api("/api/source", { path });
+      if (closed) return;
+      info = got;
       if (info.error) throw new Error(info.error);
       duration = info.duration_s || 0;
       fps = info.fps || 25;
       draw();
       try {
         await load(info.url);
+        if (closed) return;
         status.textContent = "";
       } catch {
+        if (closed) return;
         clipBtn.hidden = false;
         await makeClip(0);
       }
     } catch (e) {
       status.textContent = "Cannot open the video: " + e.message + ". You can still type the times.";
     }
+    if (closed) return;
     raf = requestAnimationFrame(tick);
   })();
 
@@ -543,7 +610,7 @@ function sectionsEditor(path) {
       h("button", { class: "small", onclick: () => addRow(null, null, true) }, "+ Section"),
       h("label", { class: "check", title: "While playing here, jump over the sections marked for removal" }, skip, "Skip removed parts while playing")),
     summary);
-  return { el, get: () => readRows(true).sort((x, y) => x[0] - y[0]), stop: () => { cancelAnimationFrame(raf); document.removeEventListener("keydown", onKey); v.pause(); v.removeAttribute("src"); v.load(); } };
+  return { el, get: () => readRows(true).sort((x, y) => x[0] - y[0]), stop: () => { closed = true; cancelAnimationFrame(raf); document.removeEventListener("keydown", onKey); v.pause(); v.removeAttribute("src"); v.load(); } };
 }
 
 // One label / control / hint line of a .form-grid.
@@ -553,7 +620,8 @@ function setting(label, control, hint) {
 
 // Shows the encode dialog for `inputs` (paths). Resolves true if queued. With `watch`, the
 // one input is a folder to keep an eye on: its settings are asked for, and nothing is queued now.
-function encodeDialog(inputs, roots = [], watch = false) {
+// `files` is the set of inputs known to be files, where the caller knows (see isVideoFile).
+function encodeDialog(inputs, roots = [], watch = false, files = null) {
   return new Promise((resolve) => {
     const o = defaultOptions();
     let outDir = prefs.get("outDir", null) || (STATE && STATE.default_out_dir) || "";
@@ -574,8 +642,8 @@ function encodeDialog(inputs, roots = [], watch = false) {
     const retry = h("input", { type: "checkbox", checked: o.retry_skipped });
     const existing = h("input", { type: "checkbox" });
     const shrinkAudio = h("input", { type: "checkbox", checked: o.shrink_audio });
-    const meta = metaEditor(o, inputs);
-    const one = !watch && inputs.length === 1 && /\.[A-Za-z0-9]{2,5}$/.test(inputs[0]) ? inputs[0] : null;
+    const one = !watch && inputs.length === 1 && isVideoFile(inputs[0], files) ? inputs[0] : null;
+    const meta = metaEditor(o, one);
     // Only built when opened, so the dialog doesn't load the video for nothing.
     let cuts = null;
     const cutsBox = h("div");
@@ -587,10 +655,13 @@ function encodeDialog(inputs, roots = [], watch = false) {
     const syncWorkers = () => { workers.disabled = scenes.value === "off"; };
     scenes.addEventListener("change", syncWorkers);
     syncWorkers();
-    const close = (v) => { if (cuts) cuts.stop(); bg.remove(); resolve(v); };
+    let busy = false;
+    const close = (v) => { if (cuts) cuts.stop(); bg.remove(); release(); resolve(v); };
     const go = h("button", { class: "primary", onclick: async () => {
+      // An empty preset field is the default, not preset 0.
+      const presetNum = preset.value.trim() === "" ? NaN : Number(preset.value);
       const options = {
-        container: container.value, target_vmaf: Number(vmaf.value), preset: Number(preset.value), svt_params: svtParams.value.trim(),
+        container: container.value, target_vmaf: Number(vmaf.value), preset: isNaN(presetNum) ? 5 : presetNum, svt_params: svtParams.value.trim(),
         tuned: tuning.length > 0 && tuned.checked, scenes: scenes.value,
         workers: Number(workers.value), min_savings: Number(minSav.value) / 100, force: force.checked, retry_skipped: !watch && retry.checked,
         shrink_audio: shrinkAudio.checked,
@@ -598,29 +669,32 @@ function encodeDialog(inputs, roots = [], watch = false) {
       };
       if (watch) {
         // Neither the settings nor the folder become the defaults of encodes queued by hand.
-        go.disabled = true;
+        go.disabled = busy = true;
         try {
           await api("/api/watch", { path: inputs[0], out_dir: outDir, options, existing: existing.checked });
           toast(`Watching ${inputs[0]}`);
           close(true);
-        } catch (e) { toast(e.message, true); go.disabled = false; }
+        } catch (e) { toast(e.message, true); } finally { go.disabled = busy = false; }
         return;
       }
       // The tick is remembered also while there are no tuned settings to use.
-      prefs.set("encodeOptions", { ...options, tuned: tuning.length ? tuned.checked : o.tuned });
+      const remembered = { ...options, tuned: tuning.length ? tuned.checked : o.tuned };
       // Sections belong to this one video, so they aren't remembered with the settings.
       try { if (cuts) options.remove = cuts.get(); } catch (e) { toast(e.message, true); return; }
-      prefs.set("outDir", outDir);
-      go.disabled = true;
+      go.disabled = busy = true;
       try {
         const r = await api("/api/jobs", { inputs, out_dir: outDir, roots, options });
+        prefs.set("encodeOptions", remembered);
+        prefs.set("outDir", outDir);
         toast(`Queued ${r.files} file${r.files === 1 ? "" : "s"}`);
         close(true);
         location.hash = "#/queue";
-      } catch (e) { toast(e.message, true); go.disabled = false; }
+      } catch (e) { toast(e.message, true); } finally { go.disabled = busy = false; }
     } }, watch ? "Watch folder" : "Add to queue");
     const list = inputs.length <= 6 ? inputs.map((p) => h("div", { class: "mono" }, p)) : [h("div", { class: "mono" }, inputs.slice(0, 4).join("\n")), h("div", { class: "dim" }, `… and ${inputs.length - 4} more`)];
-    const bg = h("div", { class: "modal-bg", onclick: (e) => { if (e.target === bg) close(false); } },
+    // While the request is on its way the dialog stays: what it asked for is being queued.
+    const dismiss = () => { if (!busy) close(false); };
+    const bg = h("div", { class: "modal-bg", onclick: (e) => { if (e.target === bg) dismiss(); } },
       h("div", { class: "modal" },
         h("div", { class: "head" }, h("strong", {}, watch ? "Watch a folder" : `Encode ${inputs.length} item${inputs.length === 1 ? "" : "s"}`)),
         h("div", { class: "body" },
@@ -653,8 +727,9 @@ function encodeDialog(inputs, roots = [], watch = false) {
           h("h3", {}, "Metadata"),
           meta.el,
           one ? [h("h3", {}, "Remove sections"), cutsBtn, cutsBox] : null),
-        h("div", { class: "foot" }, h("button", { onclick: () => close(false) }, "Cancel"), go)));
+        h("div", { class: "foot" }, h("button", { onclick: dismiss }, "Cancel"), go)));
     document.body.append(bg);
+    const release = holdFocus(bg, dismiss);
   });
 }
 
@@ -708,6 +783,8 @@ views.scan = (root) => {
       progText.textContent = "listing files…";
       progress.firstChild.style.width = "0%";
       out.replaceChildren();
+      // A short scan can be over before its id is known here: its last event went by unseen.
+      showResult(r.id);
     } catch (e) { toast(e.message, true); start.disabled = false; }
   };
 
@@ -723,7 +800,8 @@ views.scan = (root) => {
 
   async function showResult(id) {
     let r;
-    try { r = await api("/api/scans/" + id); } catch (e) { toast(e.message, true); return; }
+    try { r = await api("/api/scans/" + id); } catch (e) { toast(e.message, true); if (id === scanId) start.disabled = !roots.size; return; }
+    if (id !== scanId) return; // another scan was started meanwhile
     start.disabled = !roots.size;
     if (r.status === "running") {
       progText.textContent = r.total ? `probed ${r.done} / ${r.total}` : "listing files…";
@@ -742,6 +820,7 @@ views.scan = (root) => {
       progText.textContent = m.total ? `probed ${m.done} / ${m.total}` : "listing files…";
       progress.firstChild.style.width = m.total ? (100 * m.done / m.total) + "%" : "0%";
     } else if (m.kind === "scan_done" && m.id === scanId) showResult(m.id);
+    else if (m.kind === "reopened" && scanId != null) showResult(scanId);
   });
   if (lastScanId) { scanId = lastScanId; showResult(lastScanId); }
   return off;
@@ -761,7 +840,7 @@ function renderScan(out, r) {
   const selInfo = h("span", { class: "dim" });
   // Files are queued in the order of the table: sort by "Per hour" to encode the best value first.
   const inOrder = () => { const seen = shown().map((x) => x.path).filter((p) => selected.has(p)); const s = new Set(seen); return seen.concat([...selected].filter((p) => !s.has(p))); };
-  const encodeBtn = h("button", { class: "primary", disabled: true, title: "Files are queued in the order of the table", onclick: () => encodeDialog(inOrder(), r.paths) }, "Encode selected…");
+  const encodeBtn = h("button", { class: "primary", disabled: true, title: "Files are queued in the order of the table", onclick: () => encodeDialog(inOrder(), r.paths, false, selected) }, "Encode selected…");
   const allBox = h("input", { type: "checkbox", title: "Select all shown" });
 
   const shown = () => {
@@ -923,6 +1002,8 @@ views.dups = (root) => {
       progress.firstChild.style.width = "0%";
       out.replaceChildren();
       setRunning(true);
+      // A short search can be over before its id is known here: its last event went by unseen.
+      showResult(r.id);
     } catch (e) { toast(e.message, true); start.disabled = !roots.size; }
   };
   cancel.onclick = async () => {
@@ -951,7 +1032,8 @@ views.dups = (root) => {
 
   async function showResult(id) {
     let r;
-    try { r = await api("/api/dups/" + id); } catch (e) { runId = null; setRunning(false); return; }
+    try { r = await api("/api/dups/" + id); } catch (e) { if (id === lastDupId) { runId = null; setRunning(false); } return; }
+    if (id !== lastDupId) return; // another search was started meanwhile
     if (r.status === "running") { runId = id; setRunning(true); showProgress(r); return; }
     runId = null;
     setRunning(false);
@@ -966,6 +1048,7 @@ views.dups = (root) => {
   const off = onEvent((m) => {
     if (m.kind === "dups" && m.id === runId) showProgress(m);
     else if (m.kind === "dups_done" && (m.id === runId || m.id === lastDupId)) showResult(m.id);
+    else if (m.kind === "reopened" && lastDupId != null) showResult(lastDupId);
   });
   (async () => {
     // After a reload the page has forgotten the run; the server hasn't.
@@ -984,15 +1067,16 @@ function playRank(codec) { return { av1: 0, h264: 1, vp9: 1, vp8: 1, hevc: 3 }[c
 // Asks before something that can't be taken back with one click. Resolves true on "yes".
 function confirmDialog({ title, body, action }) {
   return new Promise((resolve) => {
-    const close = (v) => { bg.remove(); document.removeEventListener("keydown", onKey); resolve(v); };
-    const onKey = (e) => { if (e.key === "Escape") close(false); };
+    const close = (v) => { bg.remove(); release(); resolve(v); };
+    const cancel = h("button", { onclick: () => close(false) }, "Cancel");
     const bg = h("div", { class: "modal-bg", onclick: (e) => { if (e.target === bg) close(false); } },
       h("div", { class: "modal narrow" },
         h("div", { class: "head" }, h("strong", {}, title)),
         h("div", { class: "body" }, body),
-        h("div", { class: "foot" }, h("button", { onclick: () => close(false) }, "Cancel"), h("button", { class: "danger", onclick: () => close(true) }, action))));
+        h("div", { class: "foot" }, cancel, h("button", { class: "danger", onclick: () => close(true) }, action))));
     document.body.append(bg);
-    document.addEventListener("keydown", onKey);
+    // Enter on opening does the harmless thing.
+    const release = holdFocus(bg, () => close(false), cancel);
   });
 }
 
@@ -1028,6 +1112,7 @@ function renderDups(out, run, reload) {
   // Groups where every copy left is marked: the server refuses those too.
   const emptied = () => groups.filter((g) => g.members.every((i) => dupMarks.has(files[i].path)));
   const failures = h("div");
+  let trashing = false;
   const trashBtn = h("button", { class: "danger", onclick: async () => {
     const m = marked(), total = m.reduce((a, p) => a + sizeOf.get(p), 0);
     const ok = await confirmDialog({
@@ -1039,7 +1124,7 @@ function renderDups(out, run, reload) {
         m.length > 12 ? h("p", { class: "dim" }, `… and ${m.length - 12} more`) : null],
     });
     if (!ok) return;
-    trashBtn.disabled = true;
+    trashBtn.disabled = trashing = true;
     try {
       let r = await api(`/api/dups/${run.id}/trash`, { paths: m });
       if (r.needs_zfs) {
@@ -1052,14 +1137,14 @@ function renderDups(out, run, reload) {
             h("div", { class: "mono trash-list" }, z.slice(0, 12).join("\n")),
             z.length > 12 ? h("p", { class: "dim" }, `… and ${z.length - 12} more`) : null],
         });
-        if (!yes) { trashBtn.disabled = false; return; }
+        if (!yes) return;
         r = await api(`/api/dups/${run.id}/trash`, { paths: m, allow_zfs: true });
       }
       for (const p of r.trashed) dupMarks.delete(p);
       toast(`${plural(r.trashed.length, "file")} moved to the trash (${bytes(r.bytes)})`, r.failed.length > 0);
       if (r.failed.length) pendingTrashFailures = r.failed;
       reload();
-    } catch (e) { toast(e.message, true); trashBtn.disabled = false; }
+    } catch (e) { toast(e.message, true); } finally { trashing = false; updateMarks(); }
   } }, "Move to trash…");
   if (pendingTrashFailures) {
     failures.append(h("div", { class: "panel" }, h("strong", { class: "bad" }, `${plural(pendingTrashFailures.length, "file")} could not be moved to the trash and are still where they were`),
@@ -1072,7 +1157,7 @@ function renderDups(out, run, reload) {
     const e = emptied().length;
     markInfo.textContent = m.length ? `${m.length} file${m.length === 1 ? "" : "s"} marked · ${bytes(m.reduce((a, p) => a + sizeOf.get(p), 0))}` : "Nothing marked";
     copyBtn.disabled = saveBtn.disabled = clearBtn.disabled = !m.length;
-    trashBtn.disabled = !m.length || e > 0;
+    trashBtn.disabled = trashing || !m.length || e > 0;
     trashBtn.title = e ? `${plural(e, "video")} would have no copy left: untick one copy first` : "";
   };
 
@@ -1198,12 +1283,16 @@ views.bench = (root) => {
     param_sets: params.value.split("\n").map((x) => x.trim()).filter(Boolean),
   });
   // The server builds the same list: the default setting, then every preset with every set.
+  // It takes its own parameter sets when none is given, and refuses to start without a preset.
   const plan = () => {
     const { presets, param_sets } = form();
+    if (!presets.length) { planText.textContent = "No preset is ticked: tick at least one under “What to measure”."; return; }
+    const sets = param_sets.length ? param_sets : (defaults ? defaults.param_sets : []);
     const seen = new Set([`${base.preset} ${base.params}`]);
-    for (const p of presets) for (const x of param_sets) seen.add(`${p} ${x}`);
+    for (const p of presets) for (const x of sets) seen.add(`${p} ${x}`);
     const n = seen.size, v = Number(videos.value) || 0;
-    planText.textContent = `${plural(n, "setting")} (the default, preset ${base.preset} · ${base.params}, is always one) on up to ${plural(v, "video")}: around ${n * v * 3} sample encodes of ${samples.value} × ${secs.value} s. Slow presets and big videos take the longest.`;
+    const which = presets.length > 1 ? `presets ${presets.slice(0, -1).join(", ")} and ${presets[presets.length - 1]}` : `preset ${presets[0]}`;
+    planText.textContent = `${plural(n, "setting")}: ${which} with ${plural(sets.length, "parameter set")}${presets.length > 1 ? " each" : ""}, and the default (preset ${base.preset} · ${base.params}), which is always one. On up to ${plural(v, "video")} that is around ${n * v * 3} sample encodes of ${samples.value} × ${secs.value} s. Slow presets and big videos take the longest.`;
   };
   for (const el of [params, videos, samples, secs, ...presetBoxes.map(([, b]) => b)]) el.addEventListener("input", plan);
 
@@ -1294,7 +1383,7 @@ views.bench = (root) => {
       showRun(m.run);
       // A video is finished: its numbers can be shown.
       if (m.run.videos_done !== seenVideos) { seenVideos = m.run.videos_done; load(); }
-    } else if (m.kind === "bench_done") load();
+    } else if (m.kind === "bench_done" || m.kind === "reopened") load();
   });
   load();
   return () => { gone = true; off(); if (ui.stopChart) ui.stopChart(); };
@@ -1695,8 +1784,8 @@ views.queue = (root) => {
   root.append(
     h("div", { class: "row" }, h("h1", {}, "Encode queue"), leftAll, h("span", { class: "spacer" }),
       pauseBtn, hoursBtn, watchBtn,
-      h("button", { onclick: async () => { await api("/api/jobs/clear", {}); load(); } }, "Clear finished"),
-      h("button", { class: "primary", onclick: async () => { const p = await pick({ title: "Videos or folders to encode", mode: "multi" }); if (p) encodeDialog(p); } }, "New encode…")),
+      h("button", { onclick: async () => { try { await api("/api/jobs/clear", {}); load(); } catch (e) { toast(e.message, true); } } }, "Clear finished"),
+      h("button", { class: "primary", onclick: async () => { const p = await pick({ title: "Videos or folders to encode", mode: "multi" }); if (p) encodeDialog(p, [], false, p.files); } }, "New encode…")),
     held, holdBox, watchBox, missing, list);
   const drawMissing = (un) => {
     if (!un || !un.length) { missing.replaceChildren(); return; }
@@ -1814,14 +1903,14 @@ views.queue = (root) => {
       j.left_secs ? h("span", {}, leftText(j.left_secs, j.left_unknown)) : null,
       h("span", { class: "dim" }, Object.entries(counts).map(([k, v]) => `${v} ${(STATUS[k] || [k])[0].toLowerCase()}`).join(" · ")),
       j.status === "queued" && !isNext(j)
-        ? h("button", { class: "small", title: "Start this job before the other waiting ones", onclick: async (e) => { e.target.disabled = true; try { await api(`/api/jobs/${j.id}/first`, {}); } catch (er) { toast(er.message, true); } load(); } }, "Do next")
+        ? h("button", { class: "small", title: "Start this job before the other waiting ones", onclick: async (e) => { const b = e.target; b.disabled = true; try { await api(`/api/jobs/${j.id}/first`, {}); } catch (er) { toast(er.message, true); } finally { b.disabled = false; } load(); } }, "Do next")
         : null,
       j.status === "cancelled" || j.status === "failed"
-        ? h("button", { class: "small", title: "Queue these files again with the same settings. Finished files are skipped and scene chunks resume.", onclick: async (e) => { e.target.disabled = true; try { await api(`/api/jobs/${j.id}/again`, {}); toast("Queued again"); } catch (er) { toast(er.message, true); } load(); } }, "Queue again")
+        ? h("button", { class: "small", title: "Queue these files again with the same settings. Finished files are skipped and scene chunks resume.", onclick: async (e) => { const b = e.target; b.disabled = true; try { await api(`/api/jobs/${j.id}/again`, {}); toast("Queued again"); } catch (er) { toast(er.message, true); } finally { b.disabled = false; } load(); } }, "Queue again")
         : null,
       j.status === "running" || j.status === "queued"
-        ? h("button", { class: "danger small", onclick: async (e) => { e.target.disabled = true; try { await api(`/api/jobs/${j.id}/cancel`, {}); toast("Cancelling… (finished chunks are kept; re-queue to resume)"); } catch (er) { toast(er.message, true); } } }, "Cancel")
-        : h("button", { class: "small", onclick: async () => { await api(`/api/jobs/${j.id}/remove`, {}); load(); } }, "Remove"));
+        ? h("button", { class: "danger small", onclick: async (e) => { const b = e.target; b.disabled = true; try { await api(`/api/jobs/${j.id}/cancel`, {}); toast("Cancelling… (finished chunks are kept; re-queue to resume)"); } catch (er) { toast(er.message, true); } finally { b.disabled = false; } } }, "Cancel")
+        : h("button", { class: "small", onclick: async (e) => { const b = e.target; b.disabled = true; try { await api(`/api/jobs/${j.id}/remove`, {}); load(); } catch (er) { toast(er.message, true); } finally { b.disabled = false; } } }, "Remove"));
     return head;
   }
 
@@ -1829,7 +1918,7 @@ views.queue = (root) => {
     const name = h("div", { class: "name" }, basename(f.input), h("div", { class: "dim mono" }, dirname(f.input)));
     const right = h("div", { class: "row" });
     if (f.status === "ok" || f.status === "done_before") {
-      if (f.input_bytes && f.output_bytes) right.append(h("span", {}, `${bytes(f.input_bytes)} → ${bytes(f.output_bytes)} `, h("span", { class: "ok" }, `−${pct(1 - f.output_bytes / f.input_bytes)}`)));
+      if (f.input_bytes && f.output_bytes) right.append(h("span", {}, `${bytes(f.input_bytes)} → ${bytes(f.output_bytes)} `, h("span", { class: savedClass(f.input_bytes - f.output_bytes) }, sizeChange(1 - f.output_bytes / f.input_bytes))));
       right.append(h("a", { class: "btn", href: "#/compare?report=" + encodeURIComponent(f.report) }, "Compare"));
     }
     const el = h("div", { class: "file" }, h("div", { class: "line1" }, j.paused && f.status === "running" ? pausedPill(j) : statusPill(f.status), name, right));
@@ -1851,7 +1940,7 @@ views.queue = (root) => {
       h("div", { class: "row" }, h("span", { class: "phase" }, PHASES[f.phase] || f.phase || "Starting"), h("span", { class: "dim" }, f.phase_detail)),
       h("div", { class: "row" }, h("div", { class: "grow" }, bar), progText),
       src ? h("div", { class: "dim" }, `${src.codec} ${src.width}×${src.height} · ${num(src.fps, 2)} fps · ${hms(src.duration_s)} · ${num(src.video_mbps, 1)} Mbps${src.hdr ? " · HDR" : ""}`) : null,
-      f.chosen ? h("div", {}, `CRF ${f.chosen.crf} → VMAF ${num(f.chosen.vmaf)}, predicted video savings `, h("span", { class: "ok" }, pct(f.chosen.predicted_savings))) : null,
+      f.chosen ? h("div", {}, `CRF ${f.chosen.crf} → VMAF ${num(f.chosen.vmaf)}, predicted video savings `, h("span", { class: savedClass(f.chosen.predicted_savings) }, savedPct(f.chosen.predicted_savings))) : null,
       f.spot_checks.length ? h("div", {}, "Spot checks: ", f.spot_checks.map((c) => `${hms(c.at_secs)} → ${num(c.vmaf)}`).join(", ")) : null,
       f.notes.length ? h("div", { class: "dim" }, f.notes.join(" · ")) : null);
     const rightCol = h("div", {});
@@ -1887,6 +1976,7 @@ views.queue = (root) => {
 
   const off = onEvent((m) => {
     if (m.kind === "jobs") return reload();
+    if (m.kind === "reopened") { reload(); loadWatched(); return; }
     if (m.kind === "watch") return loadWatched();
     if (m.kind === "bench") { held.hidden = m.run.status !== "running"; return; }
     if (m.kind === "bench_done") { held.hidden = true; return; }
@@ -1907,8 +1997,8 @@ views.queue = (root) => {
 // Hours of the day encodes may run in. Resolves to the queue's new state, or null.
 function hoursDialog(sch) {
   return new Promise((resolve) => {
-    const close = (v) => { bg.remove(); document.removeEventListener("keydown", onKey); resolve(v); };
-    const onKey = (e) => { if (e.key === "Escape") close(null); };
+    let busy = false;
+    const close = (v) => { bg.remove(); release(); resolve(v); };
     const on = h("input", { type: "checkbox" });
     on.checked = sch.on;
     const from = h("input", { type: "time", value: sch.from, required: true }), to = h("input", { type: "time", value: sch.to, required: true });
@@ -1920,10 +2010,11 @@ function hoursDialog(sch) {
         : !a || !b ? "Give both times."
         : a === b ? "The hours begin and end at the same time."
         : `Encodes run from ${a} to ${b}${b < a ? " the next day" : ""}. Outside these hours nothing new starts and a running encode is held where it is; it goes on when the hours begin again.`;
-      save.disabled = on.checked && (!a || !b || a === b);
+      save.disabled = busy || (on.checked && (!a || !b || a === b));
     };
     const save = h("button", { class: "primary", onclick: async () => {
-      try { close(await api("/api/queue/schedule", { on: on.checked, from: from.value || sch.from, to: to.value || sch.to })); } catch (e) { toast(e.message, true); }
+      busy = true; sync();
+      try { close(await api("/api/queue/schedule", { on: on.checked, from: from.value || sch.from, to: to.value || sch.to })); } catch (e) { toast(e.message, true); } finally { busy = false; sync(); }
     } }, "Save");
     for (const el of [on, from, to]) el.addEventListener("input", sync);
     const bg = h("div", { class: "modal-bg", onclick: (e) => { if (e.target === bg) close(null); } },
@@ -1936,7 +2027,7 @@ function hoursDialog(sch) {
         h("div", { class: "foot" }, h("button", { onclick: () => close(null) }, "Cancel"), save)));
     sync();
     document.body.append(bg);
-    document.addEventListener("keydown", onKey);
+    const release = holdFocus(bg, () => { if (!busy) close(null); }, on);
   });
 }
 
@@ -1975,11 +2066,13 @@ function savedChart(days) {
     const m = { l: 58, r: 18, t: 22, b: 26 };
     const pw = W - m.l - m.r, ph = H - m.t - m.b;
     const t0 = days[0].day, t1 = Math.max(Date.now(), days[days.length - 1].day + DAY);
-    const top = Math.max(...days.map((d) => d.total), 1), low = Math.min(0, ...days.map((d) => d.total));
-    // Lines at round amounts, four at most.
-    const mag = Math.pow(10, Math.floor(Math.log10(top / 4)));
-    const step = [1, 2, 5, 10].map((k) => k * mag).find((v) => top / v <= 4);
-    const y1 = Math.ceil(top / step) * step, y0 = low < 0 ? Math.floor(low / step) * step : 0;
+    const top = Math.max(0, ...days.map((d) => d.total)), low = Math.min(0, ...days.map((d) => d.total));
+    // Lines at round amounts, four or so, over all that is drawn: the total can be below
+    // zero where outputs came out larger than their sources.
+    const range = top - low > 0 && isFinite(top - low) ? top - low : 1;
+    const mag = Math.pow(10, Math.floor(Math.log10(range / 4)));
+    const step = [1, 2, 5, 10].map((k) => k * mag).find((v) => range / v <= 4) || 10 * mag;
+    const y0 = Math.floor(low / step) * step || 0, y1 = Math.max(Math.ceil(top / step) * step, y0 + step);
     const x = (t) => m.l + (t - t0) / (t1 - t0) * pw;
     const y = (v) => m.t + (y1 - v) / (y1 - y0) * ph;
     // A day's encodes are drawn at its middle.
@@ -1989,9 +2082,10 @@ function savedChart(days) {
       "aria-label": `Space saved over time: ${bytes(last.total)} in all since ${date(t0, true)}, over ${plural(days.length, "day")} with encodes. Left and right arrows read a day; the table below lists every encode.` });
     const text = (str, attrs) => { const t = s("text", attrs); t.textContent = str; svg.append(t); return t; };
 
-    for (let v = y0; v <= y1 + step / 2; v += step) {
+    for (let k = 0; y0 + k * step <= y1 + step / 2; k++) {
+      const v = y0 + k * step;
       svg.append(s("line", { class: "grid", x1: m.l, x2: m.l + pw, y1: y(v), y2: y(v) }));
-      text(v === 0 ? "0" : bytes(v).replace(/\.0 /, " "), { x: m.l - 8, y: y(v) + 4, "text-anchor": "end" });
+      text(Math.abs(v) < step / 1e6 ? "0" : bytes(v).replace(/\.0 /, " "), { x: m.l - 8, y: y(v) + 4, "text-anchor": "end" });
     }
     // Dates: a few, at the start of days (of months, over a long stretch), none on top of another.
     const long = t1 - t0 > 100 * DAY, years = new Date(t0).getFullYear() !== new Date(t1).getFullYear();
@@ -2073,7 +2167,7 @@ views.history = (root) => {
     replaceBtn.disabled = !ready.length;
     replaceBtn.title = ready.length ? `${plural(ready.length, "output")} can take the place of their original` : "No output here can take its original's place (already replaced, or a file is gone or changed)";
     const tin = reps.reduce((a, x) => a + (x.source_bytes || 0), 0), tout = reps.reduce((a, x) => a + (x.output_bytes || 0), 0);
-    const dirs = h("div", { class: "chips" }, r.dirs.map((d) => h("span", { class: "chip" }, h("code", {}, d), h("button", { title: "Forget folder", onclick: async () => { await api("/api/history/dirs/remove", { path: d }); load(); } }, "×"))));
+    const dirs = h("div", { class: "chips" }, r.dirs.map((d) => h("span", { class: "chip" }, h("code", {}, d), h("button", { title: "Forget folder", onclick: async () => { try { await api("/api/history/dirs/remove", { path: d }); load(); } catch (e) { toast(e.message, true); } } }, "×"))));
     if (!r.dirs.length) dirs.append(h("span", { class: "dim" }, "No folders yet. Output folders of queued encodes are added automatically."));
     // Thousands of rows take a while to lay out; the newest come first, the rest on request.
     const LIMIT = 500;
@@ -2089,7 +2183,7 @@ views.history = (root) => {
       h("td", { class: "num" }, x.mean_vmaf != null ? num(x.mean_vmaf) : (x.verify_vmaf || []).map((v) => num(v, 1)).join(" / ")),
       h("td", { class: "num" }, bytes(x.source_bytes)),
       h("td", { class: "num" }, bytes(x.output_bytes)),
-      h("td", { class: "num ok" }, pct(x.savings)),
+      h("td", { class: "num " + savedClass(x.savings) }, savedPct(x.savings)),
       h("td", { class: "num dim" }, hms((x.search_secs || 0) + (x.encode_secs || 0))));
     const tbody = h("tbody", {}, reps.slice(0, LIMIT).map(row));
     if (reps.length > LIMIT) {
@@ -2107,7 +2201,7 @@ views.history = (root) => {
       h("div", { class: "stats" },
         h("div", { class: "stat" }, h("div", { class: "v" }, reps.length), h("div", { class: "l" }, replaced ? `encodes · ${replaced} in place of their original` : "encodes")),
         h("div", { class: "stat" }, h("div", { class: "v" }, `${bytes(tin)} → ${bytes(tout)}`), h("div", { class: "l" }, "source → AV1")),
-        h("div", { class: "stat" }, h("div", { class: "v ok" }, bytes(tin - tout)), h("div", { class: "l" }, `saved (${pct(tin ? 1 - tout / tin : 0)})`)),
+        h("div", { class: "stat" }, h("div", { class: "v " + savedClass(tin - tout) }, bytes(tin - tout)), h("div", { class: "l" }, `saved (${savedPct(tin ? 1 - tout / tin : 0)})`)),
         h("div", { class: "stat" }, h("div", { class: "v" }, STATE ? STATE.history_encodes : "–"), h("div", { class: "l" }, "encodes calibrating scan estimates"))),
       chart ? h("div", { class: "panel" }, h("h3", {}, "Space saved over time"), chart.el) : null,
       h("div", { class: "panel" }, reps.length
@@ -2130,8 +2224,7 @@ function replaceDialog(rows, reload) {
   const total = h("span", { class: "dim grow" });
   const cancel = h("button", { onclick: () => close() }, "Cancel");
   const go = h("button", { class: "danger" });
-  const close = () => { if (busy) return; bg.remove(); document.removeEventListener("keydown", onKey); };
-  const onKey = (e) => { if (e.key === "Escape") close(); };
+  const close = () => { if (busy) return; bg.remove(); release(); };
   const sum = () => {
     const c = chosen();
     go.textContent = c.length ? `Replace ${plural(c.length, "original")}` : "Replace";
@@ -2191,7 +2284,7 @@ function replaceDialog(rows, reload) {
         list),
       h("div", { class: "foot" }, total, cancel, go)));
   document.body.append(bg);
-  document.addEventListener("keydown", onKey);
+  const release = holdFocus(bg, close);
   draw();
 }
 
@@ -2249,12 +2342,14 @@ function comparePlayer(root, r) {
   const toSrc = (t) => (keep ? outToSrc(keep, t) : t);
   const srcTime = (t) => Math.max(0, toSrc(t) - srcOff + nudge);
   let split = 0.5, zoom = 1, origin = "50% 50%";
+  // Set when the view is left: what was still loading or being made then is dropped.
+  let closed = false;
 
   const layerS = h("div", { class: "layer" }, vs);
   const layerO = h("div", { class: "layer" }, vo);
   const divider = h("div", { class: "divider" });
   const tagL = h("div", { class: "tag l" }, r.pair ? `Left · ${desc(ii)} · ${bytes(r.source_bytes)}` : `Source · ${ii.codec || "?"} · ${bytes(r.source_bytes)}`);
-  const tagR = h("div", { class: "tag r" }, r.pair ? `Right · ${desc(oi)} · ${bytes(r.output_bytes)}` : `AV1 · ${bytes(r.output_bytes)} (−${pct(r.savings)})`);
+  const tagR = h("div", { class: "tag r" }, r.pair ? `Right · ${desc(oi)} · ${bytes(r.output_bytes)}` : `AV1 · ${bytes(r.output_bytes)} (${sizeChange(r.savings)})`);
   const overlay = h("div", { class: "overlay", hidden: true });
   const stage = h("div", { class: "stage" }, layerS, layerO, divider, tagL, tagR, overlay);
   if (oi.width && oi.height) stage.style.aspectRatio = `${oi.width} / ${oi.height}`;
@@ -2329,7 +2424,7 @@ function comparePlayer(root, r) {
   const pixDiff = (a, b) => { let d = 0; for (let i = 0; i < a.length; i += 4) d += Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]); return d; };
   let aligning = false;
   async function autoAlign() {
-    if (aligning || srcMode === "loading" || !vs.videoWidth || !vo.videoWidth) return;
+    if (closed || aligning || srcMode === "loading" || !vs.videoWidth || !vo.videoWidth) return;
     aligning = true;
     const was = vo.currentTime;
     vo.pause();
@@ -2445,7 +2540,8 @@ function comparePlayer(root, r) {
   const replacePanel = r.pair || !rp.state ? null : h("div", { class: "panel" }, h("h3", {}, "Original"),
     rp.state === "ready" ? [
       h("p", { class: "dim" }, "Happy with it? The AV1 file can take the original's place: the original moves to the trash, the AV1 file gets its name in its folder."),
-      h("div", { class: "row" }, h("button", { class: "danger", onclick: async () => {
+      h("div", { class: "row" }, h("button", { class: "danger", onclick: async (e) => {
+        const btn = e.currentTarget;
         const ok = await confirmDialog({
           title: "Replace the original?",
           action: "Replace original",
@@ -2457,7 +2553,11 @@ function comparePlayer(root, r) {
             rp.zfs ? h("p", { class: "warn" }, "The original is on ZFS, which av1opt writes to only when asked. Replacing it here is asking.") : null,
             h("p", { class: "dim" }, "The space is freed when you empty the trash. Until then this page can put the original back.")],
         });
-        if (ok) act("/api/replace", { report: r.report_path, allow_zfs: !!rp.zfs }, "Original replaced; it is in the trash");
+        if (!ok) return;
+        btn.disabled = true;
+        btn.textContent = "Replacing…";
+        try { await act("/api/replace", { report: r.report_path, allow_zfs: !!rp.zfs }, "Original replaced; it is in the trash"); }
+        finally { btn.disabled = false; btn.textContent = "Replace original…"; }
       } }, "Replace original…"))]
     : rp.state === "replaced" ? [
       h("p", { class: "dim" }, "The AV1 file is where the original was. ", rp.can_undo ? "The original is in the trash." : "The original is no longer in the trash (or one of the two files changed), so this can't be undone here."),
@@ -2487,7 +2587,7 @@ function comparePlayer(root, r) {
         kv("Output", h("span", { class: "mono", title: r.output_path }, basename(r.output_path))),
         kv("Size", `${bytes(r.source_bytes)} → ${bytes(r.output_bytes)}`),
         removed.length ? kv("Removed", removed.map(([a, b]) => `${fmtTime(a)}–${fmtTime(b)}`).join(", ")) : null,
-        kv("Saved", h("span", { class: "ok" }, pct(r.savings, 1))),
+        kv("Saved", h("span", { class: savedClass(r.savings) }, savedPct(r.savings, 1))),
         kv("Mode", r.mode === "scenes" ? `per-scene CRF, ${chunks.length} chunks` : "one CRF"),
         kv("CRF", r.mode === "scenes" && chunks.length ? `${Math.min(...chunks.map((c) => c.crf))}–${Math.max(...chunks.map((c) => c.crf))} (start ${r.crf})` : r.crf),
         kv("Encoder", `preset ${r.preset}${r.svt_params ? " · " + r.svt_params : ""}`),
@@ -2535,6 +2635,12 @@ function comparePlayer(root, r) {
   vo.addEventListener("seeking", () => { vs.currentTime = srcTime(vo.currentTime); });
   vo.addEventListener("ratechange", () => { vs.playbackRate = vo.playbackRate; });
   seek.addEventListener("input", () => seekTo(Number(seek.value)));
+  // After a drag the slider lets go of the keyboard, so space and the frame keys reach the
+  // player again. Moved with the arrow keys, it keeps it.
+  let seekByPointer = false;
+  seek.addEventListener("pointerdown", () => { seekByPointer = true; });
+  seek.addEventListener("keydown", () => { seekByPointer = false; });
+  seek.addEventListener("change", () => { if (seekByPointer) { seekByPointer = false; seek.blur(); } });
 
   let raf = 0;
   const tick = () => {
@@ -2585,6 +2691,7 @@ function comparePlayer(root, r) {
   }
 
   async function makePreview(at) {
+    if (closed) return;
     let start = Math.max(0, Math.min(at, Math.max(0, duration - 2)));
     let secs = Math.min(20, Math.max(2, duration - start));
     if (keep) {
@@ -2606,8 +2713,11 @@ function comparePlayer(root, r) {
     const prev = { offset, segEnd, srcOff, srcMode, src: vs.src };
     srcMode = "loading";
     try {
-      const p = await api("/api/preview", { path: r.input_path, kind: "transcode", start: toSrc(start), secs });
+      // The clip starts where the source lines up with the output, shift included.
+      const p = await api("/api/preview", { path: r.input_path, kind: "transcode", start: Math.max(0, toSrc(start) + nudge), secs });
+      if (closed) return;
       await tryLoad(vs, p.url);
+      if (closed) return;
       offset = start; segEnd = start + p.secs; srcOff = p.start; srcMode = "preview";
       segRect.setAttribute("x", x(offset)); segRect.setAttribute("width", x(segEnd) - x(offset));
       srcStatus.replaceChildren(h("span", { class: "warn" }, `${leftName}: preview clip `), `${tc(srcOff)}–${tc(srcOff + p.secs)}. The browser can't decode ${ii.codec || "this file"} directly, so this clip is re-encoded near-losslessly (H.264 CRF 12)${ii.hdr ? "; HDR shown without tone mapping" : ""}. Click the timeline outside the shaded part for a new clip.`);
@@ -2617,6 +2727,7 @@ function comparePlayer(root, r) {
       await autoAlign();
       seekTo(offset);
     } catch (e) {
+      if (closed) return;
       ({ offset, segEnd, srcOff, srcMode } = prev);
       if (prev.src && srcMode !== "loading") { vs.src = prev.src; vs.currentTime = srcTime(vo.currentTime); }
       busy(null);
@@ -2635,29 +2746,35 @@ function comparePlayer(root, r) {
     try {
       await tryLoad(vo, mediaUrl(r.output_path));
     } catch {
+      if (closed) return;
       busy("Your browser can't open this container; copying the video stream into MP4…");
       try {
         const p = await api("/api/preview", { path: r.output_path, kind: "remux" });
+        if (closed) return;
         await tryLoad(vo, p.url);
       } catch (e) {
         overlay.replaceChildren(h("div", { class: "bad" }, (r.pair ? `Cannot play the right-hand file (${oi.codec || "?"}) in this browser: ` : "Cannot play the AV1 output here: ") + e.message));
         return;
       }
     }
+    if (closed) return;
     if (ii.error) { busy(null); overlay.hidden = false; overlay.replaceChildren(h("div", { class: "bad" }, ii.error)); return; }
     try {
       await tryLoad(vs, mediaUrl(r.input_path));
+      if (closed) return;
       srcStatus.replaceChildren(h("span", { class: "ok" }, `${leftName}: original file`), " played directly.");
       previewBtn.hidden = false;
       busy(null);
       autoAlign();
     } catch (e) {
+      if (closed) return;
       busy(null);
       await makePreview(0);
     }
   })();
 
   return () => {
+    closed = true;
     cancelAnimationFrame(raf);
     document.removeEventListener("keydown", onKey);
     for (const v of [vo, vs]) { v.pause(); v.removeAttribute("src"); v.load(); }
@@ -2688,7 +2805,9 @@ views.settings = (root) => {
     save.disabled = true;
     try {
       const tools = await api("/api/settings/tools", { ffmpeg: ffmpeg.value, ffprobe: ffprobe.value });
-      STATE.tools = tools;
+      // The page may have opened while av1opt could not be reached: there is no state yet.
+      if (!STATE) await loadState().catch(() => {});
+      if (STATE) STATE.tools = tools;
       renderBanner();
       show(tools);
       refreshBadge();
@@ -2709,8 +2828,8 @@ views.settings = (root) => {
       h("h3", {}, "Log"),
       h("p", { class: "dim" }, "Messages from av1opt while the desktop app runs, with times. Useful when an encode failed overnight."),
       h("div", { class: "row" },
-        h("button", { onclick: () => desktop.openLog(false).then((ok) => ok || toast("Could not open the log", true)) }, "Open log"),
-        h("button", { onclick: () => desktop.openLog(true) }, "Show in folder"))) : null,
+        h("button", { onclick: () => desktop.openLog(false).then((ok) => ok || toast("Could not open the log", true), () => toast("Could not open the log", true)) }, "Open log"),
+        h("button", { onclick: () => desktop.openLog(true).catch(() => toast("Could not open the log", true)) }, "Show in folder"))) : null,
     h("div", { class: "panel" },
       h("h3", {}, "About"),
       h("div", { class: "kv" },

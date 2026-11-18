@@ -128,6 +128,7 @@ tr.click:hover td { background: var(--panel2); }
 /* modal */
 .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; z-index: 50; }
 .modal { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; width: min(760px, 94vw); max-height: 86vh; display: flex; flex-direction: column; }
+.modal:focus { outline: none; }
 .modal .head { padding: 12px 16px; border-bottom: 1px solid var(--line); display: flex; gap: 10px; align-items: center; }
 .modal .body { padding: 12px 16px; overflow: auto; flex: 1; }
 .modal .foot { padding: 10px 16px; border-top: 1px solid var(--line); display: flex; gap: 8px; justify-content: flex-end; align-items: center; }

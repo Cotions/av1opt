@@ -706,7 +706,8 @@ and the benchmark's requests and tuned settings over HTTP (no ffmpeg needed).
   reaches the target after the repairs: the same video 184.7 MB at a mean of 93.8 (CRF
   38.75 instead of 37; 92.5 before 5:52 of it was encoded again), and a second 373.3 MB
   at 93.2 instead of 429.7 MB at 94.2 (CRF 39 instead of 37, 1:56 encoded again instead
-  of 1:05). The lowest five seconds stayed at 89.3 and 89.5.
+  of 1:05), and a third 205.1 MB at 93.2 instead of 220.1 MB at 94.1. The three together
+  are a tenth smaller, and their lowest five seconds stayed at 89.1 to 89.5.
 - **A key frame every 10 seconds, and quantization matrices.** SVT-AV1 puts a key frame
   about every 5 seconds and leaves quantization matrices off. At equal VMAF, 10 seconds
   took 3.3% less on eight 10-second clips and 2.6% less on four of 40 seconds (20 seconds:

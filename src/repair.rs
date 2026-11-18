@@ -1044,4 +1044,311 @@ mod tests {
         assert!((o.at(7.5, 5.0).unwrap() - 93.0).abs() < 0.1);
         assert_eq!(o.at(40.0, 5.0), None);
     }
+
+    #[test]
+    fn the_timeline_counts_from_the_first_frame_and_ends_a_frame_after_the_last() {
+        let line = |pts: Vec<i64>, tb| timeline(&Times { pts, tb });
+        assert_eq!(line(vec![100, 103, 106], (1, 30)), vec![0.0, 0.1, 0.2, 0.30000000000000004]);
+        // The last frame lasts the average step.
+        assert_eq!(line(vec![0, 1, 4], (1, 1)), vec![0.0, 1.0, 4.0, 6.0]);
+        // A single frame has no step to go by.
+        assert_eq!(line(vec![7], (1, 1000)), vec![0.0, 0.04]);
+    }
+
+    #[test]
+    fn a_mean_takes_the_first_frame_of_a_range_and_not_the_one_after_it() {
+        let sc = Scores::new(&[(0, 10.0), (3, 20.0), (6, 60.0)]);
+        assert_eq!(sc.mean(0, 3), Some(10.0));
+        assert_eq!(sc.mean(0, 4), Some(15.0));
+        assert_eq!(sc.mean(3, 7), Some(40.0));
+        assert_eq!(sc.mean(0, 100), Some(30.0));
+        // Ranges holding no scored frame.
+        assert_eq!(sc.mean(1, 3), None);
+        assert_eq!(sc.mean(3, 3), None);
+        assert_eq!(sc.mean(7, 100), None);
+        assert_eq!(sc.mean(5, 2), None);
+        assert_eq!(Scores::new(&[]).mean(0, 100), None);
+    }
+
+    #[test]
+    fn five_seconds_exactly_are_one_window_and_a_frame_more_are_two() {
+        let at = |frames: usize| {
+            let s = secs(frames);
+            let sc = Scores::new(&(0..frames).map(|i| (i, 90.0)).collect::<Vec<_>>());
+            windows(&s, &sc, 0, frames).iter().map(|w| (w.start, w.end)).collect::<Vec<_>>()
+        };
+        assert_eq!(at(150), vec![(0, 150)]);
+        assert_eq!(at(151), vec![(0, 150), (1, 151)]);
+        assert_eq!(at(180), vec![(0, 150), (30, 180)]);
+        assert_eq!(at(1), vec![(0, 1)]);
+    }
+
+    #[test]
+    fn windows_stay_inside_the_range_they_were_asked_for() {
+        let s = secs(900);
+        let sc = Scores::new(&scored(900, |_| 90.0));
+        let w = windows(&s, &sc, 300, 600);
+        assert_eq!((w[0].start, w[0].end), (300, 450));
+        assert_eq!((w[w.len() - 1].start, w[w.len() - 1].end), (450, 600));
+        assert!(w.iter().all(|x| x.start >= 300 && x.end <= 600));
+    }
+
+    #[test]
+    fn a_window_without_a_scored_frame_is_left_out() {
+        let s = secs(300);
+        assert!(windows(&s, &Scores::new(&[]), 0, 300).is_empty());
+        // Scores only in the last second: the early windows hold none of them.
+        let late: Vec<(usize, f64)> = (270..300).map(|i| (i, 90.0)).collect();
+        let w = windows(&s, &Scores::new(&late), 0, 300);
+        assert!(w.iter().all(|x| x.end > 270), "{w:?}");
+        assert_eq!(w[w.len() - 1].end, 300);
+    }
+
+    #[test]
+    fn windows_cover_a_video_at_any_frame_rate_without_gaps() {
+        for fps in [24000.0 / 1001.0, 25.0, 30000.0 / 1001.0, 59.94, 120.0, 1.0] {
+            let frames = (fps * 37.3) as usize;
+            let s: Vec<f64> = (0..=frames).map(|i| i as f64 / fps).collect();
+            let sc = Scores::new(&(0..frames).map(|i| (i, 90.0)).collect::<Vec<_>>());
+            let w = windows(&s, &sc, 0, frames);
+            assert_eq!((w[0].start, w[w.len() - 1].end), (0, frames), "{fps}");
+            for pair in w.windows(2) {
+                assert!(pair[0].start < pair[1].start && pair[0].end < pair[1].end && pair[1].start < pair[0].end, "{fps}: {pair:?}");
+            }
+            for x in &w {
+                let long = s[x.end] - s[x.start];
+                assert!((long - WINDOW_SECS).abs() <= 1.0 / fps + 1e-9, "{fps}: {x:?} is {long} s");
+            }
+        }
+    }
+
+    fn low_window(start: usize, end: usize) -> Window {
+        Window { start, end, vmaf: 80.0 }
+    }
+
+    #[test]
+    fn with_no_window_low_nothing_is_blamed() {
+        let sc = Scores::new(&scored(300, |_| 70.0));
+        assert_eq!(blame(&[], &[0, 150], 300, &sc, 89.0, &[]), vec![false, false]);
+    }
+
+    #[test]
+    fn a_window_that_ends_where_a_gop_starts_does_not_touch_it() {
+        let sc = Scores::new(&scored(450, |_| 70.0));
+        assert_eq!(blame(&[low_window(0, 150)], &[0, 150, 300], 450, &sc, 89.0, &[]), vec![true, false, false]);
+        assert_eq!(blame(&[low_window(150, 300)], &[0, 150, 300], 450, &sc, 89.0, &[]), vec![false, true, false]);
+        assert_eq!(blame(&[low_window(300, 450)], &[0, 150, 300], 450, &sc, 89.0, &[]), vec![false, false, true]);
+    }
+
+    #[test]
+    fn a_window_over_a_settled_stretch_is_let_be_on_both_sides_of_it() {
+        // Frames 120-270 are low, over the first two GOPs; the first is settled.
+        let sc = Scores::new(&scored(450, |_| 70.0));
+        let settled = [Run { start: 0, end: 150 }];
+        assert_eq!(blame(&[low_window(120, 270)], &[0, 150, 300], 450, &sc, 89.0, &settled), vec![false, false, false]);
+        // A stretch that only touches the window's GOPs at their edge changes nothing.
+        let elsewhere = [Run { start: 300, end: 450 }];
+        assert_eq!(blame(&[low_window(120, 270)], &[0, 150, 300], 450, &sc, 89.0, &elsewhere), vec![true, true, false]);
+    }
+
+    #[test]
+    fn when_no_part_of_a_low_window_is_low_the_gop_with_most_of_it_answers() {
+        let sc = Scores::new(&scored(450, |_| 95.0));
+        assert_eq!(blame(&[low_window(100, 190)], &[0, 150, 300], 450, &sc, 89.0, &[]), vec![true, false, false]);
+        assert_eq!(blame(&[low_window(140, 290)], &[0, 150, 300], 450, &sc, 89.0, &[]), vec![false, true, false]);
+    }
+
+    #[test]
+    fn a_run_may_be_exactly_as_long_as_allowed_and_a_gop_alone_may_be_longer() {
+        let (frames, gops) = (900, vec![0, 150, 300, 450, 600, 750]);
+        let s = secs(frames);
+        assert_eq!(runs(&[false; 6], &gops, frames, &s, 20.0), vec![]);
+        // Two GOPs are 10 s.
+        assert_eq!(runs(&[true, true, false, false, false, false], &gops, frames, &s, 10.0), vec![Run { start: 0, end: 300 }]);
+        // Limits below a GOP's length leave each by itself; the last one ends with the video.
+        let one_each = runs(&[false, false, false, false, true, true], &gops, frames, &s, 1.0);
+        assert_eq!(one_each, vec![Run { start: 600, end: 750 }, Run { start: 750, end: 900 }]);
+    }
+
+    #[test]
+    fn a_score_from_the_acceptance_line_up_to_the_overshoot_is_kept() {
+        // Floor 89: accepted from 89.25, aimed at 90, too good above 91.5.
+        for v in [89.25, 90.0, 91.5] {
+            assert_eq!(next_crf(&[(40.0, 80.0), (38.0, v)], 89.0, 20.0), (None, false), "{v}");
+        }
+        assert_eq!(next_crf(&[(38.0, 89.24)], 89.0, 20.0), (Some(37.0), false));
+    }
+
+    #[test]
+    fn a_score_too_good_goes_back_only_toward_a_crf_that_fell_short() {
+        // Nothing above it fell short: there is nowhere to go back to.
+        assert_eq!(next_crf(&[(38.0, 92.0)], 89.0, 20.0), (None, false));
+        assert_eq!(next_crf(&[(40.0, 90.5), (38.0, 92.0)], 89.0, 20.0), (None, false));
+        // Less than a step away: not worth another encode.
+        assert_eq!(next_crf(&[(38.5, 85.0), (37.75, 95.0)], 89.0, 20.0), (None, false));
+        // A step away: halfway, and never onto the CRF that fell short.
+        assert_eq!(next_crf(&[(31.0, 89.5), (30.0, 100.0)], 89.0, 20.0), (Some(30.5), false));
+    }
+
+    #[test]
+    fn the_next_try_stops_at_the_lowest_crf_allowed() {
+        assert_eq!(next_crf(&[(38.0, 85.0)], 89.0, 36.0), (Some(36.0), false));
+        assert_eq!(next_crf(&[(36.25, 85.0)], 89.0, 36.0), (Some(36.0), false));
+        assert_eq!(next_crf(&[(36.0, 85.0)], 89.0, 36.0), (None, true));
+        assert_eq!(next_crf(&[(30.0, 85.0)], 89.0, 36.0), (None, true));
+    }
+
+    #[test]
+    fn half_a_point_over_three_steps_is_the_line_of_levelling_off() {
+        assert_eq!(next_crf(&[(38.0, 85.0), (35.0, 85.49)], 89.0, 10.0), (None, true));
+        // At exactly half a point it may go on: half the usual gain a step, 4.5 points to go.
+        assert_eq!(next_crf(&[(38.0, 85.0), (35.0, 85.5)], 89.0, 10.0), (Some(26.0), false));
+        // Over two steps, a gain that would not reach the floor by the lowest CRF ends it.
+        assert_eq!(next_crf(&[(37.0, 85.0), (35.0, 85.2)], 89.0, 10.0), (None, true));
+        // Over one step it proves nothing yet: half the usual gain is gone by.
+        assert_eq!(next_crf(&[(36.0, 85.0), (35.0, 85.2)], 89.0, 10.0), (Some(25.25), false));
+    }
+
+    #[test]
+    fn every_try_for_a_short_stretch_is_lower_on_quarter_steps_and_inside_the_range() {
+        for crf in (84..=200).map(|q| q as f64 / 4.0) {
+            for vmaf in [60.0, 75.5, 85.0, 88.1, 89.24] {
+                for lo in [10.0, 21.0, 30.5] {
+                    if crf <= lo {
+                        continue;
+                    }
+                    if let (Some(next), _) = next_crf(&[(crf, vmaf)], 89.0, lo) {
+                        assert!(next < crf && next >= lo, "{crf} {vmaf} {lo}: {next}");
+                        assert_eq!(next * 4.0, (next * 4.0).floor(), "{crf} {vmaf} {lo}: {next}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_stretch_is_judged_by_its_new_scores_where_there_are_any() {
+        let s = secs(300);
+        let old = scored(300, |_| 90.0);
+        let whole = Run { start: 0, end: 300 };
+        assert_eq!(lowest_over(&s, &old, None, whole), 90.0);
+        assert_eq!(lowest_over(&s, &old, Some(&scored(300, |_| 70.0)), whole), 70.0);
+        // Frame 1 is not scored: only the windows over it can speak for it.
+        assert_eq!(lowest_over(&s, &old, None, Run { start: 1, end: 2 }), 90.0);
+        // Replacing a part leaves the frames around it as they were: ten scores of 70 among
+        // forty of 90 in the worst window, where replacing them all would say 70.
+        let part: Vec<(usize, f64)> = old.iter().copied().filter(|f| (150..180).contains(&f.0)).map(|(f, _)| (f, 70.0)).collect();
+        let low = lowest_over(&s, &old, Some(&part), Run { start: 150, end: 180 });
+        assert!((low - 86.0).abs() < 1e-9, "{low}");
+    }
+
+    fn kept(frames: usize) -> Outcome {
+        Outcome {
+            summary: Summary { mean_vmaf: 0.0, lowest_vmaf: 0.0, lowest_before: 0.0, floor: 89.0, stretches: Vec::new(), near: 0, left: Vec::new(), secs: 0.0 },
+            video: None,
+            scores: scored(frames, |_| 90.0),
+            secs: secs(frames),
+        }
+    }
+
+    #[test]
+    fn an_outcome_knows_its_length_and_reads_up_to_the_end() {
+        let o = kept(900);
+        assert_eq!(o.length(), 30.0);
+        assert_eq!(o.at(25.0, 100.0), Some(90.0));
+        assert_eq!(o.at(-5.0, 6.0), Some(90.0));
+        assert_eq!(o.at(5.0, 0.0), None);
+        assert_eq!(o.at(30.0, 5.0), None);
+    }
+
+    fn ivf_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("av1opt-repair-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn an_ivf_file_without_frames_or_with_empty_ones_is_read() {
+        let dir = ivf_dir("empty");
+        let p = dir.join("x.ivf");
+        write_ivf(&p, &[]);
+        assert!(ivf_index(&p).unwrap().1.is_empty());
+        write_ivf(&p, &[(5, Vec::new()), (u64::MAX, vec![1, 2])]);
+        let (head, index) = ivf_index(&p).unwrap();
+        assert_eq!(&head[..4], b"DKIF");
+        assert_eq!(index.iter().map(|f| (f.offset, f.size, f.pts)).collect::<Vec<_>>(), vec![(44, 0, 5), (56, 2, u64::MAX)]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_ivf_file_that_does_not_add_up_is_refused() {
+        let dir = ivf_dir("bad");
+        let p = dir.join("x.ivf");
+        write_ivf(&p, &[(0, vec![1; 10])]);
+        let good = std::fs::read(&p).unwrap();
+        let refused = |bytes: &[u8]| {
+            std::fs::write(&p, bytes).unwrap();
+            ivf_index(&p).err().map(|e| e.to_string())
+        };
+        // Shorter than its header, another header length, another signature.
+        assert!(refused(&good[..31]).is_some());
+        let mut other = good.clone();
+        other[6] = 16;
+        assert!(refused(&other).is_some());
+        let mut other = good.clone();
+        other[0] = b'X';
+        assert!(refused(&other).is_some());
+        // Half a frame header after the last frame.
+        let mut other = good.clone();
+        other.extend([0; 5]);
+        assert!(refused(&other).is_some());
+        // A frame that says it is longer than what is left.
+        let e = refused(&good[..good.len() - 1]).unwrap();
+        assert!(e.contains("stops partway through frame 1"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn with_nothing_to_replace_only_the_times_move_to_zero() {
+        let dir = ivf_dir("copy");
+        let frames: Vec<(u64, Vec<u8>)> = vec![(50, vec![1; 3]), (60, vec![2; 4]), (75, vec![3])];
+        write_ivf(&dir.join("src.ivf"), &frames);
+        let (head, index) = ivf_index(&dir.join("src.ivf")).unwrap();
+        splice(&dir.join("src.ivf"), &head, &index, &[], &dir.join("out.ivf")).unwrap();
+        let (_, out) = ivf_index(&dir.join("out.ivf")).unwrap();
+        assert_eq!(out.iter().map(|f| (f.pts, f.size)).collect::<Vec<_>>(), vec![(0, 3), (10, 4), (25, 1)]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_first_and_last_frames_can_be_replaced_too() {
+        let dir = ivf_dir("ends");
+        write_ivf(&dir.join("src.ivf"), &[(0, vec![1]), (1, vec![2]), (2, vec![3])]);
+        write_ivf(&dir.join("a.ivf"), &[(9, vec![0xa; 5])]);
+        write_ivf(&dir.join("b.ivf"), &[(9, vec![0xb; 6])]);
+        let (head, index) = ivf_index(&dir.join("src.ivf")).unwrap();
+        let fx = [fixed(Run { start: 0, end: 1 }, dir.join("a.ivf")), fixed(Run { start: 2, end: 3 }, dir.join("b.ivf"))];
+        splice(&dir.join("src.ivf"), &head, &index, &fx, &dir.join("out.ivf")).unwrap();
+        let (_, out) = ivf_index(&dir.join("out.ivf")).unwrap();
+        assert_eq!(out.iter().map(|f| (f.pts, f.size)).collect::<Vec<_>>(), vec![(0, 5), (1, 1), (2, 6)]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_stretch_that_lies_outside_the_frames_left_is_refused() {
+        let dir = ivf_dir("outside");
+        write_ivf(&dir.join("src.ivf"), &[(0, vec![1]), (1, vec![2]), (2, vec![3])]);
+        write_ivf(&dir.join("a.ivf"), &[(0, vec![9]), (1, vec![9])]);
+        let (head, index) = ivf_index(&dir.join("src.ivf")).unwrap();
+        for fx in [
+            vec![fixed(Run { start: 7, end: 8 }, dir.join("a.ivf"))],
+            // The second begins inside the first.
+            vec![fixed(Run { start: 0, end: 2 }, dir.join("a.ivf")), fixed(Run { start: 1, end: 3 }, dir.join("a.ivf"))],
+        ] {
+            let e = splice(&dir.join("src.ivf"), &head, &index, &fx, &dir.join("out.ivf")).unwrap_err().to_string();
+            assert!(e.contains("does not begin at a frame"), "{e}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

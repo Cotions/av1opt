@@ -126,8 +126,13 @@ For each file:
    of them up to about 17 minutes, then one for every two minutes more, 32 at most.
    `--samples` and `--sample-secs` set both by hand, and with them the 4-second scheme.
    A video whose first frame is not at zero (Matroska and MPEG-TS files can start late) is
-   measured from where it starts. A file that stops before the length it claims is refused,
-   and the message says that it ends early or is damaged.
+   measured from where it starts; for a Matroska file that takes a look at its first and its
+   last packets, a fraction of a second. Clips, and the chunks of a per-scene encode, are
+   chosen by the source's own timestamps: where a seek lands past them (MPEG-TS, files
+   without an index), the cut is redone from 30 seconds earlier and then from the start,
+   which is slow on a long transport stream but takes the right frames. A file that stops
+   before the length it claims is refused, and the message says that it ends early or is
+   damaged.
 2. **Search** – finds the highest CRF between `--min-crf` (20) and `--max-crf` (55) whose mean
    VMAF over the samples meets the target. The
    first CRF tried is a guess: 35 for VMAF 93, moved by what your own past encodes say about
@@ -332,7 +337,7 @@ with `--overwrite`, so is the second of two inputs that would write one output. 
 encode from an earlier run found among the inputs is left alone. `--order per-hour` encodes the files with the largest estimated
 saving per hour of encoding first (`--order savings`: the largest saving first), going by the
 same estimates as `scan`, so a long run stopped early has saved the most for its time; in the
-web UI files are queued in the order of the scan table. Trial encodes are remembered in `~/.cache/av1opt/trials-v1.jsonl`
+web UI files are queued in the order of the scan table. Trial encodes are remembered in `~/.cache/av1opt/trials-v2.jsonl`
 for the same file (path, size, date), sample clips, settings, ffmpeg build, SVT-AV1 version and way of measuring: an encode that
 was stopped or failed, or is run again with another container or `--min-savings`,
 starts from the scores it already has and often measures nothing new. Another target does so

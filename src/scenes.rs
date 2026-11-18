@@ -557,7 +557,7 @@ fn encode_chunk(c: &Ctx, plan: &Plan, i: usize) -> Result<ChunkResult> {
     let r = ChunkResult { index: i, start_secs, frames, crf, probes, vmaf, bytes, corrected, out_of_reach };
     // The JSON is written first and the encode renamed last: a chunk counts as done only when
     // its .obu exists, which can't happen half-written.
-    std::fs::write(chunk_path(c.work, i, "json"), serde_json::to_vec(&r)?)?;
+    crate::files::write_new(&chunk_path(c.work, i, "json"), &serde_json::to_vec(&r)?)?;
     std::fs::rename(&part, chunk_path(c.work, i, "obu"))?;
     let _ = std::fs::remove_file(&reference);
     Ok(r)
@@ -639,7 +639,7 @@ pub fn encode_all(c: &Ctx, plan: &Plan) -> Result<Vec<ChunkResult>> {
 /// with a sequence header and key frame, so plain concatenation is a valid stream.
 pub fn concat(work: &Path, n: usize) -> Result<PathBuf> {
     let out = work.join("video.obu");
-    let mut f = std::fs::File::create(&out)?;
+    let mut f = crate::files::create_new(&out)?;
     for i in 0..n {
         let mut chunk = std::fs::File::open(chunk_path(work, i, "obu")).with_context(|| format!("chunk {} missing", i + 1))?;
         std::io::copy(&mut chunk, &mut f)?;
@@ -669,7 +669,7 @@ pub fn stamp(tools: &Tools, work: &Path, video: &Path, info: &MediaInfo) -> Resu
 fn restamp(from: &Path, to: &Path, times: &Times) -> Result<()> {
     use std::io::{BufRead, Read, Write};
     let mut r = std::io::BufReader::new(std::fs::File::open(from)?);
-    let mut w = std::io::BufWriter::new(std::fs::File::create(to)?);
+    let mut w = std::io::BufWriter::new(crate::files::create_new(to)?);
     // 32 bytes: "DKIF", version, header length, codec, width, height, time base denominator
     // and numerator, length of the stream, four unused. Little-endian throughout.
     let mut head = [0u8; 32];

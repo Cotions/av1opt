@@ -3,6 +3,7 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -10,12 +11,146 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// file is made anew: a link left there (in an output folder others can write to) is
 /// replaced, never written through.
 pub fn write_new(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    create_new(path)?.write_all(data)
+}
+
+/// A new, empty file at `path`, made as [`write_new`] makes one.
+pub fn create_new(path: &Path) -> std::io::Result<std::fs::File> {
     match std::fs::remove_file(path) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
         _ => {}
     }
-    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
-    f.write_all(data)
+    std::fs::OpenOptions::new().write(true).create_new(true).custom_flags(libc::O_NOFOLLOW).open(path)
+}
+
+/// `count` random bytes as text, for names nobody can work out ahead of time.
+pub fn random_text(count: usize) -> std::io::Result<String> {
+    let mut bytes = vec![0u8; count];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// When process `pid` started, in the system's clock ticks since boot. None if there is no
+/// such process. A process number alone can come back as another program's.
+pub fn process_start(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The program's name, in brackets, comes second and can hold anything: the fields are
+    // counted from the last bracket, the first after it being number three.
+    stat.rsplit_once(')')?.1.split_whitespace().nth(19)?.parse().ok()
+}
+
+fn my_user() -> u32 {
+    // SAFETY: geteuid has no failure mode and touches no memory.
+    unsafe { libc::geteuid() }
+}
+
+/// Makes a folder for this run in `parent`, which others may be able to write to, and returns
+/// it. Only this user can enter it, and it is new: the name holds random bytes and the folder
+/// is made by a `mkdir` that fails on anything already there, so nothing can have been laid
+/// out in it beforehand, and what ffmpeg then writes by name in it cannot go through a link.
+/// The name also says which process it is for: see [`remove_abandoned_folders`].
+pub fn make_run_folder(parent: &Path, prefix: &str) -> std::io::Result<PathBuf> {
+    let pid = std::process::id();
+    let start = process_start(pid).unwrap_or(0);
+    let mut result = Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
+    for _ in 0..16 {
+        let path = parent.join(format!("{prefix}{pid}-{start}-{}", random_text(8)?));
+        result = std::fs::DirBuilder::new().mode(0o700).create(&path).map(|()| path);
+        if !result.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists) {
+            break;
+        }
+    }
+    result
+}
+
+/// Whether the process a run folder's name (what follows its prefix) speaks of is still
+/// there. None for a name that is not one of a run folder: `<process>-<start>-<random>`, or
+/// the bare process number older versions used.
+fn run_folder_in_use(name: &str) -> Option<bool> {
+    let mut parts = name.split('-');
+    let pid: u32 = parts.next()?.parse().ok()?;
+    match (parts.next(), parts.next(), parts.next()) {
+        (None, ..) => Some(Path::new(&format!("/proc/{pid}")).exists()),
+        (Some(start), Some(random), None) if !random.is_empty() && random.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            let start: u64 = start.parse().ok()?;
+            Some(process_start(pid) == Some(start))
+        }
+        _ => None,
+    }
+}
+
+/// Removes the run folders in `parent` left by runs that ended without clearing up.
+pub fn remove_abandoned_folders(parent: &Path, prefix: &str) {
+    remove_abandoned_folders_of(parent, prefix, my_user());
+}
+
+/// As [`remove_abandoned_folders`], for the folders of user `me`. The name says nothing of
+/// who made a folder, as anyone who can write to `parent` can choose it: only a real folder
+/// of this user's is ever removed. The removal does not follow links, neither one in the
+/// folder's place nor ones inside it: each is taken away as a link.
+fn remove_abandoned_folders_of(parent: &Path, prefix: &str, me: u32) {
+    // Without the system's list of processes every run would look gone.
+    if process_start(std::process::id()).is_none() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(parent) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(in_use) = name.to_str().and_then(|n| n.strip_prefix(prefix)).and_then(run_folder_in_use) else { continue };
+        let path = entry.path();
+        let mine = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir() && m.uid() == me);
+        if mine && !in_use {
+            eprintln!("removing stale temp folder {}", path.display());
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
+/// Whether the work folder at `path`, kept from an earlier run so that it can go on from it,
+/// can be believed: true if it can, false if there is none yet, and otherwise why not. Its
+/// name can be worked out by anyone, and what is in it decides what ends up in the output.
+pub fn check_kept_folder(path: &Path) -> Result<bool, String> {
+    check_kept_folder_of(path, my_user())
+}
+
+fn check_kept_folder_of(path: &Path, me: u32) -> Result<bool, String> {
+    let folder = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("it cannot be looked at ({e})")),
+    };
+    if folder.file_type().is_symlink() {
+        return Err("it is a link".into());
+    }
+    if !folder.is_dir() {
+        return Err("it is not a folder".into());
+    }
+    if folder.uid() != me {
+        return Err("it belongs to another user".into());
+    }
+    // Folders made by earlier versions follow the umask. One only its owner can write to is
+    // as good as a private one, and may hold days of encoding.
+    if folder.mode() & 0o022 != 0 {
+        return Err("other users can write to it".into());
+    }
+    let entries = std::fs::read_dir(path).map_err(|e| format!("it cannot be read ({e})"))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("it cannot be read ({e})"))?;
+        let file = std::fs::symlink_metadata(entry.path()).map_err(|e| format!("it cannot be read ({e})"))?;
+        if !file.is_file() || file.uid() != me {
+            return Err(format!("{} in it is not a plain file of this user's", entry.file_name().to_string_lossy()));
+        }
+    }
+    if folder.mode() & 0o777 != 0o700 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|e| format!("it cannot be made private ({e})"))?;
+    }
+    Ok(true)
+}
+
+/// Makes the folder `path` for work kept between runs, private and new. Fails if something
+/// is there already.
+pub fn make_kept_folder(path: &Path) -> std::io::Result<()> {
+    std::fs::DirBuilder::new().mode(0o700).create(path)
 }
 
 /// Puts `data` at `path` by way of a file beside it that then takes its name: a reader
@@ -79,7 +214,6 @@ pub fn save_name(path: &Path) -> PathBuf {
 /// name is gone through (a file of the user's own, which they may keep elsewhere) or
 /// refused (a file in a folder others can write to).
 pub fn append_line(path: &Path, line: &str, follow: bool) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
     let open = |read: bool| {
         let mut o = std::fs::OpenOptions::new();
         o.read(read).create(true).append(true);
@@ -278,6 +412,103 @@ pub fn write_script(path: &Path, body: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn room(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("av1opt-files-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The number of a process that has ended.
+    fn gone_process() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    #[test]
+    fn a_run_folder_is_new_private_and_says_whose_it_is() {
+        let dir = room("run-folder");
+        let a = make_run_folder(&dir, ".t-").unwrap();
+        let b = make_run_folder(&dir, ".t-").unwrap();
+        assert_ne!(a, b);
+        let name = a.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with(&format!(".t-{}-{}-", std::process::id(), process_start(std::process::id()).unwrap())), "{name}");
+        // Nobody can have guessed it: 16 hexadecimal digits of chance.
+        assert_eq!(name.rsplit('-').next().unwrap().len(), 16);
+        let m = std::fs::symlink_metadata(&a).unwrap();
+        assert!(m.is_dir() && m.mode() & 0o777 == 0o700, "{:o}", m.mode());
+        assert_eq!(run_folder_in_use(name.strip_prefix(".t-").unwrap()), Some(true));
+        // A folder that is there is not taken over, whatever it holds.
+        assert_eq!(make_kept_folder(&a).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_new_file_never_goes_through_a_link() {
+        let dir = room("no-link");
+        std::fs::write(dir.join("victim"), b"precious").unwrap();
+        std::os::unix::fs::symlink(dir.join("victim"), dir.join("trap")).unwrap();
+        write_new(&dir.join("trap"), b"new").unwrap();
+        assert_eq!(std::fs::read(dir.join("victim")).unwrap(), b"precious");
+        assert!(!std::fs::symlink_metadata(dir.join("trap")).unwrap().file_type().is_symlink());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn only_this_users_folders_of_ended_runs_are_cleared_and_never_through_a_link() {
+        let dir = room("abandoned");
+        let (me, gone) = (my_user(), gone_process());
+        let keep = dir.join("keep");
+        std::fs::create_dir(&keep).unwrap();
+        std::fs::write(keep.join("precious"), b"x").unwrap();
+        let make = |name: &str| {
+            let d = dir.join(name);
+            std::fs::create_dir(&d).unwrap();
+            d
+        };
+        // Of a run that ended, in both ways of naming; one holds a link leading out.
+        let ended = make(&format!(".t-{gone}-1-00ff"));
+        std::os::unix::fs::symlink(&keep, ended.join("out")).unwrap();
+        let older = make(&format!(".t-{gone}"));
+        // Of this run; of a process with this number that started at another time.
+        let running = make_run_folder(&dir, ".t-").unwrap();
+        let reused = make(&format!(".t-{}-1-00ff", std::process::id()));
+        // A link with such a name, names that are not a run's, and another prefix.
+        let link = dir.join(format!(".t-{gone}-2-00ff"));
+        std::os::unix::fs::symlink(&keep, &link).unwrap();
+        let others = [make(&format!(".t-{gone}-1")), make(&format!(".t-{gone}-1-zz")), make(&format!(".t-x-1-00ff")), make(&format!(".u-{gone}-1-00ff"))];
+
+        // Another user's look the same by name: the owner decides.
+        remove_abandoned_folders_of(&dir, ".t-", me + 1);
+        assert!(ended.exists() && older.exists() && reused.exists());
+
+        remove_abandoned_folders(&dir, ".t-");
+        assert!(!ended.exists() && !older.exists() && !reused.exists());
+        assert!(running.exists());
+        assert!(std::fs::symlink_metadata(&link).is_ok(), "a link is no folder of a run");
+        assert!(others.iter().all(|d| d.exists()), "{others:?}");
+        assert_eq!(std::fs::read(keep.join("precious")).unwrap(), b"x");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_kept_folder_of_another_user_is_not_believed() {
+        let dir = room("kept");
+        let kept = dir.join("work");
+        make_kept_folder(&kept).unwrap();
+        assert_eq!(std::fs::metadata(&kept).unwrap().mode() & 0o777, 0o700);
+        std::fs::write(kept.join("plan.json"), b"{}").unwrap();
+        assert_eq!(check_kept_folder(&kept), Ok(true));
+        assert_eq!(check_kept_folder(&dir.join("none")), Ok(false));
+        assert!(check_kept_folder_of(&kept, my_user() + 1).unwrap_err().contains("another user"));
+        // A file nobody made here counts as much as a link.
+        std::fs::create_dir(kept.join("sub")).unwrap();
+        assert!(check_kept_folder(&kept).unwrap_err().contains("sub in it"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn a_name_near_the_limit_can_still_be_saved_over() {

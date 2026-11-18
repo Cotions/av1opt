@@ -721,8 +721,8 @@ fn run_command(command: Cmd) -> Result<()> {
                 }
             }
             fsguard::ensure_writable_location(&tmp, false)?;
-            let dir = tmp.join(format!(".av1opt-curve-{}", std::process::id()));
-            std::fs::create_dir_all(&dir)?;
+            std::fs::create_dir_all(&tmp)?;
+            let dir = files::make_run_folder(&tmp, ".av1opt-curve-")?;
             // SAFETY: plain syscall on our own process; children inherit the priority.
             unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 10) };
             let tools = signals::stopping_on_signals(tools::Tools::new(ffmpeg, ffprobe, memory_cap(&memory_limit, 1)));

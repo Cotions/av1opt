@@ -1016,7 +1016,7 @@ fn trial_joined(tools: &Tools, info: &MediaInfo, samples: &[Sample], tmp: &Path,
         return Ok(None);
     }
     let lines = samples.iter().map(|s| Ok(concat_line(&std::path::absolute(&s.reference)?))).collect::<Result<String>>()?;
-    std::fs::write(&list, lines)?;
+    crate::files::write_new(&list, lines.as_bytes())?;
     let out = tmp.join(format!("samples.crf{crf}.mkv"));
     let mut args: Vec<String> = ["-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", &path_arg(&list)].map(String::from).to_vec();
     args.extend(enc.video_args(crf));

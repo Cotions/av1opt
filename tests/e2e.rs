@@ -1122,6 +1122,39 @@ fn a_name_that_is_not_text_is_refused_and_no_other_file_is_taken_for_it() {
 
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_temp_folder_laid_out_ahead_of_the_run_is_not_used() {
+    // What someone who can write to the output folder could do: the old folder name was the
+    // process number, known here because the shell becomes av1opt under its own number.
+    let c = Case::new("planted-temp");
+    let src = c.clip("clip.mp4", "320x180", 4);
+    let (report, video) = (c.dir.join("victim-report"), c.dir.join("victim-video"));
+    std::fs::write(&report, b"precious report").unwrap();
+    std::fs::write(&video, b"precious video").unwrap();
+    let script = "t=\"$1/.av1opt-tmp-$$\"; mkdir \"$t\"; ln -s \"$2\" \"$t/clip.av1opt.json\"; ln -s \"$3\" \"$t/partial.mp4\"; shift 3; exec \"$@\"";
+    let template = c.command();
+    let mut sh = Command::new("sh");
+    sh.current_dir(&c.dir).stdin(Stdio::null()).envs(template.get_envs().filter_map(|(k, v)| Some((k.to_owned(), v?.to_owned()))));
+    let o = sh
+        .args(["-c", script, "sh"])
+        .args([c.out().as_os_str(), report.as_os_str(), video.as_os_str()])
+        .arg(env!("CARGO_BIN_EXE_av1opt"))
+        .arg("encode").arg("-o").arg(c.out()).args(FAST).arg("--force").arg(&src)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(std::fs::read(&report).unwrap(), b"precious report");
+    assert_eq!(std::fs::read(&video).unwrap(), b"precious video");
+    let out = c.out().join("clip.mp4");
+    assert!(std::fs::symlink_metadata(&out).unwrap().file_type().is_file(), "the output is a file of its own");
+    assert_eq!(frames(&out), 96);
+    // The run's own folder is gone, and the one laid out is still as it was left.
+    let left: Vec<PathBuf> = entries(&c.out(), ".av1opt-tmp-");
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(left[0].join("partial.mp4").is_symlink());
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn sound_that_runs_on_after_the_picture_is_kept_whole() {
     // A recording left running: 12 s of picture under 30 s of sound. The container says 30 s,
     // so samples and spot checks used to be asked of seconds that have no frames.

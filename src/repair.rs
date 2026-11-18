@@ -725,7 +725,7 @@ fn splice(source: &Path, head: &[u8; 32], index: &[IvfFrame], fixed: &[Fixed], o
     use std::io::Write;
     use std::os::unix::fs::FileExt;
     let src = std::fs::File::open(source)?;
-    let mut w = std::io::BufWriter::new(std::fs::File::create(out)?);
+    let mut w = std::io::BufWriter::new(crate::files::create_new(out)?);
     w.write_all(head)?;
     let first = index[0].pts;
     let mut buf = Vec::new();

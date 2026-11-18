@@ -203,26 +203,15 @@ pub fn cache_dir() -> Result<PathBuf> {
 const WORK_PREFIX: &str = "bench-work-";
 
 /// Lossless sample clips are big; the folder goes away with the run, and ones left by runs
-/// that were killed (their PID is gone) are removed by the next run.
+/// that were killed (their process is gone) are removed by the next run.
 struct WorkDir(PathBuf);
 
 impl WorkDir {
     fn new(parent: &Path) -> Result<WorkDir> {
         crate::fsguard::ensure_writable_location(parent, false)?;
         std::fs::create_dir_all(parent)?;
-        for e in std::fs::read_dir(parent)?.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if let Some(pid) = name.strip_prefix(WORK_PREFIX).and_then(|p| p.parse::<u32>().ok())
-                && pid != std::process::id()
-                && !Path::new(&format!("/proc/{pid}")).exists()
-            {
-                let _ = std::fs::remove_dir_all(e.path());
-            }
-        }
-        let path = parent.join(format!("{WORK_PREFIX}{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path)?;
-        Ok(WorkDir(path))
+        crate::files::remove_abandoned_folders(parent, WORK_PREFIX);
+        Ok(WorkDir(crate::files::make_run_folder(parent, WORK_PREFIX)?))
     }
 }
 

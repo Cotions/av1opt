@@ -168,8 +168,10 @@ function openExternal(url) {
 function createWindow() {
   // A private, in-memory session: nothing from the page is kept on disk between runs.
   const ses = session.fromPartition("av1opt");
-  ses.setPermissionRequestHandler((_wc, _perm, cb) => cb(false));
-  ses.setPermissionCheckHandler(() => false);
+  // The page may copy paths and show a video full screen; nothing else, and no other origin.
+  const allowed = new Set(["clipboard-sanitized-write", "fullscreen"]);
+  ses.setPermissionRequestHandler((_wc, perm, cb, details) => cb(allowed.has(perm) && isOwn(details.requestingUrl)));
+  ses.setPermissionCheckHandler((_wc, perm, requestingOrigin) => allowed.has(perm) && isOwn(requestingOrigin));
 
   const win = new BrowserWindow({
     width: 1400,

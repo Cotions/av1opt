@@ -7,7 +7,7 @@
 //! land on an existing file. Space is only freed when the trash is emptied.
 
 use crate::encode::REPORT_FORMAT;
-use crate::source::Verdict;
+use crate::source::{Recorded, Verdict};
 use crate::trash;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -49,6 +49,8 @@ pub struct Replaced {
     pub trash: PathBuf,
     pub source_bytes: u64,
     pub output_bytes: u64,
+    /// What the file in the trash has to be to be the original.
+    pub original: Recorded,
     /// The original is still in the trash and the AV1 file where it was put, both unchanged.
     pub can_undo: bool,
     /// The original's folder is on ZFS: it goes back there only when asked.
@@ -151,6 +153,17 @@ pub fn check(report: &Path) -> Check {
     }
 }
 
+/// What a report of a replacement knows of the original it sent to the trash, if it has its
+/// size. The time is the one written down at the replacement, which is that of the file that
+/// went; reports from before that have the time at the encode, and the fingerprint settles it
+/// if the original was touched in between.
+pub fn original_in_trash(r: &Value) -> Option<Recorded> {
+    let mut known = Recorded::in_report(r);
+    known.size?;
+    known.modified = r["replaced"]["source_mtime"].as_u64().or(known.modified);
+    Some(known)
+}
+
 fn check_inner(report: &Path) -> Result<Check, String> {
     if std::fs::symlink_metadata(report).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err("the report is a link".into());
@@ -176,9 +189,10 @@ fn check_inner(report: &Path) -> Result<Check, String> {
         if output != recorded && Some(&output) != placed.as_ref() {
             return Err("the report does not say where the AV1 file went in a way `replace` would have".into());
         }
-        let can_undo = file_size(&trash) == Some(source_bytes) && file_size(&output) == Some(output_bytes) && trash::holds(&trash, &source);
+        let original = original_in_trash(&r).ok_or("report has no sizes")?;
+        let can_undo = file_size(&output) == Some(output_bytes) && trash::holds(&trash, &source, &original);
         let zfs = source.parent().is_some_and(crate::fsguard::on_zfs);
-        return Ok(Check::Replaced(Replaced { report: report.to_path_buf(), source, dest: output, from, trash, source_bytes, output_bytes, can_undo, zfs }));
+        return Ok(Check::Replaced(Replaced { report: report.to_path_buf(), source, dest: output, from, trash, source_bytes, output_bytes, original, can_undo, zfs }));
     }
     if source == output {
         return Err("output and original are the same file".into());
@@ -474,7 +488,8 @@ fn apply_with(report: &Path, allow_zfs: bool, to_trash: &dyn Fn(&Path) -> Result
     let noted = read_report(report).map_err(|e| anyhow!(e)).and_then(|mut r| {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
         r["output"] = json!(p.dest);
-        r["replaced"] = json!({ "time": now, "from": p.output, "trash": trashed });
+        let source_mtime = std::fs::symlink_metadata(&trashed).ok().and_then(|m| crate::source::modified_seconds(&m));
+        r["replaced"] = json!({ "time": now, "from": p.output, "trash": trashed, "source_mtime": source_mtime });
         write_report(report, &r)
     });
     if let Err(e) = noted {
@@ -497,8 +512,11 @@ pub fn undo(report: &Path, allow_zfs: bool) -> Result<Replaced> {
         Some(n) if n != d.source_bytes => bail!("the file in the trash is not the original"),
         Some(_) => {}
     }
-    if !trash::holds(&d.trash, &d.source) {
+    if !trash::says_came_from(&d.trash, &d.source) {
         bail!("the trash does not say that {} came from {}", d.trash.display(), d.source.display());
+    }
+    if !trash::is_file_recorded(&d.trash, &d.original) {
+        bail!("the file in the trash is not the original: it changed after the original went there");
     }
     // The original goes back to its folder: the same rule as when it left.
     crate::fsguard::ensure_writable_location(d.source.parent().context("the original has no folder")?, allow_zfs)?;
@@ -782,6 +800,57 @@ mod tests {
         // One that holds neither goes by the size, as it always did.
         rewrite_report(json!({}));
         assert!(matches!(check(&report), Check::Ready(_)));
+    }
+
+    #[test]
+    fn undo_goes_by_what_is_on_record_of_the_file_that_went_to_the_trash() {
+        let f = Fix::new("trash-age");
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        let at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        let later = at + std::time::Duration::from_secs(60);
+        let set_time = |p: &Path, t| std::fs::File::options().write(true).open(p).unwrap().set_modified(t).unwrap();
+        set_time(&f.lib("a.mp4"), at);
+        let (_, then) = crate::source::Recorded::of(&f.lib("a.mp4")).unwrap();
+        // The original was touched after the encode, and is replaced all the same.
+        let mut r: Value = serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+        r["source_mtime"] = json!(1_500_000_000u64);
+        r["source_fingerprint"] = json!(then.fingerprint);
+        std::fs::write(&report, serde_json::to_vec(&r).unwrap()).unwrap();
+        let done = f.apply(&report).unwrap();
+        let r: Value = serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+        assert_eq!(r["replaced"]["source_mtime"], 1_600_000_000u64);
+        let can_undo = || matches!(check(&report), Check::Replaced(d) if d.can_undo);
+        let write_report = |r: &Value| std::fs::write(&report, serde_json::to_vec(r).unwrap()).unwrap();
+        assert!(can_undo());
+
+        // Another file of the same size has taken the name in the trash.
+        std::fs::write(&done.trash, vec![b'v'; 1000]).unwrap();
+        set_time(&done.trash, later);
+        assert!(!can_undo());
+        assert!(undo(&report, true).unwrap_err().to_string().starts_with("the file in the trash is not the original"));
+        assert!(!f.lib("a.mp4").exists());
+
+        // A report from before the time was written down goes by the one from the encode, and
+        // by the fingerprint where that differs.
+        let mut old = r.clone();
+        old["replaced"].as_object_mut().unwrap().remove("source_mtime");
+        write_report(&old);
+        assert!(!can_undo());
+        old["source_mtime"] = json!(1_600_000_060u64);
+        write_report(&old);
+        assert!(can_undo(), "the time on record is that of the file there");
+        old["source_mtime"] = json!(1_600_000_000u64);
+        old.as_object_mut().unwrap().remove("source_fingerprint");
+        write_report(&old);
+        assert!(!can_undo(), "another time and no fingerprint to settle it");
+
+        // The original's contents back under another time: still the original.
+        std::fs::write(&done.trash, vec![b's'; 1000]).unwrap();
+        set_time(&done.trash, later + std::time::Duration::from_secs(60));
+        write_report(&r);
+        assert!(can_undo());
+        undo(&report, true).unwrap();
+        assert!(f.lib("a.mp4").exists());
     }
 
     #[test]

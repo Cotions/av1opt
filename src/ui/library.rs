@@ -481,7 +481,7 @@ fn source_of(app: &App, report: &Path, r: &Value) -> PathBuf {
     };
     // Only a file the trash itself says came from the original: the report alone could name
     // any file of the right size.
-    if is_video(&input) && crate::trash::holds(&trash, &input) && std::fs::symlink_metadata(&trash).is_ok_and(|m| m.is_file() && Some(m.len()) == r["source_bytes"].as_u64()) {
+    if is_video(&input) && replace::original_in_trash(r).is_some_and(|known| crate::trash::holds(&trash, &input, &known)) {
         app.allow(&trash);
     }
     trash

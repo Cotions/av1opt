@@ -3,6 +3,7 @@
 //! filesystem, never copied: trashing 50 GB takes a moment and can't half-finish.
 //! `restore` puts a trashed file back, as the file manager's "Restore" would.
 
+use crate::source::{Recorded, Verdict};
 use anyhow::{Context, Result, bail};
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
@@ -210,6 +211,20 @@ fn decode_path(s: &str) -> Option<PathBuf> {
     Some(PathBuf::from(std::ffi::OsString::from_vec(out)))
 }
 
+/// Whether the plain file at `path` is the one `known` describes, by the rule for sources: its
+/// size, then its time, then its fingerprint. Going into the trash changes none of them.
+pub fn is_file_recorded(path: &Path, known: &Recorded) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) && matches!(crate::source::compare(known, path), Verdict::Same)
+}
+
+/// Whether `trashed` is the file `known` describes, in a trash that says it came from
+/// `original`. An info file alone is no proof: it can be stale, its name taken over by a later
+/// file, or planted to pass another file off as the original, which [`restore`] would then
+/// put in the original's place.
+pub fn holds(trashed: &Path, original: &Path, known: &Recorded) -> bool {
+    is_file_recorded(trashed, known) && says_came_from(trashed, original)
+}
+
 /// Whether `trashed` is a file in a trash whose info file says it came from `original`.
 ///
 /// What says so has to be worth believing: a report on disk names both paths, and
@@ -217,7 +232,7 @@ fn decode_path(s: &str) -> Option<PathBuf> {
 /// only. In any other trash folder the path counts from the folder the trash is in, as the
 /// specification has it, so a `.Trash-1000` somebody put into a folder of downloads can only
 /// ever give files back to that folder.
-pub fn holds(trashed: &Path, original: &Path) -> bool {
+pub fn says_came_from(trashed: &Path, original: &Path) -> bool {
     holds_with(trashed, original, &|top| {
         // The top of a filesystem: its parent is on another one (or it has none).
         let dev = |p: &Path| std::fs::metadata(p).map(|m| m.dev()).ok();
@@ -225,7 +240,7 @@ pub fn holds(trashed: &Path, original: &Path) -> bool {
     })
 }
 
-/// [`holds`], with what counts as the top of a drive passed in (tests have no drive of their
+/// [`says_came_from`], with what counts as the top of a drive passed in (tests have no drive of their
 /// own). A trash folder anywhere else is only a folder with that name: this module never
 /// makes one there, and anybody can.
 fn holds_with(trashed: &Path, original: &Path, is_top: &dyn Fn(&Path) -> bool) -> bool {
@@ -277,6 +292,53 @@ mod tests {
     }
 
     #[test]
+    fn an_info_file_cannot_pass_another_file_off_as_the_original() {
+        let dir = scratch("known");
+        let home = dir.join("data/Trash");
+        TEST_HOME_TRASH.with(|h| *h.borrow_mut() = Some(home.clone()));
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        let a = dir.join("lib/a.mkv");
+        std::fs::write(&a, b"first").unwrap();
+        let then = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        let set_age = |p: &Path, t| std::fs::File::options().write(true).open(p).unwrap().set_modified(t).unwrap();
+        set_age(&a, then);
+        let (_, known) = Recorded::of(&a).unwrap();
+        assert_eq!(known.modified, Some(1_600_000_000));
+        let by_size = Recorded { modified: None, fingerprint: None, ..known.clone() };
+        let by_time = Recorded { fingerprint: None, ..known.clone() };
+        let dest = trash_with(&a, Some(&home), 1000, "2026-11-10T22:15:03".into()).unwrap();
+        assert!(holds(&dest, &a, &known));
+        assert!(holds(&dest, &a, &by_size));
+
+        // The info file stays true to its word, the file under its name is another one.
+        std::fs::write(&dest, b"other").unwrap();
+        set_age(&dest, then + std::time::Duration::from_secs(60));
+        assert!(says_came_from(&dest, &a));
+        assert!(!holds(&dest, &a, &known), "same size, another time and other contents");
+        assert!(!holds(&dest, &a, &by_time), "same size, another time, nothing to tell them apart");
+        // Without anything else on record the size is all there is to go by.
+        assert!(holds(&dest, &a, &by_size));
+        std::fs::write(&dest, b"longer file").unwrap();
+        set_age(&dest, then);
+        assert!(!holds(&dest, &a, &known), "same time, another size");
+        assert!(!holds(&dest, &a, &by_size));
+
+        // The right contents under another time are still the original.
+        std::fs::write(&dest, b"first").unwrap();
+        set_age(&dest, then + std::time::Duration::from_secs(120));
+        assert!(holds(&dest, &a, &known));
+
+        // A link of the right kind to a file of the right kind is still no file in the trash.
+        let elsewhere = dir.join("elsewhere.mkv");
+        std::fs::write(&elsewhere, b"first").unwrap();
+        set_age(&elsewhere, then);
+        std::fs::remove_file(&dest).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &dest).unwrap();
+        assert!(!holds(&dest, &a, &known));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn a_trash_is_believed_only_about_what_it_can_know() {
         let dir = scratch("holds");
         let home = dir.join("data/Trash");
@@ -285,9 +347,9 @@ mod tests {
         let a = dir.join("lib/vidéo #1.mkv");
         std::fs::write(&a, b"first").unwrap();
         let dest = trash_with(&a, Some(&home), 1000, "2026-11-10T22:15:03".into()).unwrap();
-        assert!(holds(&dest, &a));
-        assert!(!holds(&dest, &dir.join("lib/other.mkv")));
-        assert!(!holds(&a, &a));
+        assert!(says_came_from(&dest, &a));
+        assert!(!says_came_from(&dest, &dir.join("lib/other.mkv")));
+        assert!(!says_came_from(&a, &a));
         assert_eq!(decode_path(&encode_path(&a)), Some(a.clone()));
         assert_eq!(decode_path("a%2"), None);
         assert_eq!(decode_path("a%zz"), None);
@@ -308,7 +370,7 @@ mod tests {
         assert!(!at_top(&put("up.mkv", "../lib/up.mkv"), &top.join("../lib/up.mkv")));
         assert!(!at_top(&put("up.mkv", "../lib/up.mkv"), &dir.join("lib/up.mkv")));
         // The same folder anywhere but at the top of a drive is anybody's folder.
-        assert!(!holds(&bin.join("files/in.mkv"), &top.join("films/in.mkv")));
+        assert!(!says_came_from(&bin.join("files/in.mkv"), &top.join("films/in.mkv")));
         // Shared trash folders keep one folder per user.
         let shared = top.join(".Trash/1000");
         std::fs::create_dir_all(shared.join("files")).unwrap();

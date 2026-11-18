@@ -188,6 +188,8 @@ tr.click:hover td { background: var(--panel2); }
 
 .toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--panel2); border: 1px solid var(--line); padding: 8px 16px; border-radius: var(--radius); z-index: 60; max-width: 80vw; }
 .toast.err { border-color: var(--bad); color: var(--bad); }
+/* Paths have no spaces to break at. */
+.banner, .toast, .file.warn, .file.bad, .long-text { overflow-wrap: anywhere; }
 .spin { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--dim); border-top-color: transparent; border-radius: 50%; animation: spin 1s linear infinite; vertical-align: -2px; }
 @keyframes spin { to { transform: rotate(360deg); } }
 

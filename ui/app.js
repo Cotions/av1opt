@@ -1770,6 +1770,13 @@ function vmafColor(v, target) {
   return "#e06666";
 }
 
+// A list that can run to hundreds of entries, as `show` makes them, cut after `max` with what
+// `rest` makes of the number left out.
+function cutList(items, max, show, rest) {
+  return [...items.slice(0, max).map(show), ...(items.length > max ? [rest(items.length - max)] : [])];
+}
+const UNRESTORED_SHOWN = 20, UNRESTORED_INPUTS_SHOWN = 5;
+
 views.queue = (root) => {
   const list = h("div");
   // Estimated time left: files not yet probed have no estimate and are counted apart.
@@ -1887,7 +1894,10 @@ views.queue = (root) => {
     missing.replaceChildren(h("div", { class: "panel" },
       h("div", { class: "row" }, h("strong", { class: "warn grow" }, `${un.length} saved job${un.length === 1 ? "" : "s"} not in the queue, kept for when ${un.length === 1 ? "its files are" : "their files are"} back`),
         h("button", { onclick: act("retry") }, "Try again"), h("button", { class: "danger", onclick: act("forget") }, "Forget")),
-      un.map((u) => h("div", { class: "dim mono" }, `${Array.isArray(u.inputs) ? u.inputs.join(", ") : "(its list of videos cannot be read)"} → ${u.out_dir ?? "(no output folder)"}: ${u.error}`))));
+      cutList(un, UNRESTORED_SHOWN, (u) => {
+        const inputs = Array.isArray(u.inputs) ? cutList(u.inputs, UNRESTORED_INPUTS_SHOWN, (p) => p, (n) => `and ${n} more`).join(", ") : "(its list of videos cannot be read)";
+        return h("div", { class: "dim mono long-text" }, `${inputs} → ${u.out_dir ?? "(no output folder)"}: ${u.error}`);
+      }, (n) => h("div", { class: "dim" }, `and ${plural(n, "more job")}`))));
   };
   const fileEls = new Map(); // "job:file" -> { el, update(progress) } for running files
   // Rendered jobs. Only parts whose data changed are rebuilt, so buttons stay put while an

@@ -239,6 +239,65 @@ for (const watch of [false, true]) {
   };
 }
 
+// What the server can hand the page that is empty, very long or holds HTML characters.
+const odd = '<img src=x onerror="alert(1)">&amp;.mkv';
+const holdReply = { hold: null, paused: false, schedule: { on: false, from: "22:00", to: "07:00" } };
+const openQueue = async (jobsReply) => {
+  const page = openPage((path, body) => {
+    if (body) return {};
+    if (path === "/api/jobs") return { jobs: [], unrestored: [], queue: holdReply, ...jobsReply };
+    return path === "/api/watch" ? { watches: [] } : {};
+  });
+  await settled();
+  const root = page.show("queue");
+  await settled();
+  return root;
+};
+// No element comes of text, whatever it holds.
+const noElementFromText = (root) => assert(!root.all().some((e) => e.tag === "img"), "text became an element");
+
+checks["queue: saved jobs that could not come back are listed in a bounded way"] = async () => {
+  const inputs = Array.from({ length: 300 }, (_, i) => `/videos/${i}-${odd}`);
+  const unrestored = Array.from({ length: 500 }, () => ({ inputs, out_dir: `/out/${odd}`, error: `gone: ${odd}` }));
+  const root = await openQueue({ unrestored });
+  const rows = root.all().filter((e) => e.tag === "div" && e.classList.contains("long-text"));
+  assert.strictEqual(rows.length, 20);
+  assert(rows[0].textContent.includes(odd) && rows[0].textContent.includes("and 295 more"), rows[0].textContent.slice(0, 200));
+  assert(!rows[0].textContent.includes("/videos/5-"), "more inputs than the cut allows");
+  assert(root.textContent.includes("and 480 more jobs"), root.textContent.slice(0, 200));
+  assert(root.textContent.includes("500 saved jobs"));
+  noElementFromText(root);
+};
+checks["queue: a saved job without a list of videos or an output folder still reads"] = async () => {
+  const root = await openQueue({ unrestored: [{ out_dir: null, error: "cannot be read" }] });
+  assert(root.textContent.includes("(its list of videos cannot be read) → (no output folder): cannot be read"), root.textContent.slice(0, 300));
+  assert(!root.textContent.includes("undefined"));
+  const none = await openQueue({ unrestored: [] });
+  assert(!none.textContent.includes("saved job"));
+};
+checks["queue: jobs still coming back are counted, and none means no line"] = async () => {
+  for (const [restoring, text] of [[1, "1 job to go"], [40, "40 jobs to go"]]) assert((await openQueue({ restoring })).textContent.includes(text));
+  for (const restoring of [0, undefined]) assert(!(await openQueue({ restoring })).textContent.includes("Bringing back"));
+};
+checks["queue: the note of a job is shown as text"] = async () => {
+  const job = { id: 1, status: "queued", total: 0, out_dir: "/out", options: { target_vmaf: 93, preset: 5, container: "mp4" }, counts: {}, files: [], note: `Left out because they are gone: ${odd} and 295 more.` };
+  const root = await openQueue({ jobs: [job] });
+  assert(root.textContent.includes(job.note), root.textContent.slice(0, 300));
+  noElementFromText(root);
+};
+checks["banner: a notice is text, and goes when dismissed"] = async () => {
+  const page = openPage(() => ({}));
+  await settled();
+  page.context.__notices = [`the saved queue could not be read; it was kept as /data/${odd}`];
+  page.run("STATE = { notices: __notices, tools: {} }; renderBanner()");
+  const banner = page.document.getElementById("banner");
+  assert(!banner.hidden && banner.textContent.includes(odd), banner.textContent);
+  noElementFromText(banner);
+  banner.named("button", "Dismiss").click();
+  assert(banner.hidden);
+  page.run("STATE = { notices: [], tools: {} }; renderBanner()");
+  assert(banner.hidden && banner.textContent === "");
+};
 (async () => {
   let failed = 0;
   for (const [name, check] of Object.entries(checks)) {

@@ -1602,3 +1602,40 @@ fn servers_sharing_a_cache_keep_their_previews_apart() {
     assert!(second.terminate());
     assert_eq!(listed(), Vec::<String>::new());
 }
+
+#[test]
+fn a_scan_says_which_folders_it_could_not_read() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: a plain query of this process's user.
+    if unsafe { libc::geteuid() } == 0 {
+        return eprintln!("skipped: root can read every folder");
+    }
+    let s = Server::start("scan-unreadable", |d| {
+        for i in 0..7 {
+            std::fs::create_dir_all(d.join(format!("videos/closed{i}"))).unwrap();
+        }
+    });
+    let videos = s.dir.join("videos");
+    let closed = |i: usize| videos.join(format!("closed{i}"));
+    for i in 0..7 {
+        std::fs::set_permissions(closed(i), std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    let id = s.post("/api/scans", &json!({ "paths": [videos] })).json()["id"].as_u64().unwrap();
+    let t = Instant::now();
+    let r = loop {
+        let r = s.get(&format!("/api/scans/{id}")).json();
+        if r["status"] != "running" {
+            break r;
+        }
+        assert!(t.elapsed() < Duration::from_secs(20), "{r}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    for i in 0..7 {
+        std::fs::set_permissions(closed(i), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert_eq!(r["status"], "done", "{r}");
+    assert_eq!(r["unreadable_folders"], 7, "{r}");
+    let paths = r["unreadable_paths"].as_array().unwrap();
+    assert_eq!(paths.len(), 5, "{r}");
+    assert!(paths.iter().all(|p| p.as_str().unwrap().starts_with(videos.to_str().unwrap())), "{r}");
+}

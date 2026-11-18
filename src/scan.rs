@@ -46,11 +46,26 @@ pub struct FileResult {
     pub unjudged: bool,
 }
 
+/// How many of the folders that could not be read are named to the person.
+pub const UNREADABLE_SHOWN: usize = 5;
+
 /// Counts of a finished scan, for the log lines.
 pub struct Stats {
     pub fresh: usize,
     pub cached: usize,
     pub dropped: usize,
+    /// Folders that could not be read, so that what is in them is not in the results.
+    pub unreadable: Vec<PathBuf>,
+}
+
+impl Stats {
+    /// What to tell about the folders that could not be read, if there are any.
+    pub fn unreadable_note(&self) -> Option<String> {
+        let (count, named) = (self.unreadable.len(), self.unreadable.iter().take(UNREADABLE_SHOWN));
+        let names = named.map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ");
+        let more = if count > UNREADABLE_SHOWN { format!(" and {} more", count - UNREADABLE_SHOWN) } else { String::new() };
+        (count > 0).then(|| format!("{count} folder{} could not be read, so the videos in {} are not counted: {names}{more}", if count == 1 { "" } else { "s" }, if count == 1 { "it" } else { "them" }))
+    }
 }
 
 /// Probes every video under `paths` (absolute) with `jobs` ffprobe processes at once.
@@ -82,12 +97,23 @@ fn collect_with_cache(
     // inside another, the same one twice, a link to it): `dups` would otherwise find it
     // identical to itself and offer one of the two for the trash.
     let mut seen = std::collections::HashSet::new();
+    let mut unreadable: Vec<PathBuf> = Vec::new();
     for root in paths {
         for entry in WalkDir::new(root).into_iter().filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
             !(e.file_type().is_dir() && (SKIP_DIRS.contains(&name.as_ref()) || name.starts_with(".Trash")))
         }) {
-            let Ok(entry) = entry else { continue };
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    // What went away during the walk was simply not there to read.
+                    let gone = e.io_error().is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound);
+                    if let Some(path) = e.path().filter(|p| !gone || *p == root.as_path()) {
+                        unreadable.push(path.to_path_buf());
+                    }
+                    continue;
+                }
+            };
             if !entry.file_type().is_file() || !is_video(entry.path()) {
                 continue;
             }
@@ -118,13 +144,16 @@ fn collect_with_cache(
 
     // Forget files that were under the scanned folders last time but are gone now. A folder
     // with nothing in it at all is more likely a drive that is not mounted than a library
-    // that was emptied: what is known of its files is kept.
+    // that was emptied: what is known of its files is kept, as it is for a folder that could
+    // not be read this time.
     let dropped = {
         let found: std::collections::HashSet<&Path> = files.iter().map(|f| f.0.as_path()).collect();
         let live: std::collections::HashSet<&Path> = files.iter().map(|f| f.1.as_path()).collect();
         let mut c = cache.lock().unwrap();
         let before = c.len();
-        c.retain(|p, _| found.contains(p.as_path()) || !paths.iter().any(|root| live.contains(root.as_path()) && p.starts_with(root)));
+        c.retain(|p, _| {
+            found.contains(p.as_path()) || unreadable.iter().any(|folder| p.starts_with(folder)) || !paths.iter().any(|root| live.contains(root.as_path()) && p.starts_with(root))
+        });
         before - c.len()
     };
     // A file ffprobe rejected is remembered as such, so that a broken file is not probed again
@@ -173,7 +202,7 @@ fn collect_with_cache(
     });
     save_cache(cache_path, &cache.lock().unwrap())?;
     let fresh = fresh.load(Ordering::Relaxed);
-    Ok((results, Stats { fresh, cached: total - fresh, dropped }))
+    Ok((results, Stats { fresh, cached: total - fresh, dropped, unreadable }))
 }
 
 /// What earlier scans learned, read once for looking up many files without running ffprobe.
@@ -338,6 +367,48 @@ mod tests {
         assert!(!unjudged(&results, "broken.mkv") && unjudged(&results, "killed.mkv") && unjudged(&results, "stale.mkv"));
         let kept: HashMap<PathBuf, CacheEntry> = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
         assert_eq!(kept.keys().map(|p| p.file_name().unwrap().to_str().unwrap()).collect::<Vec<_>>(), ["broken.mkv"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_that_cannot_be_read_is_reported_and_what_is_known_of_it_stays() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: a plain query of this process's user.
+        if unsafe { libc::geteuid() } == 0 {
+            return eprintln!("skipped: root can read every folder");
+        }
+        let dir = std::env::temp_dir().join(format!("av1opt-scan-unreadable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let closed = dir.join("videos/closed");
+        std::fs::create_dir_all(&closed).unwrap();
+        std::fs::write(closed.join("kept.mkv"), b"x").unwrap();
+        std::fs::write(dir.join("videos/open.mkv"), b"x").unwrap();
+        // Links are not followed, so a link back up is no endless walk and hides nothing.
+        std::os::unix::fs::symlink(dir.join("videos"), dir.join("videos/back")).unwrap();
+        let ffprobe = dir.join("ffprobe");
+        std::fs::write(&ffprobe, "#!/bin/sh\nfor last; do :; done\necho \"$last: Invalid data found when processing input\" >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&ffprobe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cache = dir.join("cache.json");
+        let scan = |paths: &[PathBuf]| collect_with_cache(&cache, paths, ffprobe.to_str().unwrap(), 2, 0.15, &estimate::Model::fit(&[], 93.0), &|_, _| {}).unwrap();
+        let videos = [dir.join("videos")];
+        let (results, stats) = scan(&videos);
+        assert_eq!((results.len(), stats.unreadable.len()), (2, 0));
+        assert_eq!(stats.unreadable_note(), None);
+
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let (results, stats) = scan(&videos);
+        let (again, missing) = (scan(&videos).1, scan(&[dir.join("nowhere")]).1);
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(stats.unreadable, std::slice::from_ref(&closed));
+        assert_eq!(stats.dropped + again.dropped, 0, "what is known of the folder is kept");
+        let note = stats.unreadable_note().unwrap();
+        assert!(note.starts_with("1 folder could not be read") && note.ends_with(closed.to_str().unwrap()), "{note}");
+        assert_eq!(missing.unreadable, [dir.join("nowhere")]);
+
+        let many = Stats { fresh: 0, cached: 0, dropped: 0, unreadable: (0..8).map(|i| PathBuf::from(format!("/f{i}"))).collect() };
+        let note = many.unreadable_note().unwrap();
+        assert!(note.starts_with("8 folders") && note.contains("/f4") && !note.contains("/f5") && note.ends_with(" and 3 more"), "{note}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -298,6 +298,20 @@ checks["banner: a notice is text, and goes when dismissed"] = async () => {
   page.run("STATE = { notices: [], tools: {} }; renderBanner()");
   assert(banner.hidden && banner.textContent === "");
 };
+checks["scan: folders that could not be read are counted and the first few named"] = async () => {
+  const paths = [`/videos/${odd}`, "/videos/b"];
+  const result = { id: 1, status: "done", rows: [], totals: {}, paths: ["/videos"], unreadable_folders: 300, unreadable_paths: paths };
+  const page = openPage((path, body) => (body ? { id: 1 } : path === "/api/scans/1" ? result : {}), { scanRoots: ["/videos"] });
+  await settled();
+  const root = page.show("scan");
+  await settled();
+  await root.named("button", "Scan").click();
+  await settled();
+  assert(root.textContent.includes("300 folders could not be read"), root.textContent.slice(0, 300));
+  assert(root.textContent.includes(paths[0]) && root.textContent.includes("and 298 more"), root.textContent.slice(0, 300));
+  noElementFromText(root);
+};
+
 (async () => {
   let failed = 0;
   for (const [name, check] of Object.entries(checks)) {

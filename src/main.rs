@@ -779,6 +779,9 @@ fn scan(
         eprintln!("dropped {} cache entries for files that no longer exist", stats.dropped);
     }
     eprintln!("probed {} new files, {} from cache", stats.fresh, stats.cached);
+    if let Some(note) = stats.unreadable_note() {
+        eprintln!("warning: {note}");
+    }
 
     if model.samples == 0 {
         eprintln!("estimates: built-in pilot model (no encodes in the history yet; `encode` improves them)");

@@ -819,6 +819,7 @@ views.scan = (root) => {
   const progress = h("div", { class: "bar grow" }, h("div"));
   const progText = h("span", { class: "dim" });
   const out = h("div");
+  const unreadable = h("div");
   let scanId = null;
   let scanStatus = null; // as last read; null until then
 
@@ -844,6 +845,7 @@ views.scan = (root) => {
       progText.textContent = "listing files…";
       progress.firstChild.style.width = "0%";
       out.replaceChildren();
+      unreadable.replaceChildren();
       // A short scan can be over before its id is known here: its last event went by unseen.
       showResult(r.id);
     } catch (e) { toast(e.message, true); start.disabled = false; }
@@ -857,7 +859,15 @@ views.scan = (root) => {
       h("div", { class: "row" }, h("p", { class: "dim grow" }, "Read-only: probes every video (cached), estimates the AV1 size from metadata and past encodes. Nothing is written to the scanned folders."),
         h("label", { class: "field" }, "Min savings %", minSav), h("label", { class: "field" }, "Target VMAF", vmaf), start),
       h("div", { class: "row" }, progress, progText)),
-    out);
+    unreadable, out);
+
+  // The server names the first few and counts them all.
+  const drawUnreadable = (count, paths) => {
+    unreadable.replaceChildren(...(count ? [h("div", { class: "panel" },
+      h("strong", { class: "warn" }, `${plural(count, "folder")} could not be read, so the videos in ${count === 1 ? "it" : "them"} are not counted here`),
+      paths.map((p) => h("div", { class: "dim mono long-text" }, p)),
+      count > paths.length ? h("div", { class: "dim" }, `and ${count - paths.length} more`) : null)] : []));
+  };
 
   async function showResult(id) {
     let r;
@@ -872,6 +882,7 @@ views.scan = (root) => {
       return;
     }
     progress.firstChild.style.width = "100%";
+    drawUnreadable(r.unreadable_folders || 0, r.unreadable_paths || []);
     if (r.status === "failed") { progText.textContent = "failed"; out.replaceChildren(h("div", { class: "panel bad" }, r.error)); return; }
     progText.textContent = `${r.rows.length} videos · estimates from ${r.model_samples ? r.model_samples + " past encodes" : "the built-in model (encode a few files to calibrate)"}${r.not_listed ? ` · ${plural(r.not_listed, "video")} left out: the path is not valid UTF-8` : ""}`;
     renderScan(out, r);

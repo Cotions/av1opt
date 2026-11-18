@@ -292,6 +292,8 @@ pub struct Scan {
     results: Vec<FileResult>,
     /// Videos found whose paths are not text, which the page cannot show or name.
     not_listed: usize,
+    /// Folders that could not be read: what is in them is missing from `results`.
+    unreadable: Vec<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -352,6 +354,7 @@ pub fn start_scan(app: &Arc<App>, body: &Value) -> Result<Value> {
             time,
             results: Vec::new(),
             not_listed: 0,
+            unreadable: Vec::new(),
         });
         id
     };
@@ -383,8 +386,9 @@ pub fn start_scan(app: &Arc<App>, body: &Value) -> Result<Value> {
             let mut scans = app.scans.lock().unwrap();
             if let Some(s) = scans.iter_mut().find(|s| s.id == id) {
                 match r {
-                    Ok((mut results, _)) => {
+                    Ok((mut results, stats)) => {
                         s.not_listed = scan::drop_unnamed(&mut results);
+                        s.unreadable = stats.unreadable;
                         for f in &results {
                             app.allow_video(&f.path);
                         }
@@ -461,6 +465,8 @@ pub fn scan_result(app: &App, id: u64) -> Result<Value> {
     }
     Ok(json!({
         "id": s.id, "paths": s.paths, "status": s.status, "error": s.error, "done": s.done, "total": s.total,
+        "unreadable_folders": s.unreadable.len(),
+        "unreadable_paths": s.unreadable.iter().take(scan::UNREADABLE_SHOWN).map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
         "started": s.started, "model_samples": s.model_samples, "time_samples": s.time.samples, "scenes_factor": s.time.scenes, "scene_samples": s.time.scene_samples, "auto_factor": s.time.auto_factor(), "auto_share": s.time.auto_share, "auto_samples": s.time.auto_samples, "preset": s.time.preset, "totals": totals, "rows": rows, "not_listed": s.not_listed,
     }))
 }

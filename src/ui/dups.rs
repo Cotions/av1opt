@@ -307,7 +307,7 @@ fn trim_thumbs(keep: usize) {
 
 /// A small JPEG of the frame at `t` seconds of a file from a result (made once, then cached).
 pub fn thumb(app: &App, path: &Path, t: f64) -> Result<Vec<u8>> {
-    let src = app.is_allowed(path).filter(|c| is_video(c)).ok_or_else(|| anyhow!("not a file you picked"))?;
+    let src = app.is_allowed(path).filter(|c| is_video(c)).ok_or_else(|| anyhow!(library::NOT_LISTED))?;
     let meta = std::fs::metadata(&src)?;
     let mtime = meta.modified().ok().and_then(|m| m.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
     let t = if t.is_finite() { t.max(0.0) } else { 0.0 };

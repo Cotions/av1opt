@@ -644,10 +644,13 @@ fn d_secs() -> f64 {
     20.0
 }
 
+/// What the page gets for a path it did not list in this session, or one that has since gone.
+pub const NOT_LISTED: &str = "this file is not among those the page has listed, or it has moved; reload the page or pick the file again";
+
 /// Builds (or reuses) a playable stand-in for a file the browser can't play directly.
 pub fn preview(app: &App, body: &Value) -> Result<Value> {
     let r: PreviewRequest = serde_json::from_value(body.clone())?;
-    let src = app.is_allowed(&r.path).ok_or_else(|| anyhow!("not a file you picked"))?;
+    let src = app.is_allowed(&r.path).ok_or_else(|| anyhow!(NOT_LISTED))?;
     let meta = std::fs::metadata(&src)?;
     let mtime = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
     let start = r.start.max(0.0);

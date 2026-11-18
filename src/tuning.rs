@@ -104,7 +104,7 @@ impl Tuning {
         };
         let t: Tuning = serde_json::from_slice(&bytes).with_context(|| format!("{} is damaged", p.display()))?;
         if t.format > FORMAT {
-            bail!("{} was written by a newer av1opt (format {})", p.display(), t.format);
+            bail!("{} was saved by a newer version of av1opt (format {}) and was left as it is; update av1opt to use it, or encode without --tuned", p.display(), t.format);
         }
         Ok(t)
     }

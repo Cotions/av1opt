@@ -622,7 +622,7 @@ fn an_encode_never_lands_on_its_source_and_a_changed_source_is_noticed() {
     std::fs::hard_link(&src, c.out().join("film.mp4")).unwrap();
     let r = c.encode(&[&src], &["--overwrite"]);
     assert_eq!(r.code, Some(2), "{}", r.err);
-    r.has("output would overwrite the input");
+    r.has("the output would be written over this same video");
     assert_eq!(std::fs::read(&src).unwrap(), before);
     // An output folder that is the folder of the videos by another way.
     let link = c.dir.join("same");
@@ -630,7 +630,7 @@ fn an_encode_never_lands_on_its_source_and_a_changed_source_is_noticed() {
     for out in [link.clone(), c.videos().join("../videos")] {
         let r = c.encode_into(&out, &[&src], &["--overwrite"]);
         assert_eq!(r.code, Some(2), "{}", r.err);
-        r.has("output would overwrite the input");
+        r.has("the output would be written over this same video");
         assert_eq!(std::fs::read(&src).unwrap(), before);
     }
 
@@ -1572,7 +1572,7 @@ fn a_folder_that_is_its_own_output_keeps_its_originals_and_encodes_the_rest() {
     let pair_refused = |r: &Run| {
         assert_eq!(r.code, Some(2), "{}", r.err);
         r.has(&format!("FAILED: its output would take the place of another input, {}", a_mp4.display()));
-        r.has("FAILED: output would overwrite the input; choose another output folder");
+        r.has("FAILED: the output would be written over this same video, so nothing was written; choose another output folder");
         for (path, bytes) in &originals {
             assert!(std::fs::read(path).unwrap() == *bytes, "{} changed", path.display());
         }
@@ -1753,7 +1753,7 @@ fn a_long_track_that_is_not_kept_passes_the_length_check_and_a_cut_picture_does_
     let other = c.dir.join("out-halfway");
     let r = c.encode_into(&other, &[&src], &["--ffmpeg", halfway.to_str().unwrap()]);
     assert_eq!(r.code, Some(2), "{}", r.err);
-    r.has("encoded 0, skipped 0, failed 1").has("verify: duration 3.0s, expected 6.0s");
+    r.has("encoded 0, skipped 0, failed 1").has("the finished video lasts 3.0 seconds where it should last 6.0");
     assert_eq!(c.outputs_in(&other), ["av1opt-log.tsv"]);
 }
 

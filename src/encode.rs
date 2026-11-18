@@ -8,7 +8,7 @@ use crate::metadata::{self, MetaOptions, Resolved};
 use crate::scenes;
 use crate::sections::{self, Sections};
 use crate::search::{self, EncodeSettings, SearchParams, Trial};
-use crate::tools::{Tools, hms, path_arg};
+use crate::tools::{FAILED_INSIDE, NOT_WRITTEN, Tools, hms, path_arg};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -404,7 +404,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         bail!("{} already exists (use --overwrite)", output.display());
     }
     if std::fs::canonicalize(input)? == std::path::absolute(&output)? || same_file(input, &output) {
-        bail!("output would overwrite the input");
+        bail!("the output would be written over this same video, so nothing was written; choose another output folder");
     }
     std::fs::create_dir_all(out_dir)?;
     let tmp = TempDir { path: out_dir.join(format!(".av1opt-tmp-{}", std::process::id())), keep: o.keep_temp };
@@ -1316,8 +1316,8 @@ impl LowSpot {
 
 impl std::fmt::Display for LowSpot {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let hint = if self.hint { " (a CRF per scene, --scenes, evens quality out)" } else { "" };
-        write!(f, "verify: spot check VMAF {:.2} below {:.1}; keeping nothing{hint}", self.worst().1, self.floor)
+        let hint = if self.hint { "; a CRF per scene (--scenes) evens quality out" } else { "" };
+        write!(f, "the finished encode scores VMAF {:.2} in the weakest stretch checked, below the {:.1} it has to reach; {NOT_WRITTEN}{hint}", self.worst().1, self.floor)
     }
 }
 
@@ -1328,7 +1328,7 @@ impl std::error::Error for LowSpot {}
 fn check_layout(tools: &Tools, info: &MediaInfo, out: &Path, streams: &Streams, expect_frames: Option<u64>, cut: Option<&Sections>) -> Result<MediaInfo> {
     let out_info = probe::probe(&tools.ffprobe, out, std::fs::metadata(out)?.len())?;
     if out_info.codec != "av1" {
-        bail!("verify: output video is {}, expected av1", out_info.codec);
+        bail!("the finished video is {} where it should be AV1; {NOT_WRITTEN}", out_info.codec);
     }
     // (A share of the length, for containers that round it; never so much that a film could
     // lose its last half minute unnoticed.)
@@ -1340,25 +1340,25 @@ fn check_layout(tools: &Tools, info: &MediaInfo, out: &Path, streams: &Streams, 
     let whole = (out_info.duration_s - info.duration_s).abs() <= (info.duration_s * 0.005).clamp(1.0, 5.0);
     let understated = cut.is_none() && length > expected && whole;
     if (length - expected).abs() > tolerance && !understated {
-        let hint = if length < expected { ": the source may be cut off or damaged" } else { "" };
-        bail!("verify: duration {length:.1}s, expected {expected:.1}s{hint}");
+        let hint = if length < expected { " (the source may be cut off or damaged: check that it plays to the end)" } else { "" };
+        bail!("the finished video lasts {length:.1} seconds where it should last {expected:.1}; {NOT_WRITTEN}{hint}");
     }
     if out_info.audio_streams as usize != streams.audio || out_info.subtitle_streams as usize != streams.subs {
         bail!(
-            "verify: output has {} audio / {} subtitle streams, expected {} / {}",
+            "the finished file has {} audio and {} subtitle streams where it should have {} and {}; {NOT_WRITTEN}",
             out_info.audio_streams, out_info.subtitle_streams, streams.audio, streams.subs
         );
     }
     if out_info.color_transfer != info.color_transfer && info.hdr {
-        bail!("verify: output transfer is '{}', source is '{}' (HDR signalling lost)", out_info.color_transfer, info.color_transfer);
+        bail!("the finished video lost its HDR signalling (its transfer is '{}', the source's is '{}'); {NOT_WRITTEN}", out_info.color_transfer, info.color_transfer);
     }
     if out_info.covers.len() != streams.covers {
-        bail!("verify: output has {} cover images, expected {}", out_info.covers.len(), streams.covers);
+        bail!("the finished file has {} cover images where it should have {}; {NOT_WRITTEN}", out_info.covers.len(), streams.covers);
     }
     if let Some(want) = expect_frames {
         let got = tools.count_frames(out)?;
         if got != want {
-            bail!("verify: output has {got} frames, expected {want}");
+            bail!("the finished video has {got} frames where it should have {want}; {NOT_WRITTEN}");
         }
     }
     Ok(out_info)
@@ -1541,7 +1541,7 @@ fn verify_whole(
             let v = spot_check(tools, input, info, out, &out_info, at, alone - JOIN_SLACK, threads, tmp, &format!("joined{i}"))?;
             eprintln!("  joined video at {}: VMAF {v:.2} ({alone:.2} by itself)", hms(at.0));
             if v < alone - JOIN_SLACK {
-                bail!("verify: the video around the stretch at {} encoded again reads VMAF {v:.2} once joined, {alone:.2} by its frames; keeping nothing", hms(st.start_secs));
+                bail!("the stretch at {} was encoded again but scores VMAF {v:.2} once put back into the video, against {alone:.2} on its own; {FAILED_INSIDE}", hms(st.start_secs));
             }
         }
         let (count, total) = (s.stretches.len(), s.stretches.iter().map(|x| x.secs).sum::<f64>());

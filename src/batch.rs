@@ -305,7 +305,7 @@ fn before_encoding(output: &Path, clash: Option<&Clash>, input: &Path, size: u64
         Some(Clash::Own) => {
             return match made {
                 Some((source, ..)) if source != input => Before::Leave(format!("{} is the encode of {} from an earlier run", output.display(), source.display())),
-                _ => Before::Refuse("output would overwrite the input; choose another output folder".into()),
+                _ => Before::Refuse("the output would be written over this same video, so nothing was written; choose another output folder".into()),
             };
         }
         // Only an encode of this very input may stand there, and it is then not replaced.
@@ -548,7 +548,7 @@ mod tests {
         let mkv = &ends["a.mkv"];
         assert_eq!(mkv.0, "error");
         assert_eq!(mkv.1, format!("its output would take the place of another input, {}", f.0.join("a.mp4").display()));
-        assert!(ends["a.mp4"].1.contains("output would overwrite the input"), "{:?}", ends["a.mp4"]);
+        assert!(ends["a.mp4"].1.contains("the output would be written over this same video"), "{:?}", ends["a.mp4"]);
         // The rest of the batch goes on, and nothing was touched on the way.
         assert!(reached_the_encode(&ends["b.mkv"]), "{:?}", ends["b.mkv"]);
         assert_eq!(sum.failed, 3);
@@ -592,7 +592,7 @@ mod tests {
         let (sum, ends) = f.walk(&f.0, &options());
         assert_eq!((sum.already_done, sum.failed), (0, 2));
         assert!(ends["a.mkv"].1.starts_with("its output would take the place of another input"), "{:?}", ends["a.mkv"]);
-        assert!(ends["a.mp4"].1.contains("output would overwrite the input"), "{:?}", ends["a.mp4"]);
+        assert!(ends["a.mp4"].1.contains("the output would be written over this same video"), "{:?}", ends["a.mp4"]);
 
         // A file of that name in another folder is nobody's input: whoever tidied its report
         // away does not get it encoded again, or an error for every file of a run.

@@ -241,7 +241,7 @@ fn measure(tools: &Tools, info: &MediaInfo, samples: &[Sample], tmp: &Path, enc:
         std::fs::remove_file(&out)?;
     }
     if scores.is_empty() {
-        bail!("no samples");
+        bail!("the video reports no length, so no sample clips could be cut from it and it was not measured; check that it plays");
     }
     Ok(Measure {
         crf,

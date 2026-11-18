@@ -18,7 +18,7 @@ use crate::events::Event;
 use crate::probe::MediaInfo;
 use crate::scenes::{self, Bounds, Times};
 use crate::search::{self, EncodeSettings, VMAF_STRIDE};
-use crate::tools::{Tools, hms, path_arg};
+use crate::tools::{Tools, WENT_WRONG_INSIDE, hms, path_arg};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -464,10 +464,10 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
     c.tools.run(&args)?;
     let (head, index) = ivf_index(&plain)?;
     if index.len() != frames {
-        bail!("the encode holds {} frames as IVF, {frames} as it is", index.len());
+        bail!("reading the encode frame by frame gave {} frames where it has {frames}; {WENT_WRONG_INSIDE}", index.len());
     }
     if index.windows(2).any(|w| w[1].pts <= w[0].pts) {
-        bail!("the encode's frames are not in the order they are shown");
+        bail!("the frames of the encode did not come back in the order they are shown; {WENT_WRONG_INSIDE}");
     }
 
     let max_secs = scenes::Limits::for_video(c.info).max_secs;
@@ -499,7 +499,7 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
         // clock without making it any more to encode.)
         let most = MAX_GOP_SECS.max(max_secs) * c.info.fps.max(1.0);
         if let Some(r) = todo.iter().find(|r| (r.end - r.start) as f64 > most) {
-            bail!("a stretch of {} frames between two key frames is too long to encode again", r.end - r.start);
+            bail!("{} frames in a row have no key frame to cut at, too many to encode again on their own; a smaller keyint in --svt-params gives the video more key frames", r.end - r.start);
         }
         let total: f64 = todo.iter().map(|r| secs[r.end] - secs[r.start]).sum();
         let detail = format!("{} stretch{} ({}) below VMAF {:.0}{}", todo.len(), if todo.len() == 1 { "" } else { "es" }, hms(total), c.floor, if round > 0 { ", again" } else { "" });
@@ -698,9 +698,9 @@ fn ivf_index(path: &Path) -> Result<([u8; 32], Vec<IvfFrame>)> {
     // 32 bytes: "DKIF", version, header length, codec, width, height, time base denominator
     // and numerator, number of frames, four unused. Little-endian throughout.
     let mut head = [0u8; 32];
-    r.read_exact(&mut head).context("not an IVF stream")?;
+    r.read_exact(&mut head).with_context(|| format!("a video stream av1opt made could not be read back frame by frame; {WENT_WRONG_INSIDE}"))?;
     if &head[..4] != b"DKIF" || u16::from_le_bytes([head[6], head[7]]) != 32 {
-        bail!("not an IVF stream");
+        bail!("a video stream av1opt made could not be read back frame by frame; {WENT_WRONG_INSIDE}");
     }
     let mut frames = Vec::new();
     let mut offset = 32u64;
@@ -715,7 +715,7 @@ fn ivf_index(path: &Path) -> Result<([u8; 32], Vec<IvfFrame>)> {
         offset += 12 + size as u64;
     }
     if offset != std::fs::metadata(path)?.len() {
-        bail!("the IVF stream ends inside frame {}", frames.len());
+        bail!("a video stream av1opt made stops partway through frame {}; {WENT_WRONG_INSIDE}", frames.len());
     }
     Ok((head, frames))
 }
@@ -745,7 +745,7 @@ fn splice(source: &Path, head: &[u8; 32], index: &[IvfFrame], fixed: &[Fixed], o
             Some(f) if f.run.start == i => {
                 let (_, new) = ivf_index(&f.file)?;
                 if new.len() != f.run.end - f.run.start {
-                    bail!("a stretch encoded again holds {} frames, {} were to be replaced; refusing to join", new.len(), f.run.end - f.run.start);
+                    bail!("a stretch encoded again came back with {} frames where {} were to be replaced; {WENT_WRONG_INSIDE}", new.len(), f.run.end - f.run.start);
                 }
                 let file = std::fs::File::open(&f.file)?;
                 for (k, frame) in new.iter().enumerate() {
@@ -761,7 +761,7 @@ fn splice(source: &Path, head: &[u8; 32], index: &[IvfFrame], fixed: &[Fixed], o
         }
     }
     if next.peek().is_some() {
-        bail!("a stretch encoded again does not start at a frame of the video; refusing to join");
+        bail!("a stretch encoded again does not begin at a frame of the video; {WENT_WRONG_INSIDE}");
     }
     w.flush()?;
     Ok(())
@@ -1014,7 +1014,7 @@ mod tests {
         // A new encode with the wrong number of frames is refused.
         let fx = vec![fixed(Run { start: 2, end: 5 }, dir.join("a.ivf"))];
         let err = splice(&dir.join("src.ivf"), &head, &index, &fx, &dir.join("bad.ivf")).unwrap_err();
-        assert!(err.to_string().contains("refusing to join"), "{err}");
+        assert!(err.to_string().contains("were to be replaced"), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

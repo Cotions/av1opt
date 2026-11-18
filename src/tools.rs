@@ -483,6 +483,17 @@ impl Tools {
 }
 
 /// Why a file cannot be worked on, where its name is not text.
+/// How a message ends when a finished encode was turned down.
+pub const NOT_WRITTEN: &str = "no output was written and the original is untouched";
+
+/// How a message ends when av1opt or ffmpeg went wrong in a way that ends the encode, and
+/// the user has nothing to change but can report it.
+pub const FAILED_INSIDE: &str = "this went wrong inside av1opt or ffmpeg, no output was written and the original is untouched. AV1OPT_DEBUG=1 prints the ffmpeg commands and --keep-temp keeps the files for a bug report";
+
+/// The same where the encode goes on: a stretch that cannot be encoded again leaves the
+/// video to the spot checks, and the message ends up in brackets in the note that says so.
+pub const WENT_WRONG_INSIDE: &str = "this went wrong inside av1opt or ffmpeg; AV1OPT_DEBUG=1 prints the ffmpeg commands and --keep-temp keeps the files for a bug report";
+
 pub const NOT_TEXT: &str = "its path is not valid UTF-8, which av1opt cannot pass on; rename it";
 
 /// A path as an ffmpeg argument. Absolute, because ffmpeg takes what stands before a colon in

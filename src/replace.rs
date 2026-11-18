@@ -367,7 +367,7 @@ fn apply_with(report: &Path, allow_zfs: bool, to_trash: &dyn Fn(&Path) -> Result
         Check::No(why) => bail!("{why}"),
     };
     if p.zfs && !allow_zfs {
-        bail!("the original is on ZFS, which is only replaced when asked for");
+        bail!("the original is on ZFS, so it was left where it is and nothing was changed; --allow-zfs replaces originals there");
     }
     let source_meta = std::fs::symlink_metadata(&p.source)?;
     let in_place = p.dest == p.output;
@@ -443,7 +443,7 @@ pub fn undo(report: &Path, allow_zfs: bool) -> Result<Replaced> {
     let _lock = lock(report)?;
     let d = match check(report) {
         Check::Replaced(d) => d,
-        Check::Ready(_) => bail!("not replaced"),
+        Check::Ready(_) => bail!("this original has not been replaced, so there is nothing to put back"),
         Check::No(why) => bail!("{why}"),
     };
     match file_size(&d.trash) {
@@ -638,7 +638,8 @@ pub fn run(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool) -> Result<(
         println!("\n{} replaced; {} of originals are in the trash and take up space until it is emptied", plural(done, "original", "originals"), gb(trashed as f64));
     }
     if failed > 0 {
-        bail!("{failed} failed");
+        let what = if back { "put back" } else { "replaced" };
+        bail!("{} not be {what}; the lines starting with FAILED above say why and where each file is now", plural(failed, "original could", "originals could"));
     }
     Ok(())
 }
@@ -740,7 +741,7 @@ mod tests {
         assert!(r.get("replaced").is_none());
         assert_eq!(r["output"], json!(f.out("clip one.mkv")));
         assert!(matches!(check(&report), Check::Ready(_)));
-        assert_eq!(undo(&report, false).unwrap_err().to_string(), "not replaced");
+        assert_eq!(undo(&report, false).unwrap_err().to_string(), "this original has not been replaced, so there is nothing to put back");
     }
 
     #[test]

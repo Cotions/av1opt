@@ -280,7 +280,7 @@ fn content_type(p: &std::path::Path) -> &'static str {
 /// Serves an allowed file with HTTP range support (the video element seeks with ranges).
 fn media(app: &App, req: Request, path: PathBuf) {
     let Some(path) = app.is_allowed(&path) else {
-        return reply(req, 403, "text/plain", "not a file you picked");
+        return reply(req, 403, "text/plain", library::NOT_LISTED);
     };
     let Ok(mut f) = std::fs::File::open(&path) else { return reply(req, 404, "text/plain", "cannot open") };
     let len = f.metadata().map_or(0, |m| m.len());

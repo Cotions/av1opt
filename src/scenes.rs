@@ -13,7 +13,7 @@
 use crate::events::Event;
 use crate::probe::MediaInfo;
 use crate::search::{self, EncodeSettings, Trial};
-use crate::tools::{Tools, hms, path_arg};
+use crate::tools::{FAILED_INSIDE, Tools, hms, path_arg};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -492,7 +492,7 @@ fn encode_chunk(c: &Ctx, plan: &Plan, i: usize) -> Result<ChunkResult> {
     extract_chunk(c.tools, c.input, c.info, b, plan.timed, &reference)?;
     let frames = c.tools.count_frames(&reference)?;
     if frames == 0 {
-        bail!("chunk {i} at {} has no frames", hms(start_secs));
+        bail!("cutting the chunk at {} from the source gave no frames; {FAILED_INSIDE}", hms(start_secs));
     }
 
     let model = search::vmaf_model(c.info);
@@ -608,7 +608,7 @@ pub fn encode_all(c: &Ctx, plan: &Plan) -> Result<Vec<ChunkResult>> {
     let results: Vec<ChunkResult> = results.into_inner().unwrap().into_iter().map(|r| r.expect("all chunks done")).collect();
     let frames: u64 = results.iter().map(|r| r.frames).sum();
     if frames != plan.total_frames {
-        bail!("chunks hold {frames} frames but the video has {}; refusing to join", plan.total_frames);
+        bail!("the encoded chunks hold {frames} frames but the video has {}; {FAILED_INSIDE}", plan.total_frames);
     }
     Ok(results)
 }
@@ -631,8 +631,8 @@ pub fn concat(work: &Path, n: usize) -> Result<PathBuf> {
 /// AV1 leaves the encoder in the order it is shown, one packet per frame, so the n-th packet
 /// is the n-th source frame.
 pub fn stamp(tools: &Tools, work: &Path, video: &Path, info: &MediaInfo) -> Result<PathBuf> {
-    let text = std::fs::read_to_string(work.join(TIMES_FILE)).context("the frame times of the scene pass are missing")?;
-    let times = Times::parse(&text, info.time_base).context("the frame times of the scene pass can't be read")?;
+    let text = std::fs::read_to_string(work.join(TIMES_FILE)).with_context(|| format!("the source's frame times saved for this per-scene encode are missing; {FAILED_INSIDE}"))?;
+    let times = Times::parse(&text, info.time_base).with_context(|| format!("the source's frame times saved for this per-scene encode can't be read; {FAILED_INSIDE}"))?;
     let (plain, out) = (work.join("plain.ivf"), work.join("video.ivf"));
     let args: Vec<String> = ["-y", "-v", "error", "-framerate", &search::cfr(info), "-i", &path_arg(video), "-c", "copy", "-f", "ivf", &path_arg(&plain)]
         .map(String::from)
@@ -651,9 +651,9 @@ fn restamp(from: &Path, to: &Path, times: &Times) -> Result<()> {
     // 32 bytes: "DKIF", version, header length, codec, width, height, time base denominator
     // and numerator, length of the stream, four unused. Little-endian throughout.
     let mut head = [0u8; 32];
-    r.read_exact(&mut head).context("the joined video is not an IVF stream")?;
+    r.read_exact(&mut head).with_context(|| format!("the joined chunks could not be read back; {FAILED_INSIDE}"))?;
     if &head[..4] != b"DKIF" || u16::from_le_bytes([head[6], head[7]]) != 32 {
-        bail!("the joined video is not an IVF stream");
+        bail!("the joined chunks could not be read back; {FAILED_INSIDE}");
     }
     let (num, den) = (u32::try_from(times.tb.0)?, u32::try_from(times.tb.1)?);
     let first = times.pts[0];
@@ -667,16 +667,16 @@ fn restamp(from: &Path, to: &Path, times: &Times) -> Result<()> {
         let mut frame = [0u8; 12];
         r.read_exact(&mut frame)?;
         let size = u32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]) as u64;
-        let Some(&pts) = times.pts.get(n) else { bail!("the joined video has more frames than the source's {}; refusing to mux", times.pts.len()) };
+        let Some(&pts) = times.pts.get(n) else { bail!("the joined chunks have more frames than the source's {}; {FAILED_INSIDE}", times.pts.len()) };
         frame[4..].copy_from_slice(&((pts - first) as u64).to_le_bytes());
         w.write_all(&frame)?;
         if std::io::copy(&mut (&mut r).take(size), &mut w)? != size {
-            bail!("the joined video ends inside frame {}", n + 1);
+            bail!("the joined chunks stop partway through frame {}; {FAILED_INSIDE}", n + 1);
         }
         n += 1;
     }
     if n != times.pts.len() {
-        bail!("the joined video has {n} frames, the source {}; refusing to mux", times.pts.len());
+        bail!("the joined chunks have {n} frames and the source has {}; {FAILED_INSIDE}", times.pts.len());
     }
     w.flush()?;
     Ok(())
@@ -872,12 +872,12 @@ mod tests {
         // A frame too many or too few, or a stream that stops inside a frame: no video.
         for pts in [vec![0, 3000], vec![0, 3000, 6000, 9000]] {
             let e = restamp(&from, &to, &Times { pts, tb: (1, 90000) }).unwrap_err().to_string();
-            assert!(e.contains("refusing to mux"), "{e}");
+            assert!(e.contains("no output was written"), "{e}");
         }
         std::fs::write(&from, &plain[..plain.len() - 10]).unwrap();
-        assert!(restamp(&from, &to, &times).unwrap_err().to_string().contains("ends inside frame 3"));
+        assert!(restamp(&from, &to, &times).unwrap_err().to_string().contains("partway through frame 3"));
         std::fs::write(&from, b"not a video at all, though long enough").unwrap();
-        assert!(restamp(&from, &to, &times).unwrap_err().to_string().contains("not an IVF stream"));
+        assert!(restamp(&from, &to, &times).unwrap_err().to_string().contains("could not be read back"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

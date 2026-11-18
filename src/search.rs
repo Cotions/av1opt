@@ -377,7 +377,7 @@ pub fn extract_samples(tools: &Tools, input: &Path, info: &MediaInfo, tmp: &Path
         }
     }
     if samples.len() != n {
-        bail!("the sample clips could not all be cut");
+        bail!("not every sample clip could be cut from the video, so it was not measured and is left as it was; AV1OPT_DEBUG=1 prints the ffmpeg commands");
     }
     Ok(samples)
 }
@@ -872,7 +872,7 @@ pub fn trial(
     lift_to: Option<f64>,
 ) -> Result<Trial> {
     if samples.is_empty() {
-        bail!("no samples");
+        bail!("the video reports no length, so no sample clips could be cut from it and it was not measured; check that it plays");
     }
     let joined = if samples.len() > 1 { trial_joined(tools, info, samples, tmp, enc, crf, threads)? } else { None };
     let (scores, bytes) = match joined {

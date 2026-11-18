@@ -733,7 +733,9 @@ and the benchmark's requests and tuned settings over HTTP (no ffmpeg needed).
   at a mean of 93.1 instead of 205.1 MB at 93.2, the lowest five seconds at 89.0 and 89.1,
   in 54 minutes instead of 52 (search, check and repairs take the same time at either; the
   machine was busy both times). The default went from 6 to 5 on that; `--preset 6` gets
-  the quicker encode back, `--preset 4` goes further for a library that can wait.
+  the quicker encode back, `--preset 4` goes further for a library that can wait, and
+  `--preset 3` further still: 16.0% smaller than 6 on the first set of clips (8 to 26% by
+  clip; 14 to 16% by the other three metrics) for three times the processor time.
 - **A container's length is not the picture's.** One recording had 7:40 of video under 17:32
   of sound. Samples and spot checks were placed along the 17:32 and asked for frames that
   don't exist. They go by the video stream's own length now.

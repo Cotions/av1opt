@@ -205,10 +205,10 @@ const SCENES_FACTOR: f64 = 3.0;
 
 const SPF_1080P: f64 = 0.022;
 const SPF_EXPONENT: f64 = 0.85;
-/// Encode time of each SVT-AV1 preset against preset 6, roughly (5 and 4 as measured with
-/// SVT-AV1 4.2 on 1080p: 28% and about 60% more processor time). Encodes made at another
+/// Encode time of each SVT-AV1 preset against preset 6, roughly (5, 4 and 3 as measured with
+/// SVT-AV1 4.2 on 1080p: 28%, about 60% and 200% more processor time). Encodes made at another
 /// preset still tell how fast the machine is once scaled by this.
-const PRESET_TIME: [f64; 14] = [40.0, 20.0, 9.0, 5.0, 1.6, 1.3, 1.0, 0.75, 0.55, 0.45, 0.35, 0.3, 0.27, 0.25];
+const PRESET_TIME: [f64; 14] = [40.0, 20.0, 9.0, 3.0, 1.6, 1.3, 1.0, 0.75, 0.55, 0.45, 0.35, 0.3, 0.27, 0.25];
 /// The CRF search costs about as much as encoding its sample clips this many times.
 const SEARCH_ENCODES: f64 = 2.0;
 

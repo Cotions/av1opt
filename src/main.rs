@@ -60,7 +60,7 @@ enum Cmd {
         #[arg(long, default_value_t = 93.0)]
         target_vmaf: f64,
         /// SVT-AV1 preset the encode time estimates assume.
-        #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u8).range(0..=13))]
+        #[arg(long, default_value_t = search::DEFAULT_PRESET, value_parser = clap::value_parser!(u8).range(0..=13))]
         preset: u8,
         /// Order of the list of top candidates: most saved, or most saved per hour of encoding.
         #[arg(long, value_enum, default_value_t)]
@@ -217,8 +217,8 @@ enum Cmd {
         /// Mean VMAF the samples must reach. 93 is hard to tell apart from an already-lossy source.
         #[arg(long, default_value_t = 93.0)]
         target_vmaf: f64,
-        /// SVT-AV1 preset: lower is slower and smaller.
-        #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u8).range(0..=13))]
+        /// SVT-AV1 preset: lower is slower and smaller (6 is about 5% larger and a fifth quicker).
+        #[arg(long, default_value_t = search::DEFAULT_PRESET, value_parser = clap::value_parser!(u8).range(0..=13))]
         preset: u8,
         /// SVT-AV1 parameters besides the CRF, as key=value:key=value. Replaces the default
         /// (tune=0); note that SVT-AV1's own default is tune=1.
@@ -324,7 +324,7 @@ enum Cmd {
         /// Folder for the sample clips (removed afterwards).
         #[arg(long)]
         tmp: PathBuf,
-        #[arg(long, default_value_t = 6)]
+        #[arg(long, default_value_t = search::DEFAULT_PRESET)]
         preset: u8,
         #[arg(long, default_value = search::DEFAULT_PARAMS, value_parser = search::parse_params)]
         svt_params: String,

@@ -40,7 +40,7 @@ you encode more.
 with a CRF per scene (a multiple learned from the per-scene encodes made here), and with
 `--scenes=auto` (the share of videos that end up per scene: a third at first, then what the
 encodes made that way here say; the queue of the UI counts each file at that average)
-(`--preset`, default 6) and lists the time per file; `--sort per-hour` orders the top candidates by bytes saved per
+(`--preset`, default 5) and lists the time per file; `--sort per-hour` orders the top candidates by bytes saved per
 hour of encoding, the place to start when the library is larger than your patience. The time
 is seconds per frame by frame size: a guess from one six-core machine at first, then fitted to
 the encode times in the history, so it becomes this machine's speed after a few encodes.
@@ -97,7 +97,7 @@ listed apart and Compare is one click away.
 ## encode
 
 ```
-av1opt encode movie.mkv some/folder -o /out [--target-vmaf 93] [--preset 6] [--container mp4|mkv]
+av1opt encode movie.mkv some/folder -o /out [--target-vmaf 93] [--preset 5] [--container mp4|mkv]
 ```
 
 For each file:
@@ -143,7 +143,7 @@ For each file:
    HDR10 and HLG are encoded with their colour signalling
    and mastering/light-level metadata intact (VMAF is then measured on the HDR signal, which
    tracks encoding damage but is not calibrated like SDR scores).
-4. **Encode** – SVT-AV1, 10-bit, `--preset` 6 with `tune=0` unless `--svt-params` or `--tuned`
+4. **Encode** – SVT-AV1, 10-bit, `--preset` 5 with `tune=0` unless `--svt-params` or `--tuned`
    say otherwise (see [bench](#bench)). Two parameters are added to whatever set is in
    use unless it names them itself: `keyint=10s` (a key frame every 10 seconds instead of
    every 5) and `enable-qm=1` (quantization matrices). Audio already in AAC/Opus/MP3 is copied, anything else becomes
@@ -310,7 +310,7 @@ videos.
    three size classes: 720p and below, 1080p, above 1080p (by pixel count, so portrait and
    cropped videos count with their landscape peers). Dolby Vision and very short files are left out.
 2. **Measure** – `--samples` (2) lossless clips of `--sample-secs` (6) seconds per video. Every
-   setting (each preset with each parameter set, plus the default: preset 6 with `tune=0`) gets
+   setting (each preset with each parameter set, plus the default: preset 5 with `tune=0`) gets
    the same CRF search as `encode`, so each ends at the target VMAF; every sample encode is timed.
 3. **Compare at equal quality** – a setting's size and time at exactly the target are read
    between the last CRF that passes and the first that fails. Settings are then compared with
@@ -728,9 +728,12 @@ and the benchmark's requests and tuned settings over HTTP (no ffmpeg needed).
 - **A slower preset is the one sure gain left, and it costs time.** Against preset 6 at
   equal VMAF: preset 5 is 6.0%, 5.5% and 4.9% smaller on three sets of clips (eight of 10
   seconds, six others, four of 40 seconds), preset 4 9.1%, 9.7% and 8.1%, on every clip and
-  by VMAF NEG, XPSNR and SSIMULACRA2 alike, for about 27% and 60% more processor time
-  (measured on a busy machine). The default stays 6; `--preset 5` or `4` is there for a
-  library that can wait.
+  by VMAF NEG, XPSNR and SSIMULACRA2 alike, for 28% and about 60% more processor time in
+  the encode. One real 15-minute video through the whole of `encode` at preset 5: 191.3 MB
+  at a mean of 93.1 instead of 205.1 MB at 93.2, the lowest five seconds at 89.0 and 89.1,
+  in 54 minutes instead of 52 (search, check and repairs take the same time at either; the
+  machine was busy both times). The default went from 6 to 5 on that; `--preset 6` gets
+  the quicker encode back, `--preset 4` goes further for a library that can wait.
 - **A container's length is not the picture's.** One recording had 7:40 of video under 17:32
   of sound. Samples and spot checks were placed along the 17:32 and asked for frames that
   don't exist. They go by the video stream's own length now.

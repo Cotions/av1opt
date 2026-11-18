@@ -200,7 +200,7 @@ struct ScanRequest {
 }
 
 fn d_preset() -> u8 {
-    6
+    crate::search::DEFAULT_PRESET
 }
 
 fn d_savings() -> f64 {

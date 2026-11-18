@@ -41,7 +41,7 @@ pub struct Config {
 impl Config {
     /// What `encode` uses when nothing is said; everything is compared against it.
     pub fn baseline() -> Config {
-        Config { preset: 6, params: search::DEFAULT_PARAMS.to_string() }
+        Config { preset: search::DEFAULT_PRESET, params: search::DEFAULT_PARAMS.to_string() }
     }
 
     pub fn label(&self) -> String {
@@ -560,7 +560,8 @@ mod tests {
         let m = matrix(&[4, 6], &sets);
         assert_eq!(m[0], Config::baseline());
         let labels: Vec<String> = m.iter().map(Config::label).collect();
-        assert_eq!(labels, ["preset 6 · tune=0", "preset 4 · tune=0", "preset 4 · tune=1", "preset 6 · tune=1"]);
+        assert_eq!(labels, ["preset 5 · tune=0", "preset 4 · tune=0", "preset 4 · tune=1", "preset 6 · tune=0", "preset 6 · tune=1"]);
+        assert_eq!(matrix(&[5], &sets).len(), 2, "the baseline is not measured twice");
         assert_eq!(matrix(&[], &sets), [Config::baseline()]);
         assert_eq!(Config { preset: 8, params: String::new() }.label(), "preset 8 · SVT-AV1 defaults");
     }

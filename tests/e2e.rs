@@ -1408,7 +1408,7 @@ fn a_benchmark_ranks_settings_remembers_its_encodes_and_tunes_the_encoder() {
     let b: Value = serde_json::from_slice(&std::fs::read(&json).unwrap()).unwrap();
     // The default settings are measured too, as what the others are compared with.
     let configs: Vec<(u64, &str)> = b["configs"].as_array().unwrap().iter().map(|k| (k["preset"].as_u64().unwrap(), k["params"].as_str().unwrap())).collect();
-    assert_eq!(configs, [(6, "tune=0"), (8, "tune=0"), (10, "tune=0")]);
+    assert_eq!(configs, [(5, "tune=0"), (8, "tune=0"), (10, "tune=0")]);
     assert_eq!(b["videos"].as_array().unwrap().len(), 2);
     let rows = b["summaries"][0]["rows"].as_array().unwrap();
     assert_eq!((rows[0]["size"].as_f64(), rows[0]["time"].as_f64()), (Some(1.0), Some(1.0)));

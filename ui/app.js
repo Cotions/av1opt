@@ -264,7 +264,7 @@ function scenesMode(v) {
 
 function defaultOptions() {
   return Object.assign({
-    container: "mp4", target_vmaf: 93, preset: 6, svt_params: "", tuned: false, scenes: "off", workers: 1, min_savings: 0.15, force: false, retry_skipped: false,
+    container: "mp4", target_vmaf: 93, preset: 5, svt_params: "", tuned: false, scenes: "off", workers: 1, min_savings: 0.15, force: false, retry_skipped: false,
     keep_metadata: true, keep_dates: false, info_json: true, meta_preset: "", meta_tags: [], shrink_audio: false,
   }, prefs.get("encodeOptions", {}));
 }
@@ -638,7 +638,7 @@ function encodeDialog(inputs, roots = [], watch = false) {
           h("h3", {}, "Settings"),
           h("div", { class: "form-grid" },
             setting("Target VMAF", vmaf, "Quality to match: 93 looks like the source, higher keeps more and saves less"),
-            setting("Preset", preset, "0–13: lower makes smaller files but encodes slower. Measured against 6 at the same quality: 5 is about 5% smaller for a quarter more time, 4 about 9% smaller for 60% more"),
+            setting("Preset", preset, "0–13: lower makes smaller files but encodes slower. Measured at the same quality: 6 is about 5% larger than 5 and a fifth quicker, 4 about 4% smaller for a quarter more time"),
             setting("Encoder parameters", svtParams, "SVT-AV1 options as name=value:name=value; the Benchmark page finds good ones"),
             tuning.length ? setting("Tuned settings", h("label", { class: "check" }, tuned, "Use the benchmark's settings by video size"),
               tuning.map((x) => `${x.label}: ${configLabel(x.choice)}`).join("; ") + ". Other sizes use the preset and parameters above") : null,
@@ -703,7 +703,7 @@ views.scan = (root) => {
     prefs.set("scanVmaf", Number(vmaf.value));
     start.disabled = true;
     try {
-      const r = await api("/api/scans", { paths: [...roots], min_savings: Number(minSav.value) / 100, target_vmaf: Number(vmaf.value), preset: Number(defaultOptions().preset) || 6 });
+      const r = await api("/api/scans", { paths: [...roots], min_savings: Number(minSav.value) / 100, target_vmaf: Number(vmaf.value), preset: Number(defaultOptions().preset) || 5 });
       scanId = lastScanId = r.id;
       progText.textContent = "listing files…";
       progress.firstChild.style.width = "0%";
@@ -1179,7 +1179,7 @@ views.bench = (root) => {
   const progText = h("span", { class: "dim" });
   const out = h("div");
   const ui = { tab: prefs.get("benchTab", "all"), video: 0, sort: "size", dir: 1, stopChart: null };
-  let base = { preset: 6, params: "tune=0" };
+  let base = { preset: 5, params: "tune=0" };
   let defaults = null;
   let running = false;
   let seenVideos = -1;

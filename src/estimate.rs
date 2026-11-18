@@ -205,9 +205,10 @@ const SCENES_FACTOR: f64 = 3.0;
 
 const SPF_1080P: f64 = 0.022;
 const SPF_EXPONENT: f64 = 0.85;
-/// Encode time of each SVT-AV1 preset against preset 6, roughly. Encodes made at another
+/// Encode time of each SVT-AV1 preset against preset 6, roughly (5 and 4 as measured with
+/// SVT-AV1 4.2 on 1080p: 28% and about 60% more processor time). Encodes made at another
 /// preset still tell how fast the machine is once scaled by this.
-const PRESET_TIME: [f64; 14] = [40.0, 20.0, 9.0, 5.0, 2.8, 1.7, 1.0, 0.75, 0.55, 0.45, 0.35, 0.3, 0.27, 0.25];
+const PRESET_TIME: [f64; 14] = [40.0, 20.0, 9.0, 5.0, 1.6, 1.3, 1.0, 0.75, 0.55, 0.45, 0.35, 0.3, 0.27, 0.25];
 /// The CRF search costs about as much as encoding its sample clips this many times.
 const SEARCH_ENCODES: f64 = 2.0;
 
@@ -529,7 +530,7 @@ mod tests {
         assert!((guess.secs_per_frame(PIXELS_1080P) - SPF_1080P).abs() < 1e-12);
         // Bigger frames and slower presets take longer; an hour of 1080p is hours, not minutes.
         assert!(guess.secs_per_frame(3840.0 * 2160.0) > 2.5 * SPF_1080P);
-        assert!(TimeModel::fit(&[], 4).secs_per_frame(PIXELS_1080P) > 2.0 * SPF_1080P);
+        assert!(TimeModel::fit(&[], 4).secs_per_frame(PIXELS_1080P) > 1.5 * SPF_1080P);
         assert!(TimeModel::fit(&[], 8).secs_per_frame(PIXELS_1080P) < 0.7 * SPF_1080P);
         let hour = guess.secs(&info(1920, 1080, 3600.0));
         // 64 sample clips of a second, encoded about twice.

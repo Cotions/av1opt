@@ -70,7 +70,7 @@ fn d_vmaf() -> f64 {
     93.0
 }
 fn d_preset() -> u8 {
-    6
+    crate::search::DEFAULT_PRESET
 }
 fn d_workers() -> u8 {
     1

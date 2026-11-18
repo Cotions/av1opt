@@ -626,4 +626,125 @@ mod tests {
         assert!((picks[1].1.size - 0.9).abs() < 1e-12);
         assert!(choice(&report, &report.summaries[0], 7).is_none());
     }
+
+    fn timed_video(class: Class, points: &[(f64, f64)]) -> Video {
+        let mut v = video(class, &points.iter().map(|p| Some(p.0)).collect::<Vec<_>>());
+        for (cell, p) in v.cells.iter_mut().zip(points) {
+            cell.point.as_mut().unwrap().cost = p.1;
+        }
+        v
+    }
+
+    fn settings(n: u8) -> Vec<Config> {
+        (0..n).map(|i| Config { preset: 4 + i, params: format!("tune={i}") }).collect()
+    }
+
+    fn report(videos: Vec<Video>, configs: Vec<Config>) -> Report {
+        let summaries = summaries(&videos, configs.len(), 0);
+        Report {
+            format: REPORT_FORMAT, made: 5, encoder: "ffmpeg".into(), target_vmaf: 93.0, min_crf: 20, max_crf: 55, samples: 2, sample_secs: 6.0,
+            configs, baseline: 0, videos, summaries, skipped: Vec::new(), elapsed_secs: 1.0, fresh: 0, cached: 0,
+        }
+    }
+
+    #[test]
+    fn the_settings_keep_the_order_given_and_lose_what_is_repeated() {
+        let sets: Vec<String> = ["b", "a", "b"].map(String::from).to_vec();
+        let got: Vec<(u8, &str)> = matrix(&[9, 7, 9], &sets).iter().skip(1).map(|c| (c.preset, if c.params == "a" { "a" } else { "b" })).collect();
+        assert_eq!(got, [(9, "b"), (9, "a"), (7, "b"), (7, "a")]);
+        assert_eq!(matrix(&[4, 6], &[]), [Config::baseline()]);
+    }
+
+    #[test]
+    fn the_default_settings_are_the_ones_encode_uses() {
+        let b = Config::baseline();
+        assert_eq!((b.preset, b.params.as_str()), (search::DEFAULT_PRESET, search::DEFAULT_PARAMS));
+        // Everything tried by default is different from each other.
+        let sets: Vec<String> = DEFAULT_PARAM_SETS.map(String::from).to_vec();
+        assert_eq!(matrix(&DEFAULT_PRESETS, &sets).len(), 1 + DEFAULT_PRESETS.len() * DEFAULT_PARAM_SETS.len());
+    }
+
+    #[test]
+    fn with_no_video_or_no_default_result_there_is_nothing_to_compare() {
+        assert!(summaries(&[], 2, 0).is_empty());
+        assert!(summaries(&[video(Class::Hd, &[None, Some(900.0)])], 2, 0).is_empty());
+    }
+
+    #[test]
+    fn a_class_where_the_default_failed_is_absent_and_its_video_left_out_of_the_whole() {
+        let videos = [video(Class::Hd, &[Some(1000.0), Some(900.0)]), video(Class::Sd, &[None, Some(300.0)])];
+        let s = summaries(&videos, 2, 0);
+        assert_eq!(s.iter().map(|x| x.class).collect::<Vec<_>>(), [None, Some(Class::Hd)]);
+        assert_eq!((s[0].videos, s[0].left_out), (1, 1));
+    }
+
+    #[test]
+    fn a_video_still_being_measured_does_not_count_yet() {
+        let videos = [video(Class::Hd, &[Some(1000.0), Some(900.0)]), video(Class::Hd, &[Some(1000.0)])];
+        let s = summaries(&videos, 2, 0);
+        assert_eq!((s[0].videos, s[0].left_out, s[1].videos, s[1].left_out), (1, 1, 1, 1));
+    }
+
+    #[test]
+    fn each_pick_means_its_own_winner() {
+        let s = Summary { class: None, videos: 1, left_out: 0, rows: Vec::new(), picks: stats::Picks { smallest: 1, balanced: 2, fastest: 3 } };
+        assert_eq!((Pick::Smallest.of(&s), Pick::Balanced.of(&s), Pick::Fastest.of(&s)), (1, 2, 3));
+        assert_eq!(serde_json::to_string(&Pick::Balanced).unwrap(), "\"balanced\"");
+    }
+
+    #[test]
+    fn saved_settings_are_the_chosen_winner_of_each_class_and_not_of_the_whole() {
+        // Setting 1 is smaller but slow, setting 2 fast at about the same size.
+        let r = report(vec![timed_video(Class::Hd, &[(1000.0, 1.0), (800.0, 3.0), (1010.0, 0.5)])], settings(3));
+        let params = |pick| tuning_picks(&r, pick).into_iter().map(|(c, x)| (c, x.params)).collect::<Vec<_>>();
+        assert_eq!(params(Pick::Smallest), [(Class::Hd, "tune=1".to_string())]);
+        assert_eq!(params(Pick::Balanced), [(Class::Hd, "tune=0".to_string())]);
+        assert_eq!(params(Pick::Fastest), [(Class::Hd, "tune=2".to_string())]);
+        assert!(tuning_picks(&report(Vec::new(), settings(3)), Pick::Balanced).is_empty());
+    }
+
+    #[test]
+    fn a_choice_carries_what_the_benchmark_measured_for_it() {
+        let r = report(vec![timed_video(Class::Uhd, &[(1000.0, 1.0), (800.0, 3.0)])], settings(2));
+        let c = choice(&r, &r.summaries[1], 1).unwrap();
+        assert_eq!((c.preset, c.params.as_str(), c.videos, c.target_vmaf, c.made), (5, "tune=1", 1, 93.0, 5));
+        assert!((c.size - 0.8).abs() < 1e-12 && (c.time - 3.0).abs() < 1e-12);
+        // A setting the report has but the summary does not.
+        let empty = Summary { rows: Vec::new(), ..r.summaries[1].clone() };
+        assert!(choice(&r, &empty, 1).is_none());
+    }
+
+    #[test]
+    fn differences_from_the_default_are_written_with_their_sign() {
+        assert_eq!(percent(1.0), "+0.0%");
+        assert_eq!(percent(0.9), "-10.0%");
+        assert_eq!(percent(1.25), "+25.0%");
+    }
+
+    #[test]
+    fn the_csv_has_one_row_per_video_and_setting_with_blanks_for_what_is_missing() {
+        let dir = std::env::temp_dir().join(format!("av1opt-bench-csv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = video(Class::Hd, &[Some(2000.0), None]);
+        a.path = "/v/one, two.mkv".into();
+        a.cells[1].error = Some("first line\nsecond line".into());
+        let mut b = video(Class::Sd, &[None]);
+        b.error = Some("no clips\nmore".into());
+        let file = dir.join("r.csv");
+        write_csv(&report(vec![a, b], settings(2)), &file).unwrap();
+        let rows: Vec<Vec<String>> = csv::ReaderBuilder::new().has_headers(false).from_path(&file).unwrap().records().map(|r| r.unwrap().iter().map(String::from).collect()).collect();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        assert_eq!(rows[0][0], "path");
+        assert!(rows.iter().all(|r| r.len() == rows[0].len()), "{rows:?}");
+        assert_eq!(rows[1], ["/v/one, two.mkv", "hd", "1920", "1080", "4", "tune=0", "35.00", "2000.0", "1.000", "93.00", "false", "0", ""]);
+        assert_eq!(rows[2], ["/v/one, two.mkv", "hd", "1920", "1080", "5", "tune=1", "", "", "", "", "", "0", "first line"]);
+        assert_eq!((rows[3][1].as_str(), rows[3][6].as_str(), rows[3][12].as_str()), ("sd", "", "no clips"));
+    }
+
+    #[test]
+    fn no_file_of_remembered_encodes_is_nothing_remembered() {
+        let path = std::env::temp_dir().join(format!("av1opt-bench-none-{}/lines.jsonl", std::process::id()));
+        assert!(read_lines(&path).is_empty());
+    }
 }

@@ -239,4 +239,134 @@ mod tests {
             assert!(parse_clock(bad).is_err(), "{bad}");
         }
     }
+
+    #[test]
+    fn hours_of_a_single_minute_work_at_both_ends_of_the_day() {
+        let first = Schedule { on: true, from: 0, to: 1 };
+        assert!(first.allows(0));
+        assert!(!first.allows(1) && !first.allows(DAY - 1));
+        let last = Schedule { on: true, from: DAY - 1, to: 0 };
+        assert!(last.allows(DAY - 1));
+        assert!(!last.allows(0) && !last.allows(DAY - 2));
+        // All day but the last minute.
+        let long = Schedule { on: true, from: 0, to: DAY - 1 };
+        assert!(long.allows(0) && long.allows(DAY - 2));
+        assert!(!long.allows(DAY - 1));
+    }
+
+    #[test]
+    fn the_hours_offered_first_are_the_night_and_hold_nothing_until_switched_on() {
+        let s = Schedule::default();
+        assert_eq!((s.on, clock(s.from).as_str(), clock(s.to).as_str()), (false, "23:00", "07:00"));
+        assert!((0..DAY).all(|m| s.allows(m)));
+    }
+
+    #[test]
+    fn hours_that_begin_when_they_end_leave_nothing_out() {
+        for at in [0, 600, DAY - 1] {
+            let s = Schedule { on: true, from: at, to: at };
+            assert!((0..DAY).all(|m| s.allows(m)), "{at}");
+        }
+    }
+
+    #[test]
+    fn the_wait_counts_through_midnight_to_the_second() {
+        let midnight = Schedule { on: true, from: 0, to: 60 };
+        assert_eq!(midnight.opens_in(DAY - 1, 59), 1);
+        assert_eq!(midnight.opens_in(DAY - 1, 0), 60);
+        assert_eq!(midnight.opens_in(60, 0), 23 * 3600);
+        assert_eq!(NIGHT.opens_in(23 * 60 + 1, 0), 23 * 3600 + 59 * 60);
+        // A minute past the end of the day is the start of the next.
+        assert_eq!(NIGHT.opens_in(DAY, 0), NIGHT.opens_in(0, 0));
+    }
+
+    #[test]
+    fn the_wait_is_never_below_nothing() {
+        assert_eq!(NIGHT.opens_in(23 * 60, 0), 0);
+        assert_eq!(NIGHT.opens_in(23 * 60, 59), 0);
+    }
+
+    #[test]
+    fn from_every_minute_held_the_wait_ends_at_the_first_minute_allowed() {
+        for s in [NIGHT, DAYTIME, Schedule { on: true, from: 0, to: 1 }, Schedule { on: true, from: DAY - 1, to: 0 }, Schedule { on: true, from: 1, to: 0 }] {
+            for minute in (0..DAY).filter(|&m| !s.allows(m)) {
+                let wait = s.opens_in(minute, 0);
+                assert_eq!(wait % 60, 0);
+                let steps = (wait / 60) as u16;
+                assert!(steps > 0 && steps < DAY, "{s:?} at {minute}");
+                assert!(s.allows((minute + steps) % DAY), "{s:?} at {minute}");
+                assert!((1..steps).all(|k| !s.allows((minute + k) % DAY)), "{s:?} at {minute}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_hold_lifts_on_the_very_second_the_hours_begin() {
+        let now = 5_000_000;
+        assert_eq!(hold_at(false, NIGHT, None, now, (22 * 60 + 59, 59)), Some(Hold::Hours { opens: now + 1 }));
+        assert_eq!(hold_at(false, NIGHT, None, now + 1, (23 * 60, 0)), None);
+        // And comes back on the second they end.
+        assert_eq!(hold_at(false, NIGHT, None, now, (6 * 60 + 59, 59)), None);
+        assert_eq!(hold_at(false, NIGHT, None, now + 1, (7 * 60, 0)), Some(Hold::Hours { opens: now + 1 + 16 * 3600 }));
+    }
+
+    #[test]
+    fn run_now_ends_on_the_second_it_was_given_and_an_old_one_counts_for_nothing() {
+        let (now, noon) = (5_000_000, (12 * 60, 0));
+        assert_eq!(hold_at(false, DAYTIME, Some(now + 1), now, (8 * 60, 0)), None);
+        let held = Some(Hold::Hours { opens: now + 3600 });
+        assert_eq!(hold_at(false, DAYTIME, Some(now), now, (8 * 60, 0)), held);
+        assert_eq!(hold_at(false, DAYTIME, Some(now - 86_400), now, (8 * 60, 0)), held);
+        // Inside the hours it changes nothing.
+        assert_eq!(hold_at(false, DAYTIME, Some(now - 1), now, noon), None);
+    }
+
+    #[test]
+    fn when_the_clock_jumps_forward_past_the_start_the_hours_are_simply_open() {
+        // 01:59:59 is followed by 03:00:00 one second later; the hours begin at 02:30.
+        let s = Schedule { on: true, from: 2 * 60 + 30, to: 7 * 60 };
+        let now = 5_000_000;
+        assert_eq!(hold_at(false, s, None, now, (60 + 59, 59)), Some(Hold::Hours { opens: now + 30 * 60 + 1 }));
+        assert_eq!(hold_at(false, s, None, now + 1, (3 * 60, 0)), None);
+        // Hours wholly inside the skipped hour wait for the next day's.
+        let skipped = Schedule { on: true, from: 2 * 60, to: 2 * 60 + 30 };
+        assert_eq!(hold_at(false, skipped, None, now + 1, (3 * 60, 0)), Some(Hold::Hours { opens: now + 1 + 23 * 3600 }));
+    }
+
+    #[test]
+    fn when_the_clock_falls_back_the_repeated_hour_is_judged_again() {
+        // 01:59:59 is followed by 01:00:00; the hours run from 01:30.
+        let s = Schedule { on: true, from: 60 + 30, to: 5 * 60 };
+        let now = 5_000_000;
+        assert_eq!(hold_at(false, s, None, now, (60 + 59, 59)), None);
+        assert_eq!(hold_at(false, s, None, now + 1, (60, 0)), Some(Hold::Hours { opens: now + 1 + 30 * 60 }));
+    }
+
+    #[test]
+    fn every_minute_of_the_day_is_written_so_it_reads_back() {
+        for m in 0..DAY {
+            assert_eq!(parse_clock(&clock(m)).unwrap(), m);
+        }
+        assert_eq!(clock(0), "00:00");
+        assert_eq!(clock(DAY - 1), "23:59");
+        assert_eq!(clock(DAY), "00:00");
+    }
+
+    #[test]
+    fn only_a_time_of_the_day_is_read_as_one() {
+        assert_eq!(parse_clock("00:00").unwrap(), 0);
+        assert_eq!(parse_clock("23:59").unwrap(), DAY - 1);
+        assert_eq!(parse_clock("7:5").unwrap(), 7 * 60 + 5);
+        for bad in ["23:60", "1:2:3", ":30", "12:", ":", "65536:00", "12:65536", "٠٧:٠٠", "07:００", "1 2:00", "07.30", "7h30"] {
+            let e = parse_clock(bad).unwrap_err().to_string();
+            assert!(e.contains("not a time of day"), "{bad:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn the_saved_hours_keep_their_form() {
+        let v = serde_json::to_value(NIGHT).unwrap();
+        assert_eq!(v, json!({ "on": true, "from": 1380, "to": 420 }));
+        assert_eq!(serde_json::from_value::<Schedule>(v).unwrap(), NIGHT);
+    }
 }

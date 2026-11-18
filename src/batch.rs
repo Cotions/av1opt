@@ -148,15 +148,43 @@ fn read_skips(log: &Path, settings: &str) -> HashMap<(PathBuf, u64), String> {
             if f.len() < 5 || f[1] != "skip" || f.get(5).is_some_and(|s| *s != settings) {
                 return None;
             }
-            Some(((PathBuf::from(f[2]), f[3].parse().ok()?), f[4].to_string()))
+            Some(((PathBuf::from(unescape_name(f[2])), f[3].parse().ok()?), f[4].to_string()))
         })
         .collect()
 }
 
+/// A path as a field of the log, which is split at tabs and line ends. Written out rather than
+/// replaced by spaces: `a<tab>b.mkv` would otherwise read as `a b.mkv`, and a skip made for
+/// the one would hold for the other.
+fn escape_name(name: &str) -> String {
+    name.replace('\\', "\\\\").replace('\t', "\\t").replace('\n', "\\n").replace('\r', "\\r")
+}
+
+/// The name [`escape_name`] wrote. A backslash before anything else is one of its own: the
+/// logs of earlier versions did not escape it.
+fn unescape_name(field: &str) -> String {
+    let mut name = String::with_capacity(field.len());
+    let mut chars = field.chars().peekable();
+    while let Some(c) = chars.next() {
+        let meant = match (c, chars.peek()) {
+            ('\\', Some('\\')) => Some('\\'),
+            ('\\', Some('t')) => Some('\t'),
+            ('\\', Some('n')) => Some('\n'),
+            ('\\', Some('r')) => Some('\r'),
+            _ => None,
+        };
+        if meant.is_some() {
+            chars.next();
+        }
+        name.push(meant.unwrap_or(c));
+    }
+    name
+}
+
 fn log_line(log: &Path, status: &str, input: &Path, size: u64, detail: &str, settings: &str) -> Result<()> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let clean = |s: &str| s.replace(['\t', '\n'], " ");
-    let line = format!("{now}\t{status}\t{}\t{size}\t{}\t{settings}", clean(&input.display().to_string()), clean(detail));
+    let clean = detail.replace(['\t', '\n'], " ");
+    let line = format!("{now}\t{status}\t{}\t{size}\t{clean}\t{settings}", escape_name(&input.display().to_string()));
     Ok(crate::files::append_line(log, &line, false)?)
 }
 
@@ -699,6 +727,28 @@ mod tests {
         assert_eq!(outs(&["in/Kay", "in/loose.mp4"]), p(&["", "old", ""]));
         // Two: the same file name in both no longer lands on one output.
         assert_eq!(outs(&["in/Kay", "in/Sofia/", "in/loose.mp4"]), p(&["Kay", "Kay/old", "Sofia", ""]));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_name_with_a_tab_or_line_break_stays_its_own_in_the_log() {
+        let dir = std::env::temp_dir().join(format!("av1opt-oddlog-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join(LOG_NAME);
+        let names = ["/v/a\tb.mkv", "/v/c\nd.mkv", "/v/e\rf.mkv", "/v/back\\slash.mkv", "/v/lit\\tab.mkv"];
+        for n in names {
+            log_line(&log, "skip", Path::new(n), 10, "lean", "s").unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), names.len());
+        let skips = read_skips(&log, "s");
+        for n in names {
+            assert!(skips.contains_key(&(PathBuf::from(n), 10)), "{n:?}");
+        }
+        // The file with spaces where the other has a tab is another file.
+        assert!(!skips.contains_key(&(PathBuf::from("/v/a b.mkv"), 10)));
+        assert!(!skips.contains_key(&(PathBuf::from("/v/c d.mkv"), 10)));
+        // A backslash in the log of an earlier version stays what it was.
+        assert_eq!(unescape_name("/v/back\\slash.mkv"), "/v/back\\slash.mkv");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

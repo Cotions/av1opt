@@ -63,8 +63,9 @@ pub struct MediaInfo {
     #[serde(default)]
     pub vfr: bool,
     pub duration_s: f64,
-    /// Length of the video stream itself, 0 when the container doesn't say. A recording whose
-    /// sound runs on after the picture stops has a `duration_s` far past its last frame.
+    /// Length of the video stream itself, from its first frame to the end of its last, 0 when
+    /// the container doesn't say. A recording whose sound runs on after the picture stops has
+    /// a `duration_s` far past its last frame.
     #[serde(default)]
     pub video_s: f64,
     /// Container start time and the video stream's own start time, in seconds.
@@ -120,6 +121,16 @@ impl MediaInfo {
     /// Seconds of picture: what samples, spot checks and frame counts can come from.
     pub fn picture_secs(&self) -> f64 {
         if self.video_s > 0.0 && self.video_s < self.duration_s { self.video_s } else { self.duration_s }
+    }
+
+    /// When the picture starts, counted from the start of the file (sound can start earlier).
+    pub fn picture_start(&self) -> f64 {
+        (self.video_start - self.start_time).max(0.0)
+    }
+
+    /// When the picture stops, counted from the start of the file.
+    pub fn picture_end(&self) -> f64 {
+        self.picture_start() + self.picture_secs()
     }
 }
 
@@ -226,21 +237,35 @@ fn probe_within(ffprobe: &str, path: &Path, file_size: u64, limit: Duration) -> 
         v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
     };
     let start_time = num(&j["format"]["start_time"]).unwrap_or(0.0);
-    let matroska = j["format"]["format_name"].as_str().is_some_and(|f| f.contains("matroska"));
-    let from_end = |end: f64| if matroska { length_from_end(end, start_time) } else { end };
-    let duration_s = num(&j["format"]["duration"]).map(from_end)
-        .or_else(|| num(&video["duration"]))
-        .unwrap_or(0.0);
-    // Matroska keeps a stream's length in a tag ("00:07:39.966000000"), MP4 in the stream.
-    let video_s = num(&video["duration"])
-        .or_else(|| video["tags"]["DURATION"].as_str().and_then(clock_secs).map(from_end))
-        .unwrap_or(0.0);
     let avg_rate = parse_rate(video["avg_frame_rate"].as_str());
     let nominal_rate = parse_rate(video["r_frame_rate"].as_str());
     let fps = avg_rate.or(nominal_rate).unwrap_or(0.0);
     let vfr = matches!((avg_rate, nominal_rate), (Some(a), Some(r)) if (a - r).abs() / r > 0.005);
-    let video_start = num(&video["start_time"]).unwrap_or(start_time);
+    let mut video_start = num(&video["start_time"]).unwrap_or(start_time);
 
+    // Matroska keeps a stream's length in a tag ("00:07:39.966000000"), MP4 in the stream.
+    let tagged_length = video["tags"]["DURATION"].as_str().and_then(clock_secs);
+    let stated = num(&j["format"]["duration"]);
+    // What a Matroska file calls its duration depends on who wrote it, which only shows when
+    // the file does not start at zero: ffmpeg writes when its last frame ends, mkvmerge how
+    // long it is. Nearly every file does start at zero, and pays nothing for this.
+    let frame = if fps > 0.0 { 1.0 / fps } else { 0.1 };
+    let starts_late = j["format"]["format_name"].as_str().is_some_and(|f| f.contains("matroska")) && (start_time > frame || video_start - start_time > frame);
+    let from_end = |end: f64| if starts_late { length_from_end(end, start_time) } else { end };
+    let mut duration_s = stated.map(from_end).or_else(|| num(&video["duration"])).unwrap_or(0.0);
+    let mut video_s = num(&video["duration"]).or_else(|| tagged_length.map(from_end)).unwrap_or(0.0);
+    if starts_late
+        && let Some(ends) = stated.and_then(|d| matroska_ends(ffprobe, path, video["index"].as_u64().unwrap_or(0), frame, start_time + d))
+        && ends.file > start_time
+    {
+        video_start = ends.first_frame.unwrap_or(video_start);
+        duration_s = ends.file - start_time;
+        // A picture that stopped long before the sound is not in the end of the file: its tag
+        // says how long it is the way the file's duration does.
+        let duration_is_an_end = stated.is_some_and(|d| (d - ends.file).abs() <= (d - duration_s).abs());
+        let by_tag = tagged_length.map(|t| if duration_is_an_end { t - video_start } else { t });
+        video_s = ends.picture.map(|end| end - video_start).or(by_tag).filter(|s| *s > 0.0).unwrap_or(video_s);
+    }
     let audio: Vec<&Value> = streams.iter().filter(|s| s["codec_type"] == "audio").collect();
     let total_bitrate = if duration_s > 0.0 { file_size as f64 * 8.0 / duration_s } else { 0.0 };
     // Matroska has no field for a stream's rate; mkvmerge writes it as a tag. A file encoded
@@ -393,14 +418,95 @@ fn parse_rate(s: Option<&str>) -> Option<f64> {
     (d > 0.0 && n > 0.0).then(|| n / d)
 }
 
-/// Seconds in a "hh:mm:ss.fraction" clock time.
-/// How long a Matroska file is, from what it calls its duration: the time its last frame
-/// ends, which for a file that starts at 5 s is 5 s more than it holds. Samples placed along
-/// that length would fall past the end.
+/// How long a Matroska file is if what it calls its duration is the time its last frame
+/// ends, as ffmpeg writes it: for a file that starts at 5 s, 5 s less than that. What is
+/// left to go by where the packets could not be read (see [`matroska_ends`]).
 fn length_from_end(end: f64, start: f64) -> f64 {
     if start > 0.0 && end > start { end - start } else { end }
 }
 
+/// Where a Matroska file's packets say it starts and ends, in the file's timestamps.
+#[derive(Debug, PartialEq)]
+struct PacketEnds {
+    /// Where the last packet of any stream ends.
+    file: f64,
+    /// Where the last packet of the video ends, if it is among the file's last.
+    picture: Option<f64>,
+    /// When the video's first frame is shown.
+    first_frame: Option<f64>,
+}
+
+/// How much of the end of a file is read for [`matroska_ends`]: enough for the last packet
+/// of every stream that goes on to the end, and little enough to take no time.
+const END_SECS: f64 = 10.0;
+
+/// A disk that has gone quiet should not stop a scan: past this the file's own word stands.
+const END_READ_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Reads the first packets of the video and the last packets of the file. Only those: this
+/// costs the same on a file of 50 GB. `latest_end` is the latest the file can end; a seek past
+/// the real end lands on the last place the file's index knows, which is what is wanted.
+fn matroska_ends(ffprobe: &str, path: &Path, video: u64, frame: f64, latest_end: f64) -> Option<PacketEnds> {
+    let index = video.to_string();
+    let first = packets(ffprobe, path, &["-select_streams", &index, "-read_intervals", "%+#16", "-show_entries", "packet=pts_time"])?;
+    let first_frame = first.lines().filter_map(|l| l.trim().trim_end_matches(',').parse::<f64>().ok()).min_by(f64::total_cmp);
+    let from = format!("{:.3}%", (latest_end - END_SECS).max(0.0));
+    let last = packets(ffprobe, path, &["-read_intervals", &from, "-show_entries", "packet=stream_index,pts_time,duration_time"])?;
+    let ends = last_ends(&last, &index, frame);
+    Some(PacketEnds { file: ends.0?, picture: ends.1, first_frame })
+}
+
+/// From lines of "stream,time,duration": where the last packet of any stream ends, and where
+/// the last of stream `video` does. A video packet without a duration lasts one `frame`.
+fn last_ends(lines: &str, video: &str, frame: f64) -> (Option<f64>, Option<f64>) {
+    let (mut file, mut picture) = (None::<f64>, None::<f64>);
+    for line in lines.lines() {
+        let mut fields = line.trim().trim_end_matches(',').split(',');
+        let (Some(stream), Some(Ok(pts))) = (fields.next(), fields.next().map(str::parse::<f64>)) else { continue };
+        let lasts = fields.next().and_then(|d| d.parse::<f64>().ok());
+        let is_video = stream == video;
+        let end = pts + lasts.unwrap_or(if is_video { frame } else { 0.0 });
+        file = Some(file.map_or(end, |f| f.max(end)));
+        if is_video {
+            picture = Some(picture.map_or(end, |p| p.max(end)));
+        }
+    }
+    (file, picture)
+}
+
+/// The packet lines ffprobe prints for `what`, or None if it fails or takes too long.
+fn packets(ffprobe: &str, path: &Path, what: &[&str]) -> Option<String> {
+    let mut child = Command::new(ffprobe)
+        .args(["-v", "error"])
+        .args(what)
+        .args(["-of", "csv=p=0"])
+        .arg(crate::tools::probe_arg(path))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        stdout.read_to_string(&mut text).map(|_| text).ok()
+    });
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < END_READ_LIMIT => std::thread::sleep(std::time::Duration::from_millis(5)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    reader.join().ok().flatten().filter(|_| status.success())
+}
+
+/// Seconds in a "hh:mm:ss.fraction" clock time.
 fn clock_secs(s: &str) -> Option<f64> {
     let mut parts = s.trim().split(':');
     let (h, m, sec) = (parts.next()?, parts.next()?, parts.next()?);
@@ -414,6 +520,101 @@ fn clock_secs(s: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A short Matroska file made by ffmpeg with the picture at `video_at`, and sound from
+    /// `sound_at` to the end of the picture if asked for.
+    fn matroska(ffmpeg: &str, path: &Path, video_at: f64, sound_at: Option<f64>, secs: u32) {
+        let mut c = Command::new(ffmpeg);
+        c.args(["-v", "error", "-nostdin", "-y", "-itsoffset", &video_at.to_string(), "-f", "lavfi", "-i"]).arg(format!("testsrc2=s=64x64:r=25:d={secs}"));
+        if let Some(at) = sound_at {
+            let length = video_at + f64::from(secs) - at;
+            c.args(["-itsoffset", &at.to_string(), "-f", "lavfi", "-i"]).arg(format!("sine=d={length}"));
+        }
+        let made = c.args(["-c:v", "libx264", "-preset", "ultrafast", "-g", "25", "-pix_fmt", "yuv420p"]).arg(path).output().unwrap();
+        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+    }
+
+    /// Writes `secs` into the file's Duration element and `tag` over its stream length, as a
+    /// program that states lengths instead of ends would have them.
+    fn state_length(path: &Path, secs: f64, tag: (&str, &str)) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let at = bytes.windows(3).position(|w| w == [0x44, 0x89, 0x88]).expect("a Duration element") + 3;
+        bytes[at..at + 8].copy_from_slice(&(secs * 1000.0).to_be_bytes());
+        let at = bytes.windows(tag.0.len()).position(|w| w == tag.0.as_bytes()).expect("a DURATION tag");
+        bytes[at..at + tag.1.len()].copy_from_slice(tag.1.as_bytes());
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn close(a: f64, b: f64, what: &str) {
+        assert!((a - b).abs() < 0.05, "{what}: {a} where {b} was expected");
+    }
+
+    #[test]
+    fn a_matroska_file_is_measured_from_its_packets_when_it_does_not_start_at_zero() {
+        let Some(tools) = crate::tools::real_tools("a_matroska_file_is_measured_from_its_packets") else { return };
+        let ffmpeg = std::env::var("AV1OPT_FFMPEG").unwrap();
+        let dir = std::env::temp_dir().join(format!("av1opt-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // ffprobe behind a script that counts its runs.
+        let runs = dir.join("runs");
+        let counting = dir.join("ffprobe");
+        std::fs::write(&counting, format!("#!/bin/sh\necho run >> '{}'\nexec '{}' \"$@\"\n", runs.display(), tools.ffprobe)).unwrap();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut std::fs::metadata(&counting).unwrap().permissions(), 0o755);
+        std::fs::set_permissions(&counting, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let read = |path: &Path| {
+            let _ = std::fs::remove_file(&runs);
+            let info = probe(&counting.to_string_lossy(), path, std::fs::metadata(path).unwrap().len()).unwrap();
+            (info, std::fs::read_to_string(&runs).unwrap().lines().count())
+        };
+
+        // At zero: what the file says, from the one run every file costs.
+        let plain = dir.join("plain.mkv");
+        matroska(&ffmpeg, &plain, 0.0, None, 4);
+        let (info, cost) = read(&plain);
+        close(info.duration_s, 4.0, "plain");
+        assert_eq!(cost, 1);
+
+        // Starting at 5 s, for 4 s, with a duration that is the end and one that is the length.
+        let ends = dir.join("ends.mkv");
+        matroska(&ffmpeg, &ends, 5.0, None, 4);
+        let lengths = dir.join("lengths.mkv");
+        std::fs::copy(&ends, &lengths).unwrap();
+        state_length(&lengths, 4.0, ("00:00:09.000000000", "00:00:04.000000000"));
+        for path in [&ends, &lengths] {
+            let (info, cost) = read(path);
+            close(info.duration_s, 4.0, "duration");
+            close(info.video_s, 4.0, "picture");
+            close(info.video_start, 5.0, "first frame");
+            assert!(cost > 1);
+        }
+        // A length close to the start, which taken for an end left next to nothing.
+        let close_by = dir.join("close-by.mkv");
+        matroska(&ffmpeg, &close_by, 6.0, None, 6);
+        state_length(&close_by, 6.04, ("00:00:12.000000000", "00:00:06.040000000"));
+        let (info, _) = read(&close_by);
+        close(info.duration_s, 6.0, "length near the start");
+        close(info.picture_secs(), 6.0, "picture near the start");
+
+        // The file starts at zero with sound, the picture at 2 s: a picture of 4 s, not 6.
+        let late_picture = dir.join("late-picture.mkv");
+        matroska(&ffmpeg, &late_picture, 2.0, Some(0.0), 4);
+        let (info, cost) = read(&late_picture);
+        close(info.video_s, 4.0, "late picture");
+        close(info.picture_start(), 2.0, "where the picture starts");
+        close(info.picture_end(), 6.0, "where the picture ends");
+        assert!(cost > 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_last_packets_say_where_a_file_and_its_picture_end() {
+        let lines = "0,10.000000,0.040000\n1,10.010000,0.023000,\n0,10.080000,N/A\n1,N/A,0.023000\n1,12.000000,N/A\n";
+        assert_eq!(last_ends(lines, "0", 0.04), (Some(12.0), Some(10.12)));
+        // The picture stopped long before: only the sound is at the end.
+        assert_eq!(last_ends("1,99.000000,1.000000\n", "0", 0.04), (Some(100.0), None));
+        assert_eq!(last_ends("", "0", 0.04), (None, None));
+    }
 
     #[test]
     fn a_matroska_length_is_counted_from_where_the_file_starts() {

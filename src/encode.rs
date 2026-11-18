@@ -420,10 +420,10 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     let cut = if o.remove.is_empty() { None } else { Some(Sections::new(&o.remove, info.duration_s)?) };
     // (The parts kept are counted along the whole file; samples and checks taken where there
     // is sound and no picture would have nothing in them.)
-    if cut.is_some() && info.duration_s - info.picture_secs() > 1.0 {
+    if cut.is_some() && info.duration_s - info.picture_end() > 1.0 {
         bail!(
             "the picture stops at {}, sound or subtitles run on to {}: sections cannot be removed from such a file",
-            hms(info.picture_secs()), hms(info.duration_s)
+            hms(info.picture_end()), hms(info.duration_s)
         );
     }
     if info.codec == "av1" && !o.force && cut.is_none() {
@@ -461,8 +461,8 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         video_mbps: info.video_bitrate / 1e6, hdr: info.hdr,
     });
     let mut notes = Vec::new();
-    if info.duration_s - info.picture_secs() > 1.0 {
-        notes.push(format!("the picture stops at {}, sound or subtitles run on to {}: the tracks that are kept keep their length", hms(info.picture_secs()), hms(info.duration_s)));
+    if info.duration_s - info.picture_end() > 1.0 {
+        notes.push(format!("the picture stops at {}, sound or subtitles run on to {}: the tracks that are kept keep their length", hms(info.picture_end()), hms(info.duration_s)));
     }
     if o.tuning.is_some() {
         let class = crate::tuning::Class::of(info.width, info.height).label();
@@ -530,10 +530,10 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
             let count = |secs: f64| o.samples.unwrap_or_else(|| search::sample_count(secs));
             let secs = o.sample_secs.unwrap_or(search::SAMPLE_SECS);
             // What a search that has to mind the worst stretch goes by.
-            let lasting = || search::sample_positions(info.picture_secs(), count(info.picture_secs()), secs);
+            let lasting = || search::in_file_time(&info, search::sample_positions(info.picture_secs(), count(info.picture_secs()), secs));
             let pos = match &cut {
                 Some(c) => c.sample_positions(count(c.kept()), secs),
-                None if mean_only => search::mean_sample_positions(info.picture_secs(), search::mean_sample_count(info.picture_secs()), search::MEAN_SAMPLE_SECS),
+                None if mean_only => search::in_file_time(&info, search::mean_sample_positions(info.picture_secs(), search::mean_sample_count(info.picture_secs()), search::MEAN_SAMPLE_SECS)),
                 None => lasting(),
             };
             // A stretch that fails after all is searched for among samples long enough to
@@ -1414,8 +1414,9 @@ fn check_layout(tools: &Tools, info: &MediaInfo, out: &Path, streams: &Streams, 
 /// picture is, the containers are compared.
 fn lengths_to_compare(info: &MediaInfo, out: &MediaInfo, cut: Option<&Sections>) -> (f64, f64) {
     if info.video_s > 0.0 && out.video_s > 0.0 {
-        let picture = info.picture_secs();
-        (out.picture_secs(), cut.map_or(picture, |c| c.kept_within(picture)))
+        // Sections are times in the file, and the picture may start after the file does.
+        let kept = |c: &Sections| c.kept_within(info.picture_end()) - c.kept_within(info.picture_start());
+        (out.picture_secs(), cut.map_or(info.picture_secs(), kept))
     } else {
         (out.duration_s, cut.map_or(info.duration_s, Sections::kept))
     }
@@ -1474,8 +1475,10 @@ fn verify(
     let mut low = Vec::new();
     let floor = target_vmaf - VERIFY_SLACK;
     for (i, (start, secs)) in spot_checks(cut.map_or(info.picture_secs(), Sections::kept)).into_iter().enumerate() {
-        // The same picture sits at different times in the source when sections were removed.
-        let (start, src_start, secs) = cut.map_or((start, start, secs), |c| c.window(start, secs));
+        // The same picture sits at different times in the source when sections were removed,
+        // and each file's picture starts where that file puts it.
+        let along = (start + search::first_frame(&out_info), start + search::first_frame(info), secs);
+        let (start, src_start, secs) = cut.map_or(along, |c| c.window(start, secs));
         let v = spot_check(tools, input, info, out, &out_info, (start, src_start, secs), floor, threads, tmp, &format!("verify{i}"))?;
         eprintln!("  spot check at {}: VMAF {v:.2}", hms(start));
         tools.emit(Event::SpotCheck { at_secs: start, vmaf: v });
@@ -1738,6 +1741,9 @@ mod tests {
         // What a cut removes comes off, and past the end of the picture it removes nothing.
         let cut = Sections::new(&[(10.0, 20.0), (110.0, f64::INFINITY)], 130.0).unwrap();
         assert_eq!(lengths_to_compare(&media(130.0, 100.0), &media(90.0, 90.0), Some(&cut)), (90.0, 90.0));
+        // The picture runs from 20 s to 70 s of the file: the section before it takes nothing off.
+        let late = MediaInfo { video_start: 20.0, ..media(120.0, 50.0) };
+        assert_eq!(lengths_to_compare(&late, &media(50.0, 50.0), Some(&cut)), (50.0, 50.0));
 
         // Where either picture's length is not known, the containers are what is known.
         assert_eq!(lengths_to_compare(&media(600.0, 0.0), &media(599.0, 599.0), None), (599.0, 600.0));

@@ -285,11 +285,18 @@ fn cache_file() -> Result<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
         .context("no HOME or XDG_CACHE_HOME")?;
-    let dir = base.join("av1opt");
-    std::fs::create_dir_all(&dir)?;
-    // Bump the version when MediaInfo gains fields that change verdicts, so old entries are re-probed.
-    let _ = std::fs::remove_file(dir.join("probe-cache-v2.json"));
-    Ok(dir.join("probe-cache-v3.json"))
+    cache_file_in(&base.join("av1opt"))
+}
+
+fn cache_file_in(dir: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    // Bump the version when MediaInfo gains fields that change verdicts or what is read into
+    // them, so old entries are re-probed. Version 3 holds Matroska lengths taken from what the
+    // file calls its duration, wrong for files that do not start at zero.
+    for old in ["probe-cache-v2.json", "probe-cache-v3.json"] {
+        let _ = std::fs::remove_file(dir.join(old));
+    }
+    Ok(dir.join("probe-cache-v4.json"))
 }
 
 /// Leaves out the files whose paths are not text and says how many there were, for what has
@@ -334,6 +341,16 @@ mod tests {
         let kept: HashMap<PathBuf, CacheEntry> = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
         assert_eq!(kept.keys().map(|p| p.file_name().unwrap().to_str().unwrap()).collect::<Vec<_>>(), ["broken.mkv"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probes_of_an_older_version_are_left_behind() {
+        let dir = std::env::temp_dir().join(format!("av1opt-scan-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("probe-cache-v3.json"), b"{}").unwrap();
+        assert_eq!(cache_file_in(&dir).unwrap(), dir.join("probe-cache-v4.json"));
+        assert!(!dir.join("probe-cache-v3.json").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn totals(items: &[(f64, f64)], picked: &[usize]) -> (f64, f64) {

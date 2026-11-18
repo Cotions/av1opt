@@ -1021,6 +1021,40 @@ fn a_stream_whose_seeks_land_late_is_cut_at_the_frames_asked_for() {
     assert_eq!(frames(&c.out().join("gop.mp4")), 576);
 }
 
+/// Start of the first packet of a stream, in the file's timestamps.
+fn first_packet(path: &Path, stream: &str) -> f64 {
+    let out = ffprobe(&["-select_streams", stream, "-read_intervals", "%+#32", "-show_entries", "packet=pts_time", "-of", "csv=p=0"], path);
+    out.lines().filter_map(|l| l.trim().trim_end_matches(',').parse::<f64>().ok()).fold(f64::INFINITY, f64::min)
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_picture_inside_longer_sound_keeps_its_place_in_every_container() {
+    // Sound from 3 s to 15 s, the picture from 5 s to 13 s: Matroska states where the picture
+    // ends and MP4 how long it is, and the check of the length has to see past that.
+    let c = Case::new("picture-inside");
+    c.ffmpeg(&[
+        "-f", "lavfi", "-i", "testsrc2=s=320x180:r=24:d=8", "-f", "lavfi", "-i", "sine=f=440:d=12", "-map", "0", "-map", "1",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "16", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "64k", "base.mkv",
+    ]);
+    for name in ["inside.mkv", "inside.mp4"] {
+        c.ffmpeg(&["-itsoffset", "5", "-i", "base.mkv", "-itsoffset", "3", "-i", "base.mkv", "-map", "0:v", "-map", "1:a", "-c", "copy", name]);
+    }
+    std::fs::remove_file(c.videos().join("base.mkv")).unwrap();
+    for name in ["inside.mkv", "inside.mp4"] {
+        for container in ["mp4", "mkv"] {
+            let out_dir = c.dir.join(format!("out-{name}-{container}"));
+            let src = c.videos().join(name);
+            c.encode_into(&out_dir, &[&src], &["--container", container]).ok().has("encoded 1, skipped 0, failed 0");
+            let out = out_dir.join("inside").with_extension(container);
+            assert_eq!(frames(&out), 192, "{name} to {container}");
+            let lead = |p: &Path| first_packet(p, "v:0") - first_packet(p, "a:0");
+            assert!((lead(&out) - lead(&src)).abs() < 0.03, "{name} to {container}: the sound led by {:.3} s, now by {:.3} s", lead(&src), lead(&out));
+            assert!(c.report_in(&out_dir, "inside")["verify_vmaf"].as_array().unwrap().iter().all(|v| v.as_f64().unwrap() > 80.0), "{name} to {container}");
+        }
+    }
+}
+
 
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]

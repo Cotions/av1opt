@@ -315,7 +315,14 @@ pub fn extract_reference(
 /// When a file's first video frame is shown, counted from the start of the file (other
 /// streams can start earlier).
 pub fn first_frame(info: &MediaInfo) -> f64 {
-    (info.video_start - info.start_time).max(0.0)
+    info.picture_start()
+}
+
+/// Clips placed along the picture, as (start, length) in the file's time, which is what
+/// [`extract_reference`] takes: where sound comes first, the picture starts later than the file.
+pub fn in_file_time(info: &MediaInfo, along_picture: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
+    let first = first_frame(info);
+    along_picture.into_iter().map(|(start, secs)| (start + first, secs)).collect()
 }
 
 /// How long a sample clip is unless `--sample-secs` says otherwise: about what a spot check

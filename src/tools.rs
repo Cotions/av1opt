@@ -467,19 +467,40 @@ impl Tools {
         Ok(String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.trim().is_empty()).map(|l| l.contains('K')).collect())
     }
 
-    /// Number of video packets (= frames) in the first video stream, without decoding.
+    /// Number of video packets (= frames) in the first video stream, without decoding. A file
+    /// with no frames in it counts none; one that cannot be read is an error.
     pub fn count_frames(&self, path: &Path) -> Result<u64> {
         let out = Command::new(&self.ffprobe)
             .args(["-v", "error", "-select_streams", "v:0", "-count_packets", "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0"])
             .arg(probe_arg(path))
             .output()
             .context("failed to run ffprobe")?;
-        String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .trim_end_matches(',')
-            .parse()
-            .with_context(|| format!("cannot count frames in {}", path.display()))
+        frames_counted(&out, path)
     }
+}
+
+/// What ffprobe's count of packets comes to. ffmpeg leaves a clip it had no frame for as a
+/// header with nothing behind it, and ffprobe ends such a file with "End of file".
+fn frames_counted(out: &Output, path: &Path) -> Result<u64> {
+    let said = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        if crate::probe::one_line(&said).ends_with("End of file") {
+            return Ok(0);
+        }
+        bail!("{}: {}", cannot_count(path), crate::probe::reason(&said, Path::new(&probe_arg(path))));
+    }
+    let count = String::from_utf8_lossy(&out.stdout);
+    let count = count.trim().trim_end_matches(',');
+    if count.is_empty() {
+        return Ok(0);
+    }
+    count.parse().with_context(|| format!("{}: ffprobe said {count:?}", cannot_count(path)))
+}
+
+/// Every file counted is one av1opt has just written, so the original is still as it was.
+fn cannot_count(path: &Path) -> String {
+    let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
+    format!("the original is untouched, but the frames of {name}, a file av1opt had just made from it, could not be counted (running it again may get past this)")
 }
 
 /// Why a file cannot be worked on, where its name is not text.
@@ -548,9 +569,36 @@ fn svt_version(log: &str) -> Option<String> {
     (!v.is_empty()).then(|| v.to_string())
 }
 
+/// A real ffmpeg and ffprobe for a test that needs them (`AV1OPT_FFMPEG`, `AV1OPT_FFPROBE`).
+/// Without them such a test says so and passes: the plain `cargo test` needs no ffmpeg.
+#[cfg(test)]
+pub(crate) fn real_tools(test: &str) -> Option<Tools> {
+    match (std::env::var("AV1OPT_FFMPEG"), std::env::var("AV1OPT_FFPROBE")) {
+        (Ok(ffmpeg), Ok(ffprobe)) => Some(Tools::new(ffmpeg, ffprobe, None)),
+        _ => {
+            eprintln!("{test}: skipped, AV1OPT_FFMPEG and AV1OPT_FFPROBE are not set");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_clip_without_frames_counts_none_and_a_failure_stays_a_failure() {
+        use std::os::unix::process::ExitStatusExt;
+        let path = Path::new("/v/clip.mkv");
+        let said = |code: i32, stdout: &str, stderr: &str| Output { status: std::process::ExitStatus::from_raw(code << 8), stdout: stdout.into(), stderr: stderr.into() };
+        assert_eq!(frames_counted(&said(0, "120,\n", ""), path).unwrap(), 120);
+        assert_eq!(frames_counted(&said(0, "", ""), path).unwrap(), 0);
+        // What ffprobe says of the header ffmpeg leaves when it had no frame to write.
+        assert_eq!(frames_counted(&said(1, "", "[matroska @ 0x1] Duplicate element\n/v/clip.mkv: End of file\n"), path).unwrap(), 0);
+        let e = frames_counted(&said(1, "", "/v/clip.mkv: Input/output error\n"), path).unwrap_err().to_string();
+        assert!(e.starts_with("the original is untouched") && e.contains("clip.mkv") && e.ends_with("): Input/output error"), "{e}");
+        assert!(frames_counted(&said(0, "many", ""), path).is_err());
+    }
 
     #[test]
     fn a_name_that_is_not_text_never_reaches_ffmpeg_as_another_name() {

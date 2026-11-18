@@ -197,6 +197,10 @@ pub const VMAF_STRIDE: u32 = 3;
 
 pub const PREROLL_SECS: f64 = 2.0;
 
+/// How far before its first try a cut seeks when that try landed past the clip: more than the
+/// distance between key frames of any ordinary video.
+pub const SEEK_BACK_SECS: f64 = 30.0;
+
 /// Moves a seek point to a quarter of a frame before the nearest frame. A seek that lands on
 /// a frame (or half-way between two) is decided by the last digit of a timestamp, and
 /// containers round those differently: Matroska keeps milliseconds, so the same frame is at
@@ -211,10 +215,41 @@ pub fn snap_seek(t: f64, fps: f64, first_frame: f64) -> f64 {
     (first_frame + (frame - 0.25) / fps).max(0.0)
 }
 
+/// Where a clip lies in its file, in the file's time (see [`clip_place`]).
+#[derive(Debug, PartialEq)]
+struct ClipPlace {
+    /// Where decoding starts, a run-in before the clip. None where the clip is so near the
+    /// first frame that decoding from the start costs no more.
+    seek: Option<f64>,
+    /// A quarter of a frame before the clip's first frame: the first frame from here on is
+    /// the clip's, whatever the last digit of its timestamp (see [`snap_seek`]).
+    from: f64,
+}
+
+/// The place of the clip at `start` seconds of a file whose frames come `rate` a second, the
+/// first of them at `first_frame`. It depends on nothing but these, so that a file and its
+/// encode, and a cut that seeks and one that decodes from the start, take the same frames.
+fn clip_place(start: f64, rate: f64, first_frame: f64) -> ClipPlace {
+    let into_picture = (start - first_frame).max(0.0);
+    if rate.is_nan() || rate <= 0.0 {
+        return ClipPlace { seek: (into_picture > PREROLL_SECS).then_some(start - PREROLL_SECS), from: start };
+    }
+    if into_picture > PREROLL_SECS {
+        let seek = snap_seek(start - PREROLL_SECS, rate, first_frame);
+        let run_in = (PREROLL_SECS * rate).round() / rate;
+        // (A seek moved to the very start has lost its quarter of a frame.)
+        let from = if seek > 0.0 { seek + run_in } else { first_frame + run_in - 0.25 / rate };
+        ClipPlace { seek: Some(seek).filter(|s| *s > 0.0), from }
+    } else {
+        ClipPlace { seek: None, from: first_frame + ((into_picture * rate).round() - 0.25) / rate }
+    }
+}
+
 /// Lossless, constant-frame-rate cut of `input` starting at `start` seconds (moved by less
-/// than a frame, see [`snap_seek`]). `is_source` applies [`source_filters`]; pass false when
-/// cutting from an already-encoded output. `first_frame` is the time of this file's first
-/// video frame after the start of the file.
+/// than a frame, see [`clip_place`]). Returns how many frames it holds, which is more than
+/// none. `is_source` applies [`source_filters`]; pass false when cutting from an
+/// already-encoded output. `first_frame` is the time of this file's first video frame after
+/// the start of the file.
 #[allow(clippy::too_many_arguments)]
 pub fn extract_reference(
     tools: &Tools,
@@ -225,30 +260,37 @@ pub fn extract_reference(
     start: f64,
     secs: f64,
     out: &Path,
-) -> Result<()> {
-    let mut vf = if is_source { source_filters(info) } else { Vec::new() };
-    // Time counts from the first frame kept before frames are put on the constant-rate grid:
-    // every frame is then at a whole number of frame times, give or take the container's
-    // rounding, and lands in its own slot. Counted from the seek point instead, a cut half-way
-    // between two frames puts every frame on the edge between two slots, where millisecond
-    // rounding decides: an MKV output then came out with every third frame doubled and the
-    // next one dropped, while its MP4 source did not (seen as a spot check of VMAF 70).
-    vf.push("setpts=PTS-STARTPTS".into());
-    vf.push(format!("fps={}", cfr(info)));
-    // Seeking straight to `start` can begin decoding mid-GOP (MPEG-2/TS, open-GOP H.264) and
-    // return frames from the wrong place. Seek a little earlier and discard the warm-up after
-    // decoding (output-side -ss), so the decoder has a clean run-in.
-    let preroll = start.min(PREROLL_SECS);
-    let seek = snap_seek(start - preroll, cfr_value(info), first_frame);
-    let cut = |seek: Option<f64>, skip: f64| -> Result<bool> {
+) -> Result<u64> {
+    let place = clip_place(start, cfr_value(info), first_frame);
+    let cut = |seek: Option<f64>| -> Result<u64> {
+        let mut vf = if is_source { source_filters(info) } else { Vec::new() };
+        // The frames are chosen by the file's own times, which ffmpeg counts from the seek
+        // point: where the decoder happens to start must not move the clip. Decoding has to
+        // start before the clip: a seek can land past the place it was sent to (MPEG-TS, no
+        // index, key frames far apart), and then the first frame seen is not the clip's first.
+        // Such a cut keeps nothing, and is made again from further back.
+        let from = place.from - seek.unwrap_or(0.0);
+        vf.push(match seek {
+            Some(_) => format!("select='gte(t,{from:.6})*if(eq(n,0),st(0,lt(t,{from:.6})),ld(0))'"),
+            None => format!("select='gte(t,{from:.6})'"),
+        });
+        // Time counts from the first frame kept before frames are put on the constant-rate
+        // grid: every frame is then at a whole number of frame times, give or take the
+        // container's rounding, and lands in its own slot. Counted from the seek point instead,
+        // a cut half-way between two frames puts every frame on the edge between two slots,
+        // where millisecond rounding decides: an MKV output then came out with every third
+        // frame doubled and the next one dropped, while its MP4 source did not (seen as a spot
+        // check of VMAF 70).
+        vf.push("setpts=PTS-STARTPTS".into());
+        vf.push(format!("fps={}", cfr(info)));
         let mut args: Vec<String> = vec!["-y".into(), "-v".into(), "error".into()];
         if let Some(seek) = seek {
-            args.extend(["-ss".into(), format!("{seek:.4}")]);
+            args.extend(["-ss".into(), format!("{seek:.6}")]);
         }
         args.extend(
             [
                 "-i", &path_arg(input),
-                "-ss", &format!("{skip:.3}"), "-t", &format!("{secs:.3}"),
+                "-t", &format!("{secs:.3}"),
                 "-map", &format!("0:{}", if is_source { info.video_index } else { 0 }), "-an", "-sn",
                 "-vf", &vf.join(","), "-c:v", REFERENCE_CODEC, "-pix_fmt", reference_pix_fmt(info), &path_arg(out),
             ]
@@ -256,16 +298,16 @@ pub fn extract_reference(
         );
         tools.run(&args)?;
         // ffmpeg ends without complaint when it has nothing to write.
-        Ok(tools.count_frames(out).is_ok_and(|frames| frames > 0))
+        tools.count_frames(out)
     };
-    if cut(Some(seek), preroll)? {
-        return Ok(());
-    }
-    // A seek can land past the place it was sent to, where key frames are far apart or the
-    // file has no index (MPEG-TS most of all). Decoding from the start finds the place. The
-    // times of the filters count from the first frame.
-    if seek > 0.0 && cut(None, (start - first_frame).max(0.0))? {
-        return Ok(());
+    // The nearest place first: a run-in is all most files need. Decoding from the start finds
+    // the clip in any file, at the price of the whole way there.
+    let further_back = place.seek.map(|s| s - SEEK_BACK_SECS).filter(|s| *s > 0.0);
+    for seek in [place.seek, further_back].into_iter().flatten().map(Some).chain([None]) {
+        let frames = cut(seek)?;
+        if frames > 0 {
+            return Ok(frames);
+        }
     }
     bail!("no picture at {} in {}: the video ends earlier than it says, or is damaged", crate::tools::hms(start), input.display())
 }
@@ -356,9 +398,7 @@ pub fn extract_samples(tools: &Tools, input: &Path, info: &MediaInfo, tmp: &Path
                     let reference = tmp.join(format!("sample{i}.ref.mkv"));
                     eprintln!("  sample {}/{n} at {} ({secs:.0}s)", i + 1, crate::tools::hms(start));
                     tools.emit(crate::events::Event::Phase { phase: "sampling".into(), detail: format!("sample {}/{n} at {}", i + 1, crate::tools::hms(start)) });
-                    let cut = extract_reference(tools, input, info, true, first, start, secs, &reference)
-                        .and_then(|_| tools.count_frames(&reference))
-                        .map(|frames| Sample { reference, secs, frames });
+                    let cut = extract_reference(tools, input, info, true, first, start, secs, &reference).map(|frames| Sample { reference, secs, frames });
                     if cut.is_err() {
                         failed.store(true, Ordering::SeqCst);
                     }
@@ -382,7 +422,7 @@ pub fn extract_samples(tools: &Tools, input: &Path, info: &MediaInfo, tmp: &Path
     Ok(samples)
 }
 
-/// CRF trials measured in earlier runs, kept in `$XDG_CACHE_HOME/av1opt/trials-v1.jsonl`: an
+/// CRF trials measured in earlier runs, kept in `$XDG_CACHE_HOME/av1opt/trials-v2.jsonl`: an
 /// encode that was stopped, failed after its search, or is run again with another target or
 /// container doesn't measure the same CRFs twice. A trial counts only for the same file
 /// (path, size, date), the same sample clips and the same ffmpeg build.
@@ -433,7 +473,10 @@ impl TrialCache {
             Some(mark) => format!("{encoder}|lifted to {mark}"),
             None => encoder.to_string(),
         };
-        Self::open_at(dir.join("trials-v1.jsonl"), input, size, positions, &encoder, reuse)
+        // Version 1 was measured on clips cut by where the decoder started: for some files
+        // (MPEG-TS most of all) they were not the frames their positions say.
+        let _ = std::fs::remove_file(dir.join("trials-v1.jsonl"));
+        Self::open_at(dir.join("trials-v2.jsonl"), input, size, positions, &encoder, reuse)
     }
 
     fn open_at(path: PathBuf, input: &Path, size: u64, positions: &[(f64, f64)], encoder: &str, reuse: bool) -> Self {
@@ -1312,7 +1355,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let video = dir.join("a \"video\".mkv");
         std::fs::write(&video, b"12345").unwrap();
-        let store = dir.join("trials-v1.jsonl");
+        let store = dir.join("trials-v2.jsonl");
         let clips = [(10.0, 8.0), (50.0, 8.0)];
         let enc = EncodeSettings { preset: 6, pix_fmt_out: "yuv420p10le", params: "tune=0".into() };
         let open = |clips: &[(f64, f64)], encoder: &str, reuse: bool| TrialCache::open_at(store.clone(), &video, 5, clips, encoder, reuse);
@@ -1428,6 +1471,75 @@ mod tests {
             start_time: 0.0, video_start: 0.0, covers: vec![], attachments: 0, tags: Default::default(), video_s: 0.0, nominal_fps: 0.0, time_base: (0, 0),
             audio_streams: 0, subtitle_streams: 0, audio: vec![], subtitle_codecs: vec![], subtitle_dispositions: vec![], other_streams: vec![],
         }
+    }
+
+    #[test]
+    fn a_clip_is_placed_by_the_frames_of_its_file() {
+        let place = |start, rate, first| clip_place(start, rate, first);
+        // 3.3 s at 30 fps is frame 99: the seek goes two seconds before, a quarter of a frame
+        // before frame 39, and the clip starts a quarter of a frame before frame 99.
+        let p = place(3.3, 30.0, 0.0);
+        assert!((p.seek.unwrap() - 38.75 / 30.0).abs() < 1e-9 && (p.from - 98.75 / 30.0).abs() < 1e-9, "{p:?}");
+        // Near the first frame there is nothing to seek past.
+        let p = place(0.5, 25.0, 0.0);
+        assert!(p.seek.is_none() && (p.from - 12.75 / 25.0).abs() < 1e-9, "{p:?}");
+        assert!(place(0.0, 30.0, 0.0).from < 0.0);
+        // Sound starts two seconds before the picture: 3 s of the file is 1 s of the picture,
+        // and was cut as if it were two (the frames a run-in would have seen were not there).
+        let p = place(3.0, 30.0, 2.0);
+        assert!(p.seek.is_none() && (p.from - (2.0 + 29.75 / 30.0)).abs() < 1e-9, "{p:?}");
+        // Before the picture: from its first frame.
+        assert!((place(1.0, 30.0, 2.0).from - (2.0 - 0.25 / 30.0)).abs() < 1e-9);
+        // A clip just past the run-in seeks to the very start, a quarter of a frame early.
+        let p = place(2.004, 30.0, 0.0);
+        assert!(p.seek.is_none() && (p.from - 59.75 / 30.0).abs() < 1e-9, "{p:?}");
+        // Without a rate there is no grid to go by.
+        assert_eq!(place(5.0, 0.0, 0.0), ClipPlace { seek: Some(3.0), from: 5.0 });
+    }
+
+    /// The hash of every frame of `path`, in order.
+    fn frame_hashes(ffmpeg: &str, path: &Path, filter: Option<&str>) -> Vec<String> {
+        let mut c = std::process::Command::new(ffmpeg);
+        c.args(["-v", "error", "-nostdin", "-i"]).arg(path).args(["-map", "0:v:0", "-fps_mode", "passthrough", "-pix_fmt", "yuv420p"]);
+        if let Some(f) = filter {
+            c.args(["-vf", f]);
+        }
+        let out = c.args(["-f", "framemd5", "-"]).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.starts_with('#')).filter_map(|l| Some(l.rsplit(',').next()?.trim().to_string())).collect()
+    }
+
+    #[test]
+    fn a_clip_holds_the_frames_a_decode_from_the_start_finds() {
+        let Some(tools) = crate::tools::real_tools("a_clip_holds_the_frames_a_decode_from_the_start_finds") else { return };
+        let ffmpeg = std::env::var("AV1OPT_FFMPEG").unwrap();
+        let dir = std::env::temp_dir().join(format!("av1opt-clips-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A transport stream has no index, and a seek in it lands on the next key frame: with
+        // two seconds between them inside the run-in, with eight past the clip altogether.
+        for (name, gop, format) in [("two.ts", "50", "mpegts"), ("eight.ts", "200", "mpegts"), ("plain.mkv", "50", "matroska")] {
+            let path = dir.join(name);
+            let made = std::process::Command::new(&ffmpeg)
+                .args(["-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i", "testsrc2=s=160x120:r=25:d=16", "-c:v", "libx264", "-preset", "ultrafast", "-bf", "2"])
+                .args(["-pix_fmt", "yuv420p", "-g", gop, "-keyint_min", gop, "-sc_threshold", "0", "-f", format])
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+            let info = crate::probe::probe(&tools.ffprobe, &path, std::fs::metadata(&path).unwrap().len()).unwrap();
+            let all = frame_hashes(&ffmpeg, &path, None);
+            assert_eq!(all.len(), 400, "{name}");
+            for start in [0.0, 1.0, 2.2, 3.32, 9.0, 15.0] {
+                let clip = dir.join("clip.mkv");
+                let frames = extract_reference(&tools, &path, &info, true, first_frame(&info), start, 1.0, &clip).unwrap() as usize;
+                let first = (clip_place(start, 25.0, 0.0).from * 25.0).ceil() as usize;
+                let got = frame_hashes(&ffmpeg, &clip, None);
+                assert_eq!(got.len(), frames, "{name} at {start}");
+                assert_eq!(got, all[first..(first + 25).min(all.len())], "{name} at {start}: not frames {first} on");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

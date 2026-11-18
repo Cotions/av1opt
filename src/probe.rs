@@ -138,7 +138,7 @@ pub struct AudioInfo {
 
 /// What ffprobe said in the end, on one line: the lines before it are the
 /// demuxer's detail, and the last one starts with the path the caller already has.
-fn reason(stderr: &str, path: &Path) -> String {
+pub(crate) fn reason(stderr: &str, path: &Path) -> String {
     let last = one_line(stderr);
     let last = last.strip_prefix(&*path.to_string_lossy()).map_or(last, |rest| rest.trim_start_matches(':').trim_start());
     if last.is_empty() { "could not read the file".into() } else { last.to_string() }

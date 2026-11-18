@@ -416,12 +416,13 @@ fn frame_time(cfr: &str) -> String {
 /// [`Plan::timed`]) no grid is laid over the source: the frames between the bounds are taken
 /// as they are and numbered along the constant rate, so the encoder and VMAF get the same
 /// kind of clip either way, holding every source frame once.
-pub(crate) fn extract_chunk(tools: &Tools, input: &Path, info: &MediaInfo, b: Bounds, timed: Option<(i64, i64)>, out: &Path) -> Result<()> {
+pub(crate) fn extract_chunk(tools: &Tools, input: &Path, info: &MediaInfo, b: Bounds, timed: Option<(i64, i64)>, out: &Path) -> Result<u64> {
     let mut vf = search::source_filters(info);
     let cfr = search::cfr(info);
     if timed.is_none() {
         vf.push(format!("fps={cfr}"));
     }
+    let before_trim = vf.len();
     let trim: Vec<String> = [b.start.map(|s| format!("start_pts={s}")), b.end.map(|e| format!("end_pts={e}"))]
         .into_iter()
         .flatten()
@@ -439,14 +440,32 @@ pub(crate) fn extract_chunk(tools: &Tools, input: &Path, info: &MediaInfo, b: Bo
     let rate = search::cfr_value(info);
     let secs = |s: i64| timed.map_or(s as f64 / rate, |(n, d)| s as f64 * n as f64 / d as f64);
     let seek = b.start.map_or(0.0, |s| (secs(s) - info.start_time - search::PREROLL_SECS).max(0.0));
-    let args: Vec<String> = [
-        "-y", "-v", "error", "-copyts", "-ss", &format!("{seek:.3}"), "-i", &path_arg(input),
-        "-map", &format!("0:{}", info.video_index), "-an", "-sn", "-dn", "-vf", &vf.join(","),
-        "-c:v", search::REFERENCE_CODEC, "-pix_fmt", search::reference_pix_fmt(info), &path_arg(out),
-    ]
-    .map(String::from)
-    .to_vec();
-    tools.run(&args).map(|_| ())
+    let cut = |seek: f64| -> Result<u64> {
+        let mut filters = vf.clone();
+        // A seek can land past the chunk's first frame (MPEG-TS, no index, key frames far
+        // apart), and the trim would keep what is left of it. Such a cut keeps nothing instead,
+        // and is made again from further back.
+        if let (true, Some(start)) = (seek > 0.0, b.start) {
+            filters.insert(before_trim, format!("select='if(eq(n,0),st(0,lte(pts,{start})),ld(0))'"));
+        }
+        let args: Vec<String> = [
+            "-y", "-v", "error", "-copyts", "-ss", &format!("{seek:.3}"), "-i", &path_arg(input),
+            "-map", &format!("0:{}", info.video_index), "-an", "-sn", "-dn", "-vf", &filters.join(","),
+            "-c:v", search::REFERENCE_CODEC, "-pix_fmt", search::reference_pix_fmt(info), &path_arg(out),
+        ]
+        .map(String::from)
+        .to_vec();
+        tools.run(&args)?;
+        tools.count_frames(out)
+    };
+    let mut frames = 0;
+    for seek in [seek, seek - search::SEEK_BACK_SECS].into_iter().filter(|s| *s > 0.0).chain([0.0]) {
+        frames = cut(seek)?;
+        if frames > 0 {
+            break;
+        }
+    }
+    Ok(frames)
 }
 
 fn encode_obu(tools: &Tools, reference: &Path, enc: &EncodeSettings, crf: f64, out: &Path) -> Result<()> {
@@ -489,8 +508,7 @@ fn encode_chunk(c: &Ctx, plan: &Plan, i: usize) -> Result<ChunkResult> {
     let reference = chunk_path(c.work, i, "ref.mkv");
     let probe_out = chunk_path(c.work, i, "probe.obu");
     let part = chunk_path(c.work, i, "obu.part");
-    extract_chunk(c.tools, c.input, c.info, b, plan.timed, &reference)?;
-    let frames = c.tools.count_frames(&reference)?;
+    let frames = extract_chunk(c.tools, c.input, c.info, b, plan.timed, &reference)?;
     if frames == 0 {
         bail!("cutting the chunk at {} from the source gave no frames; {FAILED_INSIDE}", hms(start_secs));
     }
@@ -696,6 +714,40 @@ pub fn fnv1a(s: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_chunk_holds_its_frames_when_the_seek_lands_past_them() {
+        let Some(tools) = crate::tools::real_tools("a_chunk_holds_its_frames_when_the_seek_lands_past_them") else { return };
+        let ffmpeg = std::env::var("AV1OPT_FFMPEG").unwrap();
+        let dir = std::env::temp_dir().join(format!("av1opt-chunk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Key frames 8 s apart in a file without an index: a seek to 3 s lands at 8 s.
+        let path = dir.join("far.ts");
+        let made = std::process::Command::new(&ffmpeg)
+            .args(["-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i", "testsrc2=s=160x120:r=25:d=16", "-c:v", "libx264", "-preset", "ultrafast"])
+            .args(["-pix_fmt", "yuv420p", "-g", "200", "-keyint_min", "200", "-sc_threshold", "0", "-f", "mpegts"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+        let info = crate::probe::probe(&tools.ffprobe, &path, std::fs::metadata(&path).unwrap().len()).unwrap();
+        let hashes = |file: &Path| -> Vec<String> {
+            let out = std::process::Command::new(&ffmpeg).args(["-v", "error", "-nostdin", "-i"]).arg(file).args(["-map", "0:v:0", "-fps_mode", "passthrough", "-pix_fmt", "yuv420p", "-f", "framemd5", "-"]).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.starts_with('#')).filter_map(|l| Some(l.rsplit(',').next()?.trim().to_string())).collect()
+        };
+        let all = hashes(&path);
+        let first_pts = (info.start_time * 25.0).round() as i64;
+        let clip = dir.join("chunk.mkv");
+        // The first runs across the key frame at 8 s: its end alone would be found there.
+        for (from, to) in [(150usize, 250usize), (125, 150), (60, 100), (210, 240)] {
+            let b = Bounds { start: Some(first_pts + from as i64), end: Some(first_pts + to as i64) };
+            let frames = extract_chunk(&tools, &path, &info, b, None, &clip).unwrap();
+            assert_eq!(frames as usize, to - from, "frames {from} to {to}");
+            assert_eq!(hashes(&clip), all[from..to], "frames {from} to {to}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_fps_filter_tells_whether_frames_keep_a_constant_rate() {

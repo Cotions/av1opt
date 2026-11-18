@@ -624,8 +624,7 @@ fn fix(c: &Ctx, times: &Times, secs: &[f64], all: &[(usize, f64)], run: Run, ser
     // The frames between two of the source's own timestamps, as scene mode cuts a source
     // whose frames keep their times: the encode holds every source frame once.
     let b = Bounds { start: (run.start > 0).then(|| times.pts[run.start]), end: times.pts.get(run.end).copied() };
-    scenes::extract_chunk(c.tools, c.input, c.info, b, Some(times.tb), &reference)?;
-    let got = c.tools.count_frames(&reference)? as usize;
+    let got = scenes::extract_chunk(c.tools, c.input, c.info, b, Some(times.tb), &reference)? as usize;
     if got != run.end - run.start {
         bail!("the stretch at {at} holds {got} frames cut from the source, {} in the encode", run.end - run.start);
     }

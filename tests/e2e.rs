@@ -1001,6 +1001,29 @@ fn a_video_that_starts_late_is_measured_and_cut_from_where_it_starts() {
 
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_stream_whose_seeks_land_late_is_cut_at_the_frames_asked_for() {
+    // Key frames eight seconds apart in a file with no index: a seek lands on the next one, past
+    // the sample, the spot check or the scene it was sent for. Cut from there, the checks compared
+    // other frames than the encode's, and scenes came out short.
+    let c = Case::new("late-seek");
+    c.scenes_clip("scenes.mp4");
+    c.ffmpeg(&[
+        "-i", "scenes.mp4", "-map", "0:v", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "16", "-pix_fmt", "yuv420p",
+        "-g", "192", "-keyint_min", "192", "-sc_threshold", "0", "-f", "mpegts", "gop.ts",
+    ]);
+    std::fs::remove_file(c.videos().join("scenes.mp4")).unwrap();
+    let src = c.videos().join("gop.ts");
+    c.encode(&[&src], &["--scenes=always"]).ok().has("encoded 1, skipped 0, failed 0");
+    let report = c.report("gop");
+    assert!(report["chunks"].as_array().unwrap().len() > 1, "{report}");
+    let checks: Vec<f64> = report["verify_vmaf"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    assert!(!checks.is_empty() && checks.iter().all(|v| *v > 80.0), "{checks:?}");
+    assert_eq!(frames(&c.out().join("gop.mp4")), 576);
+}
+
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn a_file_cut_off_is_refused_with_the_reason_and_leaves_nothing() {
     let c = Case::new("cutoff");
     // Far before its stated end: the samples have no frames to come from.

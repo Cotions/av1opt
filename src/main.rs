@@ -478,6 +478,7 @@ fn main() -> Result<()> {
             let progress = |p: bench::Progress| match p {
                 bench::Progress::Probing { done: 0, total } => eprintln!("found {total} video files"),
                 bench::Progress::Probing { .. } => {}
+                bench::Progress::LeftOut { videos } => eprintln!("note: {videos} videos left out: {}", tools::NOT_TEXT),
                 bench::Progress::Plan { videos, configs } => {
                     *plan.lock().unwrap() = (videos, configs, 0);
                     eprintln!("comparing {configs} settings on {videos} videos (run it on an otherwise idle machine: encode times are measured)");
@@ -600,6 +601,7 @@ fn main() -> Result<()> {
                 search::check_params(&tools, preset, &svt_params)?;
             }
             let opts = encode::Options {
+                out_dir_must_exist: false,
                 container, target_vmaf, preset, svt_params, tuning, min_crf, max_crf, samples: samples.map(|n| n as usize), sample_secs,
                 min_savings, force, overwrite, keep_temp, scenes, workers: workers.into(), meta, remove, audio, fresh_search,
             };

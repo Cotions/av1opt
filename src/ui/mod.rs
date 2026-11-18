@@ -228,10 +228,11 @@ pub struct Saves {
 }
 
 impl Saves {
-    /// Writes what `take` returns to `path`. `take` runs with the other saves held off, so
-    /// that the last to take its copy is the last to write.
-    pub fn write(&self, what: &str, path: &Path, take: impl FnOnce() -> Vec<u8>) {
+    /// Writes what `take` returns to `path`, if it returns anything. `take` runs with the other
+    /// saves held off, so that the last to take its copy is the last to write.
+    pub fn write(&self, what: &str, path: &Path, take: impl FnOnce() -> Option<Vec<u8>>) {
         one_at_a_time(&self.gate, take, |data| {
+            let Some(data) = data else { return };
             let saved = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| crate::files::replace_with(path, &data));
             if let Some(message) = self.failure_to_tell(what, path, saved) {
                 eprintln!("{message}");

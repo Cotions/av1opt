@@ -249,7 +249,7 @@ fn judge(app: &App, w: &Watch, ready: Vec<PathBuf>) -> Result<Judged> {
     }
     // A job queued now could only fail. The videos wait until the folder is back.
     if !w.out_dir.is_dir() {
-        bail!("{}", jobs::OutDirMissing(w.out_dir.clone()));
+        bail!("{}", crate::batch::OutDirMissing(w.out_dir.clone()));
     }
     let model = Model::fit(&crate::history::load(), w.options.target_vmaf);
     let (results, _) = crate::scan::collect(&ready, &app.ffprobe(), app.cfg.jobs, w.options.min_savings, &model, &|_, _| {})?;

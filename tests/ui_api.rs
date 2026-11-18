@@ -915,7 +915,7 @@ fn a_missing_output_folder_is_not_made_for_a_job_nobody_just_asked_for() {
     let (ffmpeg, ffprobe) = stand_in_tools("drive", "exit 1");
     let mut s = Server::start_with_tools("drive", &ffmpeg, &ffprobe, |d| {
         std::fs::write(d.join("videos/a.mkv"), b"x").unwrap();
-        let job = json!({ "inputs": [d.join("videos/a.mkv")], "roots": [], "out_dir": d.join("drive/out"), "options": {} });
+        let job = json!({ "inputs": [d.join("videos/a.mkv")], "roots": [], "out_dir": d.join("drive/out"), "options": {}, "out_dir_made": true });
         std::fs::write(d.join("data/av1opt/ui-queue.json"), json!({ "format": 1, "jobs": [job] }).to_string()).unwrap();
     });
     let (input, away) = (s.dir.join("videos/a.mkv"), s.dir.join("drive/out"));
@@ -930,6 +930,9 @@ fn a_missing_output_folder_is_not_made_for_a_job_nobody_just_asked_for() {
     let s = Server::start_in(&s.dir, &ffmpeg, &ffprobe);
     assert_eq!(first_job_ended(&s)["status"], "failed");
     assert_eq!(saved_jobs(&s), 1);
+    // Clearing what is finished leaves it: it is waiting, not over.
+    assert_eq!(s.post("/api/jobs/clear", &json!({})).status, 200);
+    assert_eq!((heads(&s).len(), saved_jobs(&s)), (1, 1));
     // Taken off the list, it is gone for good.
     let id = heads(&s)[0]["id"].as_u64().unwrap();
     assert_eq!(s.post(&format!("/api/jobs/{id}/remove"), &json!({})).status, 200);
@@ -1060,6 +1063,212 @@ fn a_probe_that_was_cut_short_is_tried_again_and_a_rejected_file_is_not() {
     assert_eq!(look(), (1, 1), "the rejected one is left at once, the other tried again");
     assert_eq!(look(), (1, 1));
     assert_eq!(look(), (0, 2), "three tries, and the other is left too");
+}
+
+/// Waits for something the server does just after what a test saw.
+fn soon(what: &str, done: impl Fn() -> bool) {
+    let started = Instant::now();
+    while !done() {
+        assert!(started.elapsed() < Duration::from_secs(20), "not so after twenty seconds: {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn paused(d: &Path) {
+    std::fs::write(d.join("data/av1opt/ui.json"), json!({ "queue_paused": true }).to_string()).unwrap();
+}
+
+fn write_saved_queue(d: &Path, jobs: Value) {
+    std::fs::write(d.join("data/av1opt/ui-queue.json"), json!({ "format": 1, "jobs": jobs }).to_string()).unwrap();
+}
+
+/// Where the first job's files go.
+fn outputs(s: &Server) -> Vec<PathBuf> {
+    let list = s.get("/api/jobs").json();
+    list["jobs"][0]["files"].as_array().unwrap().iter().map(|f| PathBuf::from(f["output"].as_str().unwrap())).collect()
+}
+
+#[test]
+fn inputs_left_out_of_a_job_outlive_it() {
+    let (ffmpeg, ffprobe) = stand_in_tools("outlive", "exit 1");
+    let mut s = Server::start_with_tools("outlive", &ffmpeg, &ffprobe, |d| {
+        std::fs::write(d.join("videos/a.mkv"), b"x").unwrap();
+        std::fs::create_dir_all(d.join("out")).unwrap();
+        write_saved_queue(d, json!([{ "inputs": [d.join("videos/a.mkv"), d.join("videos/b.mkv")], "roots": [], "out_dir": d.join("out"), "options": { "preset": 9 }, "out_dir_made": true }]));
+    });
+    let job = first_job_ended(&s);
+    assert_eq!(job["status"], "done", "{job}");
+    assert!(job["note"].is_null(), "they are not this job's any more: {job}");
+    // Saved on their own, with the settings of the job, and shown with the way to forget them.
+    soon("the left-out input is saved", || saved_jobs(&s) == 1);
+    let saved = saved_queue(&s)["jobs"][0].clone();
+    assert_eq!(saved["inputs"], json!([s.dir.join("videos/b.mkv")]), "{saved}");
+    assert_eq!(saved["options"]["preset"], 9, "{saved}");
+    let unrestored = s.get("/api/jobs").json()["unrestored"].clone();
+    assert_eq!(unrestored[0]["inputs"], json!([s.dir.join("videos/b.mkv")]), "{unrestored}");
+
+    // Still away at the next start they stay saved, and once back they are queued.
+    assert!(s.terminate());
+    let mut s = Server::start_in(&s.dir, &ffmpeg, &ffprobe);
+    assert_eq!(s.get("/api/jobs").json()["unrestored"].as_array().unwrap().len(), 1);
+    assert!(s.terminate());
+    std::fs::write(s.dir.join("videos/b.mkv"), b"x").unwrap();
+    let s = Server::start_in(&s.dir, &ffmpeg, &ffprobe);
+    assert_eq!(heads(&s)[0]["total"], 1);
+    assert!(s.get("/api/jobs").json()["unrestored"].as_array().unwrap().is_empty());
+
+    // A job cleared from the list before it ran keeps them too.
+    let s = Server::start_with_tools("outlive-cleared", &ffmpeg, &ffprobe, |d| {
+        paused(d);
+        std::fs::write(d.join("videos/a.mkv"), b"x").unwrap();
+        std::fs::create_dir_all(d.join("out")).unwrap();
+        write_saved_queue(d, json!([{ "inputs": [d.join("videos/a.mkv"), d.join("videos/b.mkv")], "roots": [], "out_dir": d.join("out"), "options": {}, "out_dir_made": true }]));
+    });
+    let id = heads(&s)[0]["id"].as_u64().unwrap();
+    assert_eq!(s.post(&format!("/api/jobs/{id}/cancel"), &json!({})).status, 200);
+    assert_eq!(s.post("/api/jobs/clear", &json!({})).status, 200);
+    assert!(heads(&s).is_empty());
+    assert_eq!(saved_queue(&s)["jobs"][0]["inputs"], json!([s.dir.join("videos/b.mkv")]));
+}
+
+#[test]
+fn a_job_that_comes_back_in_part_writes_where_it_would_have_written() {
+    let (ffmpeg, ffprobe) = stand_in_tools("layout", "exit 1");
+    let mut s = Server::start_with_tools("layout", &ffmpeg, &ffprobe, |d| {
+        paused(d);
+        for name in ["A/a.mkv", "B/b.mkv"] {
+            std::fs::create_dir_all(d.join("videos").join(name).parent().unwrap()).unwrap();
+            std::fs::write(d.join("videos").join(name), b"x").unwrap();
+        }
+    });
+    let (videos, out) = (s.dir.join("videos"), s.dir.join("out"));
+    let r = s.post("/api/jobs", &json!({ "inputs": [videos.join("A"), videos.join("B")], "roots": [], "out_dir": out }));
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(outputs(&s), [out.join("A/a.mp4"), out.join("B/b.mp4")]);
+    // One folder away at a restart: the other's outputs stay where they are.
+    assert!(s.terminate());
+    std::fs::rename(videos.join("B"), videos.join("B.away")).unwrap();
+    let mut s = Server::start_in(&s.dir, &ffmpeg, &ffprobe);
+    assert_eq!(outputs(&s), [out.join("A/a.mp4")]);
+    // Back, it goes where it would have gone.
+    assert!(s.terminate());
+    std::fs::rename(videos.join("B.away"), videos.join("B")).unwrap();
+    let s = Server::start_in(&s.dir, &ffmpeg, &ffprobe);
+    assert_eq!(outputs(&s), [out.join("A/a.mp4"), out.join("B/b.mp4")]);
+    drop(s);
+
+    // Saved by an earlier version, which did not write down how many folders there were.
+    let s = Server::start_with_tools("layout-old", &ffmpeg, &ffprobe, |d| {
+        paused(d);
+        std::fs::create_dir_all(d.join("videos/A")).unwrap();
+        std::fs::write(d.join("videos/A/a.mkv"), b"x").unwrap();
+        write_saved_queue(d, json!([{ "inputs": [d.join("videos/A")], "dropped": [d.join("videos/B")], "roots": [], "out_dir": d.join("out"), "options": {}, "out_dir_made": true }]));
+    });
+    assert_eq!(outputs(&s), [s.dir.join("out/A/a.mp4")]);
+    drop(s);
+
+    // The folder a selection was made in, away with one of the files: nothing is forgotten.
+    let mut s = Server::start_with_tools("layout-root", &ffmpeg, &ffprobe, |d| {
+        paused(d);
+        std::fs::write(d.join("videos/y.mkv"), b"x").unwrap();
+        let root = d.join("videos/library");
+        write_saved_queue(d, json!([{ "inputs": [root.join("sub/x.mkv"), d.join("videos/y.mkv")], "roots": [root], "out_dir": d.join("out"), "options": {}, "out_dir_made": true }]));
+    });
+    let root = s.dir.join("videos/library");
+    soon("the job is saved again", || saved_queue(&s)["jobs"][0]["dropped"][0].is_string());
+    assert_eq!(saved_queue(&s)["jobs"][0]["roots"], json!([root]));
+    assert!(s.terminate());
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::write(root.join("sub/x.mkv"), b"x").unwrap();
+    let s = Server::start_in(&s.dir, &ffmpeg, &ffprobe);
+    assert!(outputs(&s).contains(&s.dir.join("out/sub/x.mp4")), "{:?}", outputs(&s));
+}
+
+#[test]
+fn an_output_folder_nothing_has_made_yet_is_made_once() {
+    let (ffmpeg, ffprobe) = stand_in_tools("once", "exit 1");
+    let mut s = Server::start_with_tools("once", &ffmpeg, &ffprobe, |d| {
+        paused(d);
+        std::fs::write(d.join("videos/a.mkv"), b"x").unwrap();
+        write_saved_queue(d, json!([{ "inputs": [d.join("videos/a.mkv")], "roots": [], "out_dir": d.join("first/out"), "options": {} }]));
+    });
+    let out = s.dir.join("first/out");
+    assert!(out.is_dir());
+    soon("the job is saved with its mark", || saved_queue(&s)["jobs"][0]["out_dir_made"] == true);
+    // From then on its absence means a drive that is away.
+    assert!(s.terminate());
+    std::fs::remove_dir_all(s.dir.join("first")).unwrap();
+    let s = Server::start_in(&s.dir, &ffmpeg, &ffprobe);
+    assert_eq!(heads(&s).len(), 1);
+    assert!(!s.dir.join("first").exists());
+}
+
+#[test]
+fn a_drive_lost_during_a_job_is_not_written_under_its_mount_point() {
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ui-lost/drive/out");
+    // Reading the first video is when the drive goes.
+    let (ffmpeg, ffprobe) = stand_in_tools("lost", &format!("rm -rf '{}'\nexit 1", out.parent().unwrap().display()));
+    let s = Server::start_with_tools("lost", &ffmpeg, &ffprobe, |d| {
+        for name in ["a.mkv", "b.mkv"] {
+            std::fs::write(d.join("videos").join(name), b"x").unwrap();
+        }
+        std::fs::create_dir_all(d.join("drive/out")).unwrap();
+        write_saved_queue(d, json!([{ "inputs": [d.join("videos/a.mkv"), d.join("videos/b.mkv")], "roots": [], "out_dir": d.join("drive/out"), "options": {}, "out_dir_made": true }]));
+    });
+    let job = first_job_ended(&s);
+    assert_eq!(job["status"], "failed", "{job}");
+    assert!(job["error"].as_str().unwrap_or_default().contains("is not there"), "{job}");
+    assert!(!s.dir.join("drive").exists());
+    let files = s.get("/api/jobs").json()["jobs"][0]["files"].clone();
+    assert!(files[1]["detail"].as_str().unwrap_or_default().contains("is not there"), "{files}");
+    // It waits for the drive with all its files.
+    soon("the job stays saved", || saved_jobs(&s) == 1);
+}
+
+#[test]
+fn a_saved_job_with_a_broken_list_of_inputs_reaches_the_page_without_it() {
+    let s = Server::start("broken-list", |d| {
+        write_saved_queue(d, json!([
+            { "inputs": "not a list", "out_dir": d.join("out") },
+            { "inputs": [1, 2], "out_dir": d.join("out") },
+            { "inputs": [d.join("videos/gone.mkv")], "roots": [], "out_dir": d.join("out"), "options": {} },
+        ]));
+    });
+    let list = s.get("/api/jobs").json()["unrestored"].as_array().unwrap().clone();
+    assert_eq!(list.len(), 3, "{list:?}");
+    assert!(list[0].get("inputs").is_none() && list[1].get("inputs").is_none(), "{list:?}");
+    assert!(list[0]["error"].is_string());
+    assert!(list[2]["inputs"].is_array(), "{list:?}");
+}
+
+#[test]
+fn videos_left_out_for_their_names_are_said_on_the_page() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let (ffmpeg, ffprobe) = stand_in_tools("names", "exit 1");
+    let s = Server::start_with_tools("names", &ffmpeg, &ffprobe, |d| {
+        paused(d);
+        std::fs::create_dir_all(d.join("videos/in")).unwrap();
+        std::fs::write(d.join("videos/in/a.mkv"), b"x").unwrap();
+        std::fs::write(d.join("videos/in").join(OsStr::from_bytes(b"b\xff.mkv")), b"x").unwrap();
+    });
+    let dir = s.dir.join("videos/in");
+    let r = s.post("/api/jobs", &json!({ "inputs": [dir], "roots": [], "out_dir": s.dir.join("out") }));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let job = heads(&s)[0].clone();
+    assert_eq!(job["total"], 1, "{job}");
+    let note = job["note"].as_str().unwrap_or_default();
+    assert!(note.contains("1 video(s) left out") && note.contains("UTF-8"), "{job}");
+
+    // A benchmark says it too, however it ends.
+    let id = job["id"].as_u64().unwrap();
+    assert_eq!(s.post(&format!("/api/jobs/{id}/remove"), &json!({})).status, 200);
+    let r = s.post("/api/bench", &json!({ "paths": [dir], "presets": [8], "param_sets": ["tune=0"] }));
+    assert_eq!(r.status, 200, "{}", r.body);
+    soon("the benchmark ends", || s.get("/api/bench").json()["run"]["status"] != "running");
+    let run = s.get("/api/bench").json()["run"].clone();
+    let note = run["note"].as_str().unwrap_or_default();
+    assert!(note.contains("1 video(s) left out") && note.contains("UTF-8"), "{run}");
 }
 
 /// `av1opt scan` of an empty folder, with a scratch environment of its own.

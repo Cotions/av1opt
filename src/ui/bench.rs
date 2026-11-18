@@ -27,6 +27,8 @@ pub struct Run {
     /// Videos chosen, and settings finished over all of them (of videos x settings).
     videos_total: usize,
     cells_done: usize,
+    /// What the page should say of videos that were not measured.
+    note: Option<String>,
     /// What is being measured right now: video index and path, setting index, last trial.
     current: Value,
     /// Finished videos, for results while the run goes on.
@@ -75,7 +77,7 @@ fn head(r: &Run) -> Value {
         "id": r.id, "paths": r.paths, "status": r.status, "error": r.error, "phase": r.phase, "started": r.started,
         "configs": r.configs, "target_vmaf": r.target_vmaf,
         "videos_total": r.videos_total, "videos_done": r.videos.len(), "cells_done": r.cells_done,
-        "cells_total": r.videos_total * r.configs.len(), "current": r.current,
+        "cells_total": r.videos_total * r.configs.len(), "current": r.current, "note": r.note,
     })
 }
 
@@ -142,7 +144,7 @@ pub fn start(app: &Arc<App>, body: &Value) -> Result<Value> {
         let id = run.as_ref().map_or(0, |x| x.id) + 1;
         *run = Some(Run {
             id, paths: paths.clone(), status: "running".into(), error: None, phase: "probing", started: now(), configs: configs.clone(),
-            target_vmaf: r.target_vmaf, videos_total: 0, cells_done: 0, current: Value::Null, videos: Vec::new(), report: None, hooks: hooks.clone(),
+            target_vmaf: r.target_vmaf, videos_total: 0, cells_done: 0, note: None, current: Value::Null, videos: Vec::new(), report: None, hooks: hooks.clone(),
         });
         id
     };
@@ -166,6 +168,9 @@ pub fn start(app: &Arc<App>, body: &Value) -> Result<Value> {
                 Progress::Probing { done, total } => {
                     run.current = json!({ "done": done, "total": total });
                     throttled = done != total;
+                }
+                Progress::LeftOut { videos } => {
+                    run.note = Some(format!("{videos} video(s) left out: {}", crate::tools::NOT_TEXT));
                 }
                 Progress::Plan { videos, .. } => {
                     run.videos_total = videos;
@@ -207,7 +212,7 @@ pub fn start(app: &Arc<App>, body: &Value) -> Result<Value> {
                 match result {
                     Ok(report) => {
                         if let Some(p) = last_path() {
-                            app.bench_saves.write("the benchmark result", &p, || serde_json::to_vec(&report).unwrap_or_default());
+                            app.bench_saves.write("the benchmark result", &p, || serde_json::to_vec(&report).ok());
                         }
                         run.report = Some(Arc::new(report));
                         run.status = "done".into();

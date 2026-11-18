@@ -2,7 +2,7 @@
 //! Progress events update a per-file state (for page reloads) and go out on the event stream.
 
 use super::{App, hold, now};
-use crate::batch;
+use crate::batch::{self, OutDirMissing};
 use crate::encode::{Container, Options};
 use crate::events::{Event, Hooks};
 use crate::metadata::MetaOptions;
@@ -125,6 +125,7 @@ impl JobOptions {
             remove: self.remove.clone(),
             fresh_search: false,
             audio: if self.shrink_audio { crate::encode::Audio::Shrink } else { crate::encode::Audio::Keep },
+            out_dir_must_exist: false,
         })
     }
 
@@ -211,19 +212,18 @@ pub struct Job {
     /// It failed for that reason, and stays in the saved queue for when the drive is back.
     #[serde(skip)]
     out_dir_missing: bool,
+    /// The output folder was made for this job once. Jobs saved before folders were made at
+    /// queue time lack this, and get theirs made when they come back.
+    #[serde(skip)]
+    out_dir_made: bool,
+    /// How many folders were queued together. Part of where outputs go, so it is kept as it
+    /// was: with one of them away the others must not move.
+    #[serde(skip)]
+    folders_queued: usize,
+    /// Videos of the selection left out because their names are not valid UTF-8.
+    #[serde(skip)]
+    not_text: usize,
 }
-
-/// A job's output folder is not there, and the job may not make it.
-#[derive(Debug)]
-pub struct OutDirMissing(pub PathBuf);
-
-impl std::fmt::Display for OutDirMissing {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "the output folder {} is not there; its drive may not be mounted", self.0.display())
-    }
-}
-
-impl std::error::Error for OutDirMissing {}
 
 /// Where a job comes from, which decides what is asked of its folders and files.
 #[derive(Clone, Copy, PartialEq)]
@@ -353,8 +353,15 @@ fn head(j: &Job) -> Value {
         "total": j.files.len(), "counts": counts, "saved": saved,
         "left_secs": left, "left_unknown": unknown,
         "paused": j.hooks.as_ref().is_some_and(|h| h.is_paused()),
-        "note": dropped_note(&j.dropped),
+        "note": job_note(j),
     })
+}
+
+/// What the page says of what is not in a job.
+fn job_note(j: &Job) -> Option<String> {
+    let not_text = (j.not_text > 0).then(|| format!("{} video(s) left out: {}.", j.not_text, crate::tools::NOT_TEXT));
+    let notes: Vec<String> = [dropped_note(&j.dropped), not_text].into_iter().flatten().collect();
+    (!notes.is_empty()).then(|| notes.join(" "))
 }
 
 /// What the page says of inputs left out of a job. A long list is cut: this goes out with
@@ -366,7 +373,7 @@ fn dropped_note(dropped: &[PathBuf]) -> Option<String> {
     }
     let names: Vec<String> = dropped.iter().take(NAMED).map(|p| p.display().to_string()).collect();
     let more = if dropped.len() > NAMED { format!(" and {} more", dropped.len() - NAMED) } else { String::new() };
-    Some(format!("Left out because they are gone: {}{more}. They rejoin this job if they are back when av1opt next starts.", names.join(", ")))
+    Some(format!("Left out because they are gone: {}{more}. They stay saved, and are queued if they are back when av1opt next starts.", names.join(", ")))
 }
 
 fn full(j: &Job) -> Value {
@@ -427,6 +434,13 @@ struct AddRequest {
     /// In a saved job: inputs that were gone when it was last queued.
     #[serde(default)]
     dropped: Vec<PathBuf>,
+    /// In a saved job: how many folders were queued together. Saved jobs of earlier versions
+    /// do not say.
+    #[serde(default)]
+    folders_queued: Option<usize>,
+    /// In a saved job: its output folder was made once. See `Job::out_dir_made`.
+    #[serde(default)]
+    out_dir_made: bool,
 }
 
 /// ffmpeg carries on without parameters SVT-AV1 doesn't know; better said when the settings
@@ -500,7 +514,15 @@ fn prepare(app: &App, body: &Value, origin: Origin, known: &Known) -> Result<Job
     if let (true, Some(e)) = (inputs.is_empty(), first_gone) {
         return Err(e);
     }
-    let roots: Vec<PathBuf> = r.roots.iter().filter_map(|p| canon(p).ok()).collect();
+    // What decides where outputs go stays as it was when the job was queued, or a job that
+    // comes back with part of it away would write what is there to other places, and encode
+    // again what it had finished. A root that is away is kept for the files that rejoin.
+    let roots: Vec<PathBuf> = r.roots.iter().map(|p| canon(p).unwrap_or_else(|_| p.clone())).collect();
+    let folders_queued = r.folders_queued.filter(|_| origin == Origin::Saved).unwrap_or_else(|| {
+        // Of a saved job that does not say: what is away counts as a folder unless it is
+        // named like a video.
+        r.inputs.iter().chain(earlier).filter(|p| p.is_dir() || (!p.exists() && !is_video(p))).count()
+    });
     let mut batch_jobs = Vec::new();
     for input in &inputs {
         let root = roots.iter().filter(|root| input.starts_with(root) && input != *root).max_by_key(|p| p.as_os_str().len());
@@ -510,7 +532,7 @@ fn prepare(app: &App, body: &Value, origin: Origin, known: &Known) -> Result<Job
                 r.out_dir.join(rel)
             }
             // Folders queued together each keep their name, as on the command line.
-            _ if input.is_dir() => batch::folder_out(&inputs, input, &r.out_dir),
+            _ if input.is_dir() => batch::folder_out_among(folders_queued, input, &r.out_dir),
             _ => r.out_dir.clone(),
         };
         batch_jobs.extend(batch::expand(std::slice::from_ref(input), &out_dir, is_video));
@@ -519,7 +541,9 @@ fn prepare(app: &App, body: &Value, origin: Origin, known: &Known) -> Result<Job
         bail!("no video files in the selection");
     }
     // The queue is kept as JSON, and a folder can hold names that cannot go there.
+    let found = batch_jobs.len();
     batch_jobs.retain(|j| j.input.to_str().is_some() && std::fs::canonicalize(&j.input).map_or(true, |c| c.to_str().is_some()));
+    let not_text = found - batch_jobs.len();
     if batch_jobs.is_empty() {
         bail!("no video in the selection can be encoded: {}", crate::tools::NOT_TEXT);
     }
@@ -535,9 +559,20 @@ fn prepare(app: &App, body: &Value, origin: Origin, known: &Known) -> Result<Job
     // A folder asked for now is made now, and a name that cannot be used is said at once. After
     // this a missing folder means a drive that is away: see `out_dir_must_exist`.
     let out_dir_must_exist = origin == Origin::Saved || r.watch.is_some();
-    if !out_dir_must_exist {
+    let out_dir_made = if !out_dir_must_exist {
         std::fs::create_dir_all(&r.out_dir).with_context(|| format!("cannot create {}", r.out_dir.display()))?;
-    }
+        true
+    } else if origin == Origin::Saved && !r.out_dir_made {
+        // Saved by a version that did not make the folder when a job was queued: nothing has
+        // made it yet, so its absence says nothing about a drive. This happens once.
+        let made = std::fs::create_dir_all(&r.out_dir);
+        if let Err(e) = &made {
+            eprintln!("warning: cannot create {}: {e}", r.out_dir.display());
+        }
+        made.is_ok()
+    } else {
+        true
+    };
     // Time estimates for files a scan has seen; the others get theirs when they are probed.
     let time = crate::estimate::TimeModel::fit(&known.history, opts.preset);
     // Estimates are for the way the files will be encoded. "Where uneven" is not known
@@ -586,6 +621,9 @@ fn prepare(app: &App, body: &Value, origin: Origin, known: &Known) -> Result<Job
         dropped,
         out_dir_must_exist,
         out_dir_missing: false,
+        out_dir_made,
+        folders_queued,
+        not_text,
     })
 }
 
@@ -621,31 +659,58 @@ fn queue_path() -> Option<PathBuf> {
 
 /// A job as the saved queue holds it, and as it is queued again.
 fn saved_form(j: &Job) -> Value {
-    json!({ "inputs": j.inputs, "dropped": j.dropped, "roots": j.roots, "out_dir": j.out_dir, "options": j.options, "watch": j.watch })
+    json!({
+        "inputs": j.inputs, "dropped": j.dropped, "roots": j.roots, "out_dir": j.out_dir, "options": j.options, "watch": j.watch,
+        "folders_queued": j.folders_queued, "out_dir_made": j.out_dir_made,
+    })
+}
+
+/// Inputs left out of a job outlive it: when the job leaves the list or has nothing more to do,
+/// they become a saved entry of their own, with its settings, and come back at a later start.
+fn keep_left_out(queue: &Queue, j: &mut Job) {
+    if j.dropped.is_empty() {
+        return;
+    }
+    let mut saved = saved_form(j);
+    saved["inputs"] = json!(std::mem::take(&mut j.dropped));
+    saved["dropped"] = json!([]);
+    queue.unrestored.lock().unwrap().push((saved, "they were not there when the rest of their job ran; they are queued when they are back".into()));
 }
 
 /// Saves unfinished jobs so the next `av1opt ui` picks them up again: those in the queue, those
 /// that could not be brought back and those still on their way. Whenever it is called, the
 /// file holds every one of them.
 fn persist(app: &App) {
-    if app.jobs.shutting_down.load(Ordering::SeqCst) {
-        return;
+    if let Some(path) = queue_path() {
+        app.jobs.save(&path);
     }
-    let Some(path) = queue_path() else { return };
-    app.jobs.saves.write("the queue", &path, || {
-        let pending: Vec<Value> = app
-            .jobs
-            .jobs
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|j| matches!(j.status.as_str(), "queued" | "running") || j.out_dir_missing)
-            .map(saved_form)
-            .chain(app.jobs.unrestored.lock().unwrap().iter().map(|(j, _)| j.clone()))
-            .chain(app.jobs.to_restore.lock().unwrap().iter().cloned())
-            .collect();
-        serde_json::to_vec_pretty(&json!({ "format": QUEUE_FORMAT, "jobs": pending })).unwrap_or_default()
-    });
+}
+
+impl Queue {
+    fn save(&self, path: &Path) {
+        let stopping = || self.shutting_down.load(Ordering::SeqCst);
+        if stopping() {
+            return;
+        }
+        self.saves.write("the queue", path, || {
+            let pending: Vec<Value> = self
+                .jobs
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|j| matches!(j.status.as_str(), "queued" | "running") || j.out_dir_missing)
+                .map(saved_form)
+                .chain(self.unrestored.lock().unwrap().iter().map(|(j, _)| j.clone()))
+                .chain(self.to_restore.lock().unwrap().iter().cloned())
+                .collect();
+            // Looked at after the copy is taken. Shutting down sets this before it cancels the
+            // running job, so a copy that lacks the job for that reason is never written.
+            if stopping() {
+                return None;
+            }
+            serde_json::to_vec_pretty(&json!({ "format": QUEUE_FORMAT, "jobs": pending })).ok()
+        });
+    }
 }
 
 /// The jobs in the saved queue. A file that cannot be understood is moved aside, or the next
@@ -756,7 +821,17 @@ fn finish_bringing_back(app: &App, all_read: bool) {
 /// Saved jobs that could not be restored, with the reason.
 fn unrestored_list(app: &App) -> Vec<Value> {
     let list = app.jobs.unrestored.lock().unwrap();
-    list.iter().map(|(j, why)| json!({ "inputs": j["inputs"], "out_dir": j["out_dir"], "error": why })).collect()
+    list.iter()
+        .map(|(j, why)| {
+            let mut entry = json!({ "out_dir": j["out_dir"], "error": why });
+            // A saved file can hold anything, and this one could not be understood perhaps
+            // for that reason: the page gets a list of names or none.
+            if j["inputs"].as_array().is_some_and(|l| l.iter().all(Value::is_string)) {
+                entry["inputs"] = j["inputs"].clone();
+            }
+            entry
+        })
+        .collect()
 }
 
 /// Tries the saved-but-missing jobs again (say, after mounting a drive), or forgets them.
@@ -807,7 +882,10 @@ pub fn remove(app: &App, id: u64) -> Result<Value> {
     if jobs.iter().any(|j| j.id == id && j.status == "running") {
         bail!("cancel the job first");
     }
-    jobs.retain(|j| j.id != id);
+    if let Some(at) = jobs.iter().position(|j| j.id == id) {
+        keep_left_out(&app.jobs, &mut jobs[at]);
+        jobs.remove(at);
+    }
     drop(jobs);
     persist(app);
     app.broadcast(json!({ "kind": "jobs" }));
@@ -851,8 +929,16 @@ pub fn again(app: &App, id: u64) -> Result<Value> {
     Ok(r)
 }
 
+/// Takes the jobs that are over off the list. Those waiting for their output folder are not
+/// over: they stay saved for when the drive is back, until they are removed one by one.
 pub fn clear_finished(app: &App) -> Result<Value> {
-    app.jobs.jobs.lock().unwrap().retain(|j| matches!(j.status.as_str(), "queued" | "running"));
+    app.jobs.jobs.lock().unwrap().retain_mut(|j| {
+        let stays = matches!(j.status.as_str(), "queued" | "running") || j.out_dir_missing;
+        if !stays {
+            keep_left_out(&app.jobs, j);
+        }
+        stays
+    });
     persist(app);
     app.broadcast(json!({ "kind": "jobs" }));
     Ok(json!({ "ok": true }))
@@ -964,11 +1050,18 @@ pub fn start_worker(app: Arc<App>) {
                             f.status = "cancelled".into();
                         }
                     }
-                    Ok(_) => j.status = "done".into(),
+                    Ok(_) => {
+                        j.status = "done".into();
+                        keep_left_out(&app.jobs, j);
+                    }
                     Err(e) => {
                         j.status = "failed".into();
                         j.error = Some(format!("{e:#}"));
                         j.out_dir_missing = e.downcast_ref::<OutDirMissing>().is_some();
+                        // A job that waits for its folder comes back whole.
+                        if !j.out_dir_missing {
+                            keep_left_out(&app.jobs, j);
+                        }
                     }
                 }
                 done = Some(head(j));
@@ -987,7 +1080,8 @@ pub fn start_worker(app: Arc<App>) {
 }
 
 fn run_job(app: &Arc<App>, id: u64, opts: Result<Options>, retry: bool, out_dir: &Path, must_exist: bool, workers: u8) -> Result<batch::Summary> {
-    let opts = opts?;
+    let mut opts = opts?;
+    opts.out_dir_must_exist = must_exist;
     crate::fsguard::ensure_writable_location(out_dir, false)?;
     // Made anew it would land on the disk under the mount point of a drive that is away.
     if must_exist && !out_dir.is_dir() {
@@ -1034,5 +1128,38 @@ fn run_job(app: &Arc<App>, id: u64, opts: Result<Options>, retry: bool, out_dir:
     if let Some(j) = app.jobs.jobs.lock().unwrap().iter_mut().find(|j| j.id == id) {
         j.batch = batch_jobs;
     }
+    // Lost on the way, the folder failed the files after that. The job waits for the drive
+    // like one that found it missing at the start, or those files would be forgotten.
+    if must_exist && !out_dir.is_dir() && r.as_ref().is_ok_and(|s| !s.cancelled) {
+        return Err(OutDirMissing(out_dir.to_path_buf()).into());
+    }
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_save_that_was_waiting_when_the_server_began_to_stop_writes_nothing() {
+        let dir = std::env::temp_dir().join(format!("av1opt-queue-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ui-queue.json");
+        let queue = Queue::default();
+        queue.save(&path);
+        assert!(path.exists(), "a save in normal times writes the file");
+        std::fs::remove_file(&path).unwrap();
+        std::thread::scope(|s| {
+            // The save gets past its first check and waits for the one in progress.
+            let held = queue.saves.hold();
+            let saving = s.spawn(|| queue.save(&path));
+            std::thread::sleep(Duration::from_millis(50));
+            queue.shutting_down.store(true, Ordering::SeqCst);
+            drop(held);
+            saving.join().unwrap();
+        });
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

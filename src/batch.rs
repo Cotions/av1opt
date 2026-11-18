@@ -14,6 +14,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const LOG_NAME: &str = "av1opt-log.tsv";
 
+/// A job's output folder is not there, and the job may not make it.
+#[derive(Debug)]
+pub struct OutDirMissing(pub PathBuf);
+
+impl std::fmt::Display for OutDirMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "the output folder {} is not there; its drive may not be mounted", self.0.display())
+    }
+}
+
+impl std::error::Error for OutDirMissing {}
+
 /// One input file and the folder its output goes to.
 pub struct Job {
     pub input: PathBuf,
@@ -24,7 +36,12 @@ pub struct Job {
 /// below `out_dir`. Given with other folders, each gets a folder of its own name there:
 /// two libraries encoded in one run stay apart, as they are where they came from.
 pub fn folder_out(inputs: &[PathBuf], input: &Path, out_dir: &Path) -> PathBuf {
-    let folders = inputs.iter().filter(|p| p.is_dir()).count();
+    folder_out_among(inputs.iter().filter(|p| p.is_dir()).count(), input, out_dir)
+}
+
+/// [`folder_out`] for a folder given with `folders` folders in all, counting itself: a job kept
+/// for later goes by how many there were when it was queued, whichever are there now.
+pub fn folder_out_among(folders: usize, input: &Path, out_dir: &Path) -> PathBuf {
     let abs = std::path::absolute(input).unwrap_or_else(|_| input.to_path_buf());
     match abs.file_name() {
         Some(name) if folders > 1 => out_dir.join(name),
@@ -409,6 +426,16 @@ pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipp
             tools.emit(Event::FileEnd { index: i, status: status.into(), detail: detail.into(), input_bytes: size, output_bytes: out_bytes });
         };
 
+        // A drive lost during the job: encoding on would fill the disk under its mount point.
+        // Not logged, since the log lives in the folder that is gone.
+        if o.out_dir_must_exist && !out_dir.is_dir() {
+            let msg = OutDirMissing(out_dir.to_path_buf()).to_string();
+            eprintln!("FAILED: {msg}");
+            end("error", &msg, 0);
+            sum.failed += 1;
+            continue;
+        }
+
         // Checked before anything else: what is known about such a file goes by a name that
         // may be another file's.
         let named = [job.input.as_path(), &abs, &output].iter().all(|p| p.to_str().is_some());
@@ -513,6 +540,7 @@ mod tests {
             container: encode::Container::Mp4, target_vmaf: 93.0, preset: 5, svt_params: crate::search::DEFAULT_PARAMS.into(), tuning: None,
             min_crf: 20, max_crf: 55, samples: None, sample_secs: None, min_savings: 0.15, force: false, overwrite: false, keep_temp: false,
             scenes: encode::Scenes::Off, workers: 1, meta: Default::default(), remove: Vec::new(), audio: encode::Audio::Keep, fresh_search: false,
+            out_dir_must_exist: false,
         }
     }
 
@@ -654,6 +682,22 @@ mod tests {
         f.report("x.mp4", "x.mkv", 5);
         let (_, ends) = f.walk(&f.0, &Options { overwrite: true, ..options() });
         assert!(ends["x.mkv"].1.starts_with("its output would take the place of another input"), "{:?}", ends["x.mkv"]);
+    }
+
+    #[test]
+    fn a_job_that_may_not_make_its_output_folder_stops_writing_when_it_is_gone() {
+        let source = Folder::new("away-in", &["a.mkv", "b.mkv"]);
+        let out = Folder::new("away-out", &[]);
+        std::fs::remove_dir_all(&out.0).unwrap();
+        let mut o = options();
+        o.out_dir_must_exist = true;
+        let (summary, ends) = source.walk(&out.0, &o);
+        assert_eq!(summary.failed, 2);
+        for (status, detail) in ends.values() {
+            assert_eq!(status, "error");
+            assert_eq!(*detail, OutDirMissing(out.0.clone()).to_string());
+        }
+        assert!(!out.0.exists());
     }
 
     #[test]

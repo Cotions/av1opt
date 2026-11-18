@@ -15,6 +15,10 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 pub struct Options {
+    /// The top output folder of the batch may not be made: a job nobody just asked for, whose
+    /// folder gone means a drive that is away. Checked before each file; folders below it are
+    /// still made.
+    pub out_dir_must_exist: bool,
     pub container: Container,
     pub target_vmaf: f64,
     pub preset: u8,

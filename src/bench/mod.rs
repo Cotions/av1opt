@@ -144,6 +144,8 @@ pub struct Report {
 #[cfg_attr(not(feature = "ui"), allow(dead_code))]
 pub enum Progress<'a> {
     Probing { done: usize, total: usize },
+    /// This many videos cannot be used because their names are not valid UTF-8.
+    LeftOut { videos: usize },
     /// The videos and settings are known; `cells` = videos x settings is the work to do.
     Plan { videos: usize, configs: usize },
     /// Cutting the sample clips of a video.
@@ -285,7 +287,7 @@ pub fn run(paths: &[PathBuf], tools: &Tools, o: &Options, progress: &(dyn Fn(Pro
     tools.check_cancel()?;
     let not_text = scan::drop_unnamed(&mut found);
     if not_text > 0 {
-        eprintln!("note: {not_text} videos left out: {}", crate::tools::NOT_TEXT);
+        progress(Progress::LeftOut { videos: not_text });
     }
     let mut skipped: Vec<Skipped> = Vec::new();
     let mut usable: Vec<(Class, &scan::FileResult)> = Vec::new();

@@ -1556,6 +1556,7 @@ function renderBench(out, data, ui) {
   const rep = data.report, run = data.run, tuning = data.tuning || [];
   const kids = [];
   if (run && run.status === "failed") kids.push(h("div", { class: "panel bad" }, run.error || "The benchmark failed."));
+  if (run && run.note) kids.push(h("div", { class: "panel warn" }, run.note));
 
   const setTuning = async (classes, config, done) => {
     try {
@@ -1837,9 +1838,9 @@ views.queue = (root) => {
       } catch (e) { toast(e.message, true); }
     };
     missing.replaceChildren(h("div", { class: "panel" },
-      h("div", { class: "row" }, h("strong", { class: "warn grow" }, `${un.length} saved job${un.length === 1 ? "" : "s"} from the last session could not be re-queued`),
+      h("div", { class: "row" }, h("strong", { class: "warn grow" }, `${un.length} saved job${un.length === 1 ? "" : "s"} not in the queue, kept for when ${un.length === 1 ? "its files are" : "their files are"} back`),
         h("button", { onclick: act("retry") }, "Try again"), h("button", { class: "danger", onclick: act("forget") }, "Forget")),
-      un.map((u) => h("div", { class: "dim mono" }, `${(u.inputs || []).join(", ")} → ${u.out_dir}: ${u.error}`))));
+      un.map((u) => h("div", { class: "dim mono" }, `${Array.isArray(u.inputs) ? u.inputs.join(", ") : "(its list of videos cannot be read)"} → ${u.out_dir ?? "(no output folder)"}: ${u.error}`))));
   };
   const fileEls = new Map(); // "job:file" -> { el, update(progress) } for running files
   // Rendered jobs. Only parts whose data changed are rebuilt, so buttons stay put while an

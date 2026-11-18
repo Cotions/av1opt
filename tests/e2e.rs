@@ -966,7 +966,7 @@ fn sound_that_runs_on_after_the_picture_is_kept_whole() {
         assert_eq!(packets_md5(&out, "a:0"), packets_md5(&c.videos().join(name), "a:0"), "{name}");
         let report = c.report(stem);
         let notes = report["notes"].to_string();
-        assert!(notes.contains("the picture stops at 0:00:12, the sound runs on to 0:00:30"), "{name}: {notes}");
+        assert!(notes.contains("the picture stops at 0:00:12, sound or subtitles run on to 0:00:30"), "{name}: {notes}");
         assert!(report["verify_vmaf"].as_array().is_some_and(|v| v.len() == 2), "{name}: {report}");
     }
 }

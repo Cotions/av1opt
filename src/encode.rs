@@ -374,7 +374,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     // is sound and no picture would have nothing in them.)
     if cut.is_some() && info.duration_s - info.picture_secs() > 1.0 {
         bail!(
-            "the picture stops at {}, the sound runs on to {}: sections cannot be removed from such a file",
+            "the picture stops at {}, sound or subtitles run on to {}: sections cannot be removed from such a file",
             hms(info.picture_secs()), hms(info.duration_s)
         );
     }
@@ -413,7 +413,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     });
     let mut notes = Vec::new();
     if info.duration_s - info.picture_secs() > 1.0 {
-        notes.push(format!("the picture stops at {}, the sound runs on to {}: both kept as they are", hms(info.picture_secs()), hms(info.duration_s)));
+        notes.push(format!("the picture stops at {}, sound or subtitles run on to {}: the tracks that are kept keep their length", hms(info.picture_secs()), hms(info.duration_s)));
     }
     if o.tuning.is_some() {
         let class = crate::tuning::Class::of(info.width, info.height).label();

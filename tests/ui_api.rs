@@ -1568,3 +1568,37 @@ fn a_watch_record_that_cannot_be_read_is_kept_aside_and_nothing_gets_queued() {
     assert_eq!((w["videos"].as_u64(), w["before"].as_u64(), w["fresh"].as_u64()), (Some(1), Some(1), Some(0)), "{w}");
     assert_eq!(s.get("/api/jobs").json()["jobs"], json!([]));
 }
+
+#[test]
+fn servers_sharing_a_cache_keep_their_previews_apart() {
+    let shared = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ui-shared-cache");
+    let _ = std::fs::remove_dir_all(&shared);
+    std::fs::create_dir_all(shared.join("av1opt/previews/2147483646")).unwrap();
+    std::fs::create_dir_all(shared.join("av1opt/previews/not-a-process")).unwrap();
+    std::fs::write(shared.join("av1opt/previews/2147483646/left.mp4"), b"x").unwrap();
+    std::fs::write(shared.join("av1opt/previews/old-version.mp4"), b"x").unwrap();
+    let use_shared = |d: &Path| {
+        std::fs::remove_dir(d.join("cache")).unwrap();
+        std::os::unix::fs::symlink(&shared, d.join("cache")).unwrap();
+    };
+    let previews = shared.join("av1opt/previews");
+    let listed = || {
+        let mut names: Vec<String> = std::fs::read_dir(&previews).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    };
+    let mut first = Server::start("previews-first", use_shared);
+    let own = previews.join(first.child.id().to_string());
+    assert_eq!(listed(), [first.child.id().to_string()], "what servers that are gone left is cleared");
+    std::fs::write(own.join("playing.mp4"), b"x").unwrap();
+
+    let mut second = Server::start("previews-second", use_shared);
+    assert!(own.join("playing.mp4").exists(), "the second server wiped the first one's previews");
+    assert!(previews.join(second.child.id().to_string()).is_dir());
+
+    assert!(first.terminate());
+    assert!(!own.exists(), "a server takes its previews along when it stops");
+    assert_eq!(listed(), [second.child.id().to_string()]);
+    assert!(second.terminate());
+    assert_eq!(listed(), Vec::<String>::new());
+}

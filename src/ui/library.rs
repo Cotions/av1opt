@@ -28,14 +28,36 @@ pub fn cache_dir() -> Option<PathBuf> {
     Some(d)
 }
 
-/// Short playback previews live in the user's cache, never next to the source. Leftovers of
-/// earlier sessions are removed at start.
+/// Short playback previews live in the user's cache, never next to the source, in a folder
+/// named after this process: servers with data folders of their own are not kept apart by
+/// their lock, and may share the cache. What servers that are gone left there is removed.
 pub fn preview_dir() -> Result<PathBuf> {
-    let d = cache_dir().context("no HOME for the preview folder")?.join("previews");
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d)?;
-    crate::fsguard::ensure_writable_location(&d, false)?;
-    Ok(std::fs::canonicalize(&d)?)
+    let all = cache_dir().context("no HOME for the preview folder")?.join("previews");
+    std::fs::create_dir_all(&all)?;
+    let own = all.join(std::process::id().to_string());
+    remove_left_previews(&all, &own);
+    std::fs::create_dir_all(&own)?;
+    crate::fsguard::ensure_writable_location(&own, false)?;
+    Ok(std::fs::canonicalize(&own)?)
+}
+
+/// Clears `all` of everything but the folders of other running processes. `own` may be there
+/// from an earlier process of the same number. Plain files are from versions that kept their
+/// previews directly in `all`.
+fn remove_left_previews(all: &Path, own: &Path) {
+    for entry in std::fs::read_dir(all).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            let _ = std::fs::remove_file(&path);
+        } else if path == own || !entry.file_name().to_str().and_then(|n| n.parse().ok()).is_some_and(process_is_running) {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
+fn process_is_running(id: i32) -> bool {
+    // SAFETY: signal 0 is not sent, the call only asks whether the process could be reached.
+    id > 0 && (unsafe { libc::kill(id, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
 }
 
 fn home() -> PathBuf {

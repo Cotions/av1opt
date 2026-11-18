@@ -298,9 +298,9 @@ fn local_stamp() -> String {
     format!("{:04}{:02}{:02}-{:02}{:02}{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec)
 }
 
-/// Keeps a second server off this user's files: two would restore the same jobs and encode them
-/// twice, wipe each other's previews and overwrite each other's queue. The system lets go of
-/// the lock when the process ends, however it ends.
+/// Keeps a second server off this user's files: two would restore the same jobs, encode them
+/// twice and overwrite each other's queue. The system lets go of the lock when the process
+/// ends, however it ends.
 fn one_server_per_user() -> Result<Option<std::fs::File>> {
     use std::io::{Read, Seek, Write};
     use std::os::fd::AsRawFd;
@@ -458,6 +458,12 @@ extern "C" fn on_signal(_: libc::c_int) {
     unsafe { libc::write(fd, b"x".as_ptr().cast(), 1) };
 }
 
+fn stop(app: &App) -> ! {
+    jobs::shutdown(app);
+    let _ = std::fs::remove_dir_all(&app.preview_dir);
+    std::process::exit(0);
+}
+
 /// On SIGINT, SIGTERM or SIGHUP (and, for a wrapper app, when stdin closes with
 /// `AV1OPT_UI_EXIT_WITH_STDIN=1`), stops the encodes cleanly and exits.
 fn stop_on_signal(app: Arc<App>) {
@@ -486,16 +492,14 @@ fn stop_on_signal(app: Arc<App>) {
             // SAFETY: read(2) on our own pipe.
             while unsafe { libc::read(fds[0], b.as_mut_ptr().cast(), 1) } < 0 {}
             eprintln!("stopping");
-            jobs::shutdown(&a);
-            std::process::exit(0);
+            stop(&a);
         });
     }
     if std::env::var_os("AV1OPT_UI_EXIT_WITH_STDIN").is_some_and(|v| v == "1") {
         std::thread::spawn(move || {
             let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
             eprintln!("parent went away, stopping");
-            jobs::shutdown(&app);
-            std::process::exit(0);
+            stop(&app);
         });
     }
 }

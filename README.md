@@ -34,8 +34,10 @@ range; `encode` measures the real numbers. Low expected gain means under 20% her
 (`--min-savings`); `encode` has a `--min-savings` of its own, 15%, for what it measures. Never
 writes to the scanned folders.
 
-ffprobe gets two minutes per file, which only a stalled drive takes. A file it could not
-finish, or that the system could not read for it, shows as unreadable in this scan and is
+Every run of ffprobe on a video, here and in the other commands, has a time limit that only
+a stalled drive should reach: at most two minutes, and for a run that reads every packet of a
+file, as counting its frames does, a minute more for each gigabyte begun. A file ffprobe could
+not finish, or that the system could not read for it, shows as unreadable in this scan and is
 probed again by the next. A file ffprobe read and rejected is remembered until it changes.
 
 Every successful `encode` appends its source and output bitrates to
@@ -61,6 +63,11 @@ The CSV has it as `est_encode_secs`.
 off at eight hours: a long video with the best rate can leave a gap that two shorter ones
 would have filled, so every way of filling the time is tried (a knapsack over the time cut
 in up to 10,000 slots; lengths are rounded up, so the choice never runs over).
+
+What a command was asked to write (`scan --csv` and `--list`, `dups --csv` and `--json`,
+`bench --csv`, `--json` and `--save`) is written before its results are printed, so a closed
+pipe, as in `av1opt bench /videos --save | head`, loses none of it. A file that cannot be
+written is reported after the results.
 
 ## dups
 
@@ -208,9 +215,14 @@ For each file:
    room for them on the drive, say), and the report then says so. A spot check more than 4
    below the target leads to the same second search; a video encoded per scene or with
    sections removed fails instead. Nothing is written unless all checks pass. The source
-   has to be as it was, too: if its size or modification time changed during the encode, or
-   it went away, the encode fails. No output or report is kept, and neither are the chunks
-   of a per-scene encode, which no longer belong to the file as it is now.
+   has to be as it was, too. It counts as changed if its size is different, or if its
+   modification time is more than two seconds off and a fingerprint of its contents (a hash
+   of its size and of a megabyte at its start, middle and end) differs as well; a file only
+   touched passes. A changed source fails the encode: no output or report is kept, and
+   neither are the chunks of a per-scene encode, which no longer belong to the file as it is
+   now. A source that has gone away or cannot be read fails the encode too, but as that may
+   only be a drive that dropped out, the chunks are kept and encoding it again goes on from
+   them.
 6. **Report** – the output plus `<name>.av1opt.json` with every CRF tried, scores, sizes and timings.
 
 ### Metadata
@@ -328,9 +340,13 @@ skipped for a reason (low savings, ...) are not searched again with the same set
 preset, CRF range, `--min-savings`, `--force`, and `--scenes`, `--audio`, `--svt-params`,
 `--tuned`, `--remove` and the samples where set) unless
 `--retry-skipped` is given. A finished file counts only for the source it was made from, as the
-report beside it says: one of the same name with another size or another modification time is
-reported, not passed over (a report too old to hold the time goes by the size alone, and a
-file there with no report at all counts as done). An output is never written where its own source or another
+report beside it says. A source of the same name with another size is reported, not passed
+over. At the same size and another modification time the fingerprint in the report decides
+(see Verify above): a source only touched, or copied without its dates, counts as done, and
+one rewritten is reported. So is one whose report holds the time but no fingerprint, which
+cannot tell the two apart. Deleting the output encodes the source again. A report too old to
+hold the time goes by the size alone, and a file there with no report at all counts as done.
+An output is never written where its own source or another
 input of the run is, whatever name leads there (`--overwrite` included): with `-o` the folder
 being walked, `a.mkv` is refused when `a.mp4` is there too, and the rest of the run goes on;
 with `--overwrite`, so is the second of two inputs that would write one output. An
@@ -352,8 +368,8 @@ from two input folders), the second is reported as a name collision instead of b
 A name that is not valid UTF-8 can't be passed to ffmpeg. `encode` refuses such a file with a
 message to rename it and goes on with the others. `scan` still lists it; `dups` and `bench`
 leave it out and say how many they left out. On the page the folder picker, the scan and the
-duplicate search leave such names out and say how many, and a folder that is queued or
-watched goes on without them.
+duplicate search leave such names out and say how many. So do a folder that is queued, on its
+job, and a benchmark. A watched folder goes on without them.
 
 The report is named after the output and has the longer name of the two. If that name is more
 than the output folder's file system takes (255 bytes on most, 143 in an encrypted home
@@ -432,8 +448,11 @@ single output files.
   was replaced earlier.
 - An output is only used while its report still matches both files: the original and the
   output must be there with the sizes the encode recorded, and the output must be the smaller
-  one. Originals that are links, reports without full paths (very old ones) and a new name
-  that is already taken in the original's folder are refused too.
+  one. An original with another modification time is judged as when `encode` resumes: one only
+  touched or copied is replaced, while one rewritten, one that cannot be read and one whose
+  report has no fingerprint to tell by are refused. Originals that are links, reports without
+  full paths (very old ones) and a new name that is already taken in the original's folder are
+  refused too.
 - An output with sections removed takes its original's place like any other, and the list
   says so. The removed sections are then only in the original in the trash.
 - A report is a file like any other, so it is only followed where `encode` writes one: next
@@ -495,12 +514,16 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
   says how many are still to come. **Do next** on a waiting job
   starts it before the other waiting ones, and **Queue again** on a cancelled or failed job
   queues its files once more with the same settings. Inputs of a saved or requeued job that
-  are gone are left out and named on the job, and rejoin it if they are back at the next
-  start; a saved job with no input left is listed apart, with **Try again** and **Forget**.
+  are gone are left out and named on the job. They stay saved when the job finishes, fails or
+  is taken off the list, and are queued once they are back at a later start; a saved job with
+  no input left is listed apart, with **Try again** and **Forget**.
   A job queued by hand makes its output folder when it is queued. One that comes back from
   the saved queue, is queued again or comes from a watch needs that folder to exist, so that
   nothing is written under the mount point of a drive that is away: without it the job fails
-  saying so and stays in the saved queue for the next start, unless you clear it.
+  saying so and stays in the saved queue for the next start, until you remove it (**Clear
+  finished** leaves it). Such a job also checks the folder before each file, so one whose
+  drive is lost on the way waits in the same manner. Jobs and watches saved by earlier versions
+  get their folder made once.
   **Pause** holds the queue until
   you resume, and **Hours…** sets the hours of the day encodes may run in (for example 23:00
   to 07:00). Either way nothing new starts and the running encode is held where it is: its
@@ -518,7 +541,10 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
   Dolby Vision, too short, too little to gain and unreadable files are left. A watch with
   **Force** ticked leaves only AV1 and unreadable files. A video whose probe could not
   finish, or that the system could not read, is not called unreadable at once: it gets three
-  looks before it is left. The videos in the folder
+  looks and is then tried at growing intervals, up to once a day. Until a probe gets through
+  it is listed as not read yet, with the reason and the number of tries, and **Look now** tries
+  it at once.
+  One that an earlier version had given up on is tried again. The videos in the folder
   when it was added are not queued unless asked for. Queueing is all a watch does: the
   pause and the hours decide when the encode runs, and originals are never replaced or
   touched. The output folder is made when the watch is added, and while it is not there
@@ -641,9 +667,10 @@ A `ui.json` or `ui-queue.json` that can't be read is not written over. It is kep
 it was under a name with the time in it (`ui.unreadable-20261118-213005.json`), and the server's
 output and a banner on the page say so. av1opt then starts with default settings or an empty
 queue. Settings hold the pause, the hours and the watched folders, so after losing them the
-queue starts paused until you resume it. A damaged line in `history.jsonl` or the trial cache
-costs that line alone. A failed save of the queue or of the last benchmark is said once, until
-saving works again.
+queue starts paused until you resume it. A damaged line in `history.jsonl`, the trial cache,
+`av1opt-log.tsv` or the benchmark's saved measurements costs that line alone, and a last line
+cut short does not take the next one with it. A failed save of the queue or of the last
+benchmark is said once, until saving works again.
 
 ### Debugging
 

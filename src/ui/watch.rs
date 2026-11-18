@@ -166,7 +166,7 @@ fn save(app: &App, force: bool) {
     let written = p.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| crate::files::replace_with(&p, &serde_json::to_vec(&doc).unwrap_or_default()));
     match written {
         Ok(()) => *saved = now(),
-        Err(e) => super::note(&format!("watched folders not saved: cannot write {}: {e}", p.display())),
+        Err(e) => eprintln!("watched folders not saved: cannot write {}: {e}", p.display()),
     }
 }
 

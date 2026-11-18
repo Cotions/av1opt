@@ -745,6 +745,36 @@ fn waiting_jobs_can_be_moved_first_and_stopped_ones_queued_again() {
     assert_eq!(s.post("/api/jobs/999/again", &json!({})).status, 404);
 }
 
+/// `av1opt scan` of an empty folder, with a scratch environment of its own.
+fn scan_command(name: &str) -> std::process::Command {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("ui-{name}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("videos")).unwrap();
+    let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_av1opt"));
+    c.arg("scan").arg(dir.join("videos")).env("XDG_DATA_HOME", dir.join("data")).env("XDG_CACHE_HOME", dir.join("cache")).env("AV1OPT_HISTORY", dir.join("history.jsonl"));
+    c.stdin(std::process::Stdio::null());
+    c
+}
+
+#[test]
+fn a_closed_stderr_is_no_reason_to_stop() {
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let out = scan_command("no-stderr").stdout(std::process::Stdio::null()).stderr(writer).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+}
+
+#[test]
+fn a_closed_stdout_ends_a_command_as_a_closed_pipe_does() {
+    use std::os::unix::process::ExitStatusExt;
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let out = scan_command("no-stdout").stdout(writer).stderr(std::process::Stdio::piped()).output().unwrap();
+    assert_eq!(out.status.signal(), Some(libc::SIGPIPE), "{out:?}");
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(!said.contains("panicked"), "{said}");
+}
+
 /// Sets a file's modification time `secs` in the past.
 fn age(path: &Path, secs: u64) {
     let f = std::fs::File::options().write(true).open(path).unwrap();

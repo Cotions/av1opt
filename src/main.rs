@@ -1,3 +1,7 @@
+// First: its macros are for every module below.
+#[macro_use]
+mod output;
+
 mod batch;
 mod bench;
 mod dups;

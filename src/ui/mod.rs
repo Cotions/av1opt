@@ -188,7 +188,7 @@ impl App {
     pub fn save_settings(&self) {
         one_at_a_time(&self.settings_save, || self.settings.lock().unwrap().clone(), |mut s| {
             if s.format > SETTINGS_FORMAT {
-                note("settings not saved: ui.json is from a newer av1opt");
+                eprintln!("settings not saved: ui.json is from a newer av1opt");
                 return;
             }
             s.format = SETTINGS_FORMAT;
@@ -200,7 +200,7 @@ impl App {
                 .map_or(Ok(()), std::fs::create_dir_all)
                 .and_then(|()| crate::files::replace_with(&path, &serde_json::to_vec_pretty(&s).unwrap_or_default()));
             if let Err(e) = saved {
-                note(&format!("settings not saved: cannot write {}: {e}", path.display()));
+                eprintln!("settings not saved: cannot write {}: {e}", path.display());
             }
         });
     }
@@ -250,7 +250,7 @@ pub fn run(cfg: Config) -> Result<()> {
         match library::chosen_program(name, &path) {
             Ok(real) => *tool = Some(real.to_string_lossy().into_owned()),
             Err(why) => {
-                note(&format!("{name}: {why}; using the default"));
+                eprintln!("{name}: {why}; using the default");
                 *tool = None;
             }
         }
@@ -338,7 +338,7 @@ fn stop_on_signal(app: Arc<App>) {
             let mut b = [0u8; 1];
             // SAFETY: read(2) on our own pipe.
             while unsafe { libc::read(fds[0], b.as_mut_ptr().cast(), 1) } < 0 {}
-            note("stopping");
+            eprintln!("stopping");
             jobs::shutdown(&a);
             std::process::exit(0);
         });
@@ -346,17 +346,11 @@ fn stop_on_signal(app: Arc<App>) {
     if std::env::var_os("AV1OPT_UI_EXIT_WITH_STDIN").is_some_and(|v| v == "1") {
         std::thread::spawn(move || {
             let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
-            note("parent went away, stopping");
+            eprintln!("parent went away, stopping");
             jobs::shutdown(&app);
             std::process::exit(0);
         });
     }
-}
-
-/// Like `eprintln!` but never panics: when a wrapper app dies, stderr is a broken pipe.
-fn note(msg: &str) {
-    use std::io::Write;
-    let _ = writeln!(std::io::stderr(), "{msg}");
 }
 
 /// Hands the sign-in link to the desktop's default browser through a private file, so the

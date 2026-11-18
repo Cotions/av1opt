@@ -205,6 +205,17 @@ fn decode_path(s: &str) -> Option<PathBuf> {
 /// specification has it, so a `.Trash-1000` somebody put into a folder of downloads can only
 /// ever give files back to that folder.
 pub fn holds(trashed: &Path, original: &Path) -> bool {
+    holds_with(trashed, original, &|top| {
+        // The top of a filesystem: its parent is on another one (or it has none).
+        let dev = |p: &Path| std::fs::metadata(p).map(|m| m.dev()).ok();
+        top.parent().is_none_or(|up| dev(top).is_some() && dev(top) != dev(up))
+    })
+}
+
+/// [`holds`], with what counts as the top of a drive passed in (tests have no drive of their
+/// own). A trash folder anywhere else is only a folder with that name: this module never
+/// makes one there, and anybody can.
+fn holds_with(trashed: &Path, original: &Path, is_top: &dyn Fn(&Path) -> bool) -> bool {
     let inner = || -> Option<bool> {
         let files = trashed.parent().filter(|d| d.file_name().is_some_and(|n| n == "files"))?;
         let bin = files.parent()?;
@@ -222,7 +233,7 @@ pub fn holds(trashed: &Path, original: &Path) -> bool {
             top => top,
         };
         let plain = recorded.components().all(|c| matches!(c, std::path::Component::Normal(_)));
-        Some(plain && top.join(recorded) == original)
+        Some(plain && is_top(top) && top.join(recorded) == original)
     };
     inner().unwrap_or(false)
 }
@@ -278,20 +289,23 @@ mod tests {
             std::fs::write(bin.join("info").join(format!("{name}.trashinfo")), format!("[Trash Info]\nPath={path}\nDeletionDate=2026-11-10T22:15:03\n")).unwrap();
             bin.join("files").join(name)
         };
-        assert!(holds(&put("in.mkv", "films/in.mkv"), &top.join("films/in.mkv")));
-        assert!(!holds(&put("abs.mkv", "/etc/abs.mkv"), Path::new("/etc/abs.mkv")));
-        assert!(!holds(&put("up.mkv", "../lib/up.mkv"), &top.join("../lib/up.mkv")));
-        assert!(!holds(&put("up.mkv", "../lib/up.mkv"), &dir.join("lib/up.mkv")));
+        let at_top = |t: &Path, o: &Path| holds_with(t, o, &|p| p == top);
+        assert!(at_top(&put("in.mkv", "films/in.mkv"), &top.join("films/in.mkv")));
+        assert!(!at_top(&put("abs.mkv", "/etc/abs.mkv"), Path::new("/etc/abs.mkv")));
+        assert!(!at_top(&put("up.mkv", "../lib/up.mkv"), &top.join("../lib/up.mkv")));
+        assert!(!at_top(&put("up.mkv", "../lib/up.mkv"), &dir.join("lib/up.mkv")));
+        // The same folder anywhere but at the top of a drive is anybody's folder.
+        assert!(!holds(&bin.join("files/in.mkv"), &top.join("films/in.mkv")));
         // Shared trash folders keep one folder per user.
         let shared = top.join(".Trash/1000");
         std::fs::create_dir_all(shared.join("files")).unwrap();
         std::fs::create_dir_all(shared.join("info")).unwrap();
         std::fs::write(shared.join("files/s.mkv"), b"x").unwrap();
         std::fs::write(shared.join("info/s.mkv.trashinfo"), "[Trash Info]\nPath=films/s.mkv\n").unwrap();
-        assert!(holds(&shared.join("files/s.mkv"), &top.join("films/s.mkv")));
+        assert!(at_top(&shared.join("files/s.mkv"), &top.join("films/s.mkv")));
         // No info file, no say.
         std::fs::write(bin.join("files/bare.mkv"), b"x").unwrap();
-        assert!(!holds(&bin.join("files/bare.mkv"), &top.join("bare.mkv")));
+        assert!(!at_top(&bin.join("files/bare.mkv"), &top.join("bare.mkv")));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

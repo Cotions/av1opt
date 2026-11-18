@@ -461,7 +461,8 @@ gets it as a cookie). Requests with a foreign Host or Origin are refused, and me
 served for files you picked in the app. Output folders on ZFS are refused (no override in the UI);
 replacing an original that is on ZFS needs a tick in the dialog, or the confirmation in Compare, which says so.
 Putting one back there, and moving duplicates on ZFS to the trash, ask in a dialog of their own.
-The ffmpeg and ffprobe programs set in Settings have to be named like that (`ffmpeg`, `/opt/x/ffprobe-7`).
+The ffmpeg and ffprobe programs set in Settings have to be named like that (`ffmpeg`, `/opt/x/ffprobe-7`)
+and be yours or the system's, writable by nobody else.
 `AV1OPT_UI_TOKEN` sets the token (for a desktop wrapper loading the same page);
 `AV1OPT_UI_DEV=<repo>/ui` serves the page files from disk while working on them.
 

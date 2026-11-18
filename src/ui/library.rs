@@ -99,6 +99,14 @@ fn tools_state(app: &App) -> Value {
     })
 }
 
+/// Whether a file is the user's or the system's, and writable by nobody else.
+fn mine_alone(m: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: getuid has no failure mode and touches no memory.
+    let uid = unsafe { libc::getuid() };
+    (m.uid() == 0 || m.uid() == uid) && m.mode() & 0o022 == 0
+}
+
 /// Sets the ffmpeg and ffprobe programs (empty = back to the command-line default) and
 /// reports what they can do.
 pub fn set_tools(app: &App, body: &Value) -> Result<Value> {
@@ -107,9 +115,13 @@ pub fn set_tools(app: &App, body: &Value) -> Result<Value> {
             None | Some("") => Ok(None),
             Some(p) if p.contains('/') && !Path::new(p).is_absolute() => bail!("{k}: use an absolute path or a program name"),
             // This page starts what is named here. Whoever can reach the page can already
-            // encode and trash; running any program of the machine is not part of that.
+            // encode and trash; running any program of the machine is not part of that. So:
+            // a program named like the tool, and one nobody else could have put there.
             Some(p) if !Path::new(p).file_name().and_then(|n| n.to_str()).is_some_and(|n| n.to_ascii_lowercase().starts_with(k)) => {
                 bail!("{k}: the program's name has to start with {k}")
+            }
+            Some(p) if Path::new(p).is_absolute() && std::fs::metadata(p).is_ok_and(|m| !mine_alone(&m)) => {
+                bail!("{k}: {p} belongs to another user or can be changed by others")
             }
             Some(p) => Ok(Some(p.to_string())),
         }

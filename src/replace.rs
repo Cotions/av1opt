@@ -106,6 +106,9 @@ pub fn check(report: &Path) -> Check {
 }
 
 fn check_inner(report: &Path) -> Result<Check, String> {
+    if std::fs::symlink_metadata(report).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err("the report is a link".into());
+    }
     let r = read_report(report)?;
     let source = full_path(&r, "input")?;
     let output = full_path(&r, "output")?;
@@ -119,6 +122,12 @@ fn check_inner(report: &Path) -> Result<Check, String> {
         }
         if !crate::scan::is_video(&source) || !crate::scan::is_video(&output) {
             return Err("the report names a file that is not a video".into());
+        }
+        // `apply` puts the AV1 file under the original's name, or leaves it where it was:
+        // anywhere else is not a place a replacement can have left it.
+        let placed = from.extension().map(|ext| source.with_extension(ext));
+        if output != from && Some(&output) != placed.as_ref() {
+            return Err("the report does not say where the AV1 file went in a way `replace` would have".into());
         }
         let can_undo = file_size(&trash) == Some(source_bytes) && file_size(&output) == Some(output_bytes) && trash::holds(&trash, &source);
         let zfs = source.parent().is_some_and(crate::fsguard::on_zfs);
@@ -879,6 +888,20 @@ mod tests {
         r["replaced"]["trash"] = json!(fake.join("files/a.mp4"));
         std::fs::write(&report, serde_json::to_vec(&r).unwrap()).unwrap();
         assert!(undo(&report, true).unwrap_err().to_string().starts_with("the trash does not say that"));
+        // The AV1 file somewhere a replacement would never have put it: undo would carry
+        // that file off to the report's folder.
+        let mut r: Value = serde_json::from_slice(&honest).unwrap();
+        r["output"] = json!(victim);
+        std::fs::write(&report, serde_json::to_vec(&r).unwrap()).unwrap();
+        assert_eq!(no(&report), "the report does not say where the AV1 file went in a way `replace` would have");
+        assert!(undo(&report, true).is_err() && victim.exists());
+        // A link to a report is not a report.
+        std::fs::write(&report, &honest).unwrap();
+        let aside = f.dir.join("downloads/real.json");
+        std::fs::rename(&report, &aside).unwrap();
+        std::os::unix::fs::symlink(&aside, &report).unwrap();
+        assert_eq!(no(&report), "the report is a link");
+        std::fs::remove_file(&report).unwrap();
         // The honest report still undoes.
         std::fs::write(&report, honest).unwrap();
         let Check::Replaced(d) = check(&report) else { panic!() };

@@ -2461,14 +2461,17 @@ function comparePlayer(root, r) {
       } }, "Replace original…"))]
     : rp.state === "replaced" ? [
       h("p", { class: "dim" }, "The AV1 file is where the original was. ", rp.can_undo ? "The original is in the trash." : "The original is no longer in the trash (or one of the two files changed), so this can't be undone here."),
-      rp.can_undo ? h("div", { class: "row" }, h("button", { title: `Original back to ${r.input}\nAV1 file back to ${rp.from}`, onclick: async () => {
+      rp.can_undo ? h("div", { class: "row" }, h("button", { title: `Original back to ${r.input}\nAV1 file back to ${rp.from}`, onclick: async (e) => {
+        const btn = e.currentTarget;
         if (rp.zfs && !await confirmDialog({
           title: "Put the original back on ZFS?",
           action: "Put original back",
           body: [h("p", { class: "warn" }, "The original's folder is on ZFS, which av1opt writes to only when asked. Putting it back here is asking."),
             h("div", { class: "mono trash-list" }, r.input)],
         })) return;
-        act("/api/replace/undo", { report: r.report_path, allow_zfs: !!rp.zfs }, "Original back in its place");
+        btn.disabled = true;
+        await act("/api/replace/undo", { report: r.report_path, allow_zfs: !!rp.zfs }, "Original back in its place");
+        btn.disabled = false;
       } }, "Put original back")) : null]
     : h("p", { class: "dim" }, `The AV1 file can't take the original's place: ${rp.why}.`));
 

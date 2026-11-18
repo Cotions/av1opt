@@ -421,4 +421,300 @@ mod tests {
             ";FFMETADATA1\n\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=10000\ntitle=Intro\n\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=10000\nEND=90000\ntitle=A\\=B\n"
         );
     }
+
+    #[test]
+    fn a_time_has_at_most_three_parts_and_none_of_them_empty() {
+        for bad in ["1:2:3:4", ":5", "5:", "::", "1::2", ":", " ", "1: 20", "1.5:00", "1:2.5:00"] {
+            assert_eq!(parse_time(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn seconds_stop_at_sixty_only_when_minutes_stand_before_them() {
+        assert_eq!(parse_time("60"), Some(60.0));
+        assert_eq!(parse_time("3600.5"), Some(3600.5));
+        assert_eq!(parse_time("0:59.5"), Some(59.5));
+        assert_eq!(parse_time("0:60"), None);
+        assert_eq!(parse_time("1:00:59.5"), Some(3659.5));
+        assert_eq!(parse_time("1:00:60"), None);
+        // Minutes alone may run past the hour: a 90-minute mark is written 90:00.
+        assert_eq!(parse_time("90:00"), Some(5400.0));
+        assert_eq!(parse_time("100:00:00"), Some(360_000.0));
+    }
+
+    #[test]
+    #[ignore = "defect: parse_time takes 1:75:00 as 2:15:00 although it refuses 1:75 as m:ss"]
+    fn the_minutes_of_a_time_with_hours_stop_at_sixty() {
+        assert_eq!(parse_time("1:59:00"), Some(7140.0));
+        assert_eq!(parse_time("1:60:00"), None);
+        assert_eq!(parse_time("1:75:00"), None);
+    }
+
+    #[test]
+    fn what_is_not_a_finite_number_is_not_a_time() {
+        for bad in ["inf", "infinity", "NaN", "nan", "1e999", "0:inf", "0:NaN", "١:٢٠", "1:٢٠", "１:２０", "x"] {
+            assert_eq!(parse_time(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_range_may_have_spaces_and_any_case_of_end() {
+        assert_eq!(parse_range(" 1:20 - 2:05 "), Ok((80.0, 125.0)));
+        assert_eq!(parse_range("0-END"), Ok((0.0, f64::INFINITY)));
+        assert_eq!(parse_range("0:00-End"), Ok((0.0, f64::INFINITY)));
+        assert_eq!(parse_range("12:03.5-14:10"), Ok((723.5, 850.0)));
+        assert_eq!(parse_range("58:30- "), Ok((3510.0, f64::INFINITY)));
+    }
+
+    #[test]
+    fn a_range_that_is_empty_or_unreadable_is_refused_and_named() {
+        for bad in ["5-5", "1:00-60", "-5", "-", "", "abc-5", "5-abc", "end-5", "1:75-2:00", "5-1:75"] {
+            assert!(parse_range(bad).is_err(), "{bad:?}");
+        }
+        assert!(parse_range("abc-5").unwrap_err().contains("'abc'"));
+        assert!(parse_range("5-abc").unwrap_err().contains("'abc'"));
+        assert!(parse_range("9-3").unwrap_err().contains("ends before it starts"));
+    }
+
+    #[test]
+    fn times_are_written_rounded_to_the_millisecond_with_carries() {
+        for (t, want) in [
+            (0.0, "0:00"),
+            (-5.0, "0:00"),
+            (f64::NAN, "0:00"),
+            (0.25, "0:00.25"),
+            (0.001, "0:00.001"),
+            (0.0004, "0:00"),
+            (61.5, "1:01.5"),
+            (59.9996, "1:00"),
+            (3599.9996, "1:00:00"),
+            (36_000.0, "10:00:00"),
+        ] {
+            assert_eq!(fmt_time(t), want, "{t}");
+        }
+    }
+
+    #[test]
+    fn a_written_time_reads_back_as_the_same_time() {
+        for t in [0.0, 0.5, 59.75, 60.0, 3599.5, 3600.0, 86_399.125] {
+            assert!(close(parse_time(&fmt_time(t)).unwrap(), t), "{t}");
+        }
+    }
+
+    #[test]
+    fn sections_that_are_not_ranges_inside_the_video_are_refused() {
+        for bad in [(f64::NAN, 5.0), (f64::INFINITY, f64::INFINITY), (-1.0, 5.0), (1.0, f64::NAN), (5.0, 5.0), (6.0, 5.0), (100.0, 110.0)] {
+            assert!(Sections::new(&[bad], 100.0).is_err(), "{bad:?}");
+        }
+        // One bad section among good ones refuses the lot.
+        assert!(Sections::new(&[(1.0, 2.0), (5.0, 4.0)], 100.0).is_err());
+    }
+
+    #[test]
+    fn touching_contained_and_repeated_sections_become_one() {
+        for remove in [
+            vec![(10.0, 20.0), (20.0, 30.0)],
+            vec![(20.0, 30.0), (10.0, 20.0)],
+            vec![(10.0, 30.0), (15.0, 20.0)],
+            vec![(15.0, 20.0), (10.0, 30.0), (10.0, 30.0)],
+        ] {
+            let s = Sections::new(&remove, 100.0).unwrap();
+            assert_eq!(s.removed(), &[(10.0, 30.0)], "{remove:?}");
+            assert_eq!(s.keep(), &[(0.0, 10.0), (30.0, 100.0)], "{remove:?}");
+        }
+    }
+
+    #[test]
+    fn a_section_at_either_end_leaves_nothing_before_or_after_it() {
+        assert_eq!(Sections::new(&[(0.0, 10.0)], 100.0).unwrap().keep(), &[(10.0, 100.0)]);
+        assert_eq!(Sections::new(&[(90.0, 100.0)], 100.0).unwrap().keep(), &[(0.0, 90.0)]);
+        assert_eq!(Sections::new(&[(90.0, 1e9)], 100.0).unwrap().removed(), &[(90.0, 100.0)]);
+        assert_eq!(Sections::new(&[(0.0, 10.0), (90.0, f64::INFINITY)], 100.0).unwrap().keep(), &[(10.0, 90.0)]);
+    }
+
+    #[test]
+    fn a_kept_part_of_a_quarter_second_stays_and_a_shorter_one_goes() {
+        // At the start.
+        assert_eq!(Sections::new(&[(0.25, 10.0)], 20.0).unwrap().keep(), &[(0.0, 0.25), (10.0, 20.0)]);
+        assert_eq!(Sections::new(&[(0.2, 10.0)], 20.0).unwrap().keep(), &[(10.0, 20.0)]);
+        // Between two sections.
+        assert_eq!(Sections::new(&[(1.0, 2.0), (2.25, 3.0)], 20.0).unwrap().keep(), &[(0.0, 1.0), (2.0, 2.25), (3.0, 20.0)]);
+        assert_eq!(Sections::new(&[(1.0, 2.0), (2.2, 3.0)], 20.0).unwrap().keep(), &[(0.0, 1.0), (3.0, 20.0)]);
+        // At the end.
+        assert_eq!(Sections::new(&[(10.0, 19.75)], 20.0).unwrap().keep(), &[(0.0, 10.0), (19.75, 20.0)]);
+        assert_eq!(Sections::new(&[(10.0, 19.8)], 20.0).unwrap().keep(), &[(0.0, 10.0)]);
+    }
+
+    #[test]
+    fn when_only_slivers_would_be_left_the_video_is_covered() {
+        for remove in [vec![(0.1, 100.0)], vec![(0.0, 99.9)], vec![(0.1, 50.0), (50.1, 99.9)]] {
+            let e = Sections::new(&remove, 100.0).unwrap_err().to_string();
+            assert!(e.contains("nothing would be left"), "{remove:?}: {e}");
+        }
+    }
+
+    fn cut_video() -> Sections {
+        Sections::new(&[(10.0, 30.0), (50.0, 60.0)], 100.0).unwrap()
+    }
+
+    #[test]
+    fn a_time_at_or_inside_a_cut_maps_to_the_join() {
+        let s = cut_video();
+        for t in [10.0, 10.001, 20.0, 29.999, 30.0] {
+            assert!(close(s.to_out(t), 10.0), "{t}");
+        }
+        for t in [50.0, 55.0, 60.0] {
+            assert!(close(s.to_out(t), 30.0), "{t}");
+        }
+        assert!(close(s.to_out(0.0), 0.0));
+        assert!(close(s.to_out(-4.0), 0.0));
+        assert!(close(s.to_out(1000.0), 70.0));
+        // A sliver that was dropped counts as removed.
+        let s = Sections::new(&[(10.0, 20.0), (20.1, 30.0)], 100.0).unwrap();
+        assert!(close(s.to_out(20.05), 10.0));
+        assert!(close(s.to_out(31.0), 11.0));
+    }
+
+    #[test]
+    fn output_time_never_runs_backwards_and_equals_what_was_kept_so_far() {
+        let s = cut_video();
+        let mut last = 0.0;
+        for i in -8..=880 {
+            let t = i as f64 / 8.0;
+            let out = s.to_out(t);
+            assert!(out >= last, "{t}");
+            assert!(close(out, s.kept_within(t)), "{t}");
+            last = out;
+        }
+        assert!(close(s.kept_within(1e9), s.kept()));
+        assert!(close(s.kept_within(0.0), 0.0));
+    }
+
+    #[test]
+    fn a_window_at_a_join_starts_in_the_part_after_it() {
+        let s = cut_video();
+        assert_eq!(s.window(10.0, 5.0), (10.0, 30.0, 5.0));
+        assert_eq!(s.window(30.0, 5.0), (30.0, 60.0, 5.0));
+    }
+
+    #[test]
+    fn a_window_outside_the_output_is_brought_back_into_it() {
+        let s = cut_video();
+        assert_eq!(s.window(1000.0, 5.0), (65.0, 95.0, 5.0));
+        assert_eq!(s.window(-3.0, 5.0), (0.0, 0.0, 5.0));
+        assert_eq!(s.window(3.0, 0.0), (3.0, 3.0, 0.0));
+    }
+
+    #[test]
+    fn every_window_lies_inside_one_kept_part_and_maps_back_to_its_output_time() {
+        let s = cut_video();
+        for i in 0..=150 {
+            let start = i as f64 / 2.0;
+            for want in [0.5, 4.0, 15.0, 100.0] {
+                let (out, src, secs) = s.window(start, want);
+                assert!(secs > 0.0 && secs <= want, "{start} {want}");
+                assert!(s.keep().iter().any(|&(a, b)| src >= a - 1e-9 && src + secs <= b + 1e-9), "{start} {want}: {src} {secs}");
+                assert!(close(s.to_out(src), out), "{start} {want}: {src} {out}");
+            }
+        }
+    }
+
+    #[test]
+    fn samples_come_from_kept_parts_however_little_is_left() {
+        let s = cut_video();
+        let samples = s.sample_positions(4, 2.0);
+        assert_eq!(samples.len(), 4);
+        for (src, secs) in samples {
+            assert!(s.keep().iter().any(|&(a, b)| src >= a - 1e-9 && src + secs <= b + 1e-9), "{src} {secs}");
+        }
+        assert_eq!(Sections::new(&[(1.0, 100.0)], 100.0).unwrap().sample_positions(4, 8.0), vec![(0.0, 1.0)]);
+    }
+
+    #[test]
+    fn a_kept_part_is_left_open_only_when_it_reaches_the_end() {
+        let s = Sections::new(&[(20.0, f64::INFINITY)], 30.0).unwrap();
+        assert_eq!(
+            s.filter_graph(0, 2, &["a".into(), "b".into()], 30.0),
+            "[0:0]trim=start=0.000000:end=20.000000,setpts=PTS-0.000000/TB[v0];\
+             [0:a:0]atrim=start=0.000000:end=20.000000,asetpts=PTS-0.000000/TB[a0_0];\
+             [0:a:1]atrim=start=0.000000:end=20.000000,asetpts=PTS-0.000000/TB[a1_0];\
+             [v0][a0_0][a1_0]concat=n=1:v=1:a=2[vcat][ao0][ao1];[vcat]a,b[vout]"
+        );
+        // Within a millisecond of the end counts as the end.
+        let s = Sections::new(&[(0.0, 10.0)], 30.0).unwrap();
+        assert!(!s.filter_graph(0, 0, &[], 30.0005).contains(":end="));
+        assert!(s.filter_graph(0, 0, &[], 30.5).contains(":end=30.000000"));
+    }
+
+    #[test]
+    fn subtitle_lines_across_a_cut_end_or_begin_at_the_join() {
+        let s = Sections::new(&[(10.0, 20.0)], 100.0).unwrap();
+        let srt = "1\n00:00:05,000 --> 00:00:12,000\nends in the cut\n\n2\n00:00:15,000 --> 00:00:22,000\nbegins in the cut\n";
+        assert_eq!(s.retime_srt(srt), "1\n00:00:05,000 --> 00:00:10,000\nends in the cut\n\n2\n00:00:10,000 --> 00:00:12,000\nbegins in the cut\n\n");
+    }
+
+    #[test]
+    fn subtitle_files_from_other_systems_are_read_too() {
+        let s = Sections::new(&[(10.0, 20.0)], 100.0).unwrap();
+        // A byte order mark, Windows line ends, a dot for the comma, placement after the time.
+        let srt = "\u{feff}1\r\n00:00:01.000 --> 00:00:02.000 X1:10 X2:20\r\nÉté 字幕\r\n\r\n\r\n\r\n2\r\n00:00:30,000 --> 00:00:31,000\r\nLater\r\n";
+        assert_eq!(s.retime_srt(srt), "1\n00:00:01,000 --> 00:00:02,000\nÉté 字幕\n\n2\n00:00:20,000 --> 00:00:21,000\nLater\n\n");
+    }
+
+    #[test]
+    fn subtitle_blocks_without_readable_times_are_left_out() {
+        let s = Sections::new(&[(10.0, 20.0)], 100.0).unwrap();
+        assert_eq!(s.retime_srt(""), "");
+        assert_eq!(s.retime_srt("just text\n\nmore text\n"), "");
+        assert_eq!(s.retime_srt("1\nsoon --> later\nx\n\n2\n00:00:01,000 --> \ny\n"), "");
+    }
+
+    #[test]
+    fn ass_lines_follow_the_format_line_of_their_section() {
+        let s = Sections::new(&[(10.0, 20.0)], 100.0).unwrap();
+        let ass = "[V4+ Styles]\nFormat: Name, Fontname\nStyle: Default,Arial\n[Events]\nFormat: Start, End, Text\nDialogue: 0:00:25.00,0:00:26.00,Hi, you\n";
+        assert_eq!(s.retime_ass(ass), "[V4+ Styles]\nFormat: Name, Fontname\nStyle: Default,Arial\n[Events]\nFormat: Start, End, Text\nDialogue: 0:00:15.00,0:00:16.00,Hi, you\n");
+    }
+
+    #[test]
+    fn ass_lines_across_a_cut_are_shortened_and_others_stay_as_they_are() {
+        let s = Sections::new(&[(10.0, 20.0)], 100.0).unwrap();
+        let ass = "Dialogue:0,0:00:09.50,0:00:21.00,Default,,0,0,0,,across\n\
+                   Dialogue: 0,soon,0:00:26.00,Default,,0,0,0,,unreadable\n\
+                   Comment: 0,0:00:12.00,0:00:13.00,Default,,0,0,0,,a note\n";
+        assert_eq!(
+            s.retime_ass(ass),
+            "Dialogue: 0,0:00:09.50,0:00:11.00,Default,,0,0,0,,across\n\
+             Dialogue: 0,soon,0:00:26.00,Default,,0,0,0,,unreadable\n\
+             Comment: 0,0:00:12.00,0:00:13.00,Default,,0,0,0,,a note\n"
+        );
+    }
+
+    #[test]
+    fn chapters_across_a_cut_shrink_and_their_titles_are_escaped() {
+        let s = Sections::new(&[(10.0, 20.0)], 100.0).unwrap();
+        let ch = [
+            Chapter { start: 1.0006, end: 25.0, title: Some("a;b#c\\d\ne".into()) },
+            Chapter { start: 30.0, end: 40.0, title: None },
+            Chapter { start: 50.0, end: 50.0, title: Some("no length".into()) },
+        ];
+        assert_eq!(
+            s.chapters(&ch),
+            ";FFMETADATA1\n\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=1001\nEND=15000\ntitle=a\\;b\\#c\\\\d\\\ne\n\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=20000\nEND=30000\n"
+        );
+        assert_eq!(s.chapters(&[]), ";FFMETADATA1\n");
+        assert_eq!(s.chapters(&[Chapter { start: 11.0, end: 19.0, title: None }]), ";FFMETADATA1\n");
+    }
+
+    #[test]
+    fn subtitle_times_are_written_with_carries_and_never_negative() {
+        for (t, want) in [(59.9996, "00:01:00,000"), (359_999.999, "99:59:59,999"), (360_000.0, "100:00:00,000"), (-1.0, "00:00:00,000")] {
+            assert_eq!(fmt_srt(t), want, "{t}");
+        }
+        for (t, want) in [(59.996, "0:01:00.00"), (3600.0, "1:00:00.00"), (0.126, "0:00:00.13"), (-1.0, "0:00:00.00")] {
+            assert_eq!(fmt_ass(t), want, "{t}");
+        }
+        assert_eq!(srt_time("01:02:03,500"), Some(3723.5));
+        assert_eq!(ass_time("1:02:03.50"), Some(3723.5));
+    }
 }

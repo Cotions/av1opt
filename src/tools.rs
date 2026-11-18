@@ -456,11 +456,9 @@ impl Tools {
     /// Whether each packet (= frame) of the first video stream is a key frame, in the order
     /// they are stored, without decoding.
     pub fn key_packets(&self, path: &Path) -> Result<Vec<bool>> {
-        let out = Command::new(&self.ffprobe)
-            .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=flags", "-of", "csv=p=0"])
-            .arg(probe_arg(path))
-            .output()
-            .context("failed to run ffprobe")?;
+        let mut command = Command::new(&self.ffprobe);
+        command.args(["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=flags", "-of", "csv=p=0"]).arg(probe_arg(path));
+        let out = crate::probe::run_ffprobe(command, crate::probe::Reads::all_of(path))?;
         if !out.status.success() {
             bail!("cannot read the packets of {}", path.display());
         }
@@ -470,11 +468,9 @@ impl Tools {
     /// Number of video packets (= frames) in the first video stream, without decoding. A file
     /// with no frames in it counts none; one that cannot be read is an error.
     pub fn count_frames(&self, path: &Path) -> Result<u64> {
-        let out = Command::new(&self.ffprobe)
-            .args(["-v", "error", "-select_streams", "v:0", "-count_packets", "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0"])
-            .arg(probe_arg(path))
-            .output()
-            .context("failed to run ffprobe")?;
+        let mut command = Command::new(&self.ffprobe);
+        command.args(["-v", "error", "-select_streams", "v:0", "-count_packets", "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0"]).arg(probe_arg(path));
+        let out = crate::probe::run_ffprobe(command, crate::probe::Reads::all_of(path))?;
         frames_counted(&out, path)
     }
 }

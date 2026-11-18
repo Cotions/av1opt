@@ -15,6 +15,10 @@ use std::time::{Duration, Instant};
 /// when the file cannot be read at all: a network or FUSE mount that has stalled.
 const PROBE_LIMIT: Duration = Duration::from_secs(120);
 
+/// What a run over a whole file gets on top of [`PROBE_LIMIT`] per gigabyte: it reads every
+/// packet, and a slow disk that is getting through them is not a stalled one.
+const LIMIT_PER_GIGABYTE: Duration = Duration::from_secs(60);
+
 /// What the system says when reading failed for a reason outside the file. ffprobe prints
 /// these as they are, and they can be over by the next try.
 const NOT_THE_FILES_FAULT: &[&str] = &[
@@ -193,6 +197,52 @@ fn run_within(mut command: Command, limit: Duration) -> std::io::Result<Option<O
     Ok(Some(Output { status, stdout: bytes(stdout), stderr: bytes(stderr) }))
 }
 
+fn too_long(limit: Duration) -> String {
+    format!("the probe took too long (over {} s) and was stopped; the drive may have stalled", limit.as_secs_f64().round())
+}
+
+/// How much a run of ffprobe has to read, which sets how long it gets.
+pub enum Reads {
+    /// The headers, or some bounded part of the file.
+    Little,
+    /// The packets of the whole of this file.
+    AllOf(u64),
+}
+
+impl Reads {
+    /// The packets of the whole file at `path`.
+    pub fn all_of(path: &Path) -> Reads {
+        Reads::AllOf(std::fs::metadata(path).map_or(0, |m| m.len()))
+    }
+
+    fn limit(&self) -> Duration {
+        match self {
+            Reads::Little => PROBE_LIMIT,
+            Reads::AllOf(bytes) => PROBE_LIMIT + LIMIT_PER_GIGABYTE * u32::try_from(bytes.div_ceil(1_000_000_000)).unwrap_or(u32::MAX / 120),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The time limit of ffprobe runs started by this thread, for the tests of what happens
+    /// when one runs out.
+    static LIMIT_IN_TESTS: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs ffprobe with a time limit, so that a stalled mount costs the file and not the whole
+/// run, and returns what it printed.
+pub fn run_ffprobe(command: Command, reads: Reads) -> Result<Output> {
+    let limit = reads.limit();
+    #[cfg(test)]
+    let limit = LIMIT_IN_TESTS.get().unwrap_or(limit);
+    match run_within(command, limit) {
+        Ok(Some(out)) => Ok(out),
+        Ok(None) => Err(NotJudged(too_long(limit)).into()),
+        Err(e) => Err(NotJudged(format!("failed to run ffprobe: {e}")).into()),
+    }
+}
+
 pub fn probe(ffprobe: &str, path: &Path, file_size: u64) -> Result<MediaInfo> {
     probe_within(ffprobe, path, file_size, PROBE_LIMIT)
 }
@@ -202,7 +252,7 @@ fn probe_within(ffprobe: &str, path: &Path, file_size: u64, limit: Duration) -> 
     command.args(["-v", "error", "-show_format", "-show_streams", "-of", "json"]).arg(crate::tools::probe_arg(path));
     let out = match run_within(command, limit) {
         Ok(Some(out)) => out,
-        Ok(None) => return Err(NotJudged(format!("the probe took too long (over {} s) and was stopped; the drive may have stalled", limit.as_secs_f64().round())).into()),
+        Ok(None) => return Err(NotJudged(too_long(limit)).into()),
         Err(e) => return Err(NotJudged(format!("failed to run {ffprobe}: {e}")).into()),
     };
     if !out.status.success() {
@@ -380,12 +430,12 @@ fn probe_within(ffprobe: &str, path: &Path, file_size: u64, limit: Duration) -> 
 /// Bits per second of audio stream number `index` (among the audio streams), measured from
 /// the packets of its first two minutes. For containers that don't state it.
 pub fn audio_bitrate(ffprobe: &str, path: &Path, index: usize) -> Option<f64> {
-    let out = Command::new(ffprobe)
+    let mut command = Command::new(ffprobe);
+    command
         .args(["-v", "error", "-read_intervals", "%+120", "-select_streams", &format!("a:{index}")])
         .args(["-show_entries", "packet=pts_time,duration_time,size", "-of", "csv=p=0"])
-        .arg(crate::tools::probe_arg(path))
-        .output()
-        .ok()?;
+        .arg(crate::tools::probe_arg(path));
+    let out = run_ffprobe(command, Reads::Little).ok()?;
     let (mut bytes, mut first, mut last) = (0.0, f64::INFINITY, f64::NEG_INFINITY);
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         let mut f = line.split(',').map(|x| x.trim().parse::<f64>().ok());
@@ -401,12 +451,9 @@ pub fn audio_bitrate(ffprobe: &str, path: &Path, index: usize) -> Option<f64> {
 /// takes in a container that states no rate for it (Matroska), where going by the size of
 /// the file would count the sound in.
 pub fn stream_bytes(ffprobe: &str, path: &Path, index: usize) -> Option<u64> {
-    let out = Command::new(ffprobe)
-        .args(["-v", "error", "-select_streams", &index.to_string(), "-show_entries", "packet=size", "-of", "csv=p=0"])
-        .arg(crate::tools::probe_arg(path))
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
+    let mut command = Command::new(ffprobe);
+    command.args(["-v", "error", "-select_streams", &index.to_string(), "-show_entries", "packet=size", "-of", "csv=p=0"]).arg(crate::tools::probe_arg(path));
+    let out = run_ffprobe(command, Reads::all_of(path)).ok().filter(|o| o.status.success())?;
     let bytes: u64 = String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.trim().trim_end_matches(',').parse::<u64>().ok()).sum();
     (bytes > 0).then_some(bytes)
 }
@@ -627,30 +674,69 @@ mod tests {
 
     #[test]
     fn a_probe_that_hangs_is_stopped_and_says_so() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("av1opt-probe-limit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let (ffprobe, pid_file) = (dir.join("ffprobe"), dir.join("pid"));
-        std::fs::write(&ffprobe, format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 60\n", pid_file.display())).unwrap();
-        std::fs::set_permissions(&ffprobe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::files::write_script(&ffprobe, &format!("echo $$ > '{}'\nexec sleep 60\n", pid_file.display()));
         let started = Instant::now();
         let e = probe_within(ffprobe.to_str().unwrap(), &dir.join("a.mkv"), 1, Duration::from_millis(300)).unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
         assert!(left_unjudged(&e) && e.to_string().contains("took too long"), "{e}");
-        // Killed and reaped: not even a zombie stays behind.
-        let process = PathBuf::from(format!("/proc/{}", std::fs::read_to_string(&pid_file).unwrap().trim()));
-        let waited = Instant::now();
-        while process.exists() {
-            assert!(waited.elapsed() < Duration::from_secs(5), "{} is still there", process.display());
-            std::thread::sleep(Duration::from_millis(10));
+        // Killed and reaped: not even a zombie stays behind. On a busy machine the limit can
+        // come before the script has got as far as saying who it is.
+        if let Some(pid) = std::fs::read_to_string(&pid_file).ok().filter(|p| p.ends_with('\n')) {
+            let process = PathBuf::from(format!("/proc/{}", pid.trim()));
+            let waited = Instant::now();
+            while process.exists() {
+                assert!(waited.elapsed() < Duration::from_secs(5), "{} is still there", process.display());
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
         // More output than a pipe holds does not get in the way of a probe that ends.
         let long = "x".repeat(300_000);
-        std::fs::write(&ffprobe, format!("#!/bin/sh\necho '{{\"streams\":[],\"note\":\"{long}\"}}'\n")).unwrap();
+        crate::files::write_script(&ffprobe, &format!("echo '{{\"streams\":[],\"note\":\"{long}\"}}'\n"));
         let e = probe_within(ffprobe.to_str().unwrap(), &dir.join("a.mkv"), 1, Duration::from_secs(20)).unwrap_err();
         assert!(!left_unjudged(&e) && e.to_string().contains("no video stream"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_other_call_of_ffprobe_is_stopped_when_it_hangs() {
+        let dir = std::env::temp_dir().join(format!("av1opt-probe-others-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ffprobe = dir.join("ffprobe");
+        crate::files::write_script(&ffprobe, "exec sleep 60\n");
+        let name = ffprobe.to_str().unwrap();
+        let file = dir.join("a.mkv");
+        let tools = crate::tools::Tools::new("false".into(), name.into(), None);
+        LIMIT_IN_TESTS.set(Some(Duration::from_millis(100)));
+        let started = Instant::now();
+        assert!(audio_bitrate(name, &file, 0).is_none());
+        assert!(stream_bytes(name, &file, 0).is_none());
+        let errors = [
+            tools.key_packets(&file).map(drop).unwrap_err(),
+            tools.count_frames(&file).map(drop).unwrap_err(),
+            crate::sections::read_chapters(name, &file).map(drop).unwrap_err(),
+        ];
+        LIMIT_IN_TESTS.set(None);
+        assert!(started.elapsed() < Duration::from_secs(30), "{:?}", started.elapsed());
+        for e in errors {
+            assert!(e.to_string().contains("took too long"), "{e}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_run_over_a_whole_file_gets_longer_the_larger_the_file() {
+        assert_eq!(Reads::Little.limit(), Duration::from_secs(120));
+        assert_eq!(Reads::AllOf(0).limit(), Duration::from_secs(120));
+        assert_eq!(Reads::AllOf(1).limit(), Duration::from_secs(180));
+        assert_eq!(Reads::AllOf(1_000_000_000).limit(), Duration::from_secs(180));
+        assert_eq!(Reads::AllOf(40_500_000_000).limit(), Duration::from_secs(120 + 41 * 60));
+        // No size is so large that the sum overflows.
+        assert!(Reads::AllOf(u64::MAX).limit() > Duration::from_secs(120));
     }
 
     #[test]

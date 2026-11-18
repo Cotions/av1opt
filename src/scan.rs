@@ -320,7 +320,6 @@ mod tests {
 
     #[test]
     fn only_a_probe_that_really_ran_is_remembered() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("av1opt-scan-probe-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("videos")).unwrap();
@@ -329,9 +328,8 @@ mod tests {
         }
         // Rejects one file, is killed on another, and meets a read error on the third.
         let ffprobe = dir.join("ffprobe");
-        let script = "#!/bin/sh\nfor last; do :; done\ncase \"$last\" in\n*broken*) echo \"$last: Invalid data found when processing input\" >&2; exit 1;;\n*killed*) kill -9 $$;;\n*) echo \"$last: Input/output error\" >&2; exit 1;;\nesac\n";
-        std::fs::write(&ffprobe, script).unwrap();
-        std::fs::set_permissions(&ffprobe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = "for last; do :; done\ncase \"$last\" in\n*broken*) echo \"$last: Invalid data found when processing input\" >&2; exit 1;;\n*killed*) kill -9 $$;;\n*) echo \"$last: Input/output error\" >&2; exit 1;;\nesac\n";
+        crate::files::write_script(&ffprobe, script);
         let cache = dir.join("cache.json");
         let scan = || collect_with_cache(&cache, &[dir.join("videos")], ffprobe.to_str().unwrap(), 2, 0.15, &estimate::Model::fit(&[], 93.0), &|_, _| {}).unwrap().0;
         let results = scan();

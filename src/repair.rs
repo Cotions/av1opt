@@ -363,11 +363,14 @@ fn lowest_over(secs: &[f64], scores: &[(usize, f64)], new: Option<&[(usize, f64)
         None => scores,
     };
     let scores = Scores::new(scores);
-    windows(secs, &scores, 0, secs.len() - 1)
+    let over: Vec<Window> = windows(secs, &scores, 0, secs.len() - 1).into_iter().filter(|w| run.overlaps(w.start, w.end)).collect();
+    // A window that takes in less of the stretch than lies between two scored frames says
+    // nothing of it: what it scores is its neighbour's.
+    let own = over
         .iter()
-        .filter(|w| run.overlaps(w.start, w.end))
-        .map(|w| scores.mean(w.start.max(run.start), w.end.min(run.end)).map_or(w.vmaf, |own| own.max(w.vmaf)))
-        .fold(f64::INFINITY, f64::min)
+        .filter_map(|w| scores.mean(w.start.max(run.start), w.end.min(run.end)).map(|own| own.max(w.vmaf)))
+        .fold(f64::INFINITY, f64::min);
+    if own.is_finite() { own } else { over.iter().map(|w| w.vmaf).fold(f64::INFINITY, f64::min) }
 }
 
 pub struct Outcome {
@@ -530,7 +533,11 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
     if fixed.is_empty() {
         let _ = std::fs::remove_file(&plain);
         if after.iter().any(|w| w.vmaf < c.floor - NEAR && !settled.iter().any(|s| s.overlaps(w.start, w.end))) {
-            let still = after.iter().filter(|w| w.vmaf < c.floor).map(|w| (secs[w.start], secs[w.end] - secs[w.start], w.vmaf)).collect();
+            let still = after
+                .iter()
+                .filter(|w| w.vmaf < c.floor && !settled.iter().any(|s| s.overlaps(w.start, w.end)))
+                .map(|w| (secs[w.start], secs[w.end] - secs[w.start], w.vmaf))
+                .collect();
             return Err(StillLow { windows: still }.into());
         }
         let summary = Summary { mean_vmaf: mean(&scores), lowest_vmaf: lowest_before, lowest_before, floor: c.floor, stretches: Vec::new(), near: 0, left, secs: 0.0 };
@@ -584,6 +591,11 @@ fn fix(c: &Ctx, times: &Times, secs: &[f64], all: &[(usize, f64)], run: Run, ser
         scores: Vec<(usize, f64)>,
     }
     let at = hms(secs[run.start]);
+    let lo = (c.crf - CRF_SPREAD).max(c.min_crf as f64);
+    // Nothing to try (it stands at the lowest CRF already): nothing to cut from the source.
+    if next_crf(&[(from_crf, now)], c.floor, lo).0.is_none() {
+        return Ok(None);
+    }
     let reference = c.dir.join(format!("repair{serial:04}.ref.mkv"));
     // The frames between two of the source's own timestamps, as scene mode cuts a source
     // whose frames keep their times: the encode holds every source frame once.
@@ -594,7 +606,6 @@ fn fix(c: &Ctx, times: &Times, secs: &[f64], all: &[(usize, f64)], run: Run, ser
         bail!("the stretch at {at} holds {got} frames cut from the source, {} in the encode", run.end - run.start);
     }
     let (model, pix) = (search::vmaf_model(c.info), search::reference_pix_fmt(c.info));
-    let lo = (c.crf - CRF_SPREAD).max(c.min_crf as f64);
     let mut tries: Vec<Try> = Vec::new();
     let mut known = vec![(from_crf, now)];
     let out_of_reach = loop {

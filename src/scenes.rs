@@ -88,6 +88,9 @@ pub fn plan(cuts: &[u64], total: u64, min: u64, max: u64) -> Vec<u64> {
     let mut cuts: Vec<u64> = cuts.iter().copied().filter(|&c| c > 0 && c < total).collect();
     cuts.sort_unstable();
     cuts.dedup();
+    // (At a frame every few seconds the shortest chunk allowed rounds down to no frames, and
+    // a cut that is no further on than the last one would be taken again without end.)
+    let min = min.max(1);
     let mut starts = vec![0];
     let mut s = 0;
     loop {
@@ -728,6 +731,14 @@ mod tests {
         assert_eq!(plan(&[], 1125, 100, 500), [0, 375, 750]);
         assert_eq!(plan(&[], 400, 100, 500), [0]);
         assert_eq!(plan(&[], 0, 100, 500), [0]);
+    }
+
+    #[test]
+    fn a_shortest_chunk_of_no_frames_still_ends() {
+        // What a frame every few seconds makes of the shortest chunk allowed.
+        assert_eq!(plan(&[30, 60], 100, 0, 50), [0, 30, 60]);
+        assert_eq!(plan(&[1, 2, 3], 4, 0, 0), [0, 1, 2, 3]);
+        assert_eq!(plan(&[], 3, 0, 0), [0, 1, 2]);
     }
 
     #[test]

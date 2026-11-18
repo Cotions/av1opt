@@ -57,7 +57,7 @@ enum Cmd {
         #[arg(long, default_value_t = 15)]
         top: usize,
         /// VMAF target the estimates assume (past encodes for nearby targets calibrate them).
-        #[arg(long, default_value_t = 93.0)]
+        #[arg(long, default_value_t = 93.0, value_parser = parse_target)]
         target_vmaf: f64,
         /// SVT-AV1 preset the encode time estimates assume.
         #[arg(long, default_value_t = search::DEFAULT_PRESET, value_parser = clap::value_parser!(u8).range(0..=13))]
@@ -152,7 +152,7 @@ enum Cmd {
         /// tune=0 with variance boost.
         #[arg(long = "params", value_name = "PARAMS", value_parser = search::parse_params)]
         param_sets: Vec<String>,
-        #[arg(long, default_value_t = 93.0)]
+        #[arg(long, default_value_t = 93.0, value_parser = parse_target)]
         target_vmaf: f64,
         /// Use at most this many videos, spread over the folders and resolution classes.
         #[arg(long, default_value_t = 6)]
@@ -215,7 +215,7 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = encode::Container::Mp4)]
         container: encode::Container,
         /// Mean VMAF the samples must reach. 93 is hard to tell apart from an already-lossy source.
-        #[arg(long, default_value_t = 93.0)]
+        #[arg(long, default_value_t = 93.0, value_parser = parse_target)]
         target_vmaf: f64,
         /// SVT-AV1 preset: lower is slower and smaller (6 is about 5% larger and a fifth quicker).
         #[arg(long, default_value_t = search::DEFAULT_PRESET, value_parser = clap::value_parser!(u8).range(0..=13))]
@@ -364,6 +364,15 @@ enum Cmd {
         #[arg(short, long, default_value_t = 6)]
         jobs: usize,
     },
+}
+
+/// A VMAF target is a score: a number above 0 and up to 100 (not `nan`, which is neither
+/// reached nor missed by any encode).
+fn parse_target(s: &str) -> Result<f64, String> {
+    match s.parse::<f64>() {
+        Ok(v) if v > 0.0 && v <= 100.0 => Ok(v),
+        _ => Err("a VMAF target is a number above 0 and up to 100".into()),
+    }
 }
 
 fn main() -> Result<()> {

@@ -33,17 +33,23 @@ pub fn folder_out(inputs: &[PathBuf], input: &Path, out_dir: &Path) -> PathBuf {
 /// Files are used as given; folders are walked and their structure is kept below `out_dir`
 /// (below a folder of their own name there when several are given, see [`folder_out`]).
 pub fn expand(inputs: &[PathBuf], out_dir: &Path, is_video: impl Fn(&Path) -> bool) -> Vec<Job> {
-    let out_abs = std::path::absolute(out_dir).unwrap_or_else(|_| out_dir.to_path_buf());
+    // Folders as the system resolves them: an output folder named through a link or `..`
+    // is the same folder, and two strings would not say so.
+    let real = |p: &Path| std::fs::canonicalize(p).or_else(|_| std::path::absolute(p)).unwrap_or_else(|_| p.to_path_buf());
+    let out_abs = real(out_dir);
     let mut jobs = Vec::new();
     for input in inputs {
         if input.is_dir() {
             let below = folder_out(inputs, input, out_dir);
+            // A folder that lies in the output folder (or is it) is still walked: only an
+            // output folder below the input is left out.
+            let inside = real(input).starts_with(&out_abs);
             let mut files: Vec<PathBuf> = walkdir::WalkDir::new(input)
                 .into_iter()
                 .filter_entry(|e| {
                     // Never descend into our own output or temp folders.
-                    let abs = std::path::absolute(e.path()).unwrap_or_else(|_| e.path().to_path_buf());
-                    !abs.starts_with(&out_abs) && !e.file_name().to_string_lossy().starts_with(".av1opt-")
+                    let ours = !inside && e.file_type().is_dir() && real(e.path()).starts_with(&out_abs);
+                    !ours && !e.file_name().to_string_lossy().starts_with(".av1opt-")
                 })
                 .flatten()
                 .filter(|e| e.file_type().is_file() && is_video(e.path()))
@@ -110,6 +116,23 @@ fn settings_key(o: &Options) -> String {
     if let Some(t) = &o.tuning {
         let picks: Vec<String> = t.classes.iter().map(|(c, x)| format!("{}:{}:{}", c.id(), x.preset, x.params)).collect();
         k.push_str(&format!(" tuned={}", picks.join(",")));
+    }
+    // What else a skip can turn on: a CRF per scene holds a stretch one CRF cannot, lighter
+    // sound makes a smaller file, other samples another search. (Named only when set, so
+    // that the skips in the logs there are keep their key.)
+    match o.scenes {
+        encode::Scenes::Off => {}
+        encode::Scenes::Auto => k.push_str(" scenes=auto"),
+        encode::Scenes::Always => k.push_str(" scenes=always"),
+    }
+    if o.audio != encode::Audio::Keep {
+        k.push_str(" audio=shrink");
+    }
+    if let Some(n) = o.samples {
+        k.push_str(&format!(" samples={n}"));
+    }
+    if let Some(s) = o.sample_secs {
+        k.push_str(&format!(" sample_secs={s}"));
     }
     k
 }
@@ -290,6 +313,60 @@ mod tests {
         assert!(by_unwrap.is_err());
         assert_eq!(guarded(|| Ok(3)).unwrap(), 3);
         assert_eq!(guarded(|| -> Result<()> { anyhow::bail!("plain") }).unwrap_err().to_string(), "plain");
+    }
+
+    fn options() -> Options {
+        Options {
+            container: encode::Container::Mp4, target_vmaf: 93.0, preset: 5, svt_params: crate::search::DEFAULT_PARAMS.into(), tuning: None,
+            min_crf: 20, max_crf: 55, samples: None, sample_secs: None, min_savings: 0.15, force: false, overwrite: false, keep_temp: false,
+            scenes: encode::Scenes::Off, workers: 1, meta: Default::default(), remove: Vec::new(), audio: encode::Audio::Keep, fresh_search: false,
+        }
+    }
+
+    #[test]
+    fn a_skip_is_keyed_by_what_it_turned_on() {
+        // The key of the logs there are: a skip made with the defaults still counts.
+        assert_eq!(settings_key(&options()), "vmaf=93 preset=5 crf=20-55 min_savings=0.15 force=false");
+        let other = [
+            Options { scenes: encode::Scenes::Auto, ..options() },
+            Options { scenes: encode::Scenes::Always, ..options() },
+            Options { audio: encode::Audio::Shrink, ..options() },
+            Options { samples: Some(12), ..options() },
+            Options { sample_secs: Some(8.0), ..options() },
+            Options { remove: vec![(10.0, 20.0)], ..options() },
+            Options { svt_params: "tune=0:enable-qm=0".into(), ..options() },
+            Options { preset: 4, ..options() },
+        ];
+        let mut keys: Vec<String> = other.iter().map(settings_key).chain([settings_key(&options())]).collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), other.len() + 1);
+        // What does not change whether a file is worth it leaves the key alone.
+        assert_eq!(settings_key(&Options { overwrite: true, keep_temp: true, workers: 4, fresh_search: true, ..options() }), settings_key(&options()));
+    }
+
+    #[test]
+    fn the_output_folder_is_left_out_of_a_walk_however_it_is_named() {
+        let dir = std::env::temp_dir().join(format!("av1opt-walktest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("in/out/deep")).unwrap();
+        std::fs::create_dir_all(dir.join("in/.av1opt-tmp")).unwrap();
+        for f in ["in/a.mkv", "in/out/a.mp4", "in/out/deep/b.mp4", "in/.av1opt-tmp/c.mkv"] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        std::os::unix::fs::symlink(dir.join("in/out"), dir.join("link")).unwrap();
+        let names = |inputs: &[PathBuf], out: &Path| -> Vec<String> {
+            expand(inputs, out, |_| true).iter().map(|j| j.input.strip_prefix(&dir).unwrap().to_string_lossy().into_owned()).collect()
+        };
+        // Named plainly, through a link and with `..` in it: one folder.
+        assert_eq!(names(&[dir.join("in")], &dir.join("in/out")), ["in/a.mkv"]);
+        assert_eq!(names(&[dir.join("in")], &dir.join("link")), ["in/a.mkv"]);
+        assert_eq!(names(&[dir.join("in")], &dir.join("in/out/deep/..")), ["in/a.mkv"]);
+        // A folder inside the output folder is walked all the same, and so is the output
+        // folder when it is the input.
+        assert_eq!(names(&[dir.join("in/out/deep")], &dir.join("in/out")), ["in/out/deep/b.mp4"]);
+        assert_eq!(names(&[dir.join("in/out")], &dir.join("in/out")), ["in/out/a.mp4", "in/out/deep/b.mp4"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

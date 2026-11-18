@@ -402,14 +402,9 @@ pub fn print(r: &Report, top: usize) {
         println!("\n#{} {} ({:.0}% of the compared frames match)", n + 1, kind_label(g.kind), g.score * 100.0);
         for (k, &i) in g.members.iter().enumerate() {
             let f = &r.files[i];
-            let role = match (k, g.kind) {
-                (0, Kind::Same) => "keep ",
-                (_, Kind::Same) => "spare",
-                (0, _) => "long ",
-                _ => "short",
-            };
+            let role = role(r, g, k);
             println!(
-                "  {role} {:>9} {:<5} {:>5.1} Mbps {:>8} {:>10}  {}{}",
+                "  {role:<5} {:>9} {:<5} {:>5.1} Mbps {:>8} {:>10}  {}{}",
                 format!("{}x{}", f.width, f.height),
                 f.codec,
                 f.video_mbps,
@@ -429,6 +424,20 @@ pub fn print(r: &Report, top: usize) {
 }
 
 /// One row per file of every group.
+/// What a member of a group is called in the listing and the CSV. Only copies of one whole
+/// video have one to keep and others to spare; videos that share a beginning or an ending
+/// are different videos, told apart by length, and none of them is called spare (a list
+/// acted on by its "spare" rows would delete a video that exists nowhere else).
+fn role(r: &Report, g: &Group, k: usize) -> &'static str {
+    let secs = |i: usize| r.files[i].duration_s;
+    match g.kind {
+        Kind::Same if k == 0 => "keep",
+        Kind::Same => "spare",
+        _ if g.members.iter().all(|&i| secs(i) <= secs(g.members[k])) => "long",
+        _ => "short",
+    }
+}
+
 pub fn write_csv(r: &Report, path: &Path) -> Result<()> {
     let mut w = csv::Writer::from_path(path)?;
     w.write_record(["group", "kind", "match", "role", "reason", "path", "size_bytes", "codec", "width", "height", "duration_s", "video_mbps", "identical"])?;
@@ -439,7 +448,7 @@ pub fn write_csv(r: &Report, path: &Path) -> Result<()> {
                 (n + 1).to_string(),
                 kind_label(g.kind).to_string(),
                 format!("{:.2}", g.score),
-                if k == 0 { "keep" } else { "spare" }.to_string(),
+                role(r, g, k).to_string(),
                 if k == 0 { g.reason.clone() } else { String::new() },
                 f.path.display().to_string(),
                 f.size.to_string(),

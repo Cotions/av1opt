@@ -61,6 +61,10 @@ pub fn collect(
     let pool = rayon::ThreadPoolBuilder::new().num_threads(jobs.max(1)).build()?;
 
     let mut files: Vec<(PathBuf, PathBuf, u64, u64)> = Vec::new();
+    // A file is listed once, however many of the folders given lead to it (one folder
+    // inside another, the same one twice, a link to it): `dups` would otherwise find it
+    // identical to itself and offer one of the two for the trash.
+    let mut seen = std::collections::HashSet::new();
     for root in paths {
         for entry in WalkDir::new(root).into_iter().filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
@@ -71,6 +75,12 @@ pub fn collect(
                 continue;
             }
             let Ok(meta) = entry.metadata() else { continue };
+            if !seen.insert({
+                use std::os::unix::fs::MetadataExt;
+                (meta.dev(), meta.ino())
+            }) {
+                continue;
+            }
             let mtime = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
             files.push((entry.path().to_path_buf(), root.clone(), meta.len(), mtime));
         }
@@ -90,14 +100,29 @@ pub fn collect(
     let done = AtomicUsize::new(0);
     let fresh = AtomicUsize::new(0);
 
-    // Forget files that were under the scanned folders last time but are gone now.
+    // Forget files that were under the scanned folders last time but are gone now. A folder
+    // with nothing in it at all is more likely a drive that is not mounted than a library
+    // that was emptied: what is known of its files is kept.
     let dropped = {
         let found: std::collections::HashSet<&Path> = files.iter().map(|f| f.0.as_path()).collect();
+        let live: std::collections::HashSet<&Path> = files.iter().map(|f| f.1.as_path()).collect();
         let mut c = cache.lock().unwrap();
         let before = c.len();
-        c.retain(|p, _| found.contains(p.as_path()) || !paths.iter().any(|root| p.starts_with(root)));
+        c.retain(|p, _| found.contains(p.as_path()) || !paths.iter().any(|root| live.contains(root.as_path()) && p.starts_with(root)));
         before - c.len()
     };
+    // A probe that fails is remembered with the file, so that a broken file is not probed
+    // again on every scan. An ffprobe that cannot be started at all (no such program) says
+    // nothing about any file.
+    let unknown = {
+        let c = cache.lock().unwrap();
+        files.iter().any(|(path, _, size, mtime)| !c.get(path).is_some_and(|e| e.size == *size && e.mtime == *mtime))
+    };
+    if unknown {
+        if std::process::Command::new(ffprobe).arg("-version").stdin(std::process::Stdio::null()).output().is_err() {
+            anyhow::bail!("cannot run ffprobe ({ffprobe}); nothing was scanned");
+        }
+    }
 
     let results: Vec<FileResult> = pool.install(|| {
         files

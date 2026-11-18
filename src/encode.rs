@@ -243,6 +243,18 @@ impl std::fmt::Display for Skip {
 
 impl std::error::Error for Skip {}
 
+/// Whether two paths lead to one file, however they are spelled: through a link, through
+/// `..`, in other letter case on a drive that does not tell case apart, or as two names of
+/// one file. Two strings that differ say nothing about that; the file's own number does.
+/// (A path that is not there is no file, so it is not the same one.)
+pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
 /// What to do with a finished encode, going by its size (see [`size_verdict`]).
 #[derive(Debug, PartialEq)]
 enum SizeVerdict {
@@ -358,6 +370,14 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     // Removing sections is an edit the user asked for, so the output is wanted even when the
     // re-encode alone wouldn't be worth it.
     let cut = if o.remove.is_empty() { None } else { Some(Sections::new(&o.remove, info.duration_s)?) };
+    // (The parts kept are counted along the whole file; samples and checks taken where there
+    // is sound and no picture would have nothing in them.)
+    if cut.is_some() && info.duration_s - info.picture_secs() > 1.0 {
+        bail!(
+            "the picture stops at {}, the sound runs on to {}: sections cannot be removed from such a file",
+            hms(info.picture_secs()), hms(info.duration_s)
+        );
+    }
     if info.codec == "av1" && !o.force && cut.is_none() {
         skip!("already AV1 (use --force to re-encode anyway)");
     }
@@ -368,7 +388,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     if output.exists() && !o.overwrite {
         bail!("{} already exists (use --overwrite)", output.display());
     }
-    if std::fs::canonicalize(input)? == std::path::absolute(&output)? {
+    if std::fs::canonicalize(input)? == std::path::absolute(&output)? || same_file(input, &output) {
         bail!("output would overwrite the input");
     }
     std::fs::create_dir_all(out_dir)?;
@@ -715,7 +735,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         eprintln!("spot check at {} scored VMAF {lowest:.2}, a stretch the samples missed: searching again with it as a sample", hms(at));
         tools.emit(Event::Phase { phase: "searching".into(), detail: format!("again, with the stretch at {} (VMAF {lowest:.2}) as a sample", hms(at)) });
         let mut pos = pos.clone();
-        pos.extend(low.windows.iter().map(|w| (w.0, w.1)));
+        pos.extend(apart(&low.windows, AGAIN_SAMPLES).iter().map(|w| (w.0, w.1)));
         let cache = search::TrialCache::open(input, size, &pos, tools.encoder_version(), !o.fresh_search, None);
         let mut lab = search::Lab::new(tools, input, &info, &tmp.path, pos, vmaf_threads, cache);
         let start_crf = (best.crf - ((aim - lowest) / search::VMAF_PER_CRF).max(1.0)).floor().max(o.min_crf as f64) as u8;
@@ -1237,6 +1257,25 @@ struct LowSpot {
     hint: bool,
 }
 
+/// At most this many of the checks that failed become samples of the search that follows.
+const AGAIN_SAMPLES: usize = 8;
+
+/// The lowest `most` of `windows` (start, length, score) that do not overlap one another, in
+/// order of time. The check of a whole video is a window every second, five seconds long: one
+/// weak stretch is there several times over, and each time as a sample is each time encoded.
+fn apart(windows: &[(f64, f64, f64)], most: usize) -> Vec<(f64, f64, f64)> {
+    let mut by_score = windows.to_vec();
+    by_score.sort_by(|a, b| a.2.total_cmp(&b.2));
+    let mut kept: Vec<(f64, f64, f64)> = Vec::new();
+    for w in by_score {
+        if kept.len() < most && !kept.iter().any(|k| w.0 < k.0 + k.1 && k.0 < w.0 + w.1) {
+            kept.push(w);
+        }
+    }
+    kept.sort_by(|a, b| a.0.total_cmp(&b.0));
+    kept
+}
+
 impl LowSpot {
     /// Start and score of the lowest check.
     fn worst(&self) -> (f64, f64) {
@@ -1506,6 +1545,39 @@ fn free_bytes(dir: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_file_under_two_names_is_one_file() {
+        let dir = std::env::temp_dir().join(format!("av1opt-samefile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("videos/sub")).unwrap();
+        let a = dir.join("videos/a.mkv");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(dir.join("videos/b.mkv"), b"a").unwrap();
+        std::os::unix::fs::symlink(dir.join("videos"), dir.join("same")).unwrap();
+        std::fs::hard_link(&a, dir.join("twin.mkv")).unwrap();
+        assert!(same_file(&a, &a));
+        // The cases a comparison of the two strings let through.
+        assert!(same_file(&a, &dir.join("same/a.mkv")));
+        assert!(same_file(&a, &dir.join("videos/sub/../a.mkv")));
+        assert!(same_file(&a, &dir.join("twin.mkv")));
+        // Another file with the same bytes is another file; one that is not there is none.
+        assert!(!same_file(&a, &dir.join("videos/b.mkv")));
+        assert!(!same_file(&a, &dir.join("videos/c.mkv")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn checks_that_overlap_make_one_sample() {
+        // One weak stretch seen by five windows a second apart, and another far from it.
+        let low: Vec<(f64, f64, f64)> = vec![(10.0, 5.0, 88.0), (11.0, 5.0, 86.5), (12.0, 5.0, 85.0), (13.0, 5.0, 86.0), (14.0, 5.0, 88.5), (300.0, 5.0, 87.0)];
+        assert_eq!(apart(&low, 8), [(12.0, 5.0, 85.0), (300.0, 5.0, 87.0)]);
+        // Windows that only touch are apart; the lowest come first when there are too many.
+        let row: Vec<(f64, f64, f64)> = (0..6).map(|i| (i as f64 * 5.0, 5.0, 80.0 + i as f64)).collect();
+        assert_eq!(apart(&row, 8).len(), 6);
+        assert_eq!(apart(&row, 2), [(0.0, 5.0, 80.0), (5.0, 5.0, 81.0)]);
+        assert!(apart(&[], 8).is_empty());
+    }
 
     #[test]
     fn a_file_no_smaller_than_its_source_is_not_kept() {

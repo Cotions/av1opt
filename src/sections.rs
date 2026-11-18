@@ -144,7 +144,8 @@ impl Sections {
             let len = b - a;
             if out_start < base + len || i + 1 == self.keep.len() {
                 let secs = secs.min(len);
-                let o = out_start.clamp(base, base + len - secs);
+                // (`len - secs` can come out a hair below zero when the clip is the whole part.)
+                let o = out_start.clamp(base, (base + len - secs).max(base));
                 return (o, a + (o - base), secs);
             }
             base += len;
@@ -362,6 +363,10 @@ mod tests {
         assert_eq!(s.window(12.0, 5.0), (12.0, 32.0, 5.0));
         // Longer than the part: shortened to fit.
         assert_eq!(s.window(0.0, 15.0), (0.0, 0.0, 10.0));
+        // A clip that is the whole of a part, where the sums do not come out even.
+        let s = Sections::new(&[(0.3, 0.6)], 2.5).unwrap();
+        let (out, src, secs) = s.window(1.0, 5.0);
+        assert!(close(out, 0.3) && close(src, 0.6) && close(secs, 1.9), "{out} {src} {secs}");
         for (src, secs) in s.sample_positions(4, 8.0) {
             assert!(s.keep().iter().any(|&(a, b)| src >= a - 1e-9 && src + secs <= b + 1e-9), "{src} {secs}");
         }

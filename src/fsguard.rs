@@ -92,4 +92,87 @@ mod tests {
         assert!(ensure_writable_location(Path::new("../av1opt-not-made-yet"), true).is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("av1opt-fsguard-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::canonicalize(&dir).unwrap()
+    }
+
+    #[test]
+    fn a_plain_path_comes_back_as_it_is() {
+        assert_eq!(plain(Path::new("/")).unwrap(), Path::new("/"));
+        assert_eq!(plain(Path::new("/no/such/folder")).unwrap(), Path::new("/no/such/folder"));
+        assert_eq!(plain(Path::new("//no//such/./folder/")).unwrap(), Path::new("/no/such/folder"));
+    }
+
+    #[test]
+    fn a_relative_path_counts_from_the_current_folder() {
+        let here = std::env::current_dir().unwrap();
+        assert_eq!(plain(Path::new(".")).unwrap(), here);
+        assert_eq!(plain(Path::new("not/made/yet")).unwrap(), here.join("not/made/yet"));
+        assert_eq!(plain(Path::new("not-made/../x")).unwrap(), here.join("x"));
+    }
+
+    #[test]
+    fn names_that_are_not_text_survive() {
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::OsStr::from_bytes(b"caf\xe9");
+        assert_eq!(plain(&Path::new("/no/such").join(name)).unwrap().file_name(), Some(name));
+    }
+
+    #[test]
+    fn going_up_past_a_link_after_a_folder_to_be_made_leaves_from_where_the_link_leads() {
+        let dir = scratch("link");
+        std::fs::create_dir_all(dir.join("far/inner")).unwrap();
+        std::os::unix::fs::symlink(dir.join("far/inner"), dir.join("link")).unwrap();
+        // One up out of `new` is still the link's folder, a second one leaves what it points to.
+        assert_eq!(plain(&dir.join("link/new/../x")).unwrap(), dir.join("link/x"));
+        assert_eq!(plain(&dir.join("link/new/../../x")).unwrap(), dir.join("far/x"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn a_resolved_path_goes_through_links_and_keeps_what_is_still_to_be_made() {
+        let dir = scratch("resolved");
+        std::fs::create_dir_all(dir.join("far/inner")).unwrap();
+        std::os::unix::fs::symlink(dir.join("far/inner"), dir.join("link")).unwrap();
+        assert_eq!(resolved(&dir.join("link")).unwrap(), dir.join("far/inner"));
+        assert_eq!(resolved(&dir.join("link/new/deeper")).unwrap(), dir.join("far/inner/new/deeper"));
+        assert_eq!(resolved(&dir.join("new/../far")).unwrap(), dir.join("far"));
+        assert_eq!(resolved(Path::new("/")).unwrap(), Path::new("/"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    #[ignore = "defect: resolved takes a link whose target is not made yet for a plain folder"]
+    fn a_link_to_a_folder_still_to_be_made_resolves_to_that_folder() {
+        let dir = scratch("dangling");
+        std::fs::create_dir_all(dir.join("far")).unwrap();
+        std::os::unix::fs::symlink(dir.join("far/new"), dir.join("link")).unwrap();
+        let got = resolved(&dir.join("link/x"));
+        let want = dir.join("far/new/x");
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(got.unwrap(), want);
+    }
+
+    #[test]
+    fn the_filesystem_is_read_from_the_nearest_folder_that_exists() {
+        // /proc is on every Linux and never on ZFS.
+        assert_eq!(fs_magic(Path::new("/proc")), Some(libc::PROC_SUPER_MAGIC));
+        assert_eq!(fs_magic(Path::new("/proc/no-such-entry")), None);
+        assert_eq!(fs_magic(Path::new("/pro\0c")), None);
+        assert!(!on_zfs(Path::new("/proc/no-such-entry/deeper")));
+        assert!(ensure_writable_location(Path::new("/proc/no-such-entry/deeper"), false).is_ok());
+        assert!(ensure_writable_location(Path::new("/proc/no-such-entry/deeper"), true).is_ok());
+    }
+
+    #[test]
+    fn a_path_the_system_could_not_take_is_judged_by_the_folder_above_it() {
+        assert!(!on_zfs(Path::new("/proc/a\0b")));
+        assert!(ensure_writable_location(Path::new("/proc/a\0b"), false).is_ok());
+    }
 }

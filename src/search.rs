@@ -363,6 +363,18 @@ pub fn sample_positions(duration: f64, count: usize, secs: f64) -> Vec<(f64, f64
 /// lie), 64 clips of 1 s by 0.3. So the same seconds go to many short clips.
 pub const MEAN_SAMPLE_SECS: f64 = 1.0;
 
+/// The fewest frames a sample clip is cut to hold. Every [`VMAF_STRIDE`]-th frame is scored, so
+/// a clip under that many frames can end up without a score, and its trial is then encoded
+/// clip by clip. Twice the stride gives each clip two scores.
+pub const MIN_SAMPLE_FRAMES: f64 = 2.0 * VMAF_STRIDE as f64;
+
+/// How long a sample clip wanted at `secs` seconds has to be in this video: as asked, unless
+/// the frame rate is so low (slide shows, time lapses) that it would hold too few frames.
+pub fn clip_secs(info: &MediaInfo, secs: f64) -> f64 {
+    let rate = cfr_value(info);
+    if rate > 0.0 { secs.max(MIN_SAMPLE_FRAMES / rate) } else { secs }
+}
+
 /// How many sample clips a search for the mean alone takes: one for about every 8 seconds
 /// of video, 8 at least and 64 at most.
 pub fn mean_sample_count(duration: f64) -> usize {
@@ -1039,6 +1051,25 @@ fn split_scores(frames: &[(u64, f64)], lengths: &[u64], stride: u64) -> Option<V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sample_clips_of_slow_videos_are_long_enough_to_be_scored() {
+        let clip = |fps, secs| clip_secs(&info_with_fps(fps), secs);
+        // Ordinary videos keep the lengths that were asked for.
+        assert_eq!(clip(24.0, MEAN_SAMPLE_SECS), MEAN_SAMPLE_SECS);
+        assert_eq!(clip(6.0, MEAN_SAMPLE_SECS), MEAN_SAMPLE_SECS);
+        assert_eq!(clip(1.0, 10.0), 10.0);
+        // Slower ones get the time their frames take.
+        assert_eq!(clip(2.0, MEAN_SAMPLE_SECS), 3.0);
+        assert_eq!(clip(1.0, MEAN_SAMPLE_SECS), 6.0);
+        assert_eq!(clip(0.5, SAMPLE_SECS), 12.0);
+        // A rate nobody knows says nothing about the frames.
+        assert_eq!(clip(0.0, 4.0), 4.0);
+        // Every clip laid out for a 40 s video at 1 fps then holds a scored frame or two.
+        for (_, secs) in mean_sample_positions(40.0, mean_sample_count(40.0), clip(1.0, MEAN_SAMPLE_SECS)) {
+            assert!(secs >= MIN_SAMPLE_FRAMES, "{secs}");
+        }
+    }
 
     #[test]
     fn joined_samples_are_scored_one_by_one() {

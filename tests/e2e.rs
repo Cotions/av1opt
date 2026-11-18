@@ -2151,3 +2151,38 @@ mod queue {
         assert!(saved["out_dir"].is_null(), "{saved}");
     }
 }
+
+/// Slide shows and time lapses: a clip of a second or two holds a frame or two, and scoring
+/// every third frame then leaves clips without a score.
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn videos_of_a_few_frames_a_second_are_measured_on_clips_that_hold_enough_of_them() {
+    let c = Case::new("low-rate");
+    let long = [("one-fps.mp4", "1", "40"), ("two-fps.mp4", "2", "30"), ("half-fps.mp4", "1/2", "60")];
+    // Too short for more than one clip, which is then all there is to encode.
+    let short = [("five-slides.mp4", "1", "5"), ("two-fps-short.mp4", "2", "4")];
+    for (name, rate, secs) in long.iter().chain(&short) {
+        let picture = format!("testsrc2=s=320x180:r={rate}:d={secs}");
+        c.ffmpeg(&["-f", "lavfi", "-i", &picture, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "16", "-pix_fmt", "yuv420p", name]);
+    }
+    // The commands are printed: they show how the clips were encoded.
+    let encode = |sources: &[(&str, &str, &str)]| {
+        let inputs: Vec<PathBuf> = sources.iter().map(|(name, _, _)| c.videos().join(name)).collect();
+        let o = c.command().env("AV1OPT_DEBUG", "1").args(["encode", "--preset", "10", "--force", "-o"]).arg(c.out()).args(&inputs).output().unwrap();
+        let log = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        assert!(!log.contains("panicked"), "{log}");
+        assert_eq!(o.status.code(), Some(0), "{log}");
+        assert!(log.contains(&format!("encoded {}, skipped 0, failed 0", sources.len())), "{log}");
+        for (name, _, _) in sources {
+            let (src, out) = (c.videos().join(name), c.out().join(name));
+            assert_eq!(frames(&out), frames(&src), "{name}");
+            assert!((duration(&out) - duration(&src)).abs() < 2.1, "{name}: {} against {}", duration(&out), duration(&src));
+        }
+        log
+    };
+    let log = encode(&long);
+    // Encoded end to end, not clip by clip.
+    assert!(log.contains("samples.txt"), "{log}");
+    assert!(!log.contains("sample0.crf"), "{log}");
+    encode(&short);
+}

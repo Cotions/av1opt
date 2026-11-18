@@ -526,12 +526,12 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
             let counted = if mean_only { format!(" once stretches below {} are encoded again", o.target_vmaf - VERIFY_SLACK) } else { String::new() };
             eprintln!("searching CRF for VMAF >= {}{counted} ({model}, preset {preset}), from CRF {start_crf}{learned}", o.target_vmaf);
             let count = |secs: f64| o.samples.unwrap_or_else(|| search::sample_count(secs));
-            let secs = o.sample_secs.unwrap_or(search::SAMPLE_SECS);
+            let secs = search::clip_secs(&info, o.sample_secs.unwrap_or(search::SAMPLE_SECS));
             // What a search that has to mind the worst stretch goes by.
             let lasting = || search::in_file_time(&info, search::sample_positions(info.picture_secs(), count(info.picture_secs()), secs));
             let pos = match &cut {
                 Some(c) => c.sample_positions(count(c.kept()), secs),
-                None if mean_only => search::in_file_time(&info, search::mean_sample_positions(info.picture_secs(), search::mean_sample_count(info.picture_secs()), search::MEAN_SAMPLE_SECS)),
+                None if mean_only => search::in_file_time(&info, search::mean_sample_positions(info.picture_secs(), search::mean_sample_count(info.picture_secs()), search::clip_secs(&info, search::MEAN_SAMPLE_SECS))),
                 None => lasting(),
             };
             // A stretch that fails after all is searched for among samples long enough to

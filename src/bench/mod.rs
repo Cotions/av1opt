@@ -351,7 +351,7 @@ pub fn run(paths: &[PathBuf], tools: &Tools, o: &Options, progress: &(dyn Fn(Pro
                     None => {
                         if samples.is_none() {
                             progress(Progress::Sampling { video: vi, path: &f.path });
-                            let pos = search::sample_positions(info.duration_s, o.samples.max(1), o.sample_secs);
+                            let pos = search::sample_positions(info.duration_s, o.samples.max(1), search::clip_secs(info, o.sample_secs));
                             samples = Some(search::extract_samples(tools, &f.path, info, &work.0, pos)?);
                         }
                         let m = measure(tools, info, samples.as_deref().unwrap_or_default(), &work.0, &enc, crf, vmaf_threads)?;

@@ -10,9 +10,11 @@ use crate::scan::is_video;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 #[derive(Deserialize, Serialize, Clone)]
 pub struct JobOptions {
@@ -198,6 +200,51 @@ pub struct Job {
     /// Cancel arrived before the job's hooks existed.
     #[serde(skip)]
     cancel_requested: bool,
+    /// Inputs of the saved job that were gone when it was queued. Kept with it, so that they
+    /// rejoin the job if they are back at the next start.
+    #[serde(skip)]
+    dropped: Vec<PathBuf>,
+    /// Queued by a watch or brought back from the saved queue: nobody is there to have chosen
+    /// the output folder just now, so a missing one means a drive that is not mounted.
+    #[serde(skip)]
+    out_dir_must_exist: bool,
+    /// It failed for that reason, and stays in the saved queue for when the drive is back.
+    #[serde(skip)]
+    out_dir_missing: bool,
+}
+
+/// A job's output folder is not there, and the job may not make it.
+#[derive(Debug)]
+pub struct OutDirMissing(pub PathBuf);
+
+impl std::fmt::Display for OutDirMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "the output folder {} is not there; its drive may not be mounted", self.0.display())
+    }
+}
+
+impl std::error::Error for OutDirMissing {}
+
+/// Where a job comes from, which decides what is asked of its folders and files.
+#[derive(Clone, Copy, PartialEq)]
+enum Origin {
+    /// A request made now: a file that is missing is an error to report.
+    Asked,
+    /// The saved queue, or a stopped job queued again: what is gone is left out if anything
+    /// else of the job is still there.
+    Saved,
+}
+
+/// What every job queued looks things up in, read once for a whole saved queue.
+struct Known {
+    history: Vec<crate::history::Record>,
+    probes: crate::scan::ProbeCache,
+}
+
+impl Known {
+    fn load() -> Known {
+        Known { history: crate::history::load(), probes: crate::scan::ProbeCache::load() }
+    }
 }
 
 #[derive(Default)]
@@ -210,6 +257,11 @@ pub struct Queue {
     /// Saved jobs that could not be restored (say, a drive not mounted yet). Kept in the saved
     /// queue so they come back once their files are there again.
     unrestored: Mutex<Vec<(Value, String)>>,
+    /// Saved jobs on their way back into the queue. They count as saved until they are in it.
+    to_restore: Mutex<VecDeque<Value>>,
+    /// One pass over `to_restore` at a time.
+    restoring: Mutex<()>,
+    saves: super::Saves,
 }
 
 /// Holds the running job where it is, or lets it go on, and wakes the worker: a queue that
@@ -228,10 +280,15 @@ pub fn encoding(app: &App) -> bool {
 
 /// True while a queued or running job still has `input` to encode.
 pub fn waiting_on(app: &App, input: &Path) -> bool {
-    let jobs = app.jobs.jobs.lock().unwrap();
-    jobs.iter()
-        .filter(|j| matches!(j.status.as_str(), "queued" | "running"))
-        .any(|j| j.files.iter().any(|f| matches!(f.status.as_str(), "pending" | "running") && f.input == input))
+    let queued = {
+        let jobs = app.jobs.jobs.lock().unwrap();
+        jobs.iter()
+            .filter(|j| matches!(j.status.as_str(), "queued" | "running"))
+            .any(|j| j.files.iter().any(|f| matches!(f.status.as_str(), "pending" | "running") && f.input == input))
+    };
+    // A saved job not back yet names its files or a folder above them.
+    let names = |j: &Value| j["inputs"].as_array().is_some_and(|l| l.iter().filter_map(Value::as_str).any(|p| input.starts_with(p)));
+    queued || app.jobs.to_restore.lock().unwrap().iter().any(names)
 }
 
 /// True once the server is stopping: no new work may start.
@@ -296,7 +353,20 @@ fn head(j: &Job) -> Value {
         "total": j.files.len(), "counts": counts, "saved": saved,
         "left_secs": left, "left_unknown": unknown,
         "paused": j.hooks.as_ref().is_some_and(|h| h.is_paused()),
+        "note": dropped_note(&j.dropped),
     })
+}
+
+/// What the page says of inputs left out of a job. A long list is cut: this goes out with
+/// every live event of the job.
+fn dropped_note(dropped: &[PathBuf]) -> Option<String> {
+    const NAMED: usize = 5;
+    if dropped.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = dropped.iter().take(NAMED).map(|p| p.display().to_string()).collect();
+    let more = if dropped.len() > NAMED { format!(" and {} more", dropped.len() - NAMED) } else { String::new() };
+    Some(format!("Left out because they are gone: {}{more}. They rejoin this job if they are back when av1opt next starts.", names.join(", ")))
 }
 
 fn full(j: &Job) -> Value {
@@ -308,13 +378,21 @@ fn full(j: &Job) -> Value {
 pub fn list(app: &App) -> Value {
     let jobs: Vec<Value> = app.jobs.jobs.lock().unwrap().iter().map(full).collect();
     // Queued jobs wait while a benchmark measures; the page says so.
-    json!({ "jobs": jobs, "unrestored": unrestored_list(app), "benchmark": super::bench::running(app), "queue": hold::json(app) })
+    json!({ "jobs": jobs, "unrestored": unrestored_list(app), "restoring": restoring(app), "benchmark": super::bench::running(app), "queue": hold::json(app) })
+}
+
+/// Saved jobs still on their way back into the queue. While the last step runs, saving what
+/// came of them, that counts as one: nothing is settled until it is done.
+fn restoring(app: &App) -> usize {
+    let waiting = app.jobs.to_restore.lock().unwrap().len();
+    let under_way = matches!(app.jobs.restoring.try_lock(), Err(std::sync::TryLockError::WouldBlock));
+    waiting.max(usize::from(under_way))
 }
 
 /// Headers only, for the queue badge.
 pub fn heads(app: &App) -> Value {
     let jobs: Vec<Value> = app.jobs.jobs.lock().unwrap().iter().map(head).collect();
-    json!({ "jobs": jobs, "unrestored": unrestored_list(app), "queue": hold::json(app) })
+    json!({ "jobs": jobs, "unrestored": unrestored_list(app), "restoring": restoring(app), "queue": hold::json(app) })
 }
 
 fn find(jobs: &[Job], id: u64) -> Result<&Job> {
@@ -346,6 +424,9 @@ struct AddRequest {
     /// The watched folder that queued it, if one did.
     #[serde(default)]
     watch: Option<PathBuf>,
+    /// In a saved job: inputs that were gone when it was last queued.
+    #[serde(default)]
+    dropped: Vec<PathBuf>,
 }
 
 /// ffmpeg carries on without parameters SVT-AV1 doesn't know; better said when the settings
@@ -359,6 +440,10 @@ pub fn check_options(app: &App, options: &JobOptions) -> Result<()> {
 }
 
 pub fn add(app: &App, body: &Value) -> Result<Value> {
+    add_checked(app, body, Origin::Asked)
+}
+
+fn add_checked(app: &App, body: &Value, origin: Origin) -> Result<Value> {
     if app.jobs.shutting_down.load(Ordering::SeqCst) {
         bail!("av1opt is shutting down");
     }
@@ -369,7 +454,12 @@ pub fn add(app: &App, body: &Value) -> Result<Value> {
     if let Some(o) = body.get("options").filter(|o| !o.is_null()) {
         check_options(app, &serde_json::from_value::<JobOptions>(o.clone())?)?;
     }
-    add_unchecked(app, body)
+    let id_and_files = enqueue(app, prepare(app, body, origin, &Known::load())?);
+    app.save_settings();
+    persist(app);
+    app.jobs.wake.notify_all();
+    app.broadcast(json!({ "kind": "jobs" }));
+    Ok(id_and_files)
 }
 
 /// Wakes the worker, e.g. after the tools were fixed.
@@ -379,11 +469,14 @@ pub fn kick(app: &App) {
     app.jobs.wake.notify_all();
 }
 
-fn add_unchecked(app: &App, body: &Value) -> Result<Value> {
+/// Makes a job of a request or a saved job, without touching the queue.
+fn prepare(app: &App, body: &Value, origin: Origin, known: &Known) -> Result<Job> {
     let r: AddRequest = serde_json::from_value(body.clone())?;
     let options = r.options.unwrap_or_else(|| serde_json::from_value(json!({})).expect("defaults"));
     let opts = options.to_options()?;
-    if r.inputs.is_empty() {
+    // What was gone last time is looked for again: a drive may be back.
+    let earlier = if origin == Origin::Saved { r.dropped.as_slice() } else { &[] };
+    if r.inputs.is_empty() && earlier.is_empty() {
         bail!("nothing to encode");
     }
     if !r.out_dir.is_absolute() {
@@ -393,7 +486,20 @@ fn add_unchecked(app: &App, body: &Value) -> Result<Value> {
     crate::fsguard::ensure_writable_location(&r.out_dir, false)?;
     // Canonical paths: no `..` tricks when output folders are derived from scan roots.
     let canon = |p: &PathBuf| std::fs::canonicalize(p).with_context(|| format!("{} does not exist", p.display())).and_then(super::text_path);
-    let inputs: Vec<PathBuf> = r.inputs.iter().map(canon).collect::<Result<_>>()?;
+    let (mut inputs, mut dropped, mut first_gone) = (Vec::new(), Vec::new(), None);
+    for p in r.inputs.iter().chain(earlier) {
+        match canon(p) {
+            Ok(real) => inputs.push(real),
+            Err(e) if origin == Origin::Saved => {
+                dropped.push(p.clone());
+                first_gone.get_or_insert(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    if let (true, Some(e)) = (inputs.is_empty(), first_gone) {
+        return Err(e);
+    }
     let roots: Vec<PathBuf> = r.roots.iter().filter_map(|p| canon(p).ok()).collect();
     let mut batch_jobs = Vec::new();
     for input in &inputs {
@@ -426,8 +532,14 @@ fn add_unchecked(app: &App, body: &Value) -> Result<Value> {
         }
         crate::fsguard::ensure_writable_location(&j.out_dir, false)?;
     }
+    // A folder asked for now is made now, and a name that cannot be used is said at once. After
+    // this a missing folder means a drive that is away: see `out_dir_must_exist`.
+    let out_dir_must_exist = origin == Origin::Saved || r.watch.is_some();
+    if !out_dir_must_exist {
+        std::fs::create_dir_all(&r.out_dir).with_context(|| format!("cannot create {}", r.out_dir.display()))?;
+    }
     // Time estimates for files a scan has seen; the others get theirs when they are probed.
-    let time = crate::estimate::TimeModel::fit(&crate::history::load(), opts.preset);
+    let time = crate::estimate::TimeModel::fit(&known.history, opts.preset);
     // Estimates are for the way the files will be encoded. "Where uneven" is not known
     // before a file's samples are scored: each file gets the average of the two ways.
     let time = match opts.scenes {
@@ -436,7 +548,7 @@ fn add_unchecked(app: &App, body: &Value) -> Result<Value> {
         crate::encode::Scenes::Off => time,
     };
     let abs_inputs: Vec<PathBuf> = batch_jobs.iter().map(|j| std::fs::canonicalize(&j.input).unwrap_or_else(|_| j.input.clone())).collect();
-    let known = crate::scan::cached_info(&abs_inputs);
+    let probed = known.probes.known(&abs_inputs);
     let files: Vec<FileState> = batch_jobs
         .iter()
         .zip(abs_inputs)
@@ -446,7 +558,7 @@ fn add_unchecked(app: &App, body: &Value) -> Result<Value> {
             app.allow_video(&abs);
             FileState {
                 report: output.with_extension("av1opt.json"),
-                est_secs: known.get(&abs).map(|i| time.secs(i)).filter(|s| *s > 0.0),
+                est_secs: probed.get(&abs).map(|i| time.secs(i)).filter(|s| *s > 0.0),
                 input: abs,
                 output,
                 status: "pending".into(),
@@ -455,19 +567,12 @@ fn add_unchecked(app: &App, body: &Value) -> Result<Value> {
             }
         })
         .collect();
-    let id = {
-        let mut n = app.jobs.next_id.lock().unwrap();
-        *n += 1;
-        *n
-    };
-    let count = files.len();
-    let by_hand = r.watch.is_none();
-    app.jobs.jobs.lock().unwrap().push(Job {
-        id,
+    Ok(Job {
+        id: 0,
         created: now(),
         inputs,
         roots,
-        out_dir: r.out_dir.clone(),
+        out_dir: r.out_dir,
         options,
         watch: r.watch,
         status: "queued".into(),
@@ -478,22 +583,32 @@ fn add_unchecked(app: &App, body: &Value) -> Result<Value> {
         batch: batch_jobs,
         hooks: None,
         cancel_requested: false,
-    });
-    {
-        let mut s = app.settings.lock().unwrap();
-        // The folder offered for the next encode is the one last chosen, not a watch's.
-        if by_hand {
-            s.out_dir = Some(r.out_dir.clone());
-        }
-        if !s.history_dirs.contains(&r.out_dir) {
-            s.history_dirs.push(r.out_dir.clone());
-        }
+        dropped,
+        out_dir_must_exist,
+        out_dir_missing: false,
+    })
+}
+
+/// Puts a job in the queue. Saving and telling the page are left to the caller, who may be
+/// adding many.
+fn enqueue(app: &App, mut job: Job) -> Value {
+    job.id = {
+        let mut n = app.jobs.next_id.lock().unwrap();
+        *n += 1;
+        *n
+    };
+    let (id, count) = (job.id, job.files.len());
+    let (out_dir, by_hand) = (job.out_dir.clone(), job.watch.is_none());
+    app.jobs.jobs.lock().unwrap().push(job);
+    let mut s = app.settings.lock().unwrap();
+    // The folder offered for the next encode is the one last chosen, not a watch's.
+    if by_hand {
+        s.out_dir = Some(out_dir.clone());
     }
-    app.save_settings();
-    persist(app);
-    app.jobs.wake.notify_all();
-    app.broadcast(json!({ "kind": "jobs" }));
-    Ok(json!({ "id": id, "files": count }))
+    if !s.history_dirs.contains(&out_dir) {
+        s.history_dirs.push(out_dir);
+    }
+    json!({ "id": id, "files": count })
 }
 
 /// Version of `ui-queue.json`. Bump it when a saved job's layout changes meaning. The
@@ -504,62 +619,137 @@ fn queue_path() -> Option<PathBuf> {
     super::library::settings_path().map(|p| p.with_file_name("ui-queue.json"))
 }
 
-/// Saves unfinished jobs so the next `av1opt ui` picks them up again.
+/// A job as the saved queue holds it, and as it is queued again.
+fn saved_form(j: &Job) -> Value {
+    json!({ "inputs": j.inputs, "dropped": j.dropped, "roots": j.roots, "out_dir": j.out_dir, "options": j.options, "watch": j.watch })
+}
+
+/// Saves unfinished jobs so the next `av1opt ui` picks them up again: those in the queue, those
+/// that could not be brought back and those still on their way. Whenever it is called, the
+/// file holds every one of them.
 fn persist(app: &App) {
     if app.jobs.shutting_down.load(Ordering::SeqCst) {
         return;
     }
-    let pending: Vec<Value> = app
-        .jobs
-        .jobs
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|j| matches!(j.status.as_str(), "queued" | "running"))
-        .map(|j| json!({ "inputs": j.inputs, "roots": j.roots, "out_dir": j.out_dir, "options": j.options, "watch": j.watch }))
-        .chain(app.jobs.unrestored.lock().unwrap().iter().map(|(j, _)| j.clone()))
-        .collect();
-    if let Some(p) = queue_path() {
-        let tmp = p.with_extension("json.tmp");
-        let doc = json!({ "format": QUEUE_FORMAT, "jobs": pending });
-        if std::fs::write(&tmp, serde_json::to_vec_pretty(&doc).unwrap_or_default()).is_ok() {
-            let _ = std::fs::rename(tmp, p);
+    let Some(path) = queue_path() else { return };
+    app.jobs.saves.write("the queue", &path, || {
+        let pending: Vec<Value> = app
+            .jobs
+            .jobs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|j| matches!(j.status.as_str(), "queued" | "running") || j.out_dir_missing)
+            .map(saved_form)
+            .chain(app.jobs.unrestored.lock().unwrap().iter().map(|(j, _)| j.clone()))
+            .chain(app.jobs.to_restore.lock().unwrap().iter().cloned())
+            .collect();
+        serde_json::to_vec_pretty(&json!({ "format": QUEUE_FORMAT, "jobs": pending })).unwrap_or_default()
+    });
+}
+
+/// The jobs in the saved queue. A file that cannot be understood is moved aside, or the next
+/// save would replace it with an empty queue.
+fn read_saved(app: &App, path: &Path) -> Vec<Value> {
+    let unreadable = |why: String| {
+        let told = super::set_aside(path, "the saved queue", &why, "the queue starts empty");
+        app.notices.lock().unwrap().push(told);
+        Vec::new()
+    };
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => return unreadable(e.to_string()),
+    };
+    match serde_json::from_slice::<Value>(&bytes) {
+        Err(e) => unreadable(e.to_string()),
+        Ok(Value::Array(jobs)) => jobs,
+        Ok(Value::Object(mut o)) => {
+            let format = o.get("format").and_then(Value::as_u64).unwrap_or(0);
+            if format > QUEUE_FORMAT {
+                // Written by a newer av1opt. Set it aside rather than overwrite it.
+                let aside = path.with_file_name(format!("ui-queue.format{format}.json"));
+                let _ = std::fs::rename(path, &aside);
+                eprintln!("warning: the saved queue is from a newer av1opt; moved to {} and not restored", aside.display());
+                return Vec::new();
+            }
+            match o.remove("jobs") {
+                Some(Value::Array(jobs)) => jobs,
+                _ => unreadable("it has no list of jobs".into()),
+            }
         }
+        Ok(_) => unreadable("it has no list of jobs".into()),
     }
 }
 
 /// Re-queues jobs left unfinished by the previous session. Finished files are recognised as
 /// done and scene-mode chunks resume, as with a re-run of `av1opt encode`.
-pub fn restore(app: &App) {
+///
+/// The file is read here and the jobs come back on a thread of their own: a long queue takes
+/// a while, and the server has to answer meanwhile (the desktop app gives up on one that does
+/// not). The page sees them arrive.
+pub fn restore(app: &Arc<App>) {
     let Some(path) = queue_path() else { return };
-    let Some(doc) = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) else { return };
-    let saved: Vec<Value> = match doc {
-        Value::Array(jobs) => jobs,
-        Value::Object(mut o) => {
-            let format = o.get("format").and_then(Value::as_u64).unwrap_or(0);
-            if format > QUEUE_FORMAT {
-                // Written by a newer av1opt. Set it aside rather than overwrite it.
-                let aside = path.with_file_name(format!("ui-queue.format{format}.json"));
-                let _ = std::fs::rename(&path, &aside);
-                eprintln!("warning: the saved queue is from a newer av1opt; moved to {} and not restored", aside.display());
-                return;
-            }
-            match o.remove("jobs") {
-                Some(Value::Array(jobs)) => jobs,
-                _ => return,
-            }
+    let saved = read_saved(app, &path);
+    if saved.is_empty() {
+        return;
+    }
+    *app.jobs.to_restore.lock().unwrap() = saved.into();
+    let app = app.clone();
+    std::thread::spawn(move || {
+        {
+            let _one = app.jobs.restoring.lock().unwrap_or_else(|e| e.into_inner());
+            let (_, all_read) = bring_back(&app);
+            finish_bringing_back(&app, all_read);
         }
-        _ => return,
-    };
-    for j in saved {
-        // Not `add`: with broken tools the jobs wait in the queue rather than get dropped.
-        match add_unchecked(app, &j) {
-            Ok(r) => eprintln!("re-queued {} file(s) from the last session", r["files"]),
-            Err(e) => {
-                eprintln!("could not re-queue a job from the last session (kept for later): {e:#}");
-                app.jobs.unrestored.lock().unwrap().push((j, format!("{e:#}")));
-            }
+        // Once the pass is over, so that what the page then reads says so.
+        app.broadcast(json!({ "kind": "jobs" }));
+    });
+}
+
+/// Moves the jobs of `to_restore` into the queue, or to the list of those that could not be
+/// restored. Returns how many got into the queue, and whether the list was gone through.
+fn bring_back(app: &App) -> (usize, bool) {
+    let known = Known::load();
+    let (mut added, mut told) = (0, Instant::now());
+    loop {
+        if shutting_down(app) {
+            return (added, false);
         }
+        let Some(saved) = app.jobs.to_restore.lock().unwrap().front().cloned() else { return (added, true) };
+        let prepared = prepare(app, &saved, Origin::Saved, &known);
+        {
+            // Not while a save is on its way: it would find this job in both places, or neither.
+            let _saving = app.jobs.saves.hold();
+            match prepared {
+                Ok(job) => {
+                    // Not `add`: with broken tools the jobs wait in the queue rather than get dropped.
+                    eprintln!("re-queued {} file(s) from the last session", job.files.len());
+                    enqueue(app, job);
+                    added += 1;
+                }
+                Err(e) => {
+                    eprintln!("could not re-queue a job from the last session (kept for later): {e:#}");
+                    app.jobs.unrestored.lock().unwrap().push((saved, format!("{e:#}")));
+                }
+            }
+            app.jobs.to_restore.lock().unwrap().pop_front();
+        }
+        app.jobs.wake.notify_all();
+        // Each message has the page fetch the whole queue.
+        if told.elapsed() >= Duration::from_secs(1) {
+            told = Instant::now();
+            app.broadcast(json!({ "kind": "jobs" }));
+        }
+    }
+}
+
+/// Saves what a pass over `to_restore` led to, once. A pass cut short saves nothing: the file
+/// still holds every job, and the next start goes through them again.
+fn finish_bringing_back(app: &App, all_read: bool) {
+    if all_read {
+        app.save_settings();
+        persist(app);
     }
 }
 
@@ -571,17 +761,21 @@ fn unrestored_list(app: &App) -> Vec<Value> {
 
 /// Tries the saved-but-missing jobs again (say, after mounting a drive), or forgets them.
 pub fn unrestored_action(app: &App, retry: bool) -> Result<Value> {
-    let list = std::mem::take(&mut *app.jobs.unrestored.lock().unwrap());
-    let mut restored = 0;
-    if retry {
-        for (j, _) in list {
-            match add_unchecked(app, &j) {
-                Ok(_) => restored += 1,
-                Err(e) => app.jobs.unrestored.lock().unwrap().push((j, format!("{e:#}"))),
-            }
+    let one = match app.jobs.restoring.try_lock() {
+        Ok(one) => one,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => bail!("the saved queue is still being read; try again in a moment"),
+    };
+    {
+        let _saving = app.jobs.saves.hold();
+        let list = std::mem::take(&mut *app.jobs.unrestored.lock().unwrap());
+        if retry {
+            app.jobs.to_restore.lock().unwrap().extend(list.into_iter().map(|(job, _)| job));
         }
     }
-    persist(app);
+    let (restored, all_read) = if retry { bring_back(app) } else { (0, true) };
+    finish_bringing_back(app, all_read);
+    drop(one);
     app.broadcast(json!({ "kind": "jobs" }));
     Ok(json!({ "restored": restored, "unrestored": unrestored_list(app) }))
 }
@@ -647,17 +841,19 @@ pub fn again(app: &App, id: u64) -> Result<Value> {
         if !matches!(j.status.as_str(), "cancelled" | "failed") {
             bail!("only a cancelled or failed job can be queued again");
         }
-        json!({ "inputs": j.inputs, "roots": j.roots, "out_dir": j.out_dir, "options": j.options, "watch": j.watch })
+        saved_form(j)
     };
-    let r = add(app, &body)?;
+    let r = add_checked(app, &body, Origin::Saved)?;
     // Only once the new job exists: a refused request leaves the old entry on screen.
     app.jobs.jobs.lock().unwrap().retain(|j| j.id != id);
+    persist(app);
     app.broadcast(json!({ "kind": "jobs" }));
     Ok(r)
 }
 
 pub fn clear_finished(app: &App) -> Result<Value> {
     app.jobs.jobs.lock().unwrap().retain(|j| matches!(j.status.as_str(), "queued" | "running"));
+    persist(app);
     app.broadcast(json!({ "kind": "jobs" }));
     Ok(json!({ "ok": true }))
 }
@@ -732,7 +928,7 @@ fn apply(job: &mut Job, e: &Event) -> Option<usize> {
 pub fn start_worker(app: Arc<App>) {
     std::thread::spawn(move || {
         loop {
-            let (id, opts, retry, out_dir, workers) = loop {
+            let (id, opts, retry, out_dir, must_exist, workers) = loop {
                 // Checked before taking the lock: probing runs ffmpeg. With unusable tools,
                 // queued jobs wait (the page shows why) instead of failing.
                 let tools_ok = app.encode_problem().is_none();
@@ -748,14 +944,14 @@ pub fn start_worker(app: Arc<App>) {
                     && let Some(j) = jobs.iter_mut().find(|j| j.status == "queued")
                 {
                     j.status = "running".into();
-                    break (j.id, j.options.to_options(), j.options.retry_skipped, j.out_dir.clone(), j.options.workers);
+                    break (j.id, j.options.to_options(), j.options.retry_skipped, j.out_dir.clone(), j.out_dir_must_exist, j.options.workers);
                 }
                 // Woken by new jobs and tool changes; the timeout is only a safety net.
                 drop(app.jobs.wake.wait_timeout(jobs, std::time::Duration::from_secs(30)).unwrap());
             };
             app.broadcast(json!({ "kind": "jobs" }));
             // A bug anywhere under a job fails that job; the queue goes on.
-            let result = batch::guarded(|| run_job(&app, id, opts, retry, &out_dir, workers));
+            let result = batch::guarded(|| run_job(&app, id, opts, retry, &out_dir, must_exist, workers));
             let mut jobs = app.jobs.jobs.lock().unwrap();
             let mut done = None;
             if let Some(j) = jobs.iter_mut().find(|j| j.id == id) {
@@ -772,6 +968,7 @@ pub fn start_worker(app: Arc<App>) {
                     Err(e) => {
                         j.status = "failed".into();
                         j.error = Some(format!("{e:#}"));
+                        j.out_dir_missing = e.downcast_ref::<OutDirMissing>().is_some();
                     }
                 }
                 done = Some(head(j));
@@ -789,9 +986,13 @@ pub fn start_worker(app: Arc<App>) {
     });
 }
 
-fn run_job(app: &Arc<App>, id: u64, opts: Result<Options>, retry: bool, out_dir: &Path, workers: u8) -> Result<batch::Summary> {
+fn run_job(app: &Arc<App>, id: u64, opts: Result<Options>, retry: bool, out_dir: &Path, must_exist: bool, workers: u8) -> Result<batch::Summary> {
     let opts = opts?;
     crate::fsguard::ensure_writable_location(out_dir, false)?;
+    // Made anew it would land on the disk under the mount point of a drive that is away.
+    if must_exist && !out_dir.is_dir() {
+        return Err(OutDirMissing(out_dir.to_path_buf()).into());
+    }
     std::fs::create_dir_all(out_dir)?;
     let sink_app = app.clone();
     let hooks = Arc::new(Hooks::new(move |e: Event| {

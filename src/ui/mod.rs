@@ -23,8 +23,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 pub struct Config {
     pub port: u16,
@@ -107,6 +108,11 @@ pub struct App {
     pub preview_hooks: Arc<crate::events::Hooks>,
     /// Capabilities of the current ffmpeg/ffprobe pair, keyed by their paths.
     caps: Mutex<Option<(String, String, Capabilities)>>,
+    bench_saves: Saves,
+    /// What went wrong at start that the user should hear of, for the page.
+    pub notices: Mutex<Vec<String>>,
+    /// Held as long as the server runs: see [`one_server_per_user`].
+    _only_server: Option<std::fs::File>,
 }
 
 /// `p`, if the page can be told it. What goes to the page is JSON, which holds text and has no
@@ -213,6 +219,136 @@ fn one_at_a_time<T>(gate: &Mutex<()>, take: impl FnOnce() -> T, write: impl FnOn
     write(take());
 }
 
+/// Saves of one file: one at a time, each by way of a file of its own, and a failure said once
+/// rather than after every change while the disk stays full.
+#[derive(Default)]
+pub struct Saves {
+    gate: Mutex<()>,
+    failing: AtomicBool,
+}
+
+impl Saves {
+    /// Writes what `take` returns to `path`. `take` runs with the other saves held off, so
+    /// that the last to take its copy is the last to write.
+    pub fn write(&self, what: &str, path: &Path, take: impl FnOnce() -> Vec<u8>) {
+        one_at_a_time(&self.gate, take, |data| {
+            let saved = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| crate::files::replace_with(path, &data));
+            if let Some(message) = self.failure_to_tell(what, path, saved) {
+                eprintln!("{message}");
+            }
+        });
+    }
+
+    /// Holds saves off while the things they read are being changed together.
+    pub fn hold(&self) -> MutexGuard<'_, ()> {
+        self.gate.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn failure_to_tell(&self, what: &str, path: &Path, saved: std::io::Result<()>) -> Option<String> {
+        match saved {
+            Ok(()) => {
+                self.failing.store(false, Ordering::SeqCst);
+                None
+            }
+            Err(e) => (!self.failing.swap(true, Ordering::SeqCst)).then(|| format!("warning: {what} could not be saved to {}: {e}; it is kept in memory only until saving works again", path.display())),
+        }
+    }
+}
+
+/// Moves a file that cannot be understood out of the way, so that the next save does not
+/// replace it, and says so. Returns what was said, for the page. The new name has the time in
+/// it, and a file kept elsewhere through a link is moved there and the link left.
+pub fn set_aside(path: &Path, what: &str, why: &str, consequence: &str) -> String {
+    let real = behind_links(path);
+    let told = match move_aside(&real) {
+        Ok(kept) => format!("{what} could not be read ({why}); it was kept as {} and {consequence}", kept.display()),
+        Err(e) => format!("{what} could not be read ({why}) and could not be moved aside ({e}); {consequence}, and the next save may replace it"),
+    };
+    eprintln!("warning: {told}");
+    told
+}
+
+fn move_aside(path: &Path) -> std::io::Result<PathBuf> {
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+    let extension = path.extension().map_or(String::new(), |e| format!(".{}", e.to_string_lossy()));
+    let stamp = local_stamp();
+    let mut result = Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
+    for attempt in 0..100 {
+        let number = if attempt == 0 { String::new() } else { format!("-{attempt}") };
+        let aside = path.with_file_name(format!("{stem}.unreadable-{stamp}{number}{extension}"));
+        result = crate::trash::rename_new(path, &aside).map(|()| aside);
+        if !result.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists) {
+            break;
+        }
+    }
+    result
+}
+
+/// The present local time as `20261118-213005`.
+fn local_stamp() -> String {
+    // SAFETY: `time` and `localtime_r` only write to the struct given to them.
+    let tm = unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&t, &mut tm);
+        tm
+    };
+    format!("{:04}{:02}{:02}-{:02}{:02}{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec)
+}
+
+/// Keeps a second server off this user's files: two would restore the same jobs and encode them
+/// twice, wipe each other's previews and overwrite each other's queue. The system lets go of
+/// the lock when the process ends, however it ends.
+fn one_server_per_user() -> Result<Option<std::fs::File>> {
+    use std::io::{Read, Seek, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Some(path) = library::settings_path().map(|p| p.with_file_name("ui.lock")) else { return Ok(None) };
+    let opened = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| {
+        std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(&path)
+    });
+    let mut file = match opened {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("warning: cannot open {}: {e}; nothing keeps a second av1opt page off the same files", path.display());
+            return Ok(None);
+        }
+    };
+    // SAFETY: flock(2) on a descriptor this function owns.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            // Some network file systems have no such locks; that is no reason not to start.
+            eprintln!("warning: cannot lock {}: {e}; nothing keeps a second av1opt page off the same files", path.display());
+            return Ok(Some(file));
+        }
+        let mut holder = String::new();
+        let _ = file.read_to_string(&mut holder);
+        let holder = holder.trim().parse::<u32>().map_or(String::new(), |pid| format!(" (process {pid})"));
+        anyhow::bail!("av1opt's page is already running for this user{holder}; use that one, or stop it before starting another");
+    }
+    // Only to be named in the message above: the lock is what counts.
+    let _ = file.set_len(0).and_then(|()| file.rewind()).and_then(|()| write!(file, "{}", std::process::id()));
+    Ok(Some(file))
+}
+
+/// The saved settings. A file that cannot be understood is moved aside and the queue starts
+/// paused: its pause switch, hours and watched folders are gone with it, and nothing should
+/// start running because of that.
+fn read_settings(notices: &mut Vec<String>) -> Settings {
+    let Some(path) = library::settings_path() else { return Settings::default() };
+    let why = match std::fs::read(&path) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(settings) => return settings,
+            Err(e) => e.to_string(),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Settings::default(),
+        Err(e) => e.to_string(),
+    };
+    notices.push(set_aside(&path, "the settings file", &why, "settings and watched folders are back to their defaults; the queue starts paused, so resume it when you are ready"));
+    Settings { queue_paused: true, ..Settings::default() }
+}
+
 /// The file a chain of links at `path` ends at, there or not. A chain that never ends leaves
 /// `path` itself.
 fn behind_links(path: &Path) -> PathBuf {
@@ -236,13 +372,14 @@ pub fn run(cfg: Config) -> Result<()> {
     // The programs started from here (ffmpeg, the browser) have no use for it.
     // SAFETY: the environment is changed before any other thread is started.
     unsafe { std::env::remove_var("AV1OPT_UI_TOKEN") };
+    // Before anything is read, wiped or restored.
+    let only_server = one_server_per_user()?;
     let server = tiny_http::Server::http(("127.0.0.1", cfg.port)).map_err(|e| anyhow::anyhow!("cannot listen on 127.0.0.1:{}: {e}", cfg.port))?;
     let port = server.server_addr().to_ip().context("not an IP listener")?.port();
     let preview_dir = library::preview_dir()?;
-    let mut settings: Settings = library::settings_path()
-        .and_then(|p| std::fs::read(p).ok())
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
+    let mut notices = Vec::new();
+    let mut settings = read_settings(&mut notices);
+    let settings_were_lost = !notices.is_empty();
     // A program chosen on the page was safe to start when it was chosen; it has to be still.
     for (name, tool) in [("ffmpeg", &mut settings.ffmpeg), ("ffprobe", &mut settings.ffprobe)] {
         // What runs is the file found safe, not whatever the path leads to later.
@@ -274,11 +411,19 @@ pub fn run(cfg: Config) -> Result<()> {
         preview_lock: Mutex::new(()),
         preview_hooks: Arc::new(crate::events::Hooks::new(|_| {})),
         caps: Mutex::new(None),
+        bench_saves: Saves::default(),
+        notices: Mutex::new(notices),
+        _only_server: only_server,
     });
+    // So that the pause they came up with is still there after a restart.
+    if settings_were_lost {
+        app.save_settings();
+    }
     if let Some(p) = app.encode_problem() {
         eprintln!("warning: {p}; encodes stay off until it is fixed (Settings in the page)");
     }
     stop_on_signal(app.clone());
+    // Goes on in the background: the listening line below must not wait for a long queue.
     jobs::restore(&app);
     jobs::start_worker(app.clone());
     hold::start_clock(app.clone());
@@ -404,6 +549,39 @@ pub fn err_json(e: &anyhow::Error) -> Value {
 mod save_tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn a_failing_save_is_said_once_until_saving_works_again() {
+        let saves = Saves::default();
+        let path = Path::new("/nowhere/ui-queue.json");
+        let failure = || Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
+        let told = saves.failure_to_tell("the queue", path, failure()).unwrap();
+        assert!(told.contains("the queue could not be saved to /nowhere/ui-queue.json"), "{told}");
+        assert_eq!(saves.failure_to_tell("the queue", path, failure()), None);
+        assert_eq!(saves.failure_to_tell("the queue", path, Ok(())), None);
+        assert!(saves.failure_to_tell("the queue", path, failure()).is_some());
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_is_kept_under_a_name_with_the_time() {
+        let dir = std::env::temp_dir().join(format!("av1opt-aside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ui.json");
+        let mut kept = Vec::new();
+        // Twice within a second: the second does not take the place of the first.
+        for text in ["first", "second"] {
+            std::fs::write(&path, text).unwrap();
+            let told = set_aside(&path, "the settings file", "not JSON", "it starts over");
+            assert!(told.contains("the settings file could not be read (not JSON)"), "{told}");
+            assert!(!path.exists());
+            kept.push(std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).find(|p| std::fs::read_to_string(p).unwrap() == text).unwrap());
+        }
+        assert_ne!(kept[0], kept[1]);
+        let name = kept[0].file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("ui.unreadable-20") && name.ends_with(".json"), "{name}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_slow_save_does_not_undo_a_later_one() {

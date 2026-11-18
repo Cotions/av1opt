@@ -4,8 +4,42 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::Path;
-use std::process::Command;
+#[cfg(test)]
+use std::path::PathBuf;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
+
+/// How long ffprobe gets for one file. It reads little of a file, so this is only ever reached
+/// when the file cannot be read at all: a network or FUSE mount that has stalled.
+const PROBE_LIMIT: Duration = Duration::from_secs(120);
+
+/// What the system says when reading failed for a reason outside the file. ffprobe prints
+/// these as they are, and they can be over by the next try.
+const NOT_THE_FILES_FAULT: &[&str] = &[
+    "Input/output error", "Stale file handle", "Transport endpoint is not connected", "Connection timed out", "Connection reset", "Host is down", "No route to host",
+    "Network is unreachable", "Cannot allocate memory", "Too many open files", "Resource temporarily unavailable", "No such file or directory", "Permission denied",
+];
+
+/// A probe that ended without an opinion on the file: ffprobe could not be started, was stopped
+/// or ran out of time, or the system could not read the file for it. Unlike a file ffprobe read
+/// and rejected, this says nothing that will still be true next time.
+#[derive(Debug)]
+struct NotJudged(String);
+
+impl std::fmt::Display for NotJudged {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotJudged {}
+
+/// Whether a probe's error leaves the file unjudged, to be tried again later.
+pub fn left_unjudged(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<NotJudged>().is_some()
+}
 
 /// Technical facts about one video file, as reported by ffprobe.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -115,16 +149,63 @@ pub fn one_line(message: &str) -> &str {
     message.lines().rev().map(str::trim).find(|l| !l.is_empty()).unwrap_or("")
 }
 
-pub fn probe(ffprobe: &str, path: &Path, file_size: u64) -> Result<MediaInfo> {
-    let out = Command::new(ffprobe)
-        .args(["-v", "error", "-show_format", "-show_streams", "-of", "json"])
-        .arg(crate::tools::probe_arg(path))
-        .output()
-        .with_context(|| format!("failed to run {ffprobe}"))?;
-    if !out.status.success() {
-        bail!("ffprobe: {}", reason(&String::from_utf8_lossy(&out.stderr), path));
+/// Runs a program to its end and returns what it printed, or None if `limit` ran out first.
+fn run_within(mut command: Command, limit: Duration) -> std::io::Result<Option<Output>> {
+    let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    // Read as it comes: a program whose output fills the pipe would otherwise never end.
+    fn collect(mut from: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = from.read_to_end(&mut bytes);
+            bytes
+        })
     }
-    let j: Value = serde_json::from_slice(&out.stdout).context("ffprobe returned invalid JSON")?;
+    let stdout = child.stdout.take().map(collect);
+    let stderr = child.stderr.take().map(collect);
+    let started = Instant::now();
+    let mut pause = Duration::from_millis(1);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() >= limit {
+            let _ = child.kill();
+            // A process stuck in a stalled mount ends only once the mount answers. It is
+            // reaped then, by this thread, and nobody waits for that here.
+            std::thread::spawn(move || drop(child.wait()));
+            return Ok(None);
+        }
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(Duration::from_millis(50));
+    };
+    let bytes = |reader: Option<std::thread::JoinHandle<Vec<u8>>>| reader.and_then(|r| r.join().ok()).unwrap_or_default();
+    Ok(Some(Output { status, stdout: bytes(stdout), stderr: bytes(stderr) }))
+}
+
+pub fn probe(ffprobe: &str, path: &Path, file_size: u64) -> Result<MediaInfo> {
+    probe_within(ffprobe, path, file_size, PROBE_LIMIT)
+}
+
+fn probe_within(ffprobe: &str, path: &Path, file_size: u64, limit: Duration) -> Result<MediaInfo> {
+    let mut command = Command::new(ffprobe);
+    command.args(["-v", "error", "-show_format", "-show_streams", "-of", "json"]).arg(crate::tools::probe_arg(path));
+    let out = match run_within(command, limit) {
+        Ok(Some(out)) => out,
+        Ok(None) => return Err(NotJudged(format!("the probe took too long (over {} s) and was stopped; the drive may have stalled", limit.as_secs_f64().round())).into()),
+        Err(e) => return Err(NotJudged(format!("failed to run {ffprobe}: {e}")).into()),
+    };
+    if !out.status.success() {
+        let why = reason(&String::from_utf8_lossy(&out.stderr), path);
+        if out.status.code().is_none() {
+            return Err(NotJudged(format!("ffprobe was stopped before it finished ({})", out.status)).into());
+        }
+        if NOT_THE_FILES_FAULT.iter().any(|text| why.contains(text)) {
+            return Err(NotJudged(format!("ffprobe: {why}")).into());
+        }
+        bail!("ffprobe: {why}");
+    }
+    // It said it succeeded, so an answer that does not parse is one that did not all arrive.
+    let Ok(j) = serde_json::from_slice::<Value>(&out.stdout) else { return Err(NotJudged("ffprobe returned invalid JSON".into()).into()) };
     let streams = j["streams"].as_array().cloned().unwrap_or_default();
 
     // Cover art is a video stream with attached_pic=1, but some files (often MKV) carry it
@@ -341,6 +422,34 @@ mod tests {
         // Early timestamps, or an end that makes no sense: the file's word stands.
         assert_eq!(length_from_end(9.0, -0.5), 9.0);
         assert_eq!(length_from_end(3.0, 5.0), 3.0);
+    }
+
+    #[test]
+    fn a_probe_that_hangs_is_stopped_and_says_so() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("av1opt-probe-limit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (ffprobe, pid_file) = (dir.join("ffprobe"), dir.join("pid"));
+        std::fs::write(&ffprobe, format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 60\n", pid_file.display())).unwrap();
+        std::fs::set_permissions(&ffprobe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = Instant::now();
+        let e = probe_within(ffprobe.to_str().unwrap(), &dir.join("a.mkv"), 1, Duration::from_millis(300)).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(left_unjudged(&e) && e.to_string().contains("took too long"), "{e}");
+        // Killed and reaped: not even a zombie stays behind.
+        let process = PathBuf::from(format!("/proc/{}", std::fs::read_to_string(&pid_file).unwrap().trim()));
+        let waited = Instant::now();
+        while process.exists() {
+            assert!(waited.elapsed() < Duration::from_secs(5), "{} is still there", process.display());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // More output than a pipe holds does not get in the way of a probe that ends.
+        let long = "x".repeat(300_000);
+        std::fs::write(&ffprobe, format!("#!/bin/sh\necho '{{\"streams\":[],\"note\":\"{long}\"}}'\n")).unwrap();
+        let e = probe_within(ffprobe.to_str().unwrap(), &dir.join("a.mkv"), 1, Duration::from_secs(20)).unwrap_err();
+        assert!(!left_unjudged(&e) && e.to_string().contains("no video stream"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

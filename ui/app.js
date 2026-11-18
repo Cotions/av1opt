@@ -185,12 +185,17 @@ onEvent((m) => {
 let STATE = null;
 async function loadState() { STATE = await api("/api/state"); renderBanner(); return STATE; }
 
-// Shown on every view while encodes cannot run (usually: ffmpeg without libvmaf).
+// Shown on every view while encodes cannot run (usually: ffmpeg without libvmaf), and for what
+// went wrong at start (a settings file or saved queue that could not be read) until dismissed.
+const noticesRead = new Set();
 function renderBanner() {
   const b = document.getElementById("banner");
   const p = STATE && STATE.tools && STATE.tools.problem;
-  b.hidden = !p;
-  if (p) b.replaceChildren("Encoding is off: " + p + ".", h("a", { href: "#/settings" }, "Settings"));
+  const notices = ((STATE && STATE.notices) || []).filter((n) => !noticesRead.has(n));
+  b.hidden = !p && !notices.length;
+  b.replaceChildren(
+    ...(p ? [h("div", {}, "Encoding is off: " + p + ".", h("a", { href: "#/settings" }, "Settings"))] : []),
+    ...notices.map((n) => h("div", {}, n + " ", h("button", { class: "small", onclick: () => { noticesRead.add(n); renderBanner(); } }, "Dismiss"))));
 }
 
 // ---------- folder / file picker ----------
@@ -1759,6 +1764,7 @@ views.queue = (root) => {
   }
   // Watched folders: what turns up in them is queued without being asked for.
   const watchBox = h("div");
+  const restoringBox = h("div");
   let watched = null, watchTick = null;
   // A path too long for its place loses its beginning, not its end: the mark keeps the
   // slashes in order where the text runs right to left for that.
@@ -1816,7 +1822,11 @@ views.queue = (root) => {
       pauseBtn, hoursBtn, watchBtn,
       h("button", { onclick: async () => { try { await api("/api/jobs/clear", {}); load(); } catch (e) { toast(e.message, true); } } }, "Clear finished"),
       h("button", { class: "primary", onclick: async () => { const p = await pick({ title: "Videos or folders to encode", mode: "multi" }); if (p) encodeDialog(p, [], false, p.files); } }, "New encode…")),
-    held, holdBox, watchBox, missing, list);
+    held, holdBox, watchBox, restoringBox, missing, list);
+  // The saved queue comes back while the page is already up.
+  const drawRestoring = (n) => {
+    restoringBox.replaceChildren(...(n ? [h("div", { class: "panel dim" }, `Bringing back the saved queue: ${n} job${n === 1 ? "" : "s"} to go…`)] : []));
+  };
   const drawMissing = (un) => {
     if (!un || !un.length) { missing.replaceChildren(); return; }
     const act = (what) => async () => {
@@ -1847,6 +1857,7 @@ views.queue = (root) => {
     held.hidden = !r.benchmark;
     queue = r.queue;
     drawHold();
+    drawRestoring(r.restoring);
     drawMissing(r.unrestored);
     draw();
   }
@@ -1883,14 +1894,14 @@ views.queue = (root) => {
   const heldBy = (j) => (j.paused ? queue?.hold?.why ?? "paused" : null);
   // The waiting job that starts next: the oldest one, unless another was moved ahead of it.
   const isNext = (j) => j.status === "queued" && jobs.find((x) => x.status === "queued") === j;
-  const headSig = (j) => JSON.stringify([j.status, isNext(j), heldBy(j), j.error, j.counts, j.saved, leftText(j.left_secs, j.left_unknown)]);
+  const headSig = (j) => JSON.stringify([j.status, isNext(j), heldBy(j), j.error, j.note, j.counts, j.saved, leftText(j.left_secs, j.left_unknown)]);
   const fileSig = (j, f) => JSON.stringify({ ...f, progress: null, held: f.status === "running" ? heldBy(j) : null });
   const pausedPill = (j) => h("span", { class: "pill warn" }, heldBy(j) === "hours" ? "On hold" : "Paused");
 
   function patchJob(j) {
     let e = jobEls.get(j.id);
     if (!e) {
-      e = { box: h("div", { class: "job" }), head: null, headSig: "", files: h("div", { class: "files" }), nodes: [], sigs: [], err: null };
+      e = { box: h("div", { class: "job" }), head: null, headSig: "", files: h("div", { class: "files" }), nodes: [], sigs: [], err: null, note: null };
       e.box.append(e.files);
       jobEls.set(j.id, e);
     }
@@ -1906,7 +1917,9 @@ views.queue = (root) => {
     if (e.head) e.head.replaceWith(nh); else e.box.prepend(nh);
     e.head = nh; e.headSig = hs;
     if (e.err) { e.err.remove(); e.err = null; }
+    if (e.note) { e.note.remove(); e.note = null; }
     if (j.error) { e.err = h("div", { class: "file bad" }, j.error); e.box.append(e.err); }
+    if (j.note) { e.note = h("div", { class: "file warn" }, j.note); e.box.append(e.note); }
   }
 
   function patchFile(e, j, f, i) {

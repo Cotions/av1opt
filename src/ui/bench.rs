@@ -207,8 +207,7 @@ pub fn start(app: &Arc<App>, body: &Value) -> Result<Value> {
                 match result {
                     Ok(report) => {
                         if let Some(p) = last_path() {
-                            let _ = p.parent().map(std::fs::create_dir_all);
-                            let _ = std::fs::write(&p, serde_json::to_vec(&report).unwrap_or_default());
+                            app.bench_saves.write("the benchmark result", &p, || serde_json::to_vec(&report).unwrap_or_default());
                         }
                         run.report = Some(Arc::new(report));
                         run.status = "done".into();

@@ -28,6 +28,8 @@ const FORGET_AFTER: u64 = 30 * 86400;
 const SAVE_EVERY: u64 = 86400;
 /// Version of `ui-watch.json`.
 const STATE_FORMAT: u64 = 1;
+/// Looks at which a video whose probe did not get through is tried, before it is left.
+const PROBE_TRIES: u8 = 3;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Watch {
@@ -62,6 +64,9 @@ struct Seen {
     mark: Mark,
     /// When a look last found it.
     seen: u64,
+    /// Probes of this file that could not run or were cut short.
+    #[serde(default)]
+    tries: u8,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -95,6 +100,9 @@ pub struct State {
 /// look and not written to lately.
 fn settle(files: &mut BTreeMap<PathBuf, Seen>, found: Vec<(PathBuf, u64, u64)>, now: u64, first: Mark) -> (Vec<PathBuf>, bool) {
     let (mut ready, mut changed) = (Vec::new(), false);
+    // A folder with nothing in it at all is more likely a drive that is not mounted than a
+    // library that was emptied (as in a scan): what is known of it stays, however long.
+    let forget = !found.is_empty();
     for (path, size, mtime) in found {
         match files.get_mut(&path) {
             Some(s) if s.size == size && s.mtime == mtime => {
@@ -106,30 +114,63 @@ fn settle(files: &mut BTreeMap<PathBuf, Seen>, found: Vec<(PathBuf, u64, u64)>, 
             }
             // Another file under the same name is a new video, whatever became of the old one.
             Some(s) => {
-                *s = Seen { size, mtime, mark: Mark::Fresh, seen: now };
+                *s = Seen { size, mtime, mark: Mark::Fresh, seen: now, tries: 0 };
                 changed = true;
             }
             None => {
-                files.insert(path, Seen { size, mtime, mark: first, seen: now });
+                files.insert(path, Seen { size, mtime, mark: first, seen: now, tries: 0 });
                 changed = true;
             }
         }
     }
     let before = files.len();
-    files.retain(|_, s| now.saturating_sub(s.seen) < FORGET_AFTER);
+    if forget {
+        files.retain(|_, s| now.saturating_sub(s.seen) < FORGET_AFTER);
+    }
     (ready, changed || files.len() != before)
+}
+
+/// Counts a probe that did not get through for each of these videos. They stay fresh, and so
+/// are tried again at the next look, until they have had their tries and are left.
+fn count_failed_probes(files: &mut BTreeMap<PathBuf, Seen>, paths: &[PathBuf]) {
+    for path in paths {
+        if let Some(s) = files.get_mut(path) {
+            s.tries = s.tries.saturating_add(1);
+            if s.tries >= PROBE_TRIES {
+                s.mark = Mark::Left;
+            }
+        }
+    }
+}
+
+/// Why videos could not go from `watched` into `out_dir`, if so: each one found would count as
+/// an output already, or be written over its own folder.
+fn output_problem(watched: &Path, out_dir: &Path) -> Result<()> {
+    let out = crate::fsguard::resolved(out_dir).with_context(|| format!("cannot make out where {} is", out_dir.display()))?;
+    let watched = crate::fsguard::resolved(watched).with_context(|| format!("cannot make out where {} is", watched.display()))?;
+    if out == watched {
+        bail!("the output folder cannot be the watched folder itself");
+    }
+    if watched.starts_with(&out) {
+        bail!("the output folder {} contains the watched folder, so every video found there would count as an output; pick a folder outside it", out.display());
+    }
+    Ok(())
 }
 
 /// Every video below `root`, leaving out the output folder, hidden folders (temp and work
 /// folders, trash) and what a file system keeps for itself.
 fn videos(root: &Path, out_dir: &Path) -> Result<Vec<(PathBuf, u64, u64)>> {
     std::fs::read_dir(root).with_context(|| format!("cannot read {}", root.display()))?;
+    let out_dir = crate::fsguard::resolved(out_dir).unwrap_or_else(|_| out_dir.to_path_buf());
+    // A folder being watched inside the output folder is not left out, nor is what is in it.
+    let inside_output = crate::fsguard::resolved(root).is_ok_and(|r| r.starts_with(&out_dir));
     let mut found = Vec::new();
     let walk = walkdir::WalkDir::new(root).into_iter().filter_entry(|e| {
         let name = e.file_name().to_string_lossy();
         let hidden = e.depth() > 0 && name.starts_with('.');
         let system = matches!(name.as_ref(), "System Volume Information" | "$RECYCLE.BIN" | "lost+found");
-        !hidden && !(e.file_type().is_dir() && (system || e.path().starts_with(out_dir)))
+        let output = !inside_output && e.path().starts_with(&out_dir);
+        !hidden && !(e.file_type().is_dir() && (system || output))
     });
     for e in walk.flatten() {
         // A name that is not text could not be written to the state file.
@@ -190,19 +231,43 @@ fn find(app: &App, id: u64) -> Result<Watch> {
     app.settings.lock().unwrap().watches.iter().find(|w| w.id == id).cloned().context("not found: no such watched folder")
 }
 
-/// The videos among `ready` that are worth encoding, and the rest.
-fn judge(app: &App, w: &Watch, ready: Vec<PathBuf>) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+/// What became of the videos that were ready.
+#[derive(Default)]
+struct Judged {
+    worth: Vec<PathBuf>,
+    left: Vec<PathBuf>,
+    /// Their probe did not get through, and the last reason why.
+    unjudged: Vec<PathBuf>,
+    why_unjudged: Option<String>,
+}
+
+/// Sorts `ready` into the videos worth encoding, those to leave and those it cannot tell of yet.
+fn judge(app: &App, w: &Watch, ready: Vec<PathBuf>) -> Result<Judged> {
     // With broken tools every video would look unreadable and be left for good.
     if let Some(p) = app.encode_problem() {
         bail!("{p} (see Settings)");
+    }
+    // A job queued now could only fail. The videos wait until the folder is back.
+    if !w.out_dir.is_dir() {
+        bail!("{}", jobs::OutDirMissing(w.out_dir.clone()));
     }
     let model = Model::fit(&crate::history::load(), w.options.target_vmaf);
     let (results, _) = crate::scan::collect(&ready, &app.ffprobe(), app.cfg.jobs, w.options.min_savings, &model, &|_, _| {})?;
     // "Encode anyway" is about the gain expected. AV1 is left even so: an output that took
     // its original's place in this folder would be encoded again, and again after that.
     let worth = |v: Verdict| v == Verdict::Candidate || (w.options.force && !matches!(v, Verdict::AlreadyAv1 | Verdict::Unreadable));
-    let (worth, rest): (Vec<_>, Vec<_>) = results.into_iter().partition(|r| worth(r.verdict));
-    Ok((worth.into_iter().map(|r| r.path).collect(), rest.into_iter().map(|r| r.path).collect()))
+    let mut judged = Judged::default();
+    for r in results {
+        if r.unjudged {
+            judged.why_unjudged = r.error;
+            judged.unjudged.push(r.path);
+        } else if worth(r.verdict) {
+            judged.worth.push(r.path);
+        } else {
+            judged.left.push(r.path);
+        }
+    }
+    Ok(judged)
 }
 
 /// Looks at one folder now: notes what is new, and queues what has settled and is worth it.
@@ -210,7 +275,8 @@ pub fn look(app: &App, id: u64) -> Result<()> {
     let _one = app.watch.looking.lock().unwrap();
     let w = find(app, id)?;
     let started = std::time::Instant::now();
-    let found = videos(&w.path, &w.out_dir);
+    // Also for a watch saved before this was refused: it stays listed and says what is wrong.
+    let found = output_problem(&w.path, &w.out_dir).and_then(|()| videos(&w.path, &w.out_dir));
     let walk_secs = started.elapsed().as_secs_f64();
     let at = now();
     let (ready, mut changed) = {
@@ -236,11 +302,11 @@ pub fn look(app: &App, id: u64) -> Result<()> {
     if !ready.is_empty() {
         // Already waiting in the queue, put there by hand.
         let (waiting, ready): (Vec<_>, Vec<_>) = ready.into_iter().partition(|p| jobs::waiting_on(app, p));
-        let judged = judge(app, &w, ready).and_then(|(worth, rest)| {
-            if !worth.is_empty() {
-                jobs::add(app, &json!({ "inputs": worth, "out_dir": w.out_dir, "roots": [w.path], "options": w.options, "watch": w.path }))?;
+        let judged = judge(app, &w, ready).and_then(|judged| {
+            if !judged.worth.is_empty() {
+                jobs::add(app, &json!({ "inputs": judged.worth, "out_dir": w.out_dir, "roots": [w.path], "options": w.options, "watch": w.path }))?;
             }
-            Ok((worth, rest))
+            Ok(judged)
         });
         let mut folders = app.watch.folders.lock().unwrap();
         let f = folders.entry(id).or_default();
@@ -253,9 +319,13 @@ pub fn look(app: &App, id: u64) -> Result<()> {
         };
         mark(waiting, Mark::Queued);
         match judged {
-            Ok((worth, rest)) => {
-                mark(worth, Mark::Queued);
-                mark(rest, Mark::Left);
+            Ok(judged) => {
+                mark(judged.worth, Mark::Queued);
+                mark(judged.left, Mark::Left);
+                count_failed_probes(&mut f.files, &judged.unjudged);
+                if let Some(why) = judged.why_unjudged {
+                    f.error = Some(format!("{} video(s) could not be read this time and will be tried again: {why}", judged.unjudged.len()));
+                }
             }
             // They stay fresh and are tried again at the next look.
             Err(e) => f.error = Some(format!("{e:#}")),
@@ -339,14 +409,18 @@ pub fn add(app: &App, body: &Value) -> Result<Value> {
         bail!("pick an output folder");
     }
     crate::fsguard::ensure_writable_location(&r.out_dir, false)?;
-    if r.out_dir == path {
-        bail!("the output folder cannot be the watched folder itself");
-    }
+    output_problem(&path, &r.out_dir)?;
     let options = r.options.unwrap_or_else(|| serde_json::from_value(json!({})).expect("defaults"));
     if !options.remove.is_empty() {
         bail!("sections can only be removed when encoding a single video");
     }
     jobs::check_options(app, &options)?;
+    if app.settings.lock().unwrap().watches.iter().any(|w| w.path == path) {
+        bail!("{} is watched already", path.display());
+    }
+    // Made now, while someone is here to choose it. From here on a missing folder means a
+    // drive that is away, and the jobs of this watch will not make one in its place.
+    std::fs::create_dir_all(&r.out_dir).with_context(|| format!("cannot create {}", r.out_dir.display()))?;
     let id = {
         let mut s = app.settings.lock().unwrap();
         if s.watches.iter().any(|w| w.path == path) {
@@ -431,9 +505,80 @@ mod tests {
         assert_eq!(settle(&mut known, vec![], 20_000, Mark::Fresh), (vec![], false));
         assert_eq!(settle(&mut known, old.clone(), 10_000 + 7 * 86400, Mark::Fresh), (vec![], false));
         assert_eq!(files(&known), [("/w/old.mp4", Mark::Before)]);
-        // Gone for good: forgotten after a month, and new if it ever comes back.
-        assert_eq!(settle(&mut known, vec![], 10_000 + 40 * 86400, Mark::Fresh), (vec![], true));
-        assert!(known.is_empty());
+        // Away for longer than a month, with nothing else there: still nothing is forgotten.
+        assert_eq!(settle(&mut known, vec![], 10_000 + 400 * 86400, Mark::Fresh), (vec![], false));
+        assert_eq!(settle(&mut known, old.clone(), 10_000 + 401 * 86400, Mark::Fresh), (vec![], false));
+        assert_eq!(files(&known), [("/w/old.mp4", Mark::Before)]);
+        // Gone for good while the folder lives on: forgotten after a month.
+        let other = vec![(PathBuf::from("/w/other.mp4"), 5, 100)];
+        assert_eq!(settle(&mut known, other, 10_000 + 440 * 86400, Mark::Before), (vec![], true));
+        assert_eq!(files(&known), [("/w/other.mp4", Mark::Before)]);
+    }
+
+    #[test]
+    fn a_video_whose_probe_failed_gets_three_looks_and_a_new_file_starts_over() {
+        let path = PathBuf::from("/w/a.mp4");
+        let found = || vec![(PathBuf::from("/w/a.mp4"), 5, 100)];
+        let mut known = BTreeMap::new();
+        settle(&mut known, found(), 1000, Mark::Fresh);
+        for look in 1..PROBE_TRIES {
+            assert_eq!(settle(&mut known, found(), 1000 + 300 * u64::from(look), Mark::Fresh).0, std::slice::from_ref(&path), "look {look}");
+            count_failed_probes(&mut known, std::slice::from_ref(&path));
+            assert_eq!(files(&known), [("/w/a.mp4", Mark::Fresh)], "look {look}");
+        }
+        assert_eq!(settle(&mut known, found(), 5000, Mark::Fresh).0, std::slice::from_ref(&path));
+        count_failed_probes(&mut known, std::slice::from_ref(&path));
+        assert_eq!(files(&known), [("/w/a.mp4", Mark::Left)]);
+        assert!(settle(&mut known, found(), 6000, Mark::Fresh).0.is_empty());
+        // Saved before tries were counted, it starts from none.
+        let old: Seen = serde_json::from_value(json!({ "size": 1, "mtime": 2, "mark": "fresh", "seen": 3 })).unwrap();
+        assert_eq!(old.tries, 0);
+        // Another file under the name has its own tries.
+        settle(&mut known, vec![(path.clone(), 9, 7000)], 7100, Mark::Fresh);
+        assert_eq!(known[&path].tries, 0);
+    }
+
+    #[test]
+    fn the_watched_folder_is_walked_wherever_the_output_folder_is() {
+        let dir = std::env::temp_dir().join(format!("av1opt-watch-walk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.join("out/watched");
+        std::fs::create_dir_all(root.join("made")).unwrap();
+        std::fs::write(root.join("a.mp4"), b"x").unwrap();
+        std::fs::write(root.join("made/b.mp4"), b"x").unwrap();
+        let names = |out: &Path| -> Vec<String> {
+            let mut v: Vec<String> = videos(&root, out).unwrap().into_iter().map(|f| f.0.strip_prefix(&root).unwrap().display().to_string()).collect();
+            v.sort();
+            v
+        };
+        // The root lies in the output folder (a watch saved before that was refused).
+        assert_eq!(names(&dir.join("out")), ["a.mp4", "made/b.mp4"]);
+        // The output folder lies below the root, however its path is written.
+        assert_eq!(names(&root.join("made")), ["a.mp4"]);
+        assert_eq!(names(&root.join("made/../made")), ["a.mp4"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_output_folder_is_judged_by_where_it_really_is() {
+        let dir = std::env::temp_dir().join(format!("av1opt-watch-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.join("w");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&root, dir.join("link")).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        for same in [dir.join("w"), dir.join("w/../w"), dir.join("w/sub/.."), dir.join("link")] {
+            let e = output_problem(&root, &same).unwrap_err().to_string();
+            assert!(e.contains("cannot be the watched folder"), "{}: {e}", same.display());
+        }
+        for above in [dir.clone(), dir.join("w/.."), PathBuf::from("/")] {
+            let e = output_problem(&root, &above).unwrap_err().to_string();
+            assert!(e.contains("contains the watched folder"), "{}: {e}", above.display());
+        }
+        for fine in [dir.join("out"), dir.join("w/sub"), dir.join("w/new/deeper"), dir.join("w2")] {
+            output_problem(&root, &fine).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

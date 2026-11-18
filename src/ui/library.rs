@@ -56,6 +56,7 @@ pub fn state(app: &App) -> Value {
         "meta_presets": crate::metadata::PRESETS,
         "tuning": super::bench::tuning_json(&crate::tuning::Tuning::load().unwrap_or_default()),
         "default_svt_params": crate::search::DEFAULT_PARAMS,
+        "notices": *app.notices.lock().unwrap(),
     })
 }
 

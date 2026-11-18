@@ -35,16 +35,27 @@ impl Server {
         Server::start_with_tools(name, "false", "false", prepare)
     }
 
-    /// As [`Server::start`], with the ffmpeg and ffprobe to use (`false` for none).
+    /// As [`Server::start`], with the ffmpeg and ffprobe to use (`false` for none). Returns
+    /// once a saved queue has come back, which goes on after the server starts answering.
     pub fn start_with_tools(name: &str, ffmpeg: &str, ffprobe: &str, prepare: impl FnOnce(&Path)) -> Server {
-        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("ui-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("data/av1opt")).unwrap();
-        std::fs::create_dir_all(dir.join("cache")).unwrap();
-        std::fs::create_dir_all(dir.join("videos")).unwrap();
-        prepare(&dir);
-        let mut child = Command::new(env!("CARGO_BIN_EXE_av1opt"))
-            .args(["ui", "--port", "0", "--no-open"])
+        let s = Server::launch(name, ffmpeg, ffprobe, prepare);
+        s.wait_for_restored_jobs();
+        s
+    }
+
+    /// Waits until no saved job is still on its way back into the queue.
+    pub fn wait_for_restored_jobs(&self) {
+        let t = Instant::now();
+        while self.get("/api/jobs/heads").json()["restoring"].as_u64() != Some(0) {
+            assert!(t.elapsed() < Duration::from_secs(60), "the saved queue is still coming back");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The command that starts a server on the folders below `dir`.
+    pub fn command(dir: &Path, ffmpeg: &str, ffprobe: &str) -> Command {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_av1opt"));
+        c.args(["ui", "--port", "0", "--no-open"])
             .env("XDG_DATA_HOME", dir.join("data"))
             .env("XDG_CACHE_HOME", dir.join("cache"))
             .env("AV1OPT_HISTORY", dir.join("data/av1opt/history.jsonl"))
@@ -53,10 +64,19 @@ impl Server {
             .env("AV1OPT_UI_TOKEN", TOKEN)
             .env_remove("AV1OPT_UI_DEV")
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("start av1opt ui");
+            .stdout(Stdio::null());
+        c
+    }
+
+    /// Starts a server and returns as soon as it says it is listening.
+    pub fn launch(name: &str, ffmpeg: &str, ffprobe: &str, prepare: impl FnOnce(&Path)) -> Server {
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("ui-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("data/av1opt")).unwrap();
+        std::fs::create_dir_all(dir.join("cache")).unwrap();
+        std::fs::create_dir_all(dir.join("videos")).unwrap();
+        prepare(&dir);
+        let mut child = Server::command(&dir, ffmpeg, ffprobe).stderr(Stdio::piped()).spawn().expect("start av1opt ui");
         let mut err = BufReader::new(child.stderr.take().unwrap());
         let mut port = None;
         let mut seen = String::new();
@@ -100,10 +120,14 @@ impl Server {
         s.write_all(request.as_bytes()).unwrap();
         let mut buf = Vec::new();
         s.read_to_end(&mut buf).unwrap();
-        let text = String::from_utf8_lossy(&buf).into_owned();
-        let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+        let end = buf.windows(4).position(|w| w == b"\r\n\r\n").map_or(buf.len(), |i| i + 4);
+        let (head, body) = buf.split_at(end);
+        let head = String::from_utf8_lossy(head).trim_end().to_string();
         let status = head.split(' ').nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-        Resp { status, headers: head.to_string(), body: body.to_string() }
+        // A long answer comes in pieces.
+        let chunked = head.to_ascii_lowercase().contains("transfer-encoding: chunked");
+        let body = if chunked { unchunked(body) } else { body.to_vec() };
+        Resp { status, headers: head, body: String::from_utf8_lossy(&body).into_owned() }
     }
 
     pub fn request(&self, method: &str, path: &str, extra: &[(&str, &str)], body: Option<&str>) -> Resp {
@@ -144,6 +168,22 @@ impl Server {
         }
         false
     }
+}
+
+/// The body of an answer sent in chunks: each is its length in hexadecimal, a line end, the
+/// bytes and another line end, and one of length zero ends them.
+fn unchunked(mut rest: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    while let Some(line) = rest.windows(2).position(|w| w == b"\r\n") {
+        let length = std::str::from_utf8(&rest[..line]).ok().and_then(|l| usize::from_str_radix(l.trim(), 16).ok()).unwrap_or(0);
+        if length == 0 {
+            break;
+        }
+        let start = line + 2;
+        body.extend_from_slice(&rest[start..start + length]);
+        rest = &rest[start + length + 2..];
+    }
+    body
 }
 
 impl Drop for Server {

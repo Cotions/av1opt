@@ -745,6 +745,311 @@ fn waiting_jobs_can_be_moved_first_and_stopped_ones_queued_again() {
     assert_eq!(s.post("/api/jobs/999/again", &json!({})).status, 404);
 }
 
+/// An ffmpeg and ffprobe that pass the checks at start and can do nothing else, so that jobs
+/// and watches get as far as what comes before an encode. `on_a_file` is the shell text ffprobe
+/// runs when asked about a file.
+fn stand_in_tools(name: &str, on_a_file: &str) -> (String, String) {
+    let bin = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("tools-{name}"));
+    let _ = std::fs::remove_dir_all(&bin);
+    std::fs::create_dir_all(&bin).unwrap();
+    let ffmpeg = "#!/bin/sh\ncase \"$2\" in\n-version) echo 'ffmpeg version 8.0';;\n-encoders) echo ' V....D libsvtav1 SVT-AV1';;\n-filters) echo ' ... libvmaf VV->V VMAF';;\nesac\n".to_string();
+    let ffprobe = format!("#!/bin/sh\nif [ \"$2\" = -version ]; then echo 'ffprobe version 8.0'; exit 0; fi\n{on_a_file}\n");
+    let write = |file: &str, text: &str| {
+        use std::os::unix::fs::PermissionsExt;
+        let path = bin.join(file);
+        std::fs::write(&path, text).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_str().unwrap().to_string()
+    };
+    (write("ffmpeg", &ffmpeg), write("ffprobe", &ffprobe))
+}
+
+fn saved_queue(s: &Server) -> Value {
+    serde_json::from_slice(&std::fs::read(s.data("ui-queue.json")).unwrap()).unwrap()
+}
+
+fn saved_jobs(s: &Server) -> usize {
+    saved_queue(s)["jobs"].as_array().unwrap().len()
+}
+
+fn heads(s: &Server) -> Vec<Value> {
+    s.get("/api/jobs/heads").json()["jobs"].as_array().unwrap().clone()
+}
+
+/// Waits for the first job to have ended, and returns it.
+fn first_job_ended(s: &Server) -> Value {
+    let started = Instant::now();
+    loop {
+        let job = heads(s)[0].clone();
+        if !matches!(job["status"].as_str(), Some("queued" | "running")) {
+            return job;
+        }
+        assert!(started.elapsed() < Duration::from_secs(20), "still going: {job}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_long_saved_queue_comes_back_behind_a_server_that_already_answers() {
+    const JOBS: usize = 30_000;
+    let write_queue = |d: &Path| {
+        std::fs::write(d.join("videos/a.mkv"), b"x").unwrap();
+        let job = json!({ "inputs": [d.join("videos/a.mkv")], "roots": [], "out_dir": d.join("out"), "options": {} });
+        let saved = json!({ "format": 1, "jobs": vec![job; JOBS] });
+        std::fs::write(d.join("data/av1opt/ui-queue.json"), saved.to_string()).unwrap();
+    };
+    let mut s = Server::launch("restoring", "false", "false", write_queue);
+
+    // Answering at once, with the page told what is still to come.
+    let list = s.get("/api/jobs/heads").json();
+    assert!(list["restoring"].as_u64().unwrap() > 0, "the queue was back before the first answer: make it longer");
+    // A change made meanwhile is saved with all that has not come back yet.
+    let started = Instant::now();
+    while heads(&s).is_empty() {
+        assert!(started.elapsed() < Duration::from_secs(20));
+    }
+    let id = heads(&s)[0]["id"].as_u64().unwrap();
+    assert_eq!(s.post(&format!("/api/jobs/{id}/remove"), &json!({})).status, 200);
+    assert_eq!(saved_jobs(&s), JOBS - 1);
+
+    // Stopped half way, as the desktop app stops a server it has given up on: nothing is lost.
+    assert!(s.get("/api/jobs/heads").json()["restoring"].as_u64().unwrap() > 0, "restored too soon to tell");
+    assert!(s.terminate());
+    assert_eq!(saved_jobs(&s), JOBS - 1);
+    let dir = s.dir.clone();
+    drop(s);
+
+    // Killed half way: the same.
+    let keep = dir.with_extension("again");
+    let _ = std::fs::remove_dir_all(&keep);
+    std::fs::rename(&dir, &keep).unwrap();
+    let s = Server::launch("restoring", "false", "false", |d| {
+        std::fs::remove_dir_all(d).unwrap();
+        std::fs::rename(&keep, d).unwrap();
+    });
+    drop(s);
+    let s = Server::start_in(&dir, "false", "false");
+    assert_eq!(heads(&s).len(), JOBS - 1);
+    assert_eq!(s.get("/api/jobs/heads").json()["restoring"], 0);
+    assert_eq!(saved_jobs(&s), JOBS - 1);
+}
+
+#[test]
+fn inputs_that_are_gone_are_left_out_of_a_saved_job_and_named() {
+    let (ffmpeg, ffprobe) = stand_in_tools("gone", "exit 1");
+    let mut s = Server::start_with_tools("gone", &ffmpeg, &ffprobe, |d| {
+        std::fs::write(d.join("videos/a.mkv"), b"x").unwrap();
+        std::fs::create_dir_all(d.join("out")).unwrap();
+        std::fs::write(d.join("data/av1opt/ui.json"), json!({ "queue_paused": true }).to_string()).unwrap();
+        let jobs = json!([
+            { "inputs": [d.join("videos/a.mkv"), d.join("videos/b.mkv")], "roots": [], "out_dir": d.join("out"), "options": {} },
+            { "inputs": [d.join("videos/c.mkv"), d.join("videos/e.mkv")], "roots": [], "out_dir": d.join("out"), "options": {} },
+        ]);
+        std::fs::write(d.join("data/av1opt/ui-queue.json"), json!({ "format": 1, "jobs": jobs }).to_string()).unwrap();
+    });
+    let videos = s.dir.join("videos");
+    let job = heads(&s)[0].clone();
+    assert_eq!(job["total"], 1, "{job}");
+    let note = job["note"].as_str().unwrap_or_default();
+    assert!(note.contains("b.mkv") && !note.contains("a.mkv"), "{note}");
+    // All of its inputs gone: kept aside as before, and one back is enough to retry it.
+    assert_eq!(s.get("/api/jobs").json()["unrestored"].as_array().unwrap().len(), 1);
+    std::fs::write(videos.join("c.mkv"), b"x").unwrap();
+    let r = s.post("/api/jobs/unrestored/retry", &json!({})).json();
+    assert_eq!(r["restored"], 1, "{r}");
+    let retried = heads(&s)[1].clone();
+    assert_eq!(retried["total"], 1, "{retried}");
+    assert!(retried["note"].as_str().unwrap_or_default().contains("e.mkv"), "{retried}");
+    assert_eq!(s.post(&format!("/api/jobs/{}/remove", retried["id"]), &json!({})).status, 200);
+
+    // Queued again while the missing one is back: whole, with nothing to say.
+    let again = |s: &Server| {
+        let id = heads(s)[0]["id"].as_u64().unwrap();
+        assert_eq!(s.post(&format!("/api/jobs/{id}/cancel"), &json!({})).status, 200);
+        let r = s.post(&format!("/api/jobs/{id}/again"), &json!({}));
+        (r.status, r.body, heads(s))
+    };
+    std::fs::write(videos.join("b.mkv"), b"x").unwrap();
+    let (status, body, jobs) = again(&s);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!((jobs.len(), jobs[0]["total"].as_u64(), jobs[0]["note"].is_null()), (1, Some(2), true), "{jobs:?}");
+
+    // Queued again with one of them gone: the rest goes, and the saved job remembers it.
+    std::fs::remove_file(videos.join("b.mkv")).unwrap();
+    let (status, body, jobs) = again(&s);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(jobs[0]["total"], 1, "{jobs:?}");
+    assert!(jobs[0]["note"].as_str().unwrap_or_default().contains("b.mkv"), "{jobs:?}");
+    assert!(saved_queue(&s)["jobs"][0]["dropped"][0].as_str().unwrap().ends_with("b.mkv"));
+
+    // Back by the next start, it is in the job again.
+    assert!(s.terminate());
+    std::fs::write(videos.join("b.mkv"), b"x").unwrap();
+    let s = Server::start_in(&s.dir, &ffmpeg, &ffprobe);
+    let jobs = heads(&s);
+    assert_eq!((jobs[0]["total"].as_u64(), jobs[0]["note"].is_null()), (Some(2), true), "{jobs:?}");
+
+    // With nothing left of it the job is refused, and its entry stays.
+    std::fs::remove_file(videos.join("a.mkv")).unwrap();
+    std::fs::remove_file(videos.join("b.mkv")).unwrap();
+    let (status, body, jobs) = again(&s);
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("does not exist"), "{body}");
+    assert_eq!(jobs.len(), 1);
+}
+
+#[test]
+fn a_missing_output_folder_is_not_made_for_a_job_nobody_just_asked_for() {
+    let (ffmpeg, ffprobe) = stand_in_tools("drive", "exit 1");
+    let mut s = Server::start_with_tools("drive", &ffmpeg, &ffprobe, |d| {
+        std::fs::write(d.join("videos/a.mkv"), b"x").unwrap();
+        let job = json!({ "inputs": [d.join("videos/a.mkv")], "roots": [], "out_dir": d.join("drive/out"), "options": {} });
+        std::fs::write(d.join("data/av1opt/ui-queue.json"), json!({ "format": 1, "jobs": [job] }).to_string()).unwrap();
+    });
+    let (input, away) = (s.dir.join("videos/a.mkv"), s.dir.join("drive/out"));
+    let job = first_job_ended(&s);
+    assert_eq!(job["status"], "failed", "{job}");
+    let error = job["error"].as_str().unwrap();
+    assert!(error.contains("is not there") && error.contains("may not be mounted"), "{error}");
+    assert!(!s.dir.join("drive").exists());
+    // The job waits in the saved queue for the drive.
+    assert_eq!(saved_jobs(&s), 1);
+    assert!(s.terminate());
+    let s = Server::start_in(&s.dir, &ffmpeg, &ffprobe);
+    assert_eq!(first_job_ended(&s)["status"], "failed");
+    assert_eq!(saved_jobs(&s), 1);
+    // Taken off the list, it is gone for good.
+    let id = heads(&s)[0]["id"].as_u64().unwrap();
+    assert_eq!(s.post(&format!("/api/jobs/{id}/remove"), &json!({})).status, 200);
+    assert_eq!(saved_jobs(&s), 0);
+
+    // A watch's job is held to the same.
+    let r = s.post("/api/jobs", &json!({ "inputs": [input], "roots": [], "out_dir": away, "watch": s.dir.join("videos") }));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let job = first_job_ended(&s);
+    assert!(job["error"].as_str().unwrap_or_default().contains("is not there"), "{job}");
+    assert!(!s.dir.join("drive").exists());
+    assert_eq!(s.post(&format!("/api/jobs/{}/remove", job["id"]), &json!({})).status, 200);
+
+    // A folder asked for by hand is made, as it always was.
+    let r = s.post("/api/jobs", &json!({ "inputs": [input], "roots": [], "out_dir": away }));
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(away.is_dir());
+}
+
+#[test]
+fn a_second_server_on_the_same_folders_is_refused() {
+    let s = Server::start("only-one", |d| {
+        std::fs::write(d.join("videos/a.mkv"), b"x").unwrap();
+        let job = json!({ "inputs": [d.join("videos/a.mkv")], "roots": [], "out_dir": d.join("out"), "options": {} });
+        std::fs::write(d.join("data/av1opt/ui-queue.json"), json!({ "format": 1, "jobs": [job] }).to_string()).unwrap();
+    });
+    let preview = s.dir.join("cache/av1opt/previews/playing.mp4");
+    std::fs::write(&preview, b"x").unwrap();
+    let queue = std::fs::read(s.data("ui-queue.json")).unwrap();
+
+    let mut second = Server::command(&s.dir, "false", "false").stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let started = Instant::now();
+    while second.try_wait().unwrap().is_none() {
+        if started.elapsed() > Duration::from_secs(10) {
+            second.kill().unwrap();
+            second.wait().unwrap();
+            panic!("a second server started on the folders of the first");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let second = second.wait_with_output().unwrap();
+    let said = String::from_utf8_lossy(&second.stderr);
+    assert!(!second.status.success(), "{said}");
+    assert!(said.contains(&format!("already running for this user (process {})", s.child.id())), "{said}");
+    assert!(preview.exists(), "the second start wiped the previews of the first");
+    assert_eq!(std::fs::read(s.data("ui-queue.json")).unwrap(), queue);
+    assert_eq!(heads(&s).len(), 1);
+
+    // However the first one ended, the place is free again.
+    let dir = s.dir.clone();
+    drop(s);
+    let s = Server::start_in(&dir, "false", "false");
+    assert_eq!(heads(&s).len(), 1);
+}
+
+#[test]
+fn files_that_cannot_be_read_are_kept_and_said_and_the_queue_starts_paused() {
+    let aside = |s: &Server, start: &str| -> Vec<String> {
+        let names = std::fs::read_dir(s.data("")).unwrap().flatten();
+        names.map(|e| e.path()).filter(|p| p.file_name().unwrap().to_string_lossy().starts_with(start)).map(|p| std::fs::read_to_string(p).unwrap()).collect()
+    };
+    let mut s = Server::start("unreadable", |d| {
+        std::fs::write(d.join("data/av1opt/ui.json"), "{ the settings").unwrap();
+        std::fs::write(d.join("data/av1opt/ui-queue.json"), "{ the queue").unwrap();
+    });
+    let notices = s.get("/api/state").json()["notices"].clone();
+    let text = notices.to_string();
+    assert_eq!(notices.as_array().unwrap().len(), 2, "{notices}");
+    assert!(text.contains("the settings file could not be read") && text.contains("the saved queue could not be read"), "{text}");
+    assert!(text.contains("ui.unreadable-") && text.contains("ui-queue.unreadable-"), "{text}");
+    assert_eq!(aside(&s, "ui.unreadable-"), ["{ the settings"]);
+    assert_eq!(aside(&s, "ui-queue.unreadable-"), ["{ the queue"]);
+    assert_eq!(s.get("/api/jobs/heads").json()["queue"]["paused"], true);
+
+    // The pause is saved like any other, and there is nothing more to say next time.
+    assert!(s.terminate());
+    let mut s = Server::start_in(&s.dir, "false", "false");
+    assert_eq!(s.get("/api/jobs/heads").json()["queue"]["paused"], true);
+    assert_eq!(s.get("/api/state").json()["notices"], json!([]));
+
+    // A queue of the wrong shape is no queue either, and says nothing of the pause.
+    assert_eq!(s.post("/api/queue/pause", &json!({ "paused": false })).status, 200);
+    assert!(s.terminate());
+    std::fs::write(s.data("ui-queue.json"), r#"{"format":1}"#).unwrap();
+    let s = Server::start_in(&s.dir, "false", "false");
+    assert_eq!(s.get("/api/state").json()["notices"].as_array().unwrap().len(), 1);
+    assert_eq!(aside(&s, "ui-queue.unreadable-").len(), 2);
+    assert_eq!(s.get("/api/jobs/heads").json()["queue"]["paused"], false);
+}
+
+#[test]
+fn the_queue_is_saved_whatever_lies_where_a_temporary_file_once_went() {
+    let s = Server::start("saving", |d| {
+        // The fixed name saves used to go through.
+        std::fs::create_dir_all(d.join("data/av1opt/ui-queue.json.tmp")).unwrap();
+        let job = |name: &str| {
+            std::fs::write(d.join("videos").join(name), b"x").unwrap();
+            json!({ "inputs": [d.join("videos").join(name)], "roots": [], "out_dir": d.join("out"), "options": {} })
+        };
+        std::fs::write(d.join("data/av1opt/ui-queue.json"), json!({ "format": 1, "jobs": [job("a.mkv"), job("b.mkv")] }).to_string()).unwrap();
+    });
+    let last = heads(&s)[1]["id"].as_u64().unwrap();
+    assert_eq!(s.post(&format!("/api/jobs/{last}/first"), &json!({})).status, 200);
+    assert!(saved_queue(&s)["jobs"][0]["inputs"][0].as_str().unwrap().ends_with("b.mkv"));
+    // No temporary file of a save stays behind.
+    let names: Vec<String> = std::fs::read_dir(s.data("")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with("ui-queue") || n.starts_with(".ui-queue")).collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+}
+
+#[test]
+fn a_probe_that_was_cut_short_is_tried_again_and_a_rejected_file_is_not() {
+    let (ffmpeg, ffprobe) = stand_in_tools("probes", "case \"$*\" in\n*rejected*) echo 'Invalid data found when processing input' >&2; exit 1;;\n*) kill -9 $$;;\nesac");
+    let s = Server::start_with_tools("probes", &ffmpeg, &ffprobe, |d| std::fs::create_dir_all(d.join("videos/in")).unwrap());
+    let dir = s.dir.join("videos/in");
+    let r = s.post("/api/watch", &json!({ "path": dir, "out_dir": s.dir.join("out"), "options": {} }));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let id = r.json()["id"].as_u64().unwrap();
+    let look = || {
+        let w = s.post(&format!("/api/watch/{id}/look"), &json!({})).json()["watches"][0].clone();
+        (w["fresh"].as_u64().unwrap(), w["left"].as_u64().unwrap())
+    };
+    look();
+    for name in ["rejected.mp4", "cut-short.mp4"] {
+        std::fs::write(dir.join(name), b"xx").unwrap();
+        age(&dir.join(name), 600);
+    }
+    assert_eq!(look(), (2, 0), "seen, and not yet quiet for two looks");
+    assert_eq!(look(), (1, 1), "the rejected one is left at once, the other tried again");
+    assert_eq!(look(), (1, 1));
+    assert_eq!(look(), (0, 2), "three tries, and the other is left too");
+}
+
 /// `av1opt scan` of an empty folder, with a scratch environment of its own.
 fn scan_command(name: &str) -> std::process::Command {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("ui-{name}"));
@@ -798,6 +1103,8 @@ fn watched_folders_are_kept_looked_at_and_never_queue_what_was_there() {
         (dir.join("old.mkv"), s.dir.join("out"), "not a folder"),
         (dir.clone(), PathBuf::from("out"), "output folder"),
         (dir.clone(), dir.clone(), "cannot be the watched folder"),
+        (dir.clone(), dir.join("sub/.."), "cannot be the watched folder"),
+        (dir.clone(), s.dir.join("videos"), "contains the watched folder"),
     ] {
         let r = add(&s, &path, &out);
         assert_eq!(r.status, 400, "{}", r.body);

@@ -39,6 +39,11 @@ pub struct FileResult {
     pub error: Option<String>,
     pub verdict: Verdict,
     pub estimate: SizeRange,
+    /// The probe could not run or was cut short: "unreadable" here says nothing lasting about
+    /// the file, and it is worth trying again.
+    #[serde(skip)]
+    #[cfg_attr(not(feature = "ui"), allow(dead_code))] // Only the watched folders act on it.
+    pub unjudged: bool,
 }
 
 /// Counts of a finished scan, for the log lines.
@@ -51,6 +56,18 @@ pub struct Stats {
 /// Probes every video under `paths` (absolute) with `jobs` ffprobe processes at once.
 /// `progress(done, total)` is called as files finish.
 pub fn collect(
+    paths: &[PathBuf],
+    ffprobe: &str,
+    jobs: usize,
+    min_savings: f64,
+    model: &estimate::Model,
+    progress: &(dyn Fn(usize, usize) + Sync),
+) -> Result<(Vec<FileResult>, Stats)> {
+    collect_with_cache(&cache_file()?, paths, ffprobe, jobs, min_savings, model, progress)
+}
+
+fn collect_with_cache(
+    cache_path: &Path,
     paths: &[PathBuf],
     ffprobe: &str,
     jobs: usize,
@@ -88,11 +105,10 @@ pub fn collect(
     let total = files.len();
     progress(0, total);
 
-    let cache_path = cache_file()?;
     // Two scans at once (UI) must not interleave their read-modify-write of the cache file.
     static CACHE_LOCK: Mutex<()> = Mutex::new(());
     let _guard = CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let cache: HashMap<PathBuf, CacheEntry> = std::fs::read(&cache_path)
+    let cache: HashMap<PathBuf, CacheEntry> = std::fs::read(cache_path)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default();
@@ -111,9 +127,9 @@ pub fn collect(
         c.retain(|p, _| found.contains(p.as_path()) || !paths.iter().any(|root| live.contains(root.as_path()) && p.starts_with(root)));
         before - c.len()
     };
-    // A probe that fails is remembered with the file, so that a broken file is not probed
-    // again on every scan. An ffprobe that cannot be started at all (no such program) says
-    // nothing about any file.
+    // A file ffprobe rejected is remembered as such, so that a broken file is not probed again
+    // on every scan. A probe that could not run or was cut short says nothing about the file
+    // and is not remembered; an ffprobe that cannot be started at all stops the scan here.
     let unknown = {
         let c = cache.lock().unwrap();
         files.iter().any(|(path, _, size, mtime)| !c.get(path).is_some_and(|e| e.size == *size && e.mtime == *mtime))
@@ -127,50 +143,61 @@ pub fn collect(
             .par_iter()
             .map(|(path, root, size, mtime)| {
                 let cached = cache.lock().unwrap().get(path).filter(|c| c.size == *size && c.mtime == *mtime).cloned();
-                let entry = cached.unwrap_or_else(|| {
-                    let (info, error) = match probe::probe(ffprobe, path, *size) {
-                        Ok(i) => (Some(i), None),
-                        Err(e) => (None, Some(format!("{e:#}"))),
-                    };
-                    let e = CacheEntry { size: *size, mtime: *mtime, info, error };
-                    let mut c = cache.lock().unwrap();
-                    c.insert(path.clone(), e.clone());
-                    // Save progress periodically so a crash doesn't lose a long scan.
-                    if fresh.fetch_add(1, Ordering::Relaxed) % 500 == 499 {
-                        let _ = save_cache(&cache_path, &c);
-                    }
-                    e
-                });
+                let (entry, unjudged) = cached.map_or_else(
+                    || {
+                        let (info, error, unjudged) = match probe::probe(ffprobe, path, *size) {
+                            Ok(i) => (Some(i), None, false),
+                            Err(e) => (None, Some(format!("{e:#}")), probe::left_unjudged(&e)),
+                        };
+                        let e = CacheEntry { size: *size, mtime: *mtime, info, error };
+                        let mut c = cache.lock().unwrap();
+                        if !unjudged {
+                            c.insert(path.clone(), e.clone());
+                        }
+                        // Save progress periodically so a crash doesn't lose a long scan.
+                        if fresh.fetch_add(1, Ordering::Relaxed) % 500 == 499 {
+                            let _ = save_cache(cache_path, &c);
+                        }
+                        (e, unjudged)
+                    },
+                    |e| (e, false),
+                );
                 progress(done.fetch_add(1, Ordering::Relaxed) + 1, total);
                 let (verdict, estimate) = match &entry.info {
                     Some(i) => estimate::judge(i, *size, min_savings, model),
                     None => (Verdict::Unreadable, SizeRange { low: *size as f64, likely: *size as f64, high: *size as f64 }),
                 };
-                FileResult { path: path.clone(), root: root.clone(), size: *size, mtime: *mtime, info: entry.info, error: entry.error, verdict, estimate }
+                FileResult { path: path.clone(), root: root.clone(), size: *size, mtime: *mtime, info: entry.info, error: entry.error, verdict, estimate, unjudged }
             })
             .collect()
     });
-    save_cache(&cache_path, &cache.lock().unwrap())?;
+    save_cache(cache_path, &cache.lock().unwrap())?;
     let fresh = fresh.load(Ordering::Relaxed);
     Ok((results, Stats { fresh, cached: total - fresh, dropped }))
 }
 
-/// What earlier scans learned about these files, without running ffprobe: only files whose
-/// size and date still match their cache entry.
+/// What earlier scans learned, read once for looking up many files without running ffprobe.
 #[cfg(feature = "ui")]
-pub fn cached_info(paths: &[PathBuf]) -> HashMap<PathBuf, MediaInfo> {
-    let Some(cache) = cache_file().ok().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice::<HashMap<PathBuf, CacheEntry>>(&b).ok()) else {
-        return HashMap::new();
-    };
-    paths
-        .iter()
-        .filter_map(|p| {
-            let e = cache.get(p)?;
-            let meta = std::fs::metadata(p).ok()?;
-            let mtime = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
-            (e.size == meta.len() && e.mtime == mtime).then(|| Some((p.clone(), e.info.clone()?)))?
-        })
-        .collect()
+pub struct ProbeCache(HashMap<PathBuf, CacheEntry>);
+
+#[cfg(feature = "ui")]
+impl ProbeCache {
+    pub fn load() -> ProbeCache {
+        ProbeCache(cache_file().ok().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default())
+    }
+
+    /// What is known of these files: only those whose size and date still match their entry.
+    pub fn known(&self, paths: &[PathBuf]) -> HashMap<PathBuf, MediaInfo> {
+        paths
+            .iter()
+            .filter_map(|p| {
+                let e = self.0.get(p)?;
+                let meta = std::fs::metadata(p).ok()?;
+                let mtime = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+                (e.size == meta.len() && e.mtime == mtime).then(|| Some((p.clone(), e.info.clone()?)))?
+            })
+            .collect()
+    }
 }
 
 /// The videos to encode when there are `budget_secs` to encode in: those of `items` (bytes
@@ -283,6 +310,31 @@ fn save_cache(path: &Path, cache: &HashMap<PathBuf, CacheEntry>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_probe_that_really_ran_is_remembered() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("av1opt-scan-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("videos")).unwrap();
+        for name in ["broken.mkv", "killed.mkv", "stale.mkv"] {
+            std::fs::write(dir.join("videos").join(name), b"x").unwrap();
+        }
+        // Rejects one file, is killed on another, and meets a read error on the third.
+        let ffprobe = dir.join("ffprobe");
+        let script = "#!/bin/sh\nfor last; do :; done\ncase \"$last\" in\n*broken*) echo \"$last: Invalid data found when processing input\" >&2; exit 1;;\n*killed*) kill -9 $$;;\n*) echo \"$last: Input/output error\" >&2; exit 1;;\nesac\n";
+        std::fs::write(&ffprobe, script).unwrap();
+        std::fs::set_permissions(&ffprobe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cache = dir.join("cache.json");
+        let scan = || collect_with_cache(&cache, &[dir.join("videos")], ffprobe.to_str().unwrap(), 2, 0.15, &estimate::Model::fit(&[], 93.0), &|_, _| {}).unwrap().0;
+        let results = scan();
+        let unjudged = |results: &[FileResult], name: &str| results.iter().find(|r| r.path.ends_with(name)).unwrap().unjudged;
+        assert!(results.iter().all(|r| r.verdict == Verdict::Unreadable));
+        assert!(!unjudged(&results, "broken.mkv") && unjudged(&results, "killed.mkv") && unjudged(&results, "stale.mkv"));
+        let kept: HashMap<PathBuf, CacheEntry> = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
+        assert_eq!(kept.keys().map(|p| p.file_name().unwrap().to_str().unwrap()).collect::<Vec<_>>(), ["broken.mkv"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn totals(items: &[(f64, f64)], picked: &[usize]) -> (f64, f64) {
         picked.iter().fold((0.0, 0.0), |(v, t), &i| (v + items[i].0, t + items[i].1))

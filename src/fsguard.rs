@@ -38,6 +38,19 @@ fn plain(path: &Path) -> std::io::Result<PathBuf> {
     Ok(out)
 }
 
+/// Where `path` leads as the system takes it, links included, whether or not all of it exists
+/// yet: the real place of the part that exists, followed by the rest.
+#[cfg(feature = "ui")]
+pub fn resolved(path: &Path) -> std::io::Result<PathBuf> {
+    let abs = plain(path)?;
+    for above in abs.ancestors() {
+        if let Ok(real) = std::fs::canonicalize(above) {
+            return Ok(real.join(abs.strip_prefix(above).unwrap_or(Path::new(""))));
+        }
+    }
+    Ok(abs)
+}
+
 /// Whether `path` (or, before it is made, the nearest folder above it that exists) is on ZFS.
 pub fn on_zfs(path: &Path) -> bool {
     let Ok(abs) = plain(path) else { return false };

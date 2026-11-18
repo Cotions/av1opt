@@ -112,7 +112,7 @@ enum Cmd {
         #[arg(long, env = "AV1OPT_FFPROBE", default_value = "ffprobe")]
         ffprobe: String,
         /// Memory cap shared by the ffmpeg runs, as for `encode`.
-        #[arg(long, default_value = "auto")]
+        #[arg(long, default_value = "auto", value_parser = parse_memory)]
         memory_limit: String,
         /// CPU priority (0-19, higher = more polite to the desktop).
         #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(i32).range(0..=19))]
@@ -192,7 +192,7 @@ enum Cmd {
         #[arg(long, env = "AV1OPT_FFPROBE", default_value = "ffprobe")]
         ffprobe: String,
         /// Memory cap for each ffmpeg run, as for `encode`.
-        #[arg(long, default_value = "auto")]
+        #[arg(long, default_value = "auto", value_parser = parse_memory)]
         memory_limit: String,
         /// CPU priority (0-19, higher = more polite to the desktop).
         #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(i32).range(0..=19))]
@@ -276,7 +276,7 @@ enum Cmd {
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=8))]
         workers: u8,
         /// Memory cap for each ffmpeg run (systemd MemoryMax syntax, e.g. 12G). "auto" = 40% of RAM, "none" = no cap.
-        #[arg(long, default_value = "auto")]
+        #[arg(long, default_value = "auto", value_parser = parse_memory)]
         memory_limit: String,
         /// CPU priority for encodes (0-19, higher = more polite to the desktop).
         #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(i32).range(0..=19))]
@@ -338,7 +338,7 @@ enum Cmd {
         ffmpeg: String,
         #[arg(long, env = "AV1OPT_FFPROBE", default_value = "ffprobe")]
         ffprobe: String,
-        #[arg(long, default_value = "auto")]
+        #[arg(long, default_value = "auto", value_parser = parse_memory)]
         memory_limit: String,
     },
     /// Local web app: scan folders, queue encodes with live progress, compare source and AV1
@@ -356,7 +356,7 @@ enum Cmd {
         #[arg(long, env = "AV1OPT_FFPROBE", default_value = "ffprobe")]
         ffprobe: String,
         /// Memory cap for each ffmpeg run, as for `encode`.
-        #[arg(long, default_value = "auto")]
+        #[arg(long, default_value = "auto", value_parser = parse_memory)]
         memory_limit: String,
         /// CPU priority for encodes (0-19).
         #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(i32).range(0..=19))]
@@ -373,6 +373,20 @@ fn parse_target(s: &str) -> Result<f64, String> {
     match s.parse::<f64>() {
         Ok(v) if v > 0.0 && v <= 100.0 => Ok(v),
         _ => Err("a VMAF target is a number above 0 and up to 100".into()),
+    }
+}
+
+/// A memory cap is "auto", "none", or what systemd takes for MemoryMax: bytes, with K, M, G
+/// or T for larger units, or a share of the memory in percent. Anything else would have been
+/// no cap at all, with nothing said.
+fn parse_memory(s: &str) -> Result<String, String> {
+    let digits = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let unit = s[digits..].to_ascii_uppercase();
+    let amount = digits > 0 && s[..digits].parse::<u64>().is_ok_and(|n| n > 0) && matches!(unit.as_str(), "" | "K" | "M" | "G" | "T" | "%");
+    if matches!(s, "auto" | "none" | "infinity") || amount {
+        Ok(s.to_string())
+    } else {
+        Err("a memory cap is auto, none, or an amount such as 12G, 800M or 40%".into())
     }
 }
 
@@ -631,12 +645,13 @@ fn main() -> Result<()> {
 /// Per-ffmpeg memory cap: the configured total, split between parallel workers.
 fn memory_cap(setting: &str, workers: u8) -> Option<String> {
     let mb = match setting {
-        "none" => return None,
+        "none" | "infinity" => return None,
         "auto" => std::fs::read_to_string("/proc/meminfo")
             .ok()
             .and_then(|m| m.lines().find(|l| l.starts_with("MemTotal:"))?.split_whitespace().nth(1)?.parse::<u64>().ok())
             .map(|kb| kb * 4 / 10 / 1024)?,
-        s if workers <= 1 => return Some(s.to_string()),
+        // systemd reads the units in capitals only.
+        s if workers <= 1 => return Some(s.to_ascii_uppercase()),
         s => {
             let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
             let n: u64 = num.parse().ok()?;
@@ -646,7 +661,7 @@ fn memory_cap(setting: &str, workers: u8) -> Option<String> {
                 "M" => n,
                 "G" => n * 1024,
                 "T" => n * 1024 * 1024,
-                _ => return Some(s.to_string()),
+                _ => return Some(s.to_ascii_uppercase()),
             }
         }
     };

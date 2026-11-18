@@ -87,6 +87,9 @@ pub struct App {
     pub token: String,
     pub port: u16,
     pub settings: Mutex<Settings>,
+    /// Held from taking the settings to having written them, so that of two saves the later
+    /// one is what stays on disk.
+    settings_save: Mutex<()>,
     /// Canonical paths the media endpoint may serve.
     pub allowed: Mutex<HashSet<PathBuf>>,
     /// Open event streams; dead ones are dropped on the next send.
@@ -173,17 +176,44 @@ impl App {
     }
 
     pub fn save_settings(&self) {
-        let mut s = self.settings.lock().unwrap().clone();
-        if s.format > SETTINGS_FORMAT {
-            note("settings not saved: ui.json is from a newer av1opt");
-            return;
-        }
-        s.format = SETTINGS_FORMAT;
-        if let Some(p) = library::settings_path() {
-            let _ = p.parent().map(std::fs::create_dir_all);
-            let _ = crate::files::replace_with(&p, &serde_json::to_vec_pretty(&s).unwrap_or_default());
+        one_at_a_time(&self.settings_save, || self.settings.lock().unwrap().clone(), |mut s| {
+            if s.format > SETTINGS_FORMAT {
+                note("settings not saved: ui.json is from a newer av1opt");
+                return;
+            }
+            s.format = SETTINGS_FORMAT;
+            let Some(path) = library::settings_path() else { return };
+            // A settings file kept elsewhere (a folder of dotfiles) stays a link to it.
+            let path = behind_links(&path);
+            let saved = path
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| crate::files::replace_with(&path, &serde_json::to_vec_pretty(&s).unwrap_or_default()));
+            if let Err(e) = saved {
+                note(&format!("settings not saved: cannot write {}: {e}", path.display()));
+            }
+        });
+    }
+}
+
+/// Takes what is to be saved and writes it with `gate` held throughout: a save that took its
+/// copy earlier cannot land after one that took a later copy, and undo it.
+fn one_at_a_time<T>(gate: &Mutex<()>, take: impl FnOnce() -> T, write: impl FnOnce(T)) {
+    let _saving = gate.lock().unwrap_or_else(|e| e.into_inner());
+    write(take());
+}
+
+/// The file a chain of links at `path` ends at, there or not. A chain that never ends leaves
+/// `path` itself.
+fn behind_links(path: &Path) -> PathBuf {
+    let mut at = path.to_path_buf();
+    for _ in 0..40 {
+        match std::fs::read_link(&at) {
+            Ok(next) => at = at.parent().unwrap_or(Path::new("")).join(next),
+            Err(_) => return at,
         }
     }
+    path.to_path_buf()
 }
 
 pub fn run(cfg: Config) -> Result<()> {
@@ -205,11 +235,14 @@ pub fn run(cfg: Config) -> Result<()> {
         .unwrap_or_default();
     // A program chosen on the page was safe to start when it was chosen; it has to be still.
     for (name, tool) in [("ffmpeg", &mut settings.ffmpeg), ("ffprobe", &mut settings.ffprobe)] {
-        if let Some(p) = tool.as_deref().map(Path::new).filter(|p| p.is_absolute())
-            && let Err(why) = library::safe_program(p)
-        {
-            note(&format!("{name}: {} {why}; using the default", p.display()));
-            *tool = None;
+        // What runs is the file found safe, not whatever the path leads to later.
+        let Some(path) = tool.as_deref().map(PathBuf::from).filter(|p| p.is_absolute()) else { continue };
+        match library::chosen_program(name, &path) {
+            Ok(real) => *tool = Some(real.to_string_lossy().into_owned()),
+            Err(why) => {
+                note(&format!("{name}: {why}; using the default"));
+                *tool = None;
+            }
         }
     }
     let open = cfg.open;
@@ -218,6 +251,7 @@ pub fn run(cfg: Config) -> Result<()> {
         token,
         port,
         settings: Mutex::new(settings),
+        settings_save: Mutex::new(()),
         allowed: Mutex::new(HashSet::new()),
         subscribers: Mutex::new(Vec::new()),
         jobs: jobs::Queue::default(),
@@ -360,4 +394,32 @@ pub fn now() -> u64 {
 /// Error reply for the API: `{ "error": "..." }`.
 pub fn err_json(e: &anyhow::Error) -> Value {
     json!({ "error": format!("{e:#}") })
+}
+
+#[cfg(test)]
+mod save_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn a_slow_save_does_not_undo_a_later_one() {
+        let (gate, current, on_disk) = (Mutex::new(()), Mutex::new(1), Mutex::new(0));
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                one_at_a_time(&gate, || *current.lock().unwrap(), |value| {
+                    // The change that follows is made while this copy is on its way.
+                    *current.lock().unwrap() = 2;
+                    std::thread::sleep(Duration::from_millis(150));
+                    *on_disk.lock().unwrap() = value;
+                });
+            });
+            s.spawn(|| {
+                while *current.lock().unwrap() != 2 {
+                    std::thread::yield_now();
+                }
+                one_at_a_time(&gate, || *current.lock().unwrap(), |value| *on_disk.lock().unwrap() = value);
+            });
+        });
+        assert_eq!(*on_disk.lock().unwrap(), 2);
+    }
 }

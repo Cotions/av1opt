@@ -129,11 +129,9 @@ fn alone_in_group(passwd: &str, group: &str, gid: u32, uid: u32) -> bool {
             return false;
         }
     }
-    group
-        .lines()
-        .map(|l| l.split(':').collect::<Vec<&str>>())
-        .filter(|f| f.len() >= 4 && f[2].parse() == Ok(gid))
-        .all(|f| f[3].split(',').map(str::trim).filter(|m| !m.is_empty()).all(|m| Some(m) == me))
+    // A group these files do not list (kept in LDAP, say) may have any members.
+    let mut lines = group.lines().map(|l| l.split(':').collect::<Vec<&str>>()).filter(|f| f.len() >= 4 && f[2].parse() == Ok(gid)).peekable();
+    lines.peek().is_some() && lines.all(|f| f[3].split(',').map(str::trim).filter(|m| !m.is_empty()).all(|m| Some(m) == me))
 }
 
 /// The file a program's path leads to in the end, where nobody but the user or the system
@@ -170,6 +168,22 @@ pub(super) fn safe_program(p: &Path) -> std::result::Result<PathBuf, &'static st
     Ok(real)
 }
 
+/// Whether a program's file name starts with the name of the tool it stands for.
+fn named_like(p: &Path, tool: &str) -> bool {
+    p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.to_ascii_lowercase().starts_with(tool))
+}
+
+/// The file to run for a path chosen as `tool`: safe, and itself named like the tool. A link
+/// called `ffmpeg` can lead to a program that goes by what it was called (a launcher such as
+/// `/usr/bin/snap`), and that program started under its own name is something else.
+pub(super) fn chosen_program(tool: &str, p: &Path) -> std::result::Result<PathBuf, String> {
+    let real = safe_program(p).map_err(|why| format!("{} {why}", p.display()))?;
+    if !named_like(&real, tool) {
+        return Err(format!("{} is a link that leads to {}, a program with another name", p.display(), real.display()));
+    }
+    Ok(real)
+}
+
 /// Sets the ffmpeg and ffprobe programs (empty = back to the command-line default) and
 /// reports what they can do.
 pub fn set_tools(app: &App, body: &Value) -> Result<Value> {
@@ -180,12 +194,10 @@ pub fn set_tools(app: &App, body: &Value) -> Result<Value> {
             // This page starts what is named here. Whoever can reach the page can already
             // encode and trash; running any program of the machine is not part of that. So:
             // a program named like the tool, and one nobody else could have put there.
-            Some(p) if !Path::new(p).file_name().and_then(|n| n.to_str()).is_some_and(|n| n.to_ascii_lowercase().starts_with(k)) => {
-                bail!("{k}: the program's name has to start with {k}")
-            }
-            Some(p) if Path::new(p).is_absolute() => match safe_program(Path::new(p)) {
+            Some(p) if !named_like(Path::new(p), k) => bail!("{k}: the program's name has to start with {k}"),
+            Some(p) if Path::new(p).is_absolute() => match chosen_program(k, Path::new(p)) {
                 Ok(real) => Ok(Some(real.to_string_lossy().into_owned())),
-                Err(why) => bail!("{k}: {p} {why}"),
+                Err(why) => bail!("{k}: {why}"),
             },
             Some(p) => Ok(Some(p.to_string())),
         }
@@ -720,6 +732,8 @@ mod tests {
         assert!(!alone_in_group(passwd, group, 1500, 1000));
         assert!(!alone_in_group(passwd, group, 100, 1000));
         assert!(!alone_in_group(passwd, group, 1001, 1000));
+        // A group the file does not list: its members are not known, so it is not one's own.
+        assert!(!alone_in_group(passwd, group, 4242, 1000));
     }
 
     #[test]
@@ -747,6 +761,24 @@ mod tests {
         // A file others can write to is not safe wherever it lies.
         std::fs::set_permissions(dir.join("mine/ffmpeg"), std::fs::Permissions::from_mode(0o757)).unwrap();
         assert!(safe_program(&dir.join("mine/ffmpeg")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_chosen_program_is_judged_by_the_file_its_path_leads_to() {
+        let dir = std::env::temp_dir().join(format!("av1opt-chosen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        for f in ["ffmpeg-7.1", "launcher"] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        std::os::unix::fs::symlink(dir.join("ffmpeg-7.1"), dir.join("ffmpeg")).unwrap();
+        std::os::unix::fs::symlink(dir.join("launcher"), dir.join("ffprobe")).unwrap();
+        assert_eq!(chosen_program("ffmpeg", &dir.join("ffmpeg")), Ok(dir.join("ffmpeg-7.1")));
+        let refused = chosen_program("ffprobe", &dir.join("ffprobe")).unwrap_err();
+        assert!(refused.contains("a program with another name"), "{refused}");
+        assert!(chosen_program("ffmpeg", &dir.join("nothing")).unwrap_err().ends_with("is not there"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

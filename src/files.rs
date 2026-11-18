@@ -2,6 +2,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Writes `data` to a new file at `path`. What was at that name is removed first and the
 /// file is made anew: a link left there (in an output folder others can write to) is
@@ -17,10 +18,12 @@ pub fn write_new(path: &Path, data: &[u8]) -> std::io::Result<()> {
 
 /// Puts `data` at `path` by way of a file beside it that then takes its name: a reader
 /// finds the old file or the new one, whole. The file beside it carries this process's
-/// number, so two programs saving at once do not write into each other's.
+/// number and a count of its saves, so two programs or two threads saving at once do not
+/// take each other's away.
 pub fn replace_with(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    static SAVES: AtomicU64 = AtomicU64::new(0);
     let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".{}.tmp", std::process::id()));
+    name.push(format!(".{}.{}.tmp", std::process::id(), SAVES.fetch_add(1, Ordering::Relaxed)));
     let tmp: PathBuf = path.with_file_name(name);
     write_new(&tmp, data).and_then(|()| std::fs::rename(&tmp, path)).inspect_err(|_| drop(std::fs::remove_file(&tmp)))
 }
@@ -42,6 +45,28 @@ pub fn append_line(path: &Path, line: &str, follow: bool) -> std::io::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saves_at_the_same_moment_all_succeed() {
+        let dir = std::env::temp_dir().join(format!("av1opt-files-saves-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::thread::scope(|s| {
+            for thread in 0..8 {
+                let path = &path;
+                s.spawn(move || {
+                    for turn in 0..200 {
+                        replace_with(path, format!("{thread} {turn}").as_bytes()).unwrap();
+                    }
+                });
+            }
+        });
+        // One whole file, and nothing left beside it.
+        assert!(std::fs::read_to_string(&path).unwrap().ends_with(" 199"));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_link_at_the_name_is_replaced_not_written_through() {

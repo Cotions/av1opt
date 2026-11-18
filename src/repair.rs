@@ -426,6 +426,14 @@ pub struct Ctx<'a> {
     pub dir: &'a Path,
 }
 
+/// Room for encoding stretches again, beside the encode of `output_bytes` that is already
+/// there: first its video stream alone and that stream with the stretches replaced, then the
+/// latter and the file joined from it, each a little over the encode at worst; and a lossless
+/// stretch of the source with its tries, and slack.
+fn room_to_repair(output_bytes: u64) -> u64 {
+    (output_bytes as f64 * 2.2) as u64 + 1_000_000_000 + 500_000_000
+}
+
 /// Looks for stretches of `output` below the floor and encodes them again. Fails with
 /// [`StillLow`] where stretches stay short that more tries could have helped; a stretch no
 /// CRF brings up is kept at the best it was given.
@@ -447,6 +455,9 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
         let summary = Summary { mean_vmaf: mean(&scores), lowest_vmaf: lowest_before, lowest_before, floor: c.floor, stretches: Vec::new(), near: 0, left: Vec::new(), secs: 0.0 };
         return Ok(Outcome { summary, video: None, scores, secs });
     }
+
+    let room = room_to_repair(std::fs::metadata(output).context("the encode is gone")?.len());
+    crate::encode::require_room(c.dir, crate::encode::free_bytes(c.dir), room)?;
 
     let plain = c.dir.join("repair.source.ivf");
     let args: Vec<String> = ["-y", "-v", "error", "-i", &path_arg(output), "-map", "0:v:0", "-c", "copy", "-f", "ivf", &path_arg(&plain)].map(String::from).to_vec();
@@ -759,6 +770,36 @@ fn splice(source: &Path, head: &[u8; 32], index: &[IvfFrame], fixed: &[Fixed], o
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encoding_stretches_again_asks_for_two_copies_and_a_stretch() {
+        assert_eq!(room_to_repair(0), 1_500_000_000);
+        assert_eq!(room_to_repair(10_000_000_000), 23_500_000_000);
+    }
+
+    #[test]
+    fn stretches_are_left_alone_when_there_is_no_room_to_encode_them() {
+        let dir = std::env::temp_dir().join(format!("av1opt-repair-room-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A file with nothing in it that says it holds 15 TiB: twice that is free nowhere here.
+        let output = dir.join("out.mp4");
+        let file = std::fs::File::create(&output).unwrap();
+        if file.set_len(15 << 40).is_err() {
+            return;
+        }
+        let tools = Tools::new("false".into(), "false".into(), None);
+        let (info, enc) = (MediaInfo::default(), EncodeSettings { preset: 8, pix_fmt_out: "yuv420p10le", params: String::new() });
+        let c = Ctx { tools: &tools, input: &dir.join("in.mkv"), info: &info, enc: &enc, crf: 30.0, floor: 90.0, min_crf: 20, threads: 1, dir: &dir };
+        let survey = Survey { scores: scored(300, |_| 70.0), times: Times { pts: (0..300).collect(), tb: (1, 30) }, gops: vec![0] };
+        let why = repair(&c, &output, &survey).err().expect("no room").to_string();
+        // One line: it ends up in the note that says the stretches were left as they are.
+        assert!(why.starts_with("not enough free space in ") && why.lines().count() == 1, "{why}");
+        // With nothing to encode again, no room is asked for.
+        let fine = Survey { scores: scored(300, |_| 95.0), times: Times { pts: (0..300).collect(), tb: (1, 30) }, gops: vec![0] };
+        assert!(repair(&c, &output, &fine).is_ok_and(|o| o.video.is_none()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_stretch_is_judged_with_the_frames_around_it() {

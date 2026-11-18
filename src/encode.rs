@@ -554,19 +554,9 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         skip!("predicted savings {:.0}% below --min-savings {:.0}%", predicted_savings * 100.0, o.min_savings * 100.0);
     }
 
-    // Needs room for the encode plus slack; predicted size can be off for unusual content.
-    // Scene mode holds the chunks, the joined stream and the final file at once.
-    // Lossless chunk references add up to ~4 GB each (4K) per worker.
-    // The check of a whole video holds the encode, its video stream alone, that stream with
-    // stretches replaced and the file joined anew, and a lossless stretch of the source.
-    let copies = if scenes || whole_check { 3.0 } else { 1.5 };
-    let refs = if scenes { o.workers as u64 * 4_000_000_000 } else if whole_check { 1_000_000_000 } else { 0 };
-    let need = (size as f64 * best.size_ratio.max(0.3) * copies) as u64 + 500_000_000 + refs;
-    if let Some(free) = free_bytes(out_dir)
-        && free < need
-    {
-        bail!("not enough free space in {}: {:.1} GB free, ~{:.1} GB needed", out_dir.display(), free as f64 / 1e9, need as f64 / 1e9);
-    }
+    // What encoding again weak stretches takes is looked at when it is about to start, and
+    // only if there are any (see `repair::repair`).
+    require_room(out_dir, free_bytes(out_dir), room_to_encode(size, best.size_ratio, scenes, o.workers))?;
 
     // The sample clips are lossless and large; only scene mode measures on them again.
     if !scenes && let Some(lab) = lab.as_mut() {
@@ -880,9 +870,9 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     let records_original = std::fs::read(&report_at).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).is_some_and(|r| r.get("replaced").is_some_and(|v| !v.is_null()));
     if records_original {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-        let aside = output.with_extension(format!("av1opt.json.replaced-{now}"));
-        if std::fs::rename(&report_at, &aside).is_ok() {
-            eprintln!("note: the report of an earlier encode, which says where its original is, was kept as {}", aside.display());
+        match crate::replace::set_aside(&report_at, &output, now) {
+            Ok(aside) => eprintln!("note: the report of an earlier encode, which says where its original is, was kept as {}", aside.display()),
+            Err(e) => eprintln!("warning: the report of an earlier encode, which says where its original is, could not be kept: {e}"),
         }
     }
     crate::files::write_new(&report_at, &serde_json::to_vec_pretty(&report)?)?;
@@ -1320,16 +1310,21 @@ impl std::error::Error for LowSpot {}
 /// Checks the finished file before it replaces anything: its video codec, duration, streams
 /// and, where the number is known, frames.
 fn check_layout(tools: &Tools, info: &MediaInfo, out: &Path, streams: &Streams, expect_frames: Option<u64>, cut: Option<&Sections>) -> Result<MediaInfo> {
-    let duration = cut.map_or(info.duration_s, Sections::kept);
     let out_info = probe::probe(&tools.ffprobe, out, std::fs::metadata(out)?.len())?;
     if out_info.codec != "av1" {
         bail!("verify: output video is {}, expected av1", out_info.codec);
     }
     // (A share of the length, for containers that round it; never so much that a film could
     // lose its last half minute unnoticed.)
-    let tolerance = (duration * 0.005).clamp(1.0, 5.0);
-    if (out_info.duration_s - duration).abs() > tolerance {
-        bail!("verify: duration {:.1}s, expected {:.1}s", out_info.duration_s, duration);
+    let (length, expected) = lengths_to_compare(info, &out_info, cut);
+    let tolerance = (expected * 0.005).clamp(1.0, 5.0);
+    // A source that understates its picture gives an output longer than expected: nothing
+    // was lost if the whole files still agree. A cut that was not made is longer too, and
+    // is not let through this way.
+    let whole = (out_info.duration_s - info.duration_s).abs() <= (info.duration_s * 0.005).clamp(1.0, 5.0);
+    let understated = cut.is_none() && length > expected && whole;
+    if (length - expected).abs() > tolerance && !understated {
+        bail!("verify: duration {length:.1}s, expected {expected:.1}s");
     }
     if out_info.audio_streams as usize != streams.audio || out_info.subtitle_streams as usize != streams.subs {
         bail!(
@@ -1350,6 +1345,19 @@ fn check_layout(tools: &Tools, info: &MediaInfo, out: &Path, streams: &Streams, 
         }
     }
     Ok(out_info)
+}
+
+/// How long a finished file is and how long it should be. The picture is what was encoded:
+/// the length of the container can come from a track that was not kept (image subtitles do
+/// not go into MP4) or be an estimate (TS, AVI). Where either file does not say how long its
+/// picture is, the containers are compared.
+fn lengths_to_compare(info: &MediaInfo, out: &MediaInfo, cut: Option<&Sections>) -> (f64, f64) {
+    if info.video_s > 0.0 && out.video_s > 0.0 {
+        let picture = info.picture_secs();
+        (out.picture_secs(), cut.map_or(picture, |c| c.kept_within(picture)))
+    } else {
+        (out.duration_s, cut.map_or(info.duration_s, Sections::kept))
+    }
 }
 
 /// VMAF of `secs` seconds of the output from `start` against the source from `src_start`,
@@ -1573,7 +1581,26 @@ fn verify_whole(
     Ok(Some((scores, out_info, summary)))
 }
 
-fn free_bytes(dir: &Path) -> Option<u64> {
+/// Room an encode needs in the output folder: the predicted file and slack, as the size
+/// can be off for unusual content. Scene mode holds the chunks, the joined stream and the
+/// final file at once, and lossless chunk references of up to ~4 GB each (4K) per worker.
+fn room_to_encode(size: u64, size_ratio: f64, scenes: bool, workers: usize) -> u64 {
+    let copies = if scenes { 3.0 } else { 1.5 };
+    let references = if scenes { workers as u64 * 4_000_000_000 } else { 0 };
+    (size as f64 * size_ratio.max(0.3) * copies) as u64 + 500_000_000 + references
+}
+
+/// Fails when `free` bytes (if the system could tell) are fewer than `need`.
+pub(crate) fn require_room(dir: &Path, free: Option<u64>, need: u64) -> Result<()> {
+    if let Some(free) = free
+        && free < need
+    {
+        bail!("not enough free space in {}: {:.1} GB free, ~{:.1} GB needed", dir.display(), free as f64 / 1e9, need as f64 / 1e9);
+    }
+    Ok(())
+}
+
+pub(crate) fn free_bytes(dir: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -1584,6 +1611,47 @@ fn free_bytes(dir: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_encode_asks_for_the_room_it_needs_itself() {
+        const GB: u64 = 1_000_000_000;
+        // One and a half times the predicted file and slack, with or without a check after.
+        assert_eq!(room_to_encode(10 * GB, 0.5, false, 1), 8 * GB);
+        // A prediction of next to nothing is not believed.
+        assert_eq!(room_to_encode(10 * GB, 0.01, false, 1), 5 * GB);
+        assert_eq!(room_to_encode(10 * GB, 0.5, true, 2), 15 * GB + GB / 2 + 8 * GB);
+        assert!(require_room(Path::new("/out"), Some(8 * GB), 8 * GB).is_ok());
+        assert!(require_room(Path::new("/out"), None, 8 * GB).is_ok());
+        let e = require_room(Path::new("/out"), Some(GB), 8 * GB).unwrap_err().to_string();
+        assert_eq!(e, "not enough free space in /out: 1.0 GB free, ~8.0 GB needed");
+    }
+
+    #[test]
+    fn a_finished_file_is_measured_by_its_picture() {
+        let media = |duration_s, video_s| MediaInfo { duration_s, video_s, ..info(&[]) };
+        let fits = |source: &MediaInfo, out: &MediaInfo, cut: Option<&Sections>| {
+            let (length, expected) = lengths_to_compare(source, out, cut);
+            (length - expected).abs() <= (expected * 0.005).clamp(1.0, 5.0)
+        };
+        // An image subtitle track runs an hour past the picture and does not go into MP4.
+        assert!(fits(&media(7200.0, 3600.0), &media(3600.0, 3600.0), None));
+        // Sound that runs on is kept, and does not count either.
+        assert!(fits(&media(130.0, 100.0), &media(130.0, 100.0), None));
+        // A container's length that is only an estimate.
+        assert!(fits(&media(5400.0, 5000.0), &media(5000.0, 5000.0), None));
+        // A film that lost its end does not pass for any of these reasons.
+        assert!(!fits(&media(7200.0, 3600.0), &media(3500.0, 3500.0), None));
+        assert!(!fits(&media(130.0, 100.0), &media(130.0, 90.0), None));
+
+        // What a cut removes comes off, and past the end of the picture it removes nothing.
+        let cut = Sections::new(&[(10.0, 20.0), (110.0, f64::INFINITY)], 130.0).unwrap();
+        assert_eq!(lengths_to_compare(&media(130.0, 100.0), &media(90.0, 90.0), Some(&cut)), (90.0, 90.0));
+
+        // Where either picture's length is not known, the containers are what is known.
+        assert_eq!(lengths_to_compare(&media(600.0, 0.0), &media(599.0, 599.0), None), (599.0, 600.0));
+        assert_eq!(lengths_to_compare(&media(130.0, 100.0), &media(130.0, 0.0), None), (130.0, 130.0));
+        assert_eq!(lengths_to_compare(&media(130.0, 0.0), &media(100.0, 0.0), Some(&cut)), (100.0, cut.kept()));
+    }
 
     #[test]
     fn one_file_under_two_names_is_one_file() {

@@ -233,10 +233,11 @@ function pick({ title, mode = "dir", start }) {
       else selInfo.textContent = selected.size ? `${selected.size} selected` : "nothing selected: adds the current folder";
     };
 
-    async function go(p) {
+    // The folder it opens on may be gone by now: home is listed instead (an empty path).
+    async function go(p, opening) {
       let r;
       try { r = await api("/api/browse?path=" + encodeURIComponent(p) + (hidden ? "&hidden=1" : "")); }
-      catch (e) { toast(e.message, true); return; }
+      catch (e) { if (opening) return go(""); toast(e.message, true); return; }
       cur = r.path;
       pathEl.textContent = r.path;
       places.replaceChildren(...r.places.map((pl) => h("button", { class: "small", onclick: () => go(pl.path) }, pl.name)));
@@ -300,7 +301,7 @@ function pick({ title, mode = "dir", start }) {
         h("div", { class: "foot" }, selInfo, h("button", { onclick: () => close(null) }, "Cancel"), choose)));
     document.body.append(bg);
     const release = holdFocus(bg, () => close(null));
-    go(cur);
+    go(cur, true);
   });
 }
 
@@ -782,6 +783,7 @@ views.scan = (root) => {
   const progText = h("span", { class: "dim" });
   const out = h("div");
   let scanId = null;
+  let scanStatus = null; // as last read; null until then
 
   const drawChips = () => {
     chips.replaceChildren(...[...roots].map((r) => h("span", { class: "chip" }, h("code", {}, r), h("button", { title: "Remove", onclick: () => { roots.delete(r); prefs.set("scanRoots", [...roots]); drawChips(); } }, "×"))));
@@ -797,6 +799,7 @@ views.scan = (root) => {
     try {
       const r = await api("/api/scans", { paths: [...roots], min_savings: Number(minSav.value) / 100, target_vmaf: Number(vmaf.value), preset: Number(defaultOptions().preset) || 5 });
       scanId = lastScanId = r.id;
+      scanStatus = null;
       progText.textContent = "listing files…";
       progress.firstChild.style.width = "0%";
       out.replaceChildren();
@@ -819,6 +822,7 @@ views.scan = (root) => {
     let r;
     try { r = await api("/api/scans/" + id); } catch (e) { toast(e.message, true); if (id === scanId) start.disabled = !roots.size; return; }
     if (id !== scanId) return; // another scan was started meanwhile
+    scanStatus = r.status;
     start.disabled = !roots.size;
     if (r.status === "running") {
       progText.textContent = r.total ? `probed ${r.done} / ${r.total}` : "listing files…";
@@ -837,7 +841,8 @@ views.scan = (root) => {
       progText.textContent = m.total ? `probed ${m.done} / ${m.total}` : "listing files…";
       progress.firstChild.style.width = m.total ? (100 * m.done / m.total) + "%" : "0%";
     } else if (m.kind === "scan_done" && m.id === scanId) showResult(m.id);
-    else if (m.kind === "reopened" && scanId != null) showResult(scanId);
+    // A finished scan cannot have changed, and drawing it again would lose the selection.
+    else if (m.kind === "reopened" && scanId != null && (scanStatus == null || scanStatus === "running")) showResult(scanId);
   });
   if (lastScanId) { scanId = lastScanId; showResult(lastScanId); }
   return off;
@@ -972,6 +977,7 @@ views.dups = (root) => {
   const progText = h("span", { class: "dim" });
   const out = h("div");
   let runId = null;
+  let dupStatus = null; // of the search shown, as last read; null until then
   // For the time-left estimate of the slow step.
   let fpStart = null;
 
@@ -1012,6 +1018,7 @@ views.dups = (root) => {
     try {
       const r = await api("/api/dups", { paths: [...roots], prefer, avoid: avoidList, tolerance: Number(tol.value), refresh: refresh.checked });
       runId = lastDupId = r.id;
+      dupStatus = null;
       dupMarks.clear();
       fpStart = null;
       refresh.checked = false;
@@ -1051,6 +1058,7 @@ views.dups = (root) => {
     let r;
     try { r = await api("/api/dups/" + id); } catch (e) { if (id === lastDupId) { runId = null; setRunning(false); } return; }
     if (id !== lastDupId) return; // another search was started meanwhile
+    dupStatus = r.status;
     if (r.status === "running") { runId = id; setRunning(true); showProgress(r); return; }
     runId = null;
     setRunning(false);
@@ -1065,7 +1073,8 @@ views.dups = (root) => {
   const off = onEvent((m) => {
     if (m.kind === "dups" && m.id === runId) showProgress(m);
     else if (m.kind === "dups_done" && (m.id === runId || m.id === lastDupId)) showResult(m.id);
-    else if (m.kind === "reopened" && lastDupId != null) showResult(lastDupId);
+    // A finished search cannot have changed, and drawing it again would lose the sort and the rows shown.
+    else if (m.kind === "reopened" && lastDupId != null && (dupStatus == null || dupStatus === "running")) showResult(lastDupId);
   });
   (async () => {
     // After a reload the page has forgotten the run; the server hasn't.
@@ -2016,6 +2025,8 @@ function hoursDialog(sch) {
   return new Promise((resolve) => {
     let busy = false;
     const close = (v) => { bg.remove(); release(); resolve(v); };
+    // While a save is on its way the dialog stays: its answer is what closes it.
+    const cancel = () => { if (!busy) close(null); };
     const on = h("input", { type: "checkbox" });
     on.checked = sch.on;
     const from = h("input", { type: "time", value: sch.from, required: true }), to = h("input", { type: "time", value: sch.to, required: true });
@@ -2034,17 +2045,17 @@ function hoursDialog(sch) {
       try { close(await api("/api/queue/schedule", { on: on.checked, from: from.value || sch.from, to: to.value || sch.to })); } catch (e) { toast(e.message, true); } finally { busy = false; sync(); }
     } }, "Save");
     for (const el of [on, from, to]) el.addEventListener("input", sync);
-    const bg = h("div", { class: "modal-bg", onclick: (e) => { if (e.target === bg) close(null); } },
+    const bg = h("div", { class: "modal-bg", onclick: (e) => { if (e.target === bg) cancel(); } },
       h("div", { class: "modal narrow" },
         h("div", { class: "head" }, h("strong", {}, "Encoding hours")),
         h("div", { class: "body" },
           h("label", { class: "check" }, on, "Encode only during these hours"),
           h("div", { class: "row hours" }, "from", from, "to", to),
           note),
-        h("div", { class: "foot" }, h("button", { onclick: () => close(null) }, "Cancel"), save)));
+        h("div", { class: "foot" }, h("button", { onclick: cancel }, "Cancel"), save)));
     sync();
     document.body.append(bg);
-    const release = holdFocus(bg, () => { if (!busy) close(null); }, on);
+    const release = holdFocus(bg, cancel, on);
   });
 }
 

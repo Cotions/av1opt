@@ -122,6 +122,11 @@ impl Sections {
         self.keep.iter().map(|(a, b)| b - a).sum()
     }
 
+    /// How much of the first `secs` seconds of the source stays.
+    pub fn kept_within(&self, secs: f64) -> f64 {
+        self.keep.iter().map(|&(a, b)| (b.min(secs) - a).max(0.0)).sum()
+    }
+
     /// Output time of source time `t`. Times inside a removed part map to where the next
     /// kept part starts.
     pub fn to_out(&self, t: f64) -> f64 {

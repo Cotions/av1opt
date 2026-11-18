@@ -70,23 +70,40 @@ fn has_session(app: &App, req: &Request) -> bool {
 /// TCP sockets (`tcp` is the text of `/proc/net/tcp`): the row whose own address is the
 /// client's and whose far address is this server's. `None` where there is no such row.
 fn socket_owner(tcp: &str, client: std::net::SocketAddrV4, port: u16) -> Option<u32> {
+    socket_row(tcp, client, port)?[7].parse().ok()
+}
+
+/// The columns of that row.
+fn socket_row(tcp: &str, client: std::net::SocketAddrV4, port: u16) -> Option<Vec<&str>> {
     // Addresses there are the four bytes as the machine holds them, in hex, then the port.
     let hex = |ip: &std::net::Ipv4Addr, port: u16| format!("{:08X}:{port:04X}", u32::from_ne_bytes(ip.octets()));
     let (own, far) = (hex(client.ip(), client.port()), hex(&std::net::Ipv4Addr::LOCALHOST, port));
-    tcp.lines().map(|l| l.split_whitespace().collect::<Vec<&str>>()).find(|f| f.len() > 7 && f[1] == own && f[2] == far)?[7].parse().ok()
+    tcp.lines().map(|l| l.split_whitespace().collect::<Vec<&str>>()).find(|f| f.len() > 7 && f[1] == own && f[2] == far)
+}
+
+/// Whether the kernel's list shows the other end of a connection as user `me`'s or the
+/// system's. A socket its program has closed stays listed for a while under user 0, and may
+/// be gone altogether: neither says whose it was, so user 0 only counts on a connection
+/// still established (state 01), and no row does not count.
+fn may_connect(tcp: &str, client: std::net::SocketAddrV4, port: u16, me: u32) -> bool {
+    match socket_owner(tcp, client, port) {
+        Some(0) => socket_row(tcp, client, port).is_some_and(|row| row[3] == "01"),
+        Some(uid) => uid == me,
+        None => false,
+    }
 }
 
 /// Whether the request comes from a program of the user who started this server (or the
 /// system's). The cookie alone does not say so: a browser sends it to every port of this
 /// host, and a server another user runs on one of them would learn the token from a page
-/// opened there. Where the kernel's list cannot be read or has no such row, the cookie has
-/// to do.
+/// opened there. Only where the kernel's list cannot be read at all does the cookie have to
+/// do.
 fn same_user(app: &App, req: &Request) -> bool {
     let Some(std::net::SocketAddr::V4(client)) = req.remote_addr().copied() else { return true };
     let Ok(tcp) = std::fs::read_to_string("/proc/net/tcp") else { return true };
     // SAFETY: getuid has no failure mode and touches no memory.
     let me = unsafe { libc::getuid() };
-    socket_owner(&tcp, client, app.port).is_none_or(|uid| uid == me || uid == 0)
+    may_connect(&tcp, client, app.port, me)
 }
 
 /// Constant-time comparison for the session token.
@@ -355,6 +372,29 @@ mod tests {
         assert_eq!(socket_owner(tcp, client(0xC3A3), 0x1F90), None);
         assert_eq!(socket_owner(tcp, client(0xC3A2), 0x1F91), None);
         assert_eq!(socket_owner("", client(0xC3A2), 0x1F90), None);
+    }
+
+    #[test]
+    fn only_this_users_sockets_and_live_ones_of_the_system_may_connect() {
+        if !cfg!(target_endian = "little") {
+            return;
+        }
+        let row = |port: u16, state: &str, uid: u32| {
+            format!("   0: 0100007F:{port:04X} 0100007F:1F90 {state} 00000000:00000000 00:00000000 00000000 {uid:5}        0 31000 1 0 20 4 30 10 -1\n")
+        };
+        let tcp = [row(1, "01", 1000), row(2, "08", 1000), row(3, "01", 1001), row(4, "04", 1001), row(5, "01", 0), row(6, "06", 0), row(7, "04", 0), row(8, "07", 0)].concat();
+        let may = |port, me| may_connect(&tcp, std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, port), 0x1F90, me);
+        // This user's, in any state: a program that has stopped sending keeps its socket.
+        assert!(may(1, 1000) && may(2, 1000));
+        // Another user's.
+        assert!(!may(3, 1000) && !may(4, 1000));
+        // The system's while connected; afterwards user 0 says nothing about whose it was,
+        // for a server running as root too.
+        assert!(may(5, 1000) && may(5, 0));
+        assert!(!may(6, 1000) && !may(7, 1000) && !may(8, 1000));
+        assert!(!may(6, 0) && !may(7, 0));
+        // No row at all.
+        assert!(!may(9, 1000));
     }
 
     #[test]

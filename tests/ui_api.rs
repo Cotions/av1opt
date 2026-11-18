@@ -200,6 +200,80 @@ fn files_from_a_newer_version_are_not_overwritten() {
 }
 
 #[test]
+fn a_link_is_followed_at_start_and_kept_only_to_a_program_of_that_name() {
+    let s = Server::start("tool-links", |d| {
+        let bin = d.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for f in ["ffmpeg-7.1", "launcher"] {
+            std::fs::write(bin.join(f), b"not a program").unwrap();
+        }
+        std::os::unix::fs::symlink(bin.join("ffmpeg-7.1"), bin.join("ffmpeg")).unwrap();
+        std::os::unix::fs::symlink(bin.join("launcher"), bin.join("ffprobe")).unwrap();
+        let saved = json!({ "format": 1, "ffmpeg": bin.join("ffmpeg"), "ffprobe": bin.join("ffprobe") });
+        std::fs::write(d.join("data/av1opt/ui.json"), saved.to_string()).unwrap();
+    });
+    let bin = std::fs::canonicalize(s.dir.join("bin")).unwrap();
+    let tools = s.get("/api/state").json()["tools"].clone();
+    // The saved link now names the file it led to when it was checked; the link to a program
+    // of another name is dropped for the default.
+    assert_eq!(tools["ffmpeg"], json!(bin.join("ffmpeg-7.1")), "{tools}");
+    assert_eq!(tools["ffprobe"], "false", "{tools}");
+    // Chosen on the page, it is refused and the reason names what it leads to.
+    let r = s.post("/api/settings/tools", &json!({ "ffprobe": bin.join("ffprobe") }));
+    assert!(r.status == 400 && r.body.contains("a program with another name"), "{}", r.body);
+}
+
+#[test]
+fn saves_at_the_same_moment_lose_nothing() {
+    let s = Server::start("saves", |d| {
+        for i in 0..24 {
+            std::fs::create_dir_all(d.join(format!("out{i}"))).unwrap();
+        }
+    });
+    let real = std::fs::canonicalize(&s.dir).unwrap();
+    let dirs: Vec<String> = (0..24).map(|i| real.join(format!("out{i}")).to_string_lossy().into_owned()).collect();
+    std::thread::scope(|scope| {
+        for dir in &dirs {
+            let s = &s;
+            scope.spawn(move || assert_eq!(s.post("/api/history/dirs", &json!({ "path": dir })).status, 200));
+        }
+    });
+    let ui: Value = serde_json::from_slice(&std::fs::read(s.data("ui.json")).unwrap()).unwrap();
+    let saved = ui["history_dirs"].as_array().unwrap();
+    for dir in &dirs {
+        assert!(saved.iter().any(|d| d == dir), "{dir} is missing from {saved:?}");
+    }
+    let left: Vec<_> = std::fs::read_dir(s.dir.join("data/av1opt")).unwrap().flatten().map(|e| e.file_name()).filter(|n| n.to_string_lossy().ends_with(".tmp")).collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
+fn a_settings_file_kept_elsewhere_stays_a_link() {
+    let s = Server::start("dotfiles", |d| {
+        std::fs::create_dir_all(d.join("dotfiles")).unwrap();
+        std::fs::write(d.join("dotfiles/ui.json"), "{}").unwrap();
+        std::os::unix::fs::symlink("../../dotfiles/ui.json", d.join("data/av1opt/ui.json")).unwrap();
+    });
+    assert_eq!(s.post("/api/settings/tools", &json!({ "ffmpeg": "ffmpeg9" })).status, 200);
+    assert!(std::fs::symlink_metadata(s.data("ui.json")).unwrap().file_type().is_symlink());
+    let kept: Value = serde_json::from_slice(&std::fs::read(s.dir.join("dotfiles/ui.json")).unwrap()).unwrap();
+    assert_eq!(kept["ffmpeg"], "ffmpeg9");
+}
+
+#[test]
+fn a_program_that_has_stopped_sending_is_still_answered() {
+    use std::io::{Read, Write};
+    let s = Server::start("half-closed", |_| {});
+    let mut c = std::net::TcpStream::connect(("127.0.0.1", s.port)).unwrap();
+    c.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+    write!(c, "GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nCookie: {}\r\nConnection: close\r\n\r\n", s.port, s.cookie()).unwrap();
+    c.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut answer = String::new();
+    c.read_to_string(&mut answer).unwrap();
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+}
+
+#[test]
 fn settings_tools_validation() {
     let s = Server::start("tools", |_| {});
     assert_eq!(s.post("/api/settings/tools", &json!({ "ffmpeg": "relative/ffmpeg" })).status, 400);

@@ -286,9 +286,13 @@ contents directly below it, several folders each below a folder of their own nam
 (`encode -o out lib/Kay lib/Sofia` writes `out/Kay/...` and `out/Sofia/...`). Every result is
 appended to `av1opt-log.tsv` there; re-running the same command resumes: finished files are
 skipped, and files skipped for a reason (low savings, ...) are not searched again with the same settings (target, preset, CRF range, `--min-savings`, `--force`, and `--scenes`, `--audio` and the samples where set) unless
-`--retry-skipped` is given. A finished file counts only for the source it was made from: one of
-the same name and another size is reported, not passed over. An output is never written where
-its own source is, whatever name leads there (`--overwrite` included). `--order per-hour` encodes the files with the largest estimated
+`--retry-skipped` is given. A finished file counts only for the source it was made from, as the
+report beside it says: one of the same name and another size is reported, not passed over (a
+file there with no report at all counts as done). An output is never written where its own source or another
+input of the run is, whatever name leads there (`--overwrite` included): with `-o` the folder
+being walked, `a.mkv` is refused when `a.mp4` is there too, and the rest of the run goes on;
+with `--overwrite`, so is the second of two inputs that would write one output. An
+encode from an earlier run found among the inputs is left alone. `--order per-hour` encodes the files with the largest estimated
 saving per hour of encoding first (`--order savings`: the largest saving first), going by the
 same estimates as `scan`, so a long run stopped early has saved the most for its time; in the
 web UI files are queued in the order of the scan table. Trial encodes are remembered in `~/.cache/av1opt/trials-v1.jsonl`
@@ -468,14 +472,15 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
 
 The server listens on 127.0.0.1 only and prints a sign-in link with a random token (the browser
 gets it as a cookie). Requests with a foreign Host or Origin are refused, so are requests from
-a program of another user of the machine (a browser sends the cookie to every port of the host,
-so the cookie alone would not keep them out), and media are only
+a program of another user of the machine, or from a connection the system no longer shows as
+anyone's (a browser sends the cookie to every port of the host, so the cookie alone would not
+keep them out), and media are only
 served for video files you picked in the app. Output folders on ZFS are refused (no override in the UI);
 replacing an original that is on ZFS needs a tick in the dialog, or the confirmation in Compare, which says so.
 Putting one back there, and moving duplicates on ZFS to the trash, ask in a dialog of their own.
 The ffmpeg and ffprobe programs set in Settings have to be named like that (`ffmpeg`, `/opt/x/ffprobe-7`),
 be there, and be yours or the system's, writable by nobody else, in folders of which the same holds.
-What is kept is the file the path leads to, links followed.
+What is kept is the file the path leads to, links followed, and that file has to be named like that too.
 `AV1OPT_UI_TOKEN` sets the token (for a desktop wrapper loading the same page);
 `AV1OPT_UI_DEV=<repo>/ui` serves the page files from disk while working on them.
 
@@ -523,8 +528,9 @@ environment, so set the ffmpeg path once in Settings.
 - Refuses to write to ZFS unless `--allow-zfs` is passed.
 - An output file that appears in the output folder while its encode runs is not written
   over: the finished encode is kept next to it under another name, and the run says where.
-- Each ffmpeg run gets a memory cap (`--memory-limit`, default 40% of RAM) and low CPU priority
-  (`--nice 10`), so a 4K encode can't freeze the desktop.
+- Each ffmpeg run gets a memory cap (`--memory-limit`: `12G`, `1.5G`, `800M` or `40%`, shared
+  between `--workers`; default 40% of RAM) and low CPU priority (`--nice 10`), so a 4K encode
+  can't freeze the desktop.
 - Temp files live in a hidden folder in the output directory and are removed afterwards; leftovers
   from crashed runs are cleaned up on the next run.
 

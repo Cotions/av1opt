@@ -163,9 +163,10 @@ fn save(app: &App, force: bool) {
     }
     let Some(p) = state_path() else { return };
     let doc = json!({ "format": STATE_FORMAT, "folders": *app.watch.folders.lock().unwrap() });
-    let tmp = p.with_extension("json.tmp");
-    if std::fs::write(&tmp, serde_json::to_vec(&doc).unwrap_or_default()).is_ok() && std::fs::rename(tmp, p).is_ok() {
-        *saved = now();
+    let written = p.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| crate::files::replace_with(&p, &serde_json::to_vec(&doc).unwrap_or_default()));
+    match written {
+        Ok(()) => *saved = now(),
+        Err(e) => super::note(&format!("watched folders not saved: cannot write {}: {e}", p.display())),
     }
 }
 

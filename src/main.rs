@@ -376,17 +376,30 @@ fn parse_target(s: &str) -> Result<f64, String> {
     }
 }
 
-/// A memory cap is "auto", "none", or what systemd takes for MemoryMax: bytes, with K, M, G
-/// or T for larger units, or a share of the memory in percent. Anything else would have been
-/// no cap at all, with nothing said.
+/// A memory amount cut in two: its number and what follows it.
+fn split_amount(s: &str) -> (&str, &str) {
+    s.split_at(s.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(s.len()))
+}
+
+/// A memory cap is "auto", "none", or what systemd takes for MemoryMax: a number of bytes, or
+/// a number that may have decimals followed by K, M, G or T for larger units or % for a share
+/// of the memory. Anything else would have been no cap at all, with nothing said.
 fn parse_memory(s: &str) -> Result<String, String> {
-    let digits = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
-    let unit = s[digits..].to_ascii_uppercase();
-    let amount = digits > 0 && s[..digits].parse::<u64>().is_ok_and(|n| n > 0) && matches!(unit.as_str(), "" | "K" | "M" | "G" | "T" | "%");
+    let (number, unit) = split_amount(s);
+    let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    let (whole, decimals) = number.split_once('.').map_or((number, None), |(w, d)| (w, Some(d)));
+    let written_well = digits(whole) && decimals.is_none_or(digits);
+    let amount = written_well
+        && match unit.to_ascii_uppercase().as_str() {
+            // Bytes come whole.
+            "" => decimals.is_none() && number.parse::<u64>().is_ok_and(|n| n > 0),
+            "K" | "M" | "G" | "T" | "%" => number.parse::<f64>().is_ok_and(|n| n > 0.0 && n.is_finite()),
+            _ => false,
+        };
     if matches!(s, "auto" | "none" | "infinity") || amount {
         Ok(s.to_string())
     } else {
-        Err("a memory cap is auto, none, or an amount such as 12G, 800M or 40%".into())
+        Err("a memory cap is auto, none, or an amount such as 12G, 1.5G, 800M or 40%".into())
     }
 }
 
@@ -642,30 +655,44 @@ fn main() -> Result<()> {
     }
 }
 
-/// Per-ffmpeg memory cap: the configured total, split between parallel workers.
+/// Per-ffmpeg memory cap: the configured total, split between parallel workers. Units are
+/// in capitals, the only way systemd reads them.
 fn memory_cap(setting: &str, workers: u8) -> Option<String> {
+    let workers = workers.max(1) as f64;
+    let as_given = || Some(setting.to_ascii_uppercase());
     let mb = match setting {
         "none" | "infinity" => return None,
         "auto" => std::fs::read_to_string("/proc/meminfo")
             .ok()
             .and_then(|m| m.lines().find(|l| l.starts_with("MemTotal:"))?.split_whitespace().nth(1)?.parse::<u64>().ok())
-            .map(|kb| kb * 4 / 10 / 1024)?,
-        // systemd reads the units in capitals only.
-        s if workers <= 1 => return Some(s.to_ascii_uppercase()),
+            .map(|kb| (kb * 4 / 10 / 1024) as f64)?,
         s => {
-            let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
-            let n: u64 = num.parse().ok()?;
+            let (number, unit) = split_amount(s);
+            let Ok(n) = number.parse::<f64>() else { return as_given() };
             match unit.to_ascii_uppercase().as_str() {
-                "" => n / 1024 / 1024,
-                "K" => n / 1024,
+                "%" => return Some(share_of_memory(n, workers)),
+                _ if workers <= 1.0 => return as_given(),
+                "" => n / 1024.0 / 1024.0,
+                "K" => n / 1024.0,
                 "M" => n,
-                "G" => n * 1024,
-                "T" => n * 1024 * 1024,
-                _ => return Some(s.to_ascii_uppercase()),
+                "G" => n * 1024.0,
+                "T" => n * 1024.0 * 1024.0,
+                _ => return as_given(),
             }
         }
     };
-    Some(format!("{}M", mb / workers.max(1) as u64))
+    Some(format!("{}M", ((mb / workers) as u64).max(1)))
+}
+
+/// A worker's part of `percent`, in the two decimals systemd takes at most.
+fn share_of_memory(percent: f64, workers: f64) -> String {
+    let hundredths = (((percent * 100.0).round() / workers) as u64).max(1);
+    let (whole, part) = (hundredths / 100, hundredths % 100);
+    match part {
+        0 => format!("{whole}%"),
+        p if p % 10 == 0 => format!("{whole}.{}%", p / 10),
+        p => format!("{whole}.{p:02}%"),
+    }
 }
 
 /// Sorts a batch by what `scan` expects of each file (probe results come from its cache).
@@ -759,4 +786,46 @@ fn scan(
         eprintln!("wrote {}", csv.display());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_memory_cap_is_written_as_systemd_takes_it() {
+        for good in ["auto", "none", "infinity", "12G", "12g", "1.5G", "0.5t", "800M", "512k", "40%", "50.5%", "1048576"] {
+            assert_eq!(parse_memory(good).as_deref(), Ok(good));
+        }
+        for bad in ["", "0", "0G", "0.0G", "0%", "1.", "1.G", ".5G", "1.5", "1.5.2G", "G", "%", "-1G", "1e3G", "12GB", "1 G", "NaNG", "infG", "Auto", "99999999999999999999999"] {
+            assert!(parse_memory(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_memory_cap_is_shared_between_the_workers() {
+        let cap = |s, workers| memory_cap(s, workers);
+        assert_eq!((cap("none", 2), cap("infinity", 1)), (None, None));
+        // One at a time: the amount as given, in capitals.
+        assert_eq!(cap("12g", 1).as_deref(), Some("12G"));
+        assert_eq!(cap("1.5g", 1).as_deref(), Some("1.5G"));
+        assert_eq!(cap("1048576", 1).as_deref(), Some("1048576"));
+        assert_eq!(cap("40%", 1).as_deref(), Some("40%"));
+        assert_eq!(cap("50.5%", 1).as_deref(), Some("50.5%"));
+        // Several: each its part, percentages too.
+        assert_eq!(cap("12G", 2).as_deref(), Some("6144M"));
+        assert_eq!(cap("1.5g", 2).as_deref(), Some("768M"));
+        assert_eq!(cap("1T", 4).as_deref(), Some("262144M"));
+        assert_eq!(cap("1073741824", 2).as_deref(), Some("512M"));
+        assert_eq!(cap("40%", 2).as_deref(), Some("20%"));
+        assert_eq!(cap("50%", 4).as_deref(), Some("12.5%"));
+        assert_eq!(cap("50.5%", 2).as_deref(), Some("25.25%"));
+        assert_eq!(cap("100%", 3).as_deref(), Some("33.33%"));
+        // Never nothing: a cap of 0 would stop the program at once.
+        assert_eq!(cap("500K", 2).as_deref(), Some("1M"));
+        assert_eq!(cap("0.01%", 8).as_deref(), Some("0.01%"));
+        // More decimals than systemd reads.
+        assert_eq!(cap("12.346%", 1).as_deref(), Some("12.35%"));
+        assert!(cap("auto", 2).is_some_and(|c| c.ends_with('M')));
+    }
 }

@@ -5,7 +5,9 @@ use crate::encode::{self, Options, Skip};
 use crate::events::{self, Event};
 use crate::tools::Tools;
 use anyhow::Result;
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -187,6 +189,131 @@ fn same_sections(asked: &[(f64, f64)], done: &[(f64, f64)]) -> bool {
         && merged.iter().zip(done).all(|(x, y)| (x.0 - y.0).abs() < 0.002 && ((x.1 - y.1).abs() < 0.002 || (x.1 > y.1 && x == merged.last().unwrap())))
 }
 
+/// Where a job's output goes.
+fn output_of(job: &Job, o: &Options) -> PathBuf {
+    let stem = job.input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    job.out_dir.join(format!("{stem}.{}", o.container.ext()))
+}
+
+/// A file as the system resolves it, whatever way it was named. A file that is not there yet
+/// is its real folder and its name.
+struct Identity {
+    path: PathBuf,
+    inode: Option<(u64, u64)>,
+}
+
+impl Identity {
+    fn of(path: &Path) -> Identity {
+        let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        let in_real_folder = || Some(std::fs::canonicalize(absolute.parent()?).ok()?.join(absolute.file_name()?));
+        let path = std::fs::canonicalize(path).ok().or_else(in_real_folder).unwrap_or_else(|| absolute.clone());
+        let inode = std::fs::metadata(&path).ok().map(|m| (m.dev(), m.ino()));
+        Identity { path, inode }
+    }
+
+    fn is(&self, other: &Identity) -> bool {
+        self.path == other.path || (self.inode.is_some() && self.inode == other.inode)
+    }
+}
+
+/// An input of this batch standing where a job's output would go.
+#[derive(Debug, PartialEq)]
+enum Clash {
+    /// The job's own input.
+    Own,
+    /// The input of another job.
+    Input(PathBuf),
+    /// No input, but the output of an earlier job too (`a.mkv` and `a.avi` in one folder):
+    /// named here is that job's input.
+    Twin(PathBuf),
+}
+
+/// For each job, the input its output would land on. Worked out before the first encode: a
+/// folder that is walked into itself holds both `a.mkv` and `a.mp4`, and the output of the
+/// first is the second.
+fn clashes(jobs: &[Job], o: &Options) -> Vec<Option<Clash>> {
+    let inputs: Vec<Identity> = jobs.iter().map(|j| Identity::of(&j.input)).collect();
+    let mut by_path = HashMap::new();
+    let mut by_inode = HashMap::new();
+    for (i, input) in inputs.iter().enumerate() {
+        by_path.entry(input.path.as_path()).or_insert(i);
+        if let Some(inode) = input.inode {
+            by_inode.entry(inode).or_insert(i);
+        }
+    }
+    let mut writers: HashMap<PathBuf, usize> = HashMap::new();
+    jobs.iter()
+        .zip(&inputs)
+        .enumerate()
+        .map(|(i, (job, input))| {
+            let output = Identity::of(&output_of(job, o));
+            if output.is(input) {
+                return Some(Clash::Own);
+            }
+            if let Some(other) = by_path.get(output.path.as_path()).or_else(|| by_inode.get(&output.inode?)) {
+                return Some(Clash::Input(jobs[*other].input.clone()));
+            }
+            let first = *writers.entry(output.path).or_insert(i);
+            (first != i).then(|| Clash::Twin(jobs[first].input.clone()))
+        })
+        .collect()
+}
+
+/// What to do with a job before any work on it.
+#[derive(Debug, PartialEq)]
+enum Before {
+    Encode,
+    /// The output there is this input's encode.
+    Done,
+    /// Nothing to do and nothing wrong: the input is itself the result of an earlier run.
+    Leave(String),
+    Refuse(String),
+}
+
+fn before_encoding(output: &Path, clash: Option<&Clash>, input: &Path, size: u64, o: &Options) -> Before {
+    let exists = output.exists();
+    let made = if exists { report_input(output) } else { None };
+    match clash {
+        Some(Clash::Own) => {
+            return match made {
+                Some((source, ..)) if source != input => Before::Leave(format!("{} is the encode of {} from an earlier run", output.display(), source.display())),
+                _ => Before::Refuse("output would overwrite the input; choose another output folder".into()),
+            };
+        }
+        // Only an encode of this very input may stand there, and it is then not replaced.
+        Some(Clash::Input(other)) if o.overwrite || made.as_ref().is_none_or(|(source, ..)| source != input) => {
+            return Before::Refuse(format!("its output would take the place of another input, {}", other.display()));
+        }
+        // Without --overwrite the first one's report settles it below: the second is a name
+        // collision once the first is made. With it, the second would replace the first.
+        Some(Clash::Twin(other)) if o.overwrite => {
+            return Before::Refuse(format!("its output is also that of another input, {}; give one of them another output folder", other.display()));
+        }
+        _ => {}
+    }
+    if !exists || o.overwrite {
+        return Before::Encode;
+    }
+    // Only a report says what an output was made from: the same file name can come from two
+    // input folders, or be a file that has nothing to do with this run.
+    match made {
+        // No report beside it: reports get tidied away, and a run that died between the file
+        // and its report left one such. It is nobody's input (see above), so it is left alone
+        // and counted as done, as it always was.
+        None => Before::Done,
+        Some((_, removed, _)) if !same_sections(&o.remove, &removed) => {
+            Before::Refuse(format!("{} exists but has other sections removed; move or delete it to encode again", output.display()))
+        }
+        Some((source, ..)) if source != input => Before::Refuse(format!("output name collision: {} was made from {}", output.display(), source.display())),
+        // The same name and another file: a download done again, an edit saved over it.
+        Some((_, _, Some(then))) if then != size => Before::Refuse(format!(
+            "{} was made from this file when it was another size ({then} bytes, now {size}); move or delete it to encode again",
+            output.display()
+        )),
+        Some(_) => Before::Done,
+    }
+}
+
 #[derive(Default)]
 pub struct Summary {
     pub ok: usize,
@@ -203,12 +330,21 @@ pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipp
     let log = out_dir.join(LOG_NAME);
     let settings = settings_key(o);
     let skips = if retry_skipped { HashMap::new() } else { read_skips(&log, &settings) };
+    let clashes = clashes(jobs, o);
+    // The log serves the next run; a log that cannot be written is no reason to stop this one.
+    let log_warned = Cell::new(false);
+    let record = |status: &str, input: &Path, size: u64, detail: &str| {
+        if let Err(e) = log_line(&log, status, input, size, detail, &settings)
+            && !log_warned.replace(true)
+        {
+            eprintln!("warning: cannot write to {}: {e}; going on without it", log.display());
+        }
+    };
     let mut sum = Summary::default();
     for (i, job) in jobs.iter().enumerate() {
         let abs = std::fs::canonicalize(&job.input).or_else(|_| std::path::absolute(&job.input))?;
         let size = std::fs::metadata(&job.input).map_or(0, |m| m.len());
-        let stem = job.input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        let output = job.out_dir.join(format!("{stem}.{}", o.container.ext()));
+        let output = output_of(job, o);
         eprintln!("\n[{}/{}] {}", i + 1, jobs.len(), job.input.display());
         if tools.check_cancel().is_err() {
             sum.cancelled = true;
@@ -219,42 +355,27 @@ pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipp
             tools.emit(Event::FileEnd { index: i, status: status.into(), detail: detail.into(), input_bytes: size, output_bytes: out_bytes });
         };
 
-        if output.exists() && !o.overwrite {
-            // Same file name from two input folders would map to one output; only count it as
-            // done if its report says it came from this input.
-            match report_input(&output) {
-                Some((_, removed, _)) if !same_sections(&o.remove, &removed) => {
-                    let msg = format!("{} exists but has other sections removed; move or delete it to encode again", output.display());
-                    eprintln!("FAILED: {msg}");
-                    end("error", &msg, 0);
-                    sum.failed += 1;
-                    log_line(&log, "error", &abs, size, &msg, &settings)?;
-                }
-                Some((src, _, _)) if src != abs => {
-                    let msg = format!("output name collision: {} was made from {}", output.display(), src.display());
-                    eprintln!("FAILED: {msg}");
-                    end("error", &msg, 0);
-                    sum.failed += 1;
-                    log_line(&log, "error", &abs, size, &msg, &settings)?;
-                }
-                // The same name and another file: a download done again, an edit saved over it.
-                Some((_, _, Some(then))) if then != size => {
-                    let msg = format!(
-                        "{} was made from this file when it was another size ({then} bytes, now {size}); move or delete it to encode again",
-                        output.display()
-                    );
-                    eprintln!("FAILED: {msg}");
-                    end("error", &msg, 0);
-                    sum.failed += 1;
-                    log_line(&log, "error", &abs, size, &msg, &settings)?;
-                }
-                _ => {
-                    eprintln!("already done: {}", output.display());
-                    end("done_before", &output.display().to_string(), std::fs::metadata(&output).map_or(0, |m| m.len()));
-                    sum.already_done += 1;
-                }
+        match before_encoding(&output, clashes[i].as_ref(), &abs, size, o) {
+            Before::Encode => {}
+            Before::Done => {
+                eprintln!("already done: {}", output.display());
+                end("done_before", &output.display().to_string(), std::fs::metadata(&output).map_or(0, |m| m.len()));
+                sum.already_done += 1;
+                continue;
             }
-            continue;
+            Before::Leave(why) => {
+                eprintln!("skipped: {why}");
+                end("skip", &why, 0);
+                sum.skipped += 1;
+                continue;
+            }
+            Before::Refuse(msg) => {
+                eprintln!("FAILED: {msg}");
+                end("error", &msg, 0);
+                sum.failed += 1;
+                record("error", &abs, size, &msg);
+                continue;
+            }
         }
         if let Some(reason) = skips.get(&(abs.clone(), size)) {
             eprintln!("skipped earlier: {reason} (use --retry-skipped to try again)");
@@ -271,7 +392,7 @@ pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipp
                 sum.bytes_in += size;
                 sum.bytes_out += out_size;
                 end("ok", &out.display().to_string(), out_size);
-                log_line(&log, "ok", &abs, size, &out.display().to_string(), &settings)?;
+                record("ok", &abs, size, &out.display().to_string());
             }
             Err(e) if events::is_cancelled(&e) => {
                 // Not logged: the next run picks the file up again (scene work resumes).
@@ -284,13 +405,13 @@ pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipp
                 eprintln!("skipped: {e}");
                 end("skip", &e.to_string(), 0);
                 sum.skipped += 1;
-                log_line(&log, "skip", &abs, size, &e.to_string(), &settings)?;
+                record("skip", &abs, size, &e.to_string());
             }
             Err(e) => {
                 eprintln!("FAILED: {e:#}");
                 end("error", &format!("{e:#}"), 0);
                 sum.failed += 1;
-                log_line(&log, "error", &abs, size, &format!("{e:#}"), &settings)?;
+                record("error", &abs, size, &format!("{e:#}"));
             }
         }
     }
@@ -335,6 +456,167 @@ mod tests {
             min_crf: 20, max_crf: 55, samples: None, sample_secs: None, min_savings: 0.15, force: false, overwrite: false, keep_temp: false,
             scenes: encode::Scenes::Off, workers: 1, meta: Default::default(), remove: Vec::new(), audio: encode::Audio::Keep, fresh_search: false,
         }
+    }
+
+    /// A folder for one test, and what a batch made of `names` in it comes to. The tools are
+    /// `false`, so that a job let through to the encode fails at the first probe.
+    struct Folder(PathBuf);
+
+    impl Folder {
+        fn new(name: &str, files: &[&str]) -> Folder {
+            let dir = std::env::temp_dir().join(format!("av1opt-batch-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            for f in files {
+                std::fs::write(dir.join(f), b"video").unwrap();
+            }
+            Folder(dir)
+        }
+
+        /// A report beside `output` saying it was made from `input`.
+        fn report(&self, output: &str, input: &str, bytes: u64) {
+            let at = self.0.join(output).with_extension("av1opt.json");
+            std::fs::write(at, serde_json::json!({"input": self.0.join(input), "source_bytes": bytes}).to_string()).unwrap();
+        }
+
+        /// The folder walked into `out`: per input name, the status and detail it ended with.
+        fn walk(&self, out: &Path, o: &Options) -> (Summary, HashMap<String, (String, String)>) {
+            let jobs = expand(std::slice::from_ref(&self.0), out, |p| p.extension().is_some_and(|e| e != "json" && e != "tsv"));
+            let names: Vec<String> = jobs.iter().map(|j| j.input.file_name().unwrap().to_string_lossy().into_owned()).collect();
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+            let mut tools = Tools::new("false".into(), "false".into(), None);
+            let sink = seen.clone();
+            tools.hooks = Some(std::sync::Arc::new(events::Hooks::new(move |e| {
+                if let Event::FileEnd { index, status, detail, .. } = e {
+                    sink.lock().unwrap().insert(names[index].clone(), (status, detail));
+                }
+            })));
+            let sum = run(&tools, &jobs, out, o, false).unwrap();
+            let ends = seen.lock().unwrap().clone();
+            (sum, ends)
+        }
+    }
+
+    impl Drop for Folder {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// An encode that went through to the tools, which here cannot probe anything.
+    fn reached_the_encode(end: &(String, String)) -> bool {
+        end.0 == "error" && !end.1.contains("output") && !end.1.contains("exists")
+    }
+
+    #[test]
+    fn an_output_is_never_written_over_another_input() {
+        let f = Folder::new("overwrite", &["a.mkv", "a.mp4", "b.mkv"]);
+        let o = Options { overwrite: true, ..options() };
+        let (sum, ends) = f.walk(&f.0, &o);
+        let mkv = &ends["a.mkv"];
+        assert_eq!(mkv.0, "error");
+        assert_eq!(mkv.1, format!("its output would take the place of another input, {}", f.0.join("a.mp4").display()));
+        assert!(ends["a.mp4"].1.contains("output would overwrite the input"), "{:?}", ends["a.mp4"]);
+        // The rest of the batch goes on, and nothing was touched on the way.
+        assert!(reached_the_encode(&ends["b.mkv"]), "{:?}", ends["b.mkv"]);
+        assert_eq!(sum.failed, 3);
+        assert_eq!(std::fs::read(f.0.join("a.mp4")).unwrap(), b"video");
+    }
+
+    #[test]
+    fn an_input_counts_however_the_output_folder_is_named() {
+        let f = Folder::new("named", &["a.mkv", "a.mp4"]);
+        let link = std::env::temp_dir().join(format!("av1opt-batch-link-{}", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&f.0, &link).unwrap();
+        for out in [link.clone(), f.0.join("../").join(f.0.file_name().unwrap())] {
+            let (_, ends) = f.walk(&out, &Options { overwrite: true, ..options() });
+            assert!(ends["a.mkv"].1.starts_with("its output would take the place of another input"), "{:?}", ends["a.mkv"]);
+        }
+        std::fs::remove_file(&link).unwrap();
+
+        // Another name for the same file: the output is that input, a hard link away.
+        let g = Folder::new("hardlink", &["c.mkv", "d.mkv"]);
+        std::fs::hard_link(g.0.join("c.mkv"), g.0.join("d.mp4")).unwrap();
+        let jobs: Vec<Job> = ["c.mkv", "d.mkv"].map(|n| Job { input: g.0.join(n), out_dir: g.0.clone() }).into();
+        assert_eq!(clashes(&jobs, &options()), [None, Some(Clash::Input(g.0.join("c.mkv")))]);
+
+        // Two inputs with one output name: with --overwrite the second would replace what
+        // the first has just made.
+        let t = Folder::new("twin", &["e.mkv", "e.avi"]);
+        let (sum, ends) = t.walk(&Folder::new("twin-out", &[]).0, &Options { overwrite: true, ..options() });
+        assert_eq!(sum.failed, 2);
+        assert!(reached_the_encode(&ends["e.avi"]), "{:?}", ends["e.avi"]);
+        assert_eq!(ends["e.mkv"].1, format!("its output is also that of another input, {}; give one of them another output folder", t.0.join("e.avi").display()));
+        // And when that input is the job's own, it is its own.
+        std::fs::rename(g.0.join("d.mp4"), g.0.join("c.mp4")).unwrap();
+        let own = [Job { input: g.0.join("c.mkv"), out_dir: g.0.clone() }];
+        assert_eq!(clashes(&own, &options()), [Some(Clash::Own)]);
+    }
+
+    #[test]
+    fn an_output_without_a_report_is_not_done() {
+        let f = Folder::new("noreport", &["a.mkv", "a.mp4"]);
+        let (sum, ends) = f.walk(&f.0, &options());
+        assert_eq!((sum.already_done, sum.failed), (0, 2));
+        assert!(ends["a.mkv"].1.starts_with("its output would take the place of another input"), "{:?}", ends["a.mkv"]);
+        assert!(ends["a.mp4"].1.contains("output would overwrite the input"), "{:?}", ends["a.mp4"]);
+
+        // A file of that name in another folder is nobody's input: whoever tidied its report
+        // away does not get it encoded again, or an error for every file of a run.
+        let source = Folder::new("noreport-in", &["c.mkv"]);
+        let out = Folder::new("noreport-out", &["c.mp4"]);
+        let (sum, ends) = source.walk(&out.0, &options());
+        assert_eq!((sum.already_done, sum.failed), (1, 0));
+        assert_eq!(ends["c.mkv"].0, "done_before");
+    }
+
+    #[test]
+    fn an_earlier_encode_in_the_walked_folder_is_recognised() {
+        let f = Folder::new("earlier", &["x.mkv", "x.mp4"]);
+        f.report("x.mp4", "x.mkv", 5);
+        let (sum, ends) = f.walk(&f.0, &options());
+        assert_eq!(ends["x.mkv"].0, "done_before");
+        assert_eq!(ends["x.mp4"].0, "skip", "{:?}", ends["x.mp4"]);
+        assert!(ends["x.mp4"].1.contains("from an earlier run"), "{:?}", ends["x.mp4"]);
+        assert_eq!((sum.already_done, sum.skipped, sum.failed), (1, 1, 0));
+
+        // The source has changed since: it is not done, and the encode stays where it is.
+        f.report("x.mp4", "x.mkv", 4);
+        let (sum, ends) = f.walk(&f.0, &options());
+        assert!(ends["x.mkv"].1.contains("when it was another size"), "{:?}", ends["x.mkv"]);
+        assert_eq!(sum.failed, 1);
+
+        // A report that names a third file does not make this one done.
+        f.report("x.mp4", "elsewhere.mkv", 5);
+        let (_, ends) = f.walk(&f.0, &options());
+        assert!(ends["x.mkv"].1.starts_with("its output would take the place of another input"), "{:?}", ends["x.mkv"]);
+
+        // Asked to overwrite, the earlier encode is still an input of this batch.
+        f.report("x.mp4", "x.mkv", 5);
+        let (_, ends) = f.walk(&f.0, &Options { overwrite: true, ..options() });
+        assert!(ends["x.mkv"].1.starts_with("its output would take the place of another input"), "{:?}", ends["x.mkv"]);
+    }
+
+    #[test]
+    fn a_finished_output_elsewhere_still_counts_for_its_own_input_only() {
+        let source = Folder::new("elsewhere-in", &["c.mkv"]);
+        let out = Folder::new("elsewhere-out", &["c.mp4"]);
+        std::fs::write(out.0.join("c.av1opt.json"), serde_json::json!({"input": source.0.join("c.mkv"), "source_bytes": 5}).to_string()).unwrap();
+        assert_eq!(source.walk(&out.0, &options()).1["c.mkv"].0, "done_before");
+        std::fs::write(out.0.join("c.av1opt.json"), serde_json::json!({"input": "/elsewhere/c.mkv", "source_bytes": 5}).to_string()).unwrap();
+        assert!(source.walk(&out.0, &options()).1["c.mkv"].1.starts_with("output name collision"));
+    }
+
+    #[test]
+    fn a_log_that_cannot_be_written_does_not_stop_the_batch() {
+        let source = Folder::new("log-in", &["a.mkv", "b.mkv"]);
+        let out = Folder::new("log-out", &[]);
+        std::fs::write(out.0.join("elsewhere"), b"keep").unwrap();
+        std::os::unix::fs::symlink(out.0.join("elsewhere"), out.0.join(LOG_NAME)).unwrap();
+        let (sum, ends) = source.walk(&out.0, &options());
+        assert_eq!((sum.failed, ends.len()), (2, 2));
+        assert_eq!(std::fs::read(out.0.join("elsewhere")).unwrap(), b"keep");
     }
 
     #[test]

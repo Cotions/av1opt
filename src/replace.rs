@@ -91,10 +91,48 @@ fn full_path(r: &Value, key: &str) -> Result<PathBuf, String> {
 /// it names gets moved; one that turns up somewhere else (in a folder of downloads, say) and
 /// points at files elsewhere is not followed.
 fn beside(report: &Path, output: &Path) -> bool {
+    report.file_name().is_some() && report.file_name() == output.with_extension("av1opt.json").file_name() && same_folder(report, output)
+}
+
+fn same_folder(a: &Path, b: &Path) -> bool {
     let folder = |p: &Path| std::path::absolute(p).ok().and_then(|p| std::fs::canonicalize(p.parent()?).ok());
-    report.file_name().is_some()
-        && report.file_name() == output.with_extension("av1opt.json").file_name()
-        && folder(report).is_some_and(|d| Some(d) == folder(output))
+    folder(a).is_some_and(|d| Some(d) == folder(b))
+}
+
+/// The name for the report of `output` once a new encode needs its place, `NAME.replaced-N.av1opt.json`.
+fn aside_name(output: &Path, number: u64) -> PathBuf {
+    output.with_extension(format!("replaced-{number}.av1opt.json"))
+}
+
+/// Moves the report of an output that was replaced out of the way of a new encode of that
+/// name. It says where the original is, so it has to stay, and be found as a report.
+pub fn set_aside(report: &Path, output: &Path, now: u64) -> std::io::Result<PathBuf> {
+    let mut number = now;
+    loop {
+        let aside = aside_name(output, number);
+        match trash::rename_new(report, &aside) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => number += 1,
+            done => return done.map(|()| aside),
+        }
+    }
+}
+
+/// The number in the name of a report set aside.
+fn aside_number(report: &Path) -> Option<u64> {
+    let name = report.file_name()?.to_string_lossy();
+    name.strip_suffix(REPORT_SUFFIX)?.rsplit_once(".replaced-")?.1.parse().ok()
+}
+
+/// Where the AV1 file goes back to when a replacement is undone from a report set aside. The
+/// place it came from, `from`, now holds the newer encode, so it goes beside the report under
+/// the report's name. None unless `report` is what [`set_aside`] makes of the report of `from`.
+fn place_beside_aside(report: &Path, from: &Path) -> Option<PathBuf> {
+    let number = aside_number(report)?;
+    if report.file_name() != aside_name(from, number).file_name() || !same_folder(report, from) {
+        return None;
+    }
+    let extension = from.extension()?.to_string_lossy();
+    Some(from.with_extension(format!("replaced-{number}.{extension}")))
 }
 
 /// Looks at one report and the two files it names. Changes nothing.
@@ -115,18 +153,19 @@ fn check_inner(report: &Path) -> Result<Check, String> {
     let source_bytes = r["source_bytes"].as_u64().ok_or("report has no sizes")?;
     let output_bytes = r["output_bytes"].as_u64().ok_or("report has no sizes")?;
     if let Some(done) = r.get("replaced").filter(|d| d.is_object()) {
-        let from = full_path(done, "from")?;
+        let recorded = full_path(done, "from")?;
         let trash = full_path(done, "trash")?;
-        if !beside(report, &from) {
+        let from = if beside(report, &recorded) { Some(recorded.clone()) } else { place_beside_aside(report, &recorded) };
+        let Some(from) = from else {
             return Err("the report is not the one next to where the output was".into());
-        }
+        };
         if !crate::scan::is_video(&source) || !crate::scan::is_video(&output) {
             return Err("the report names a file that is not a video".into());
         }
         // `apply` puts the AV1 file under the original's name, or leaves it where it was:
         // anywhere else is not a place a replacement can have left it.
-        let placed = from.extension().map(|ext| source.with_extension(ext));
-        if output != from && Some(&output) != placed.as_ref() {
+        let placed = recorded.extension().map(|ext| source.with_extension(ext));
+        if output != recorded && Some(&output) != placed.as_ref() {
             return Err("the report does not say where the AV1 file went in a way `replace` would have".into());
         }
         let can_undo = file_size(&trash) == Some(source_bytes) && file_size(&output) == Some(output_bytes) && trash::holds(&trash, &source);
@@ -138,6 +177,9 @@ fn check_inner(report: &Path) -> Result<Check, String> {
     }
     if !beside(report, &output) {
         return Err("the report is not the one next to its output".into());
+    }
+    if r["superseded"].as_bool() == Some(true) {
+        return Err("a newer encode took the place of this one".into());
     }
     if !crate::scan::is_video(&source) || !crate::scan::is_video(&output) {
         return Err("the report names a file that is not a video".into());
@@ -429,6 +471,11 @@ pub fn undo(report: &Path, allow_zfs: bool) -> Result<Replaced> {
         .with_context(|| format!("the AV1 file is back at {}, but the original is still in the trash at {}", d.from.display(), d.trash.display()))?;
     sync_dir(d.source.parent().unwrap_or(Path::new("/")));
     let mut r = read_report(report).map_err(|e| anyhow!(e))?;
+    // Undone from a report set aside: the AV1 file did not go back to where it came from, as
+    // a newer encode is there, and that encode's report is the one to go by.
+    if r["replaced"]["from"].as_str().is_some_and(|recorded| Path::new(recorded) != d.from) {
+        r["superseded"] = json!(true);
+    }
     r["output"] = json!(d.from);
     if let Some(o) = r.as_object_mut() {
         o.remove("replaced");
@@ -910,6 +957,57 @@ mod tests {
         assert!(d.can_undo && d.trash == done.trash);
         undo(&report, false).unwrap();
         assert!(f.lib("a.mp4").exists() && f.out("a.mkv").exists());
+    }
+
+    #[test]
+    fn a_report_set_aside_for_a_newer_encode_can_still_undo() {
+        let f = Fix::new("aside");
+        let report = f.encode("x.mp4", "x.mkv", 1000, 400);
+        let done = f.apply(&report).unwrap();
+        let aside = set_aside(&report, &f.out("x.mkv"), 1234).unwrap();
+        assert_eq!(aside, f.out("x.replaced-1234.av1opt.json"));
+        // A newer encode now has the place and the report's name.
+        let newer = f.encode("y.mp4", "x.mkv", 900, 300);
+        assert_eq!(newer, report);
+        assert_eq!(report_files(&[f.dir.join("out")]), [report.clone(), aside.clone()]);
+        assert!(matches!(check(&newer), Check::Ready(_)));
+
+        // It is listed as replaced, with a free place to go back to, and replaces nothing.
+        let Check::Replaced(d) = check(&aside) else { panic!("{}", no(&aside)) };
+        assert!(d.can_undo && d.trash == done.trash);
+        assert_eq!((d.from.clone(), d.dest.clone()), (f.out("x.replaced-1234.mkv"), f.lib("x.mkv")));
+        assert!(f.apply(&aside).is_err());
+
+        undo(&aside, false).unwrap();
+        assert_eq!(std::fs::read(f.lib("x.mp4")).unwrap().len(), 1000);
+        assert_eq!(std::fs::read(f.out("x.replaced-1234.mkv")).unwrap().len(), 400);
+        assert_eq!(std::fs::read(f.out("x.mkv")).unwrap().len(), 300);
+        assert!(!f.lib("x.mkv").exists());
+        // The older encode is not offered in the newer one's stead, and that one is untouched.
+        assert_eq!(no(&aside), "a newer encode took the place of this one");
+        assert!(f.apply(&aside).is_err());
+        assert!(matches!(check(&newer), Check::Ready(_)));
+    }
+
+    #[test]
+    fn a_report_set_aside_keeps_its_name_and_only_that_name_counts() {
+        let f = Fix::new("aside-names");
+        let report = f.encode("x.mp4", "x.mkv", 1000, 400);
+        f.apply(&report).unwrap();
+        let honest = std::fs::read(&report).unwrap();
+        // Two in the same second do not take each other's place.
+        assert_eq!(set_aside(&report, &f.out("x.mkv"), 7).unwrap(), f.out("x.replaced-7.av1opt.json"));
+        std::fs::write(&report, &honest).unwrap();
+        assert_eq!(set_aside(&report, &f.out("x.mkv"), 7).unwrap(), f.out("x.replaced-8.av1opt.json"));
+        assert!(matches!(check(&f.out("x.replaced-8.av1opt.json")), Check::Replaced(_)));
+        std::fs::create_dir_all(f.dir.join("downloads")).unwrap();
+        for forged in [f.out("x.replaced-1x.av1opt.json"), f.out("x.replaced-01.av1opt.json"), f.out("x.replaced-.av1opt.json"), f.out("y.replaced-1.av1opt.json"), f.dir.join("downloads/x.replaced-1.av1opt.json")] {
+            std::fs::write(&forged, &honest).unwrap();
+            assert_eq!(no(&forged), "the report is not the one next to where the output was", "{}", forged.display());
+        }
+        // A video that happens to be called like that is a video like any other.
+        let plain = f.encode("v.replaced-5.mp4", "v.replaced-5.mkv", 1000, 400);
+        assert!(matches!(check(&plain), Check::Ready(_)), "{}", no(&plain));
     }
 
     #[test]

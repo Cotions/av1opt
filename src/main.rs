@@ -149,7 +149,7 @@ enum Cmd {
         #[arg(long, value_delimiter = ',', default_values_t = bench::DEFAULT_PRESETS, value_parser = clap::value_parser!(u8).range(0..=13))]
         presets: Vec<u8>,
         /// An SVT-AV1 parameter set to try with every preset, as key=value:key=value.
-        /// Repeatable. Default: tune=0, tune=1, tune=2, tune=0 with quantisation matrices,
+        /// Repeatable. Default: tune=0, tune=1, tune=2, tune=0 with qm-min=0,
         /// tune=0 with variance boost.
         #[arg(long = "params", value_name = "PARAMS", value_parser = search::parse_params)]
         param_sets: Vec<String>,
@@ -218,7 +218,7 @@ enum Cmd {
         /// Mean VMAF the samples must reach. 93 is hard to tell apart from an already-lossy source.
         #[arg(long, default_value_t = 93.0, value_parser = parse_target)]
         target_vmaf: f64,
-        /// SVT-AV1 preset: lower is slower and smaller (6 is about 5% larger and a fifth quicker).
+        /// SVT-AV1 preset: lower is slower and smaller (6 is about 6% larger than 5, for a fifth less processor time).
         #[arg(long, default_value_t = search::DEFAULT_PRESET, value_parser = clap::value_parser!(u8).range(0..=13))]
         preset: u8,
         /// SVT-AV1 parameters besides the CRF, as key=value:key=value. Replaces the default
@@ -257,7 +257,8 @@ enum Cmd {
         /// estimated saving per hour of encoding (so a run stopped early has saved the most).
         #[arg(long, value_enum, default_value_t)]
         order: batch::Order,
-        /// Keep sample and partial files for debugging.
+        /// Keep the temporary folder (with the partial encode if the encode fails) and the
+        /// work folder of a per-scene encode, for debugging.
         #[arg(long)]
         keep_temp: bool,
         /// Allow writing output to ZFS.

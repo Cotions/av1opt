@@ -726,11 +726,11 @@ function encodeDialog(inputs, roots = [], watch = false, files = null) {
             const p = await pick({ title: "Output folder (not on ZFS)", mode: "dir", start: outDir || undefined });
             if (p) { outDir = p[0]; outEl.textContent = outDir; }
           } }, "Change…")),
-          h("p", { class: "dim" }, watch ? "Folders are mirrored below it. The videos in the watched folder are never modified." : "Folders are mirrored below it. Inputs are never modified. Re-adding the same files resumes."),
+          h("p", { class: "dim" }, watch ? "Folders are mirrored below it. The videos in the watched folder are never modified." : "Folders are mirrored below it. Inputs are never modified. Re-adding the same files skips finished ones and reuses what was already measured."),
           h("h3", {}, "Settings"),
           h("div", { class: "form-grid" },
             setting("Target VMAF", vmaf, "Quality to match: 93 looks like the source, higher keeps more and saves less"),
-            setting("Preset", preset, "0–13: lower makes smaller files but encodes slower. Measured at the same quality: 6 is about 5% larger than 5 and a fifth quicker, 4 about 4% smaller for a quarter more time, 3 about 10% smaller for more than twice the time"),
+            setting("Preset", preset, "0–13: lower makes smaller files but encodes slower. Measured at the same quality, against 5: 6 is about 6% larger for a fifth less processor time, 4 about 4% smaller for a quarter more, 3 about 10% smaller and 2.5 times slower"),
             setting("Encoder parameters", svtParams, "SVT-AV1 options as name=value:name=value; the Benchmark page finds good ones"),
             tuning.length ? setting("Tuned settings", h("label", { class: "check" }, tuned, "Use the benchmark's settings by video size"),
               tuning.map((x) => `${x.label}: ${configLabel(x.choice)}`).join("; ") + ". Other sizes use the preset and parameters above") : null,
@@ -740,7 +740,7 @@ function encodeDialog(inputs, roots = [], watch = false, files = null) {
             setting("Skip if saving under", h("span", { class: "unit" }, minSav, "%"), "Files that wouldn't shrink this much are left alone")),
           h("div", { class: "checks-col" },
             h("label", { class: "check", title: "AAC, Opus and MP3 sound is normally copied untouched. With this, a track far above what Opus needs (stereo above 144 kbps) is re-encoded to Opus (stereo at 96 kbps): smaller, but lossy a second time" }, shrinkAudio, "Shrink heavy sound tracks to Opus (stereo above 144 kbps becomes 96 kbps)"),
-            h("label", { class: "check" }, force, watch ? "Force: also queue videos with little to gain (AV1 files are left alone all the same)" : "Force: also re-encode AV1 files and low-gain ones"),
+            h("label", { class: "check" }, force, watch ? "Force: also queue videos that are too short or have little to gain (AV1 files are left alone all the same)" : "Force: also re-encode AV1 files and low-gain ones"),
             watch ? null : h("label", { class: "check" }, retry, "Retry files skipped in earlier runs")),
           h("h3", {}, "Metadata"),
           meta.el,
@@ -1208,13 +1208,16 @@ function renderDups(out, run, reload) {
         const [left, right] = playRank(keep.codec) <= playRank(m.codec) ? [m, keep] : [keep, m];
         compare = h("a", { class: "btn small", href: `#/compare?left=${encodeURIComponent(left.path)}&right=${encodeURIComponent(right.path)}&kind=${g.kind}` }, "Compare");
       }
+      // The first copy of a cut pair is not always the longer one: an avoided path goes second.
+      const longer = g.kind !== "same" && members.length > 1 && members.every((o) => o === m || m.duration_s > o.duration_s + 1);
       const img = h("img", { class: "dup-thumb", loading: "lazy", alt: "", src: `/thumb?path=${encodeURIComponent(m.path)}&t=${thumbAt(m).toFixed(2)}` });
       img.addEventListener("error", () => img.classList.add("missing"));
       row.append(...[cb, img,
         h("div", { class: "dup-info" },
           h("div", { class: "name", title: m.path }, h("span", { class: "dim" }, dirname(m.path) + "/"), basename(m.path)),
           h("div", { class: "dim" }, `${m.codec} · ${m.width}×${m.height} · ${num(m.video_mbps, 1)} Mbps · ${hms(m.duration_s)} · ${bytes(m.size)}`)),
-        k === 0 && !g.keepGone ? h("span", { class: "pill ok", title: g.reason }, g.kind === "same" ? "Suggested keep" : "Longer") : null,
+        g.kind === "same" && k === 0 && !g.keepGone ? h("span", { class: "pill ok", title: g.reason }, "Suggested keep") : null,
+        longer ? h("span", { class: "pill ok", title: k === 0 ? g.reason : "The longest of these copies" }, "Longer") : null,
         m.identical != null ? h("span", { class: "pill", title: "Same size and the same bytes at the start, middle and end" }, "Identical bytes") : null,
         compare].filter(Boolean));
       return row;
@@ -1318,7 +1321,7 @@ views.bench = (root) => {
     for (const p of presets) for (const x of sets) seen.add(`${p} ${x}`);
     const n = seen.size, v = Number(videos.value) || 0;
     const which = presets.length > 1 ? `presets ${presets.slice(0, -1).join(", ")} and ${presets[presets.length - 1]}` : `preset ${presets[0]}`;
-    planText.textContent = `${plural(n, "setting")}: ${which} with ${plural(sets.length, "parameter set")}${presets.length > 1 ? " each" : ""}, and the default (preset ${base.preset} · ${base.params}), which is always one. On up to ${plural(v, "video")} that is around ${n * v * 3} sample encodes of ${samples.value} × ${secs.value} s. Slow presets and big videos take the longest.`;
+    planText.textContent = `${plural(n, "setting")}: ${which} with ${plural(sets.length, "parameter set")}${presets.length > 1 ? " each" : ""}, and the default (preset ${base.preset} · ${base.params}), which is always one. With at most ${plural(v, "video")} that is up to around ${n * v * 4} sample encodes of ${samples.value} × ${secs.value} s. Slow presets and big videos take the longest.`;
   };
   for (const el of [params, videos, samples, secs, ...presetBoxes.map(([, b]) => b)]) el.addEventListener("input", plan);
 

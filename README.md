@@ -3,14 +3,16 @@
 Shrink video libraries by re-encoding to AV1 at a target perceptual quality (VMAF),
 instead of one fixed setting for everything. Built on stock FFmpeg with SVT-AV1 and libvmaf.
 
-Five commands:
+Seven commands:
 
 - `scan` — read-only survey of a library: what each file is, what re-encoding would roughly save.
 - `dups` — read-only search for videos that are kept more than once.
 - `encode` — per-file CRF search against a VMAF target, full encode, verification, report.
 - `bench` — which preset and SVT-AV1 parameters pay off on your own videos, measured.
+- `tuning` — shows the settings `bench --save` stored for `encode --tuned`, or forgets them.
 - `replace` — once you are happy with the outputs: each takes its original's place, the
   original goes to the trash.
+- `ui` — all of this in a local web app (built with `--features ui`).
 
 ## Requirements
 
@@ -28,10 +30,13 @@ av1opt scan /videos /more/videos --csv report.csv
 Probes every video in parallel (results cached in `~/.cache/av1opt/`), sorts each file into
 *candidate* or a skip reason (already AV1, Dolby Vision, too short, low expected gain), and prints totals
 by codec and folder plus the biggest wins. Savings are a rough metadata-based estimate shown as a
-range; `encode` measures the real numbers. Never writes to the scanned folders.
+range; `encode` measures the real numbers. Low expected gain means under 20% here
+(`--min-savings`); `encode` has a `--min-savings` of its own, 15%, for what it measures. Never
+writes to the scanned folders.
 
 Every successful `encode` appends its source and output bitrates to
-`~/.local/share/av1opt/history.jsonl`. `scan` fits its size model to that history (a log-linear
+`~/.local/share/av1opt/history.jsonl`, except a cut encoded below a target it could not reach,
+whose sizes would mislead. `scan` fits its size model to that history (a log-linear
 fit of AV1 bits per pixel against source bits per pixel and resolution, pulled toward the
 built-in model while there are few encodes), so estimates and their ranges tighten as
 you encode more.
@@ -78,14 +83,18 @@ How it works:
    - *Same video*: lengths within 2% (or 1.5 s) and at least three quarters of the frames
      from both ends agree.
    - *Same start* / *same end*: lengths differ, but the frames counted from that end agree
-     (at least 3 in common, 80% of them matching). The longer file is listed first.
+     (at least 3 in common, 80% of them matching). The longer file is listed first, unless
+     it is under an `--avoid` text and the other is not.
 3. **Suggest** – within a group, the copy to keep is the one that is not under an `--avoid`
-   text, then the longest (for cut copies), the highest resolution, the best bitrate for its
-   codec (AV1 counts double H.264, HEVC and VP9 one and a half), a `--prefer` folder, the bigger
-   file. The reason is printed next to it. Files with the same size and the same bytes at the
-   start, middle and end are marked as identical.
+   text, then the longest (for cut copies), the highest resolution (within 10% of the highest
+   counts as the same), the best bitrate for its codec (AV1 counts double H.264, HEVC and VP9
+   one and a half; within 15% of the best counts as the same), a `--prefer` folder, the bigger
+   file, and in the end the first by name. The reason is printed next to it. Files with the
+   same size and the same bytes at the start, middle and end are marked as identical, and among
+   those the name decides.
 
-The first run decodes about a dozen frames per video with accurate seeking: a few seconds of
+The first run decodes about 10 to 20 frames per video (14 for one of 10 to 15 minutes, 22 at
+most) with accurate seeking: a few seconds of
 one core each, so a large library takes hours once (`-j` sets how many are read at once).
 `--csv` writes one row per file of every group, `--json` the full result.
 
@@ -103,15 +112,17 @@ av1opt encode movie.mkv some/folder -o /out [--target-vmaf 93] [--preset 5] [--c
 For each file:
 
 1. **Sample** – cuts clips spread through the video into lossless, constant-frame-rate
-   references (deinterlaced and cropped to even size when needed). Where the whole video is
-   scored afterwards (step 5, the usual case), the search only has to find the video's mean,
-   and what throws that off is where the clips lie, not how long they are: one clip of 1
-   second for every 8 seconds of video, 8 at least and 64 at most, spread evenly from the
-   first second to the last. Where one CRF has to carry its worst stretch (`--scenes`, HDR,
-   removed sections), clips of 4 seconds, long enough to show a stretch: 8 of them up to a
-   quarter of an hour, then one for every two minutes more, 32 at most. `--samples` and
-   `--sample-secs` set both by hand, and with them the 4-second scheme.
-2. **Search** – finds the highest CRF whose mean VMAF over the samples meets the target. The
+   references (deinterlaced and cropped to even size when needed). A plain encode in one
+   pass (no `--scenes`, HDR, removed sections, `--samples` or `--sample-secs`: the usual case)
+   is scored along its whole length afterwards (step 5), so the search only has to find the
+   video's mean, and what throws that off is where the clips lie, not how long they are: one
+   clip of 1 second for every 8 seconds of video, 8 at least and 64 at most, spread evenly
+   from the first second to the last. Where one CRF has to carry its worst stretch
+   (`--scenes`, HDR, removed sections), clips of 4 seconds, long enough to show a stretch: 8
+   of them up to about 17 minutes, then one for every two minutes more, 32 at most.
+   `--samples` and `--sample-secs` set both by hand, and with them the 4-second scheme.
+2. **Search** – finds the highest CRF between `--min-crf` (20) and `--max-crf` (55) whose mean
+   VMAF over the samples meets the target. The
    first CRF tried is a guess: 35 for VMAF 93, moved by what your own past encodes say about
    bits per pixel and frame size (the same history `scan` learns from). The second goes where
    a curve of the usual shape through the first score crosses the target (scores fall faster
@@ -121,25 +132,28 @@ For each file:
    88 to 97) that is 2.2 trial encodes on average from the fixed guess and 2.0 from a guess
    within 3 CRF of the answer, never more than 4, and the CRF chosen is never more than 0.05
    VMAF short of the target. A trial encodes the samples end to end as one clip and scores
-   them in one pass. Where the whole video is checked afterwards, its stretches more than 4
-   below the target are going to be encoded again (step 5), which lifts the mean; so a
+   them in one pass. With the 1-second clips of the usual case, the video's stretches more
+   than 4 below the target are going to be encoded again (step 5), which lifts the mean; so a
    sample that scores below that line counts as 1.5 above it, about where such a stretch
    ends up, and the search aims at the mean the video will have when it is done. The
    answer is in SVT-AV1's quarter-step CRF. 4K uses the
-   `vmaf_4k` model. A sample 4 or more below the samples' mean gets a note that quality
-   differs along the video (see [per-scene CRF](#per-scene-crf---scenes)). Where the whole
+   `vmaf_4k` model. Clips of 1 second are too short to speak for a stretch; in the 4-second
+   scheme a sample 4 or more below the samples' mean gets a note that quality differs along
+   the video (see [per-scene CRF](#per-scene-crf---scenes)), unless `--scenes` gives every
+   scene its own CRF anyway. Where the whole
    video can't be scored afterwards (step 5: HDR, removed sections), one CRF has to carry
    its worst stretch: a spot check may read 4 VMAF below the target, and reads a little
    higher or lower than the samples did. If the worst sample at the chosen CRF is not a
    point above that mark there, the search goes on to the CRF that puts it there, and the
    report says so.
 3. **Decide** – skips files that are already AV1, Dolby Vision, can't reach the target, or would
-   save less than `--min-savings` (15%). The search stops at the first trial that misses the
+   save less than `--min-savings` (15%). `--force` encodes the ones that are AV1 already or
+   would save too little. The search stops at the first trial that misses the
    target while already larger than that: the CRF the target needs would be larger still.
    The samples speak for the video stream at one CRF; the finished file (with its
    stretches encoded again, its other streams and the container) is weighed once more:
-   no smaller than its source, it is not kept; smaller by less than `--min-savings`, it is
-   kept with a note.
+   no smaller than its source, it is not kept (with `--force` or removed sections it is);
+   smaller by less than `--min-savings`, it is kept with a note.
    HDR10 and HLG are encoded with their colour signalling
    and mastering/light-level metadata intact (VMAF is then measured on the HDR signal, which
    tracks encoding damage but is not calibrated like SDR scores).
@@ -151,8 +165,9 @@ For each file:
    Opus needs (96 kbps stereo, 56 mono, 256 for 5.1): a 320 kbps MP3 or 256 kbps AAC track
    becomes 96 kbps Opus, a 128 kbps one is left alone. It is a second lossy pass, so it is
    off unless asked for; the report notes every track it changed. MP4 output keeps text subtitles (as mov_text) and plays in Chrome and Firefox; use
-   `--container mkv` to keep image subtitles too. Cover art is kept (MP4: attached picture,
-   MKV: attachment with its original file name).
+   `--container mkv` to keep image subtitles too. Cover art is kept: JPEG and PNG in MP4 (as
+   attached pictures), JPEG, PNG, BMP and WebP in MKV (as attachments with their original
+   file names). A cover of another kind is dropped, with a note in the report.
 5. **Verify** – codec, duration, stream and cover counts, HDR transfer, and the picture.
    A video encoded in one pass is scored against its source along its whole length (every
    third frame, each against the source frame of the same number), in stretches of five
@@ -163,8 +178,10 @@ For each file:
    (up to three tries, going by what the stretch itself gains per step) and put in the place
    of the ones they replace. Every frame keeps its timestamp and the other streams are not
    touched; the joined file's frames are counted, and its first and last new stretch are
-   scored once more where they now sit. A stretch that more bits don't lift (noise the
-   metric reads as damage, mostly) is kept at the best it got. The report lists each
+   scored once more where they now sit. No stretch goes more than 16 CRF below the video's.
+   One that more bits don't lift (noise the metric reads as damage, mostly) keeps the
+   smallest encode within half a point of the best it got, which can be the one it had
+   already. The report lists each
    stretch with its CRF, score and bytes before and after, and the mean and the lowest five
    seconds of the whole video. Windows left less than a point under the line after three
    rounds are kept and noted; stretches further short become
@@ -173,10 +190,12 @@ For each file:
    saves less than `--min-savings` the video is skipped, and a second failure stands.
    Where frames can't be paired one for one (removed sections, a source whose frames stay
    for unequal times), in HDR and for videos encoded per scene, it is spot checks at
-   positions the search did not sample instead (five seconds at 30% and at 70% of the way;
+   fixed positions instead (five seconds at 30% and at 70% of the way;
    one for every ten minutes of a video of 25 minutes or more, eight at most; all of a
-   video of ten seconds or less, once), and a spot check more than 4 below the target
-   leads to the same second search. Nothing is written unless all checks pass.
+   video of ten seconds or less, once). So it is where stretches can't be encoded again (no
+   room for them on the drive, say), and the report then says so. A spot check more than 4
+   below the target leads to the same second search; a video encoded per scene or with
+   sections removed fails instead. Nothing is written unless all checks pass.
 6. **Report** – the output plus `<name>.av1opt.json` with every CRF tried, scores, sizes and timings.
 
 ### Metadata
@@ -224,9 +243,11 @@ frame-accurate: the kept parts are trimmed from the decoded source and joined (f
 are moved to their new times (lines and chapters inside removed parts go); image subtitles
 (PGS, DVD) are dropped. Sample clips and spot checks are taken from kept parts only. A cut is
 never skipped for being AV1 already or saving too little, and if the VMAF target is out of reach
-it is encoded at the best CRF tried. Per-scene mode isn't combined with cuts (one pass instead).
-The report lists the removed sections; an existing output with other sections removed is not
-overwritten. In the web UI, **Choose sections to remove…** in the encode dialog (one file) has
+it is encoded at the best CRF tried. A Dolby Vision file is skipped all the same, and sections
+can't be removed from a file whose sound runs more than a second past its picture. Per-scene
+mode isn't combined with cuts (one pass instead).
+The report lists the removed sections; an existing output with other sections removed is only
+overwritten with `--overwrite`. In the web UI, **Choose sections to remove…** in the encode dialog (one file) has
 a player with Mark start / Mark end (keys I and O), frame stepping, and playback that skips the
 marked parts; Compare maps the cut output back onto the source.
 
@@ -242,7 +263,7 @@ One CRF for a whole video spends too many bits on easy scenes and too few on har
 3. Each chunk is encoded at the real preset and measured; a chunk more than 1 VMAF off target is
    redone once with a corrected CRF. Some pictures score below the target however many bits
    they get (noise the metric reads as damage, mostly): when every probe of a chunk misses
-   and the gain between them would still miss at `--min-crf`, the chunk is encoded at the
+   and the gain between them would still miss at `--min-crf` (20), the chunk is encoded at the
    highest CRF that scored within half a point of the best and not redone, and the report
    counts such scenes.
 4. Chunks are joined into one AV1 stream and muxed with the source's audio, subtitles, chapters
@@ -266,7 +287,9 @@ stretches sat at 97. Encoded per scene, the worst five seconds of those two came
 and 89.8 instead of 84.6 and 87.5 and the best at 96 instead of 97.5, for 15% and 7% more
 bytes: the one-CRF encode of the first was 0.9 VMAF short of the target over the whole
 video, which its four samples had not shown. Without `--scenes`, the report of such a video
-says that quality differs along it.
+says that quality differs along it where the search used clips of 4 seconds (HDR, removed
+sections, your own `--samples` or `--sample-secs`). In the usual case the clips are too short
+to tell, and the check of the whole video finds the weak stretches instead.
 
 Finished chunks are kept in `.av1opt-work-*` in the output folder, so an interrupted run resumes
 where it stopped (including the search). Chunks are cut and compared at a constant frame
@@ -284,8 +307,11 @@ timestamps repeat or run backwards.
 Folders are walked recursively and their layout is mirrored under `--out-dir`: one folder's
 contents directly below it, several folders each below a folder of their own name
 (`encode -o out lib/Kay lib/Sofia` writes `out/Kay/...` and `out/Sofia/...`). Every result is
-appended to `av1opt-log.tsv` there; re-running the same command resumes: finished files are
-skipped, and files skipped for a reason (low savings, ...) are not searched again with the same settings (target, preset, CRF range, `--min-savings`, `--force`, and `--scenes`, `--audio` and the samples where set) unless
+appended to `av1opt-log.tsv` there; re-running the same command resumes: a finished file is
+skipped, whatever settings made it (`--overwrite` makes it again, over the old one), and files
+skipped for a reason (low savings, ...) are not searched again with the same settings (target,
+preset, CRF range, `--min-savings`, `--force`, and `--scenes`, `--audio`, `--svt-params`,
+`--tuned`, `--remove` and the samples where set) unless
 `--retry-skipped` is given. A finished file counts only for the source it was made from, as the
 report beside it says: one of the same name and another size is reported, not passed over (a
 file there with no report at all counts as done). An output is never written where its own source or another
@@ -297,8 +323,11 @@ saving per hour of encoding first (`--order savings`: the largest saving first),
 same estimates as `scan`, so a long run stopped early has saved the most for its time; in the
 web UI files are queued in the order of the scan table. Trial encodes are remembered in `~/.cache/av1opt/trials-v1.jsonl`
 for the same file (path, size, date), sample clips, settings, ffmpeg build and SVT-AV1 version: an encode that
-was stopped or failed, or is run again with another target, container or `--min-savings`,
-starts from the scores it already has and often measures nothing new. `--fresh-search`
+was stopped or failed, or is run again with another container or `--min-savings`,
+starts from the scores it already has and often measures nothing new. Another target does so
+only with `--scenes`, HDR, removed sections or your own samples; in the usual case the scores
+are counted towards a mark that depends on the target, so they are measured again.
+`--fresh-search`
 measures everything again. If two inputs would produce the same output name (same file name
 from two input folders), the second is reported as a name collision instead of being skipped.
 
@@ -317,15 +346,16 @@ videos.
    cropped videos count with their landscape peers). Dolby Vision and very short files are left out.
 2. **Measure** – `--samples` (2) lossless clips of `--sample-secs` (6) seconds per video. Every
    setting (each preset with each parameter set, plus the default: preset 5 with `tune=0`) gets
-   the same CRF search as `encode`, so each ends at the target VMAF; every sample encode is timed.
+   a CRF search of its own, which goes on until two neighbouring CRFs are measured (`encode`
+   stops sooner), so each ends at the target VMAF; every sample encode is timed.
 3. **Compare at equal quality** – a setting's size and time at exactly the target are read
    between the last CRF that passes and the first that fails. Settings are then compared with
    the default per video and averaged as ratios (geometric mean), for all videos and per size
    class. A setting that fails or cannot reach the target on a video the default manages is
    shown with a note and never picked.
 4. **Pick winners** – *smallest* (whatever the time), *balanced* (smallest within 10% of the
-   default's encode time) and *fastest* (within 2% of the default's size). Differences under 1%
-   count as none: the default stays.
+   default's encode time) and *fastest* (within 2% of the default's size). The default stays
+   unless *smallest* or *balanced* gains more than 1%, or *fastest* more than 5%.
 
 The table lists every setting with size and time against the default, the best and worst video,
 and marks the ones no other setting beats on both counts. `--csv` writes one row per video and
@@ -373,6 +403,8 @@ single output files.
   output must be there with the sizes the encode recorded, and the output must be the smaller
   one. Originals that are links, reports without full paths (very old ones) and a new name
   that is already taken in the original's folder are refused too.
+- An output with sections removed takes its original's place like any other, and the list
+  says so. The removed sections are then only in the original in the trash.
 - A report is a file like any other, so it is only followed where `encode` writes one: next
   to its output, under the output's name. Both files it names have to be videos. A report
   that turns up in some other folder and points at files elsewhere moves nothing.
@@ -399,7 +431,7 @@ single output files.
 
 ```
 cargo build --release --features ui
-av1opt ui [--port 8765] [--no-open] [--memory-limit 12G]
+av1opt ui [--port N] [--no-open] [--memory-limit 12G]
 ```
 
 A local web app in the browser (Chrome or Firefox), built from the same scan and encode code:
@@ -414,9 +446,10 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
   of every copy, the suggested keep and why; **Compare** opens two copies in the split player.
   Tick the copies you don't want, then **Move to trash** (after a confirmation), or copy or save
   the list of paths. Nothing is deleted: each file is renamed into the trash of the drive it is
-  on (`~/.local/share/Trash`, or `.Trash-<uid>` at the top of another drive, as file managers
-  do), so it can be put back until you empty the trash, and no space is freed before that.
-  The last copy of a video is never trashed, files that changed since the search are refused,
+  on (`~/.local/share/Trash`, or at the top of another drive `.Trash/<uid>` or `.Trash-<uid>`,
+  as file managers do), so it can be put back until you empty the trash, and no space is freed
+  before that. The last copy of a video is never trashed, files that are gone or have another
+  size since the search are refused,
   and a drive without a usable trash gives an error instead of a copy to another disk.
 - **Encode dialog**: target VMAF, preset, container, encoder parameters, metadata, sections
   to remove, and **Shrink heavy sound tracks to Opus** (`--audio shrink`, off by default).
@@ -441,7 +474,8 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
   file-change notifications, which network and FUSE mounts don't send. A video is queued
   once two looks found it unchanged and it has not been written to for two minutes, so a
   download still running is left alone, and only if a scan would call it a candidate: AV1,
-  too short, too little to gain and unreadable files are left. The videos in the folder
+  Dolby Vision, too short, too little to gain and unreadable files are left. A watch with
+  **Force** ticked leaves only AV1 and unreadable files. The videos in the folder
   when it was added are not queued unless asked for. Queueing is all a watch does: the
   pause and the hours decide when the encode runs, and originals are never replaced or
   touched. What was seen is kept in `ui-watch.json`, and a video gone from the folder is
@@ -470,12 +504,15 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
   that failed on screen with the reason. Replaced encodes carry a "replaced" mark. An original
   that is still in the encode queue is refused.
 
-The server listens on 127.0.0.1 only and prints a sign-in link with a random token (the browser
+The server listens on 127.0.0.1 only, on a free port unless `--port` names one, and prints its
+address and a sign-in link with a random token (the browser
 gets it as a cookie). Requests with a foreign Host or Origin are refused, so are requests from
 a program of another user of the machine, or from a connection the system no longer shows as
 anyone's (a browser sends the cookie to every port of the host, so the cookie alone would not
-keep them out), and media are only
-served for video files you picked in the app. Output folders on ZFS are refused (no override in the UI);
+keep them out). The system's own programs (root) pass while their connection is open, and where
+the system's list of connections can't be read the cookie alone decides. Media are only
+served for the video files the page already lists: those you picked, scanned, found as
+duplicates or queued, and the outputs and originals of its jobs and reports. Output folders on ZFS are refused (no override in the UI);
 replacing an original that is on ZFS needs a tick in the dialog, or the confirmation in Compare, which says so.
 Putting one back there, and moving duplicates on ZFS to the trash, ask in a dialog of their own.
 The ffmpeg and ffprobe programs set in Settings have to be named like that (`ffmpeg`, `/opt/x/ffprobe-7`),
@@ -529,7 +566,7 @@ environment, so set the ffmpeg path once in Settings.
 - An output file that appears in the output folder while its encode runs is not written
   over: the finished encode is kept next to it under another name, and the run says where.
 - Each ffmpeg run gets a memory cap (`--memory-limit`: `12G`, `1.5G`, `800M` or `40%`, shared
-  between `--workers`; default 40% of RAM) and low CPU priority (`--nice 10`), so a 4K encode
+  between `--workers`, or `none` for no cap; default 40% of RAM) and low CPU priority (`--nice 10`), so a 4K encode
   can't freeze the desktop.
 - Temp files live in a hidden folder in the output directory and are removed afterwards; leftovers
   from crashed runs are cleaned up on the next run.
@@ -541,11 +578,15 @@ Reports, history lines, `ui.json`, `ui-queue.json`, `ui-watch.json`, `tuning.jso
 older files; an older one skips reports and history lines from a newer format, leaves a newer
 `ui.json` untouched, sets a newer `ui-queue.json` or `ui-watch.json` aside as
 `ui-queue.format<N>.json` (the videos in a watched folder then count as there before), and starts
-a scene-mode file over rather than resuming a work folder of another format.
+a scene-mode file over rather than resuming a work folder of another format. A `tuning.json`
+from a newer av1opt is left as it is: `encode --tuned` refuses it and the page does not show it.
 
 ### Debugging
 
-`AV1OPT_DEBUG=1` prints every ffmpeg command. `--keep-temp` keeps samples and the partial encode.
+`AV1OPT_DEBUG=1` prints every ffmpeg command. `--keep-temp` keeps the temporary folder in the
+output folder (`.av1opt-tmp-<number>`, until a later run there clears it), with the partial
+encode if the encode fails, and the work folder of a per-scene encode. Sample clips are deleted
+all the same once the search is done with them.
 `cargo test --features ui` also runs `tests/ui_api.rs`, which starts the real `av1opt ui` and
 checks sign-in, request checks, media access, the job queue, its pause and hours, the duplicate search (and what its
 trash action refuses), replacing an original and putting it back (and which reports may do that)
@@ -603,9 +644,10 @@ and the benchmark's requests and tuned settings over HTTP (no ffmpeg needed).
   samples averaged the target. The search knew, since one of its four samples scored 3
   below their mean, and did nothing with it; a generated clip with one hard scene was encoded
   in full and then refused by verification, again on every run, because the remembered
-  trials led to the same CRF. The worst sample now counts: past what verification allows,
-  the CRF comes down before the encode, and a video with samples far apart can be encoded
-  per scene (`--scenes=auto`).
+  trials led to the same CRF. So the worst sample was made to count: past what verification
+  allowed, the CRF came down before the encode, and a video with samples far apart could be
+  encoded per scene (`--scenes=auto`). Since the whole video is scored after its encode (see
+  below), the CRF comes down this way only in HDR and with sections removed.
 - **A Matroska header names a frame rate whatever the frames do.** ffprobe reports 24 fps as
   both the nominal and the average rate of an MKV whose frames come at 12, so comparing the
   two finds variable frame rates in MP4 only. Scene mode then cut such a file into
@@ -655,8 +697,9 @@ and the benchmark's requests and tuned settings over HTTP (no ffmpeg needed).
   three would have been right the first time and the third nearly. Sixteen got all three
   for twice the search time, which costs more than the second encodes it saves. A spot
   check looks at five seconds: a sample of four scores as low as it will, one of eight
-  averages the hard moment away. So samples are 4 seconds now, 8 of them, and more with
-  length. The worst of eight short samples lies further below their mean than the worst of
+  averages the hard moment away. So samples became 4 seconds, 8 of them, and more with
+  length (today only where one CRF has to carry its worst stretch; the usual search has since
+  moved to clips of 1 second, see below). The worst of eight short samples lies further below their mean than the worst of
   four long ones (2.1 became 4.4 for the same video), so the line for "quality differs
   along the video" moved from 2 to 4: on 13 videos that marks the three failures (4.4, 4.6,
   5.1), one whose spot check had passed 1.3 above the line and one the four long samples had

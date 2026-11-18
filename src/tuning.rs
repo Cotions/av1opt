@@ -157,4 +157,76 @@ mod tests {
         assert_eq!(back.pick(3840, 2160).unwrap().preset, 8);
         assert!(back.pick(1920, 1080).is_none());
     }
+
+    #[test]
+    fn the_margin_ends_exactly_fifteen_percent_above_720p_and_1080p() {
+        assert_eq!(Class::of(1_059_840, 1), Class::Sd);
+        assert_eq!(Class::of(1_059_841, 1), Class::Hd);
+        assert_eq!(Class::of(2_384_640, 1), Class::Hd);
+        assert_eq!(Class::of(2_384_641, 1), Class::Uhd);
+    }
+
+    #[test]
+    fn sizes_between_the_common_ones_land_where_their_pixels_say() {
+        for (w, h, want) in [
+            (854, 480, Class::Sd), (1366, 768, Class::Sd), (1600, 900, Class::Hd), (1440, 1080, Class::Hd),
+            (2048, 1152, Class::Hd), (2560, 1080, Class::Uhd), (4096, 2160, Class::Uhd), (7680, 4320, Class::Uhd),
+        ] {
+            assert_eq!(Class::of(w, h), want, "{w}x{h}");
+            assert_eq!(Class::of(h, w), want, "{h}x{w}");
+        }
+    }
+
+    #[test]
+    fn sizes_without_a_picture_or_beyond_any_picture_do_not_overflow() {
+        assert_eq!(Class::of(0, 0), Class::Sd);
+        assert_eq!(Class::of(3840, 0), Class::Sd);
+        assert_eq!(Class::of(u32::MAX, u32::MAX), Class::Uhd);
+    }
+
+    #[test]
+    fn a_class_is_named_exactly_or_not_at_all() {
+        assert_eq!(Class::ALL.map(Class::label), ["720p and below", "1080p", "above 1080p"]);
+        assert_eq!(Class::ALL.map(Class::id), ["sd", "hd", "uhd"]);
+        for bad in ["", "HD", " hd", "hd ", "1080p", "ultra"] {
+            let e = bad.parse::<Class>().unwrap_err().to_string();
+            assert!(e.contains(&format!("'{bad}'")) && e.contains("sd, hd, uhd"), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_video_gets_the_settings_of_its_own_class_only() {
+        let choice = |preset| Choice { preset, params: "tune=0".into(), size: 1.0, time: 1.0, videos: 1, target_vmaf: 93.0, made: 0 };
+        let mut t = Tuning::default();
+        assert_eq!(t.pick(1920, 1080), None);
+        t.classes.insert(Class::Sd, choice(8));
+        t.classes.insert(Class::Uhd, choice(4));
+        assert_eq!(t.pick(720, 1280).unwrap().preset, 8);
+        assert_eq!(t.pick(2160, 3840).unwrap().preset, 4);
+        assert_eq!(t.pick(1920, 1080), None);
+    }
+
+    #[test]
+    fn tuning_survives_the_file_and_is_written_smallest_class_first() {
+        let choice = |preset| Choice { preset, params: "tune=0:enable-qm=1".into(), size: 0.9, time: 1.5, videos: 3, target_vmaf: 93.0, made: 12 };
+        let t = Tuning { format: FORMAT, classes: [(Class::Uhd, choice(4)), (Class::Sd, choice(8)), (Class::Hd, choice(6))].into() };
+        let text = serde_json::to_string(&t).unwrap();
+        assert_eq!(serde_json::from_str::<Tuning>(&text).unwrap(), t);
+        let at = |key: &str| text.find(key).unwrap();
+        assert!(at("\"sd\"") < at("\"hd\"") && at("\"hd\"") < at("\"uhd\""), "{text}");
+    }
+
+    #[test]
+    fn a_file_without_the_settings_themselves_is_refused() {
+        for bad in [
+            r#"{"format":1}"#,
+            r#"{"classes":{}}"#,
+            r#"{"format":1,"classes":{"hd":{"params":"tune=0"}}}"#,
+            r#"{"format":1,"classes":{"hd":{"preset":6}}}"#,
+            r#"{"format":1,"classes":{"hd":{"preset":300,"params":""}}}"#,
+            r#"{"format":1,"classes":{"8k":{"preset":6,"params":""}}}"#,
+        ] {
+            assert!(serde_json::from_str::<Tuning>(bad).is_err(), "{bad}");
+        }
+    }
 }

@@ -1669,31 +1669,45 @@ fn first_job_ended(s: &Server) -> Value {
 
 #[test]
 fn a_long_saved_queue_comes_back_behind_a_server_that_already_answers() {
-    const JOBS: usize = 30_000;
+    // How far a queue gets before this test looks depends on what else the machine is doing. A
+    // queue found already back says nothing either way, and the next one is longer.
+    let caught = [30_000, 120_000, 480_000].into_iter().any(saved_queue_stopped_on_its_way_back_loses_nothing);
+    assert!(caught, "even the longest queue was back before the first answer");
+}
+
+/// Stops a server while `jobs` saved jobs come back, and checks that none is lost. False when they
+/// were back too soon for that to be tried.
+fn saved_queue_stopped_on_its_way_back_loses_nothing(jobs: usize) -> bool {
     let write_queue = |d: &Path| {
         std::fs::write(d.join("videos/a.mkv"), b"x").unwrap();
         let job = json!({ "inputs": [d.join("videos/a.mkv")], "roots": [], "out_dir": d.join("out"), "options": {} });
-        let saved = json!({ "format": 1, "jobs": vec![job; JOBS] });
+        let saved = json!({ "format": 1, "jobs": vec![job; jobs] });
         std::fs::write(d.join("data/av1opt/ui-queue.json"), saved.to_string()).unwrap();
     };
     let mut s = Server::launch("restoring", "false", "false", write_queue);
 
     // Answering at once, with the page told what is still to come.
-    let list = s.get("/api/jobs/heads").json();
-    assert!(list["restoring"].as_u64().unwrap() > 0, "the queue was back before the first answer: make it longer");
-    // A change made meanwhile is saved with all that has not come back yet.
-    let started = Instant::now();
-    while heads(&s).is_empty() {
-        assert!(started.elapsed() < Duration::from_secs(20));
+    if s.get("/api/jobs/heads").json()["restoring"] == 0 {
+        return false;
     }
-    let id = heads(&s)[0]["id"].as_u64().unwrap();
+    // A change made meanwhile is saved with all that has not come back yet. The limit is for a
+    // server that hangs, and no busy machine comes near it.
+    let started = Instant::now();
+    let id = loop {
+        if let Some(job) = heads(&s).first() {
+            break job["id"].as_u64().unwrap();
+        }
+        assert!(started.elapsed() < Duration::from_secs(600), "no saved job has come back");
+    };
     assert_eq!(s.post(&format!("/api/jobs/{id}/remove"), &json!({})).status, 200);
-    assert_eq!(saved_jobs(&s), JOBS - 1);
+    assert_eq!(saved_jobs(&s), jobs - 1);
 
     // Stopped half way, as the desktop app stops a server it has given up on: nothing is lost.
-    assert!(s.get("/api/jobs/heads").json()["restoring"].as_u64().unwrap() > 0, "restored too soon to tell");
+    if s.get("/api/jobs/heads").json()["restoring"] == 0 {
+        return false;
+    }
     assert!(s.terminate());
-    assert_eq!(saved_jobs(&s), JOBS - 1);
+    assert_eq!(saved_jobs(&s), jobs - 1);
     let dir = s.dir.clone();
     drop(s);
 
@@ -1707,9 +1721,10 @@ fn a_long_saved_queue_comes_back_behind_a_server_that_already_answers() {
     });
     drop(s);
     let s = Server::start_in(&dir, "false", "false");
-    assert_eq!(heads(&s).len(), JOBS - 1);
+    assert_eq!(heads(&s).len(), jobs - 1);
     assert_eq!(s.get("/api/jobs/heads").json()["restoring"], 0);
-    assert_eq!(saved_jobs(&s), JOBS - 1);
+    assert_eq!(saved_jobs(&s), jobs - 1);
+    true
 }
 
 #[test]

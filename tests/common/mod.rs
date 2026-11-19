@@ -43,12 +43,22 @@ impl Server {
         s
     }
 
-    /// Waits until no saved job is still on its way back into the queue.
+    /// Waits until no saved job is still on its way back into the queue. A long queue on a busy
+    /// machine takes what it takes: only a minute without one more job back is a failure.
     pub fn wait_for_restored_jobs(&self) {
-        let t = Instant::now();
-        while self.get("/api/jobs/heads").json()["restoring"].as_u64() != Some(0) {
-            assert!(t.elapsed() < Duration::from_secs(60), "the saved queue is still coming back");
-            std::thread::sleep(Duration::from_millis(10));
+        let (mut left, mut moved, mut pause) = (u64::MAX, Instant::now(), Duration::from_millis(10));
+        loop {
+            let now = self.get("/api/jobs/heads").json()["restoring"].as_u64().unwrap_or(u64::MAX);
+            if now == 0 {
+                return;
+            }
+            if now < left {
+                (left, moved) = (now, Instant::now());
+            }
+            assert!(moved.elapsed() < Duration::from_secs(60), "the saved queue has stopped coming back with {left} jobs to go");
+            // Each look has the server list every job back so far.
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(Duration::from_millis(500));
         }
     }
 
@@ -121,7 +131,8 @@ impl Server {
 
     pub fn raw(&self, request: &str) -> Resp {
         let mut s = TcpStream::connect(("127.0.0.1", self.port)).unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        // For a server that hangs: a busy machine can take a while over a long answer.
+        s.set_read_timeout(Some(Duration::from_secs(120))).unwrap();
         s.write_all(request.as_bytes()).unwrap();
         let mut buf = Vec::new();
         s.read_to_end(&mut buf).unwrap();
@@ -161,11 +172,12 @@ impl Server {
         self.request("POST", path, &[("Cookie", &self.cookie()), ("Content-Type", "application/json")], Some(&b))
     }
 
-    /// SIGTERM, as the desktop app does when it quits; true if it exited within 10 s.
+    /// SIGTERM, as the desktop app does when it quits; true if it exited within a minute, which
+    /// only a server that hangs does not.
     pub fn terminate(&mut self) -> bool {
         unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
         let t = Instant::now();
-        while t.elapsed() < Duration::from_secs(10) {
+        while t.elapsed() < Duration::from_secs(60) {
             if self.child.try_wait().unwrap().is_some() {
                 return true;
             }

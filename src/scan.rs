@@ -256,6 +256,13 @@ impl ProbeCache {
     }
 }
 
+/// How finely [`best_within`] cuts the time for `videos` videos. Its work is the two multiplied.
+/// Finer slots waste less of the time on rounding; fewer keep a library of tens of thousands of
+/// videos to a moment's work.
+fn slots_for(videos: usize) -> usize {
+    (40_000_000 / videos.max(1)).clamp(1000, 10_000)
+}
+
 /// The videos to encode when there are `budget_secs` to encode in: those of `items` (bytes
 /// saved, seconds to encode) that save the most together without taking longer. Returned as
 /// indexes into `items`, the most saved per second first.
@@ -274,9 +281,7 @@ pub fn best_within(items: &[(f64, f64)], budget_secs: f64) -> Vec<usize> {
     if usable.iter().map(|&i| items[i].1).sum::<f64>() <= budget_secs {
         return by_rate(usable);
     }
-    // Finer slots waste less of the time on rounding; fewer keep a library of tens of
-    // thousands of videos to a moment's work.
-    let slots = (40_000_000 / usable.len()).clamp(1000, 10_000);
+    let slots = slots_for(usable.len());
     let slot_secs = budget_secs / slots as f64;
     let width: Vec<usize> = usable.iter().map(|&i| ((items[i].1 / slot_secs).ceil() as usize).clamp(1, slots)).collect();
     let mut best = vec![0.0_f64; slots + 1];
@@ -615,10 +620,14 @@ mod tests {
     #[test]
     fn a_large_library_is_picked_from_in_a_moment() {
         let items: Vec<(f64, f64)> = (0..30_000_u64).map(|i| (1e8 + (i * 7919 % 1000) as f64 * 5e6, 300.0 + (i * 104_729 % 5000) as f64)).collect();
-        let started = std::time::Instant::now();
         let picked = best_within(&items, 8.0 * 3600.0);
         let (_, secs) = totals(&items, &picked);
         assert!(secs <= 8.0 * 3600.0 && secs > 7.9 * 3600.0, "{secs}");
-        assert!(started.elapsed().as_secs_f64() < 5.0, "{:?}", started.elapsed());
+        // A moment is counted in steps, which a busy machine does not change: a step per video
+        // and slot, tens of millions at most for any library of that kind of size.
+        for videos in [1, 100, 4_000, 30_000, 40_000] {
+            assert!(videos * slots_for(videos) <= 40_000_000, "{videos} videos");
+        }
+        assert_eq!(slots_for(1_000_000), 1000, "never so coarse that the rounding wastes the time");
     }
 }

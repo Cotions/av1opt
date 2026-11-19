@@ -112,7 +112,9 @@ th { color: var(--dim); font-weight: 500; font-size: 12px; cursor: default; user
 th.sort { cursor: pointer; }
 th.sort:hover { color: var(--text); }
 td.num, th.num { text-align: right; }
-td.path { white-space: normal; word-break: break-all; max-width: 520px; }
+/* A name may break anywhere, and so would shrink to a few letters beside the columns that do
+   not; it keeps room for a name's worth, and a narrow window scrolls the table instead. */
+td.path { white-space: normal; word-break: break-all; max-width: 520px; min-width: 16em; }
 tr.click { cursor: pointer; }
 tr.click:hover td { background: var(--panel2); }
 .tablewrap { overflow-x: auto; max-height: 62vh; overflow-y: auto; }
@@ -133,13 +135,15 @@ tr.click:hover td { background: var(--panel2); }
 .modal .head { padding: 12px 16px; border-bottom: 1px solid var(--line); display: flex; gap: 10px; align-items: center; }
 .modal .body { padding: 12px 16px; overflow: auto; flex: 1; }
 .modal .foot { padding: 10px 16px; border-top: 1px solid var(--line); display: flex; gap: 8px; justify-content: flex-end; align-items: center; }
-.picker-path { font-family: ui-monospace, monospace; font-size: 12.5px; flex: 1; }
+.picker-path { font-family: ui-monospace, monospace; font-size: 12.5px; flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .picker-list { list-style: none; margin: 0; padding: 0; }
 .picker-list li { padding: 4px 8px; border-radius: 4px; display: flex; gap: 8px; align-items: center; cursor: pointer; }
 .picker-list li:hover { background: var(--panel2); }
 .picker-list li:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .picker-list li.sel { background: #1e3b33; }
 .picker-list .icon { width: 16px; color: var(--dim); text-align: center; }
+/* A long name wraps inside the list instead of running past the dialog's edge. */
+.picker-list li .grow { min-width: 0; overflow-wrap: anywhere; }
 .places { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
 
 /* queue */

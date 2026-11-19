@@ -61,8 +61,10 @@ reads.
 | `--list` | none | Write the paths `--hours` picked to this file, one per line. |
 
 Every run of ffprobe on a video, here and in the other commands, has a time limit that only
-a stalled drive should reach: at most two minutes, and for a run that reads every packet of a
-file, as counting its frames does, a minute more for each gigabyte begun. A file ffprobe could
+a stalled drive should reach: at most two minutes. A run that reads every packet of a file, as
+counting its frames does, is stopped after two minutes without reading anything, or a minute
+more for each gigabyte begun where its reading cannot be seen, and in any case once it has had
+two minutes plus the time to read the file at 1 MB/s. A file ffprobe could
 not finish, or that the system could not read for it, shows as unreadable in this scan and is
 probed again by the next. A file ffprobe read and rejected is remembered until it changes.
 

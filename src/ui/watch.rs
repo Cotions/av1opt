@@ -36,9 +36,15 @@ const PROBE_TRIES: u32 = 3;
 const LONGEST_WAIT: u64 = 86400;
 /// How many of those videos the page is told of by name.
 const UNREAD_LISTED: usize = 20;
-/// How many of those videos one look tries again. Each try can take as long as a probe may, and
-/// one watcher looks at every folder: thousands of them would hold it for hours.
-const RETRIES_PER_LOOK: usize = 20;
+/// How many of those videos are tried again at once. Each try can take as long as a probe may, and
+/// one watcher looks at every folder: thousands of them on a drive still away would hold it for
+/// hours. A look goes on to the next ones while these get through.
+const RETRIES_PER_ROUND: usize = 20;
+/// How long a look goes on with such rounds. Thousands of videos come back from a drive that is
+/// back again within a few looks, and the other watched folders still get their turn.
+const RETRY_TIME: Duration = Duration::from_secs(120);
+/// The same for a look someone asked for and is waiting for.
+const RETRY_TIME_BY_HAND: Duration = Duration::from_secs(30);
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Watch {
@@ -138,7 +144,12 @@ impl Folder {
     /// The videos waiting to be read. Only those the latest look found: what is known of the
     /// others is kept for a drive that comes back, but nothing of theirs is being waited for.
     fn unread(&self) -> impl Iterator<Item = (&PathBuf, &Seen)> {
-        self.files.iter().filter(|(_, s)| s.unread() && self.found_at.is_none_or(|at| s.seen >= at))
+        self.found().filter(|(_, s)| s.unread())
+    }
+
+    /// The videos the latest look found.
+    fn found(&self) -> impl Iterator<Item = (&PathBuf, &Seen)> {
+        self.files.iter().filter(|(_, s)| self.found_at.is_none_or(|at| s.seen >= at))
     }
 }
 
@@ -187,21 +198,59 @@ fn settle(files: &mut BTreeMap<PathBuf, Seen>, found: Vec<(PathBuf, u64, u64)>, 
     (ready, changed || files.len() != before)
 }
 
-/// Keeps of `ready` all that have never been tried, and of those whose probe did not get through
-/// the [`RETRIES_PER_LOOK`] that have waited longest. The others keep their place and their
-/// waits, and come up at a later look. Asked for by hand (`by_hand`), videos still within their
-/// wait count as ready too, so that "Look now" is of use without trying thousands of them.
-fn with_few_retries(files: &BTreeMap<PathBuf, Seen>, ready: Vec<PathBuf>, now: u64, by_hand: bool) -> Vec<PathBuf> {
-    let (mut retries, mut chosen): (Vec<_>, Vec<_>) = ready.into_iter().partition(|p| files.get(p).is_some_and(Seen::unread));
+/// The videos a look is to judge.
+#[derive(Debug, PartialEq, Default)]
+struct Tries {
+    /// Never tried.
+    first_time: Vec<PathBuf>,
+    /// Their probe did not get through before, those that have waited longest first.
+    again: Vec<PathBuf>,
+}
+
+/// Sorts `ready` into videos never tried and those whose probe did not get through. Those not
+/// reached by a look keep their place and their waits, and come up at a later one. Asked for by
+/// hand (`by_hand`), videos still within their wait count as ready too, so that "Look now" is of
+/// use.
+fn tries_of(files: &BTreeMap<PathBuf, Seen>, ready: Vec<PathBuf>, now: u64, by_hand: bool) -> Tries {
+    let (mut retries, first_time): (Vec<_>, Vec<_>) = ready.into_iter().partition(|p| files.get(p).is_some_and(Seen::unread));
     if by_hand {
         retries.extend(files.iter().filter(|(_, s)| s.unread() && s.seen == now && s.next_try > now).map(|(p, _)| p.clone()));
     }
     // When a video's wait began is when it was last tried.
     let last_tried = |p: &PathBuf| files.get(p).map_or(0, |s| s.next_try.saturating_sub(wait_after(s.tries)));
     retries.sort_by_cached_key(last_tried);
-    retries.truncate(RETRIES_PER_LOOK);
-    chosen.append(&mut retries);
-    chosen
+    Tries { first_time, again: retries }
+}
+
+/// Judges `tries` in rounds: those never tried with the first videos to try again, then more of
+/// those for as long as most of the last round got through, `time` lasts and `stop` does not say
+/// otherwise. What the rounds before a failing one found out is kept, and returned with the error.
+fn in_rounds(tries: Tries, time: Duration, stop: impl Fn() -> bool, mut judge_round: impl FnMut(Vec<PathBuf>) -> Result<Judged>) -> (Judged, Option<anyhow::Error>) {
+    let started = std::time::Instant::now();
+    let Tries { first_time, again } = tries;
+    let mut round = first_time;
+    let mut rounds = again.chunks(RETRIES_PER_ROUND);
+    let mut retried = rounds.next().unwrap_or_default();
+    round.extend_from_slice(retried);
+    let mut all = Judged::default();
+    loop {
+        let judged = match judge_round(round) {
+            Ok(judged) => judged,
+            Err(e) => return (all, Some(e)),
+        };
+        let still_failing = retried.iter().filter(|p| judged.unjudged.iter().any(|(failed, _)| failed == *p)).count();
+        all.waiting.extend(judged.waiting);
+        all.worth.extend(judged.worth);
+        all.left.extend(judged.left);
+        all.unjudged.extend(judged.unjudged);
+        // A drive still away answers slowly if at all: the first round tells, and the look ends.
+        if still_failing * 2 >= retried.len() || started.elapsed() >= time || stop() {
+            return (all, None);
+        }
+        let Some(next) = rounds.next() else { return (all, None) };
+        retried = next;
+        round = next.to_vec();
+    }
 }
 
 /// How long a video waits after its probe failed `tries` times: nothing for the first looks,
@@ -341,6 +390,8 @@ fn find(app: &App, id: u64) -> Result<Watch> {
 /// What became of the videos that were ready.
 #[derive(Default)]
 struct Judged {
+    /// Already waiting in the queue, put there by hand.
+    waiting: Vec<PathBuf>,
     worth: Vec<PathBuf>,
     left: Vec<PathBuf>,
     /// Their probe did not get through, and why.
@@ -398,7 +449,7 @@ pub fn use_output_folder(app: &App, id: u64) -> Result<Value> {
 }
 
 /// Sorts `ready` into the videos worth encoding, those to leave and those it cannot tell of yet.
-fn judge(app: &App, w: &Watch, ready: Vec<PathBuf>) -> Result<Judged> {
+fn judge(app: &App, w: &Watch, model: &Model, ready: Vec<PathBuf>) -> Result<Judged> {
     // With broken tools every video would look unreadable and be left for good.
     if let Some(p) = app.encode_problem() {
         bail!("{p} (see Settings)");
@@ -407,12 +458,12 @@ fn judge(app: &App, w: &Watch, ready: Vec<PathBuf>) -> Result<Judged> {
     if let Some(problem) = crate::batch::out_dir_problem(&w.out_dir, w.out_dir_place.as_ref()) {
         return Err(problem);
     }
-    let model = Model::fit_at_preset(&crate::history::load(), w.options.target_vmaf, w.options.preset);
-    let (results, _) = crate::scan::collect(&ready, &app.ffprobe(), app.cfg.jobs, w.options.min_savings, &model, &|_, _| {})?;
+    let (waiting, ready): (Vec<_>, Vec<_>) = ready.into_iter().partition(|p| jobs::waiting_on(app, p));
+    let (results, _) = crate::scan::collect(&ready, &app.ffprobe(), app.cfg.jobs, w.options.min_savings, model, &|_, _| {})?;
     // "Encode anyway" is about the gain expected. AV1 is left even so: an output that took
     // its original's place in this folder would be encoded again, and again after that.
     let worth = |v: Verdict| v.will_be_tried() || (w.options.force && !matches!(v, Verdict::AlreadyAv1 | Verdict::Unreadable));
-    let mut judged = Judged::default();
+    let mut judged = Judged { waiting, ..Default::default() };
     for r in results {
         if r.unjudged {
             judged.unjudged.push((r.path, r.error.unwrap_or_else(|| "the probe did not finish".into())));
@@ -437,7 +488,7 @@ fn look(app: &App, id: u64, by_hand: bool) -> Result<()> {
     // Said even with nothing to queue, so that the drive is seen to be away before it matters.
     let output_away = found.as_ref().ok().and_then(|_| crate::batch::out_dir_problem(&w.out_dir, w.out_dir_place.as_ref()));
     let at = now();
-    let (ready, mut changed) = {
+    let (tries, mut changed) = {
         let mut folders = app.watch.folders.lock().unwrap();
         // Nothing known of a folder that is watched: the state file was lost. Its videos
         // are then taken as there before, not as so many new ones to encode.
@@ -452,24 +503,25 @@ fn look(app: &App, id: u64, by_hand: bool) -> Result<()> {
                 f.found_at = Some(at);
                 f.note_problem(output_away.as_ref());
                 // With the output folder away the videos wait, as a job queued now could only fail.
-                let ready = if f.error.is_some() { Vec::new() } else { with_few_retries(&f.files, ready, at, by_hand) };
-                (ready, changed || had_error != f.error)
+                let tries = if f.error.is_some() { Tries::default() } else { tries_of(&f.files, ready, at, by_hand) };
+                (tries, changed || had_error != f.error)
             }
             Err(e) => {
                 f.note_problem(Some(&e));
-                (Vec::new(), true)
+                (Tries::default(), true)
             }
         }
     };
-    if !ready.is_empty() {
-        // Already waiting in the queue, put there by hand.
-        let (waiting, ready): (Vec<_>, Vec<_>) = ready.into_iter().partition(|p| jobs::waiting_on(app, p));
-        let judged = judge(app, &w, ready).and_then(|judged| {
-            if !judged.worth.is_empty() {
-                jobs::add(app, &json!({ "inputs": judged.worth, "out_dir": w.out_dir, "roots": [w.path], "options": w.options, "watch": w.path, "out_dir_place": w.out_dir_place }))?;
-            }
-            Ok(judged)
-        });
+    if tries != Tries::default() {
+        let model = Model::fit_at_preset(&crate::history::load(), w.options.target_vmaf, w.options.preset);
+        let time = if by_hand { RETRY_TIME_BY_HAND } else { RETRY_TIME };
+        let (judged, problem) = in_rounds(tries, time, || jobs::shutting_down(app), |round| judge(app, &w, &model, round));
+        // One job for all the rounds, so that one look does not fill the queue with many.
+        let queued = if judged.worth.is_empty() {
+            Ok(())
+        } else {
+            jobs::add(app, &json!({ "inputs": judged.worth, "out_dir": w.out_dir, "roots": [w.path], "options": w.options, "watch": w.path, "out_dir_place": w.out_dir_place })).map(drop)
+        };
         let mut folders = app.watch.folders.lock().unwrap();
         let f = folders.entry(id).or_default();
         let mut mark = |paths: Vec<PathBuf>, m: Mark| {
@@ -479,16 +531,20 @@ fn look(app: &App, id: u64, by_hand: bool) -> Result<()> {
                 }
             }
         };
-        mark(waiting, Mark::Queued);
-        match judged {
-            Ok(judged) => {
+        mark(judged.waiting, Mark::Queued);
+        mark(judged.left, Mark::Left);
+        // Those not queued stay fresh and are tried again at the next look.
+        let problem = match queued {
+            Ok(()) => {
                 mark(judged.worth, Mark::Queued);
-                mark(judged.left, Mark::Left);
-                // Listed with their reasons by `list`: nothing is wrong with the folder.
-                count_failed_probes(&mut f.files, judged.unjudged, at);
+                problem
             }
-            // They stay fresh and are tried again at the next look.
-            Err(e) => f.note_problem(Some(&e)),
+            Err(e) => Some(e),
+        };
+        // Listed with their reasons by `list`: nothing is wrong with the folder.
+        count_failed_probes(&mut f.files, judged.unjudged, at);
+        if let Some(e) = problem {
+            f.note_problem(Some(&e));
         }
         changed = true;
     }
@@ -537,7 +593,7 @@ pub fn list(app: &App) -> Value {
             let every = f.map_or(LOOK_EVERY, |f| LOOK_EVERY.max((f.walk_secs * 10.0) as u64));
             let next_look = f.and_then(|f| f.looked).map_or(at, |t| t + every);
             let unread = || f.into_iter().flat_map(Folder::unread);
-            let fresh = f.map_or(0, |f| f.files.values().filter(|s| s.mark == Mark::Fresh && !s.unread()).count());
+            let fresh = f.map_or(0, |f| f.found().filter(|(_, s)| s.mark == Mark::Fresh && !s.unread()).count());
             // A try happens at the first look after its wait is over.
             let unread_files: Vec<Value> = unread()
                 .take(UNREAD_LISTED)
@@ -550,7 +606,7 @@ pub fn list(app: &App) -> Value {
                 "error": f.and_then(|f| f.error.clone()),
                 "out_dir_away": f.is_some_and(|f| f.out_dir_away),
                 "out_dir_to_confirm": f.is_some_and(|f| f.out_dir_to_confirm),
-                "videos": f.map_or(0, |f| f.files.len()),
+                "videos": f.map_or(0, |f| f.found().count()),
                 "fresh": fresh, "unread": unread().count(), "unread_files": unread_files,
                 "queued": count(Mark::Queued), "left": count(Mark::Left), "before": count(Mark::Before),
             })
@@ -795,6 +851,7 @@ mod tests {
         let files = BTreeMap::from([(PathBuf::from("/w/here.mkv"), failed_at(1, 90, 100)), (PathBuf::from("/w/gone.mkv"), failed_at(1, 50, 90))]);
         let mut f = Folder { files, found_at: Some(100), ..Default::default() };
         assert_eq!(f.unread().map(|(p, _)| p.to_str().unwrap()).collect::<Vec<_>>(), ["/w/here.mkv"]);
+        assert_eq!(f.found().count(), 1, "what the last look did not find is not counted either");
         // Nothing found at all, as with a drive that is away: what is known stays, unlisted.
         f.found_at = Some(200);
         assert_eq!(f.unread().count(), 0);
@@ -804,30 +861,87 @@ mod tests {
         assert_eq!(f.unread().count(), 2);
     }
 
+    fn numbered(i: usize) -> PathBuf {
+        PathBuf::from(format!("/w/{i:04}.mkv"))
+    }
+
     #[test]
-    fn a_look_tries_again_only_the_videos_that_waited_longest() {
+    fn a_look_tries_first_what_was_never_tried_and_then_what_waited_longest() {
         let now = 1_000_000;
-        let name = |i: usize| PathBuf::from(format!("/w/{i:04}.mkv"));
         // Due again, the lowest numbers tried longest ago.
-        let mut files: BTreeMap<PathBuf, Seen> = (0..1000).map(|i| (name(i), failed_at(1, now - 5000 + i as u64, now))).collect();
+        let mut files: BTreeMap<PathBuf, Seen> = (0..1000).map(|i| (numbered(i), failed_at(1, now - 5000 + i as u64, now))).collect();
         let first_time = PathBuf::from("/w/new.mkv");
         files.insert(first_time.clone(), Seen::new(1, 1, Mark::Fresh, now));
         let before = files.clone();
-        let ready: Vec<PathBuf> = files.keys().cloned().collect();
-        let chosen = with_few_retries(&files, ready, now, false);
-        assert_eq!(chosen.len(), RETRIES_PER_LOOK + 1);
-        // A video never tried is not held back by those that failed.
-        assert_eq!(chosen[0], first_time);
-        assert_eq!(chosen[1..], (0..RETRIES_PER_LOOK).map(name).collect::<Vec<_>>());
-        assert_eq!(files, before, "the waits of the others are left alone");
+        let ready: Vec<PathBuf> = files.keys().cloned().rev().collect();
+        let tries = tries_of(&files, ready, now, false);
+        assert_eq!(tries.first_time, [first_time]);
+        assert_eq!(tries.again, (0..1000).map(numbered).collect::<Vec<_>>());
+        assert_eq!(files, before, "the waits are left alone");
 
-        // Those whose wait is not over come up only when asked for, and then in the same number.
-        let waiting: BTreeMap<PathBuf, Seen> = (0..100).map(|i| (name(i), failed_at(9, now - 10 + i as u64, now))).collect();
-        assert!(with_few_retries(&waiting, Vec::new(), now, false).is_empty());
-        assert_eq!(with_few_retries(&waiting, Vec::new(), now, true), (0..RETRIES_PER_LOOK).map(name).collect::<Vec<_>>());
+        // Those whose wait is not over come up only when asked for.
+        let waiting: BTreeMap<PathBuf, Seen> = (0..100).map(|i| (numbered(i), failed_at(9, now - 10 + i as u64, now))).collect();
+        assert_eq!(tries_of(&waiting, Vec::new(), now, false), Tries::default());
+        assert_eq!(tries_of(&waiting, Vec::new(), now, true).again, (0..100).map(numbered).collect::<Vec<_>>());
         // A video the look did not find is not tried.
-        let gone = BTreeMap::from([(name(0), failed_at(9, now - 10, now - 300))]);
-        assert!(with_few_retries(&gone, Vec::new(), now, true).is_empty());
+        let gone = BTreeMap::from([(numbered(0), failed_at(9, now - 10, now - 300))]);
+        assert_eq!(tries_of(&gone, Vec::new(), now, true), Tries::default());
+    }
+
+    /// Runs rounds in which `fails` says whose probe does not get through, and returns what the
+    /// rounds were given and what came of them.
+    fn rounds_of(first_time: usize, again: usize, time: Duration, stop: impl Fn() -> bool, fails: impl Fn(&PathBuf) -> bool) -> (Vec<Vec<PathBuf>>, Judged, Option<anyhow::Error>) {
+        let tries = Tries { first_time: (5000..5000 + first_time).map(numbered).collect(), again: (0..again).map(numbered).collect() };
+        let mut given = Vec::new();
+        let (judged, problem) = in_rounds(tries, time, stop, |round| {
+            given.push(round.clone());
+            let (failed, worth): (Vec<_>, Vec<_>) = round.into_iter().partition(|p| fails(p));
+            Ok(Judged { worth, unjudged: failed.into_iter().map(|p| (p, "no".to_string())).collect(), ..Default::default() })
+        });
+        (given, judged, problem)
+    }
+
+    #[test]
+    fn a_look_goes_through_all_retries_while_they_get_through() {
+        // The 2000 videos of a drive that is back: one look, not a hundred.
+        let (given, judged, problem) = rounds_of(3, 2000, RETRY_TIME, || false, |_| false);
+        assert!(problem.is_none());
+        assert_eq!(given.len(), 100);
+        assert_eq!(given[0].len(), 3 + RETRIES_PER_ROUND, "those never tried are not held back");
+        assert!(given[1..].iter().all(|round| round.len() == RETRIES_PER_ROUND));
+        assert_eq!(judged.worth.len(), 2003);
+    }
+
+    #[test]
+    fn a_look_ends_when_retries_fail_or_its_time_is_up() {
+        // The drive is still away: one round, as it would cost a probe's limit for each.
+        let (given, judged, _) = rounds_of(3, 2000, RETRY_TIME, || false, |p| *p < numbered(5000));
+        assert_eq!(given.len(), 1);
+        assert_eq!((judged.worth.len(), judged.unjudged.len()), (3, RETRIES_PER_ROUND));
+        // A few damaged files among many that read do not end it.
+        let (given, ..) = rounds_of(0, 100, RETRY_TIME, || false, |p| p.to_str().unwrap().ends_with("0.mkv"));
+        assert_eq!(given.len(), 5);
+        // Half of a round failing does.
+        let (given, ..) = rounds_of(0, 100, RETRY_TIME, || false, |p| *p < numbered(10));
+        assert_eq!(given.len(), 1);
+        // Out of time, or the server stopping.
+        assert_eq!(rounds_of(0, 100, Duration::ZERO, || false, |_| false).0.len(), 1);
+        assert_eq!(rounds_of(0, 100, RETRY_TIME, || true, |_| false).0.len(), 1);
+        // Nothing to try again, and those never tried are still judged.
+        assert_eq!(rounds_of(4, 0, RETRY_TIME, || false, |_| false).0, [(5000..5004).map(numbered).collect::<Vec<_>>()]);
+    }
+
+    #[test]
+    fn what_rounds_found_out_is_kept_when_a_later_one_fails() {
+        let tries = Tries { first_time: Vec::new(), again: (0..100).map(numbered).collect() };
+        let mut rounds = 0;
+        let (judged, problem) = in_rounds(tries, RETRY_TIME, || false, |round| {
+            rounds += 1;
+            anyhow::ensure!(rounds < 3, "the drive went");
+            Ok(Judged { left: round, ..Default::default() })
+        });
+        assert_eq!(judged.left.len(), 2 * RETRIES_PER_ROUND);
+        assert_eq!(problem.unwrap().to_string(), "the drive went");
     }
 
     #[test]

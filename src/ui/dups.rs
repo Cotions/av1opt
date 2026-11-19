@@ -530,7 +530,7 @@ mod tests {
         assert_eq!(std::fs::read_dir(dir.join("Trash/info")).unwrap().count(), 0);
 
         // Where it cannot go back the message says where it is.
-        let report = pair_report(&[spare.clone()]);
+        let report = pair_report(std::slice::from_ref(spare));
         std::fs::write(keep, "again").unwrap();
         let report = Report { files: vec![seen(keep), report.files[0].clone()], groups: vec![Group { kind: Kind::Same, score: 1.0, members: vec![0, 1], reason: String::new(), differences: Vec::new(), look_first: false }], ..Default::default() };
         let moved = move_marked(&report, &HashSet::new(), std::slice::from_ref(spare), &File::unchanged, &|path| {

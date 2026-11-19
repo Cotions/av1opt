@@ -933,8 +933,9 @@ mod tests {
         let dups = "av1opt dups v";
         let bench = "av1opt bench v";
         let curve = "av1opt curve v.mkv --tmp t";
-        // (command, option, range as said, accepted values, refused values)
-        let cases: &[(&str, &str, &str, &[&str], &[&str])] = &[
+        /// Command, option, range as said, accepted values, refused values.
+        type Case<'a> = (&'a str, &'a str, &'a str, &'a [&'a str], &'a [&'a str]);
+        let cases: &[Case] = &[
             (encode, "--sample-secs", "from 1 to 60", &["1", "4.5", "60"], &["nan", "inf", "-inf", "0", "0.99", "-1", "60.5", "1e9", "x"]),
             (curve, "--sample-secs", "from 1 to 60", &["1", "60"], &["nan", "0", "61"]),
             (bench, "--sample-secs", "from 2 to 30", &["2", "30"], &["nan", "inf", "1.9", "31"]),

@@ -370,7 +370,7 @@ fn judge(app: &App, w: &Watch, ready: Vec<PathBuf>) -> Result<Judged> {
     if let Some(problem) = crate::batch::out_dir_problem(&w.out_dir, w.out_dir_place.as_ref()) {
         return Err(problem);
     }
-    let model = Model::fit(&crate::history::load(), w.options.target_vmaf);
+    let model = Model::fit_at_preset(&crate::history::load(), w.options.target_vmaf, w.options.preset);
     let (results, _) = crate::scan::collect(&ready, &app.ffprobe(), app.cfg.jobs, w.options.min_savings, &model, &|_, _| {})?;
     // "Encode anyway" is about the gain expected. AV1 is left even so: an output that took
     // its original's place in this folder would be encoded again, and again after that.

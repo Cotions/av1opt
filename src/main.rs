@@ -505,7 +505,7 @@ fn run_command(command: Cmd) -> Result<()> {
     match command {
         Cmd::Scan { paths, ffprobe, jobs, min_savings, csv, top, target_vmaf, preset, sort, hours, list } => {
             let past = history::load();
-            let model = estimate::Model::fit(&past, target_vmaf);
+            let model = estimate::Model::fit_at_preset(&past, target_vmaf, preset);
             let time = estimate::TimeModel::fit(&past, preset);
             // Absolute roots keep cache keys stable however the folder was typed.
             let paths: Vec<PathBuf> = paths.iter().map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone())).collect();
@@ -832,7 +832,7 @@ fn share_of_memory(percent: f64, workers: f64) -> String {
 fn order_jobs(jobs: &mut [batch::Job], inputs: &[PathBuf], ffprobe: &str, o: &encode::Options, order: batch::Order) -> Result<()> {
     let abs = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
     let past = history::load();
-    let model = estimate::Model::fit(&past, o.target_vmaf);
+    let model = estimate::Model::fit_at_preset(&past, o.target_vmaf, o.preset);
     let time = estimate::TimeModel::fit(&past, o.preset);
     let roots: Vec<PathBuf> = inputs.iter().map(|p| abs(p)).collect();
     eprintln!("probing {} files to order them", jobs.len());

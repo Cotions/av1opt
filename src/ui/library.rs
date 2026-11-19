@@ -348,7 +348,7 @@ pub fn start_scan(app: &Arc<App>, body: &Value) -> Result<Value> {
         bail!("preset must be 0-13");
     }
     let past = history::load();
-    let model = Model::fit(&past, r.target_vmaf);
+    let model = Model::fit_at_preset(&past, r.target_vmaf, r.preset);
     let time = TimeModel::fit(&past, r.preset);
     let id = {
         let mut scans = app.scans.lock().unwrap();

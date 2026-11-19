@@ -12,6 +12,8 @@ use crate::probe::MediaInfo;
 use serde::Serialize;
 
 const BPP_1080P: f64 = 0.035;
+/// The preset of the pilot the first guess comes from.
+const PILOT_PRESET: u8 = 6;
 const PIXELS_1080P: f64 = 1920.0 * 1080.0;
 /// Bigger frames compress better per pixel. Pilot data was noisy (one 4K clip needed ~1/4
 /// the 1080p bpp, small clips only slightly more), so the prior stays mild and conservative.
@@ -39,6 +41,16 @@ const UNKNOWN_CONTENT_SIGMA: f64 = 0.4;
 const FAR_FROM_HISTORY: f64 = 4.0;
 /// Below this many encodes the history says too little of what is like it.
 const MIN_FOR_DISTANCE: usize = 5;
+/// Size of a video at each SVT-AV1 preset against preset 6, at equal VMAF. Measured with SVT-AV1
+/// 4.2 (2026-11-18): preset 3 is 0.84 (eight clips of 10 s only), 4 is 0.906 and 5 is 0.942 (14
+/// clips, every one smaller). The others are not measured: slower ones lose a little more per
+/// step, faster ones gain 4% a step, less than the 6% from 6 to 5 so that a saving is not
+/// overstated.
+const PRESET_SIZE: [f64; 14] = [0.78, 0.79, 0.81, 0.84, 0.906, 0.942, 1.0, 1.04, 1.08, 1.12, 1.16, 1.2, 1.24, 1.28];
+/// One point of VMAF costs this much in the log of the size: 17% of the bytes, measured over
+/// the same clips (2026-11-18).
+const LOG_SIZE_PER_VMAF: f64 = 0.157;
+
 /// The least a measure of the history is taken to vary (log units): a history of one frame
 /// size has no spread of its own, and a video of the same size is then no distance from it.
 const MIN_HISTORY_SD: f64 = 0.1;
@@ -65,21 +77,37 @@ fn bpp(bitrate: f64, width: u32, height: u32, fps: f64) -> f64 {
     if px_per_s > 0.0 { bitrate / px_per_s } else { 0.0 }
 }
 
+fn preset_size(preset: u8) -> f64 {
+    PRESET_SIZE[(preset as usize).min(PRESET_SIZE.len() - 1)]
+}
+
 impl Model {
+    /// The first guess, for the preset the pilot was made with.
     pub fn prior() -> Self {
         Model { beta: [BPP_1080P.ln(), SOURCE_EXPONENT, RES_EXPONENT], sigma: PRIOR_SIGMA, samples: 0, seen: [(0.0, 0.0); 2] }
     }
 
-    /// Ridge regression toward the prior, on encodes made for a similar VMAF target.
+    /// The model for encodes at the default preset, for those to whom the preset does not
+    /// matter.
     pub fn fit(records: &[Record], target_vmaf: f64) -> Self {
-        let prior = Self::prior();
+        Self::fit_at_preset(records, target_vmaf, crate::search::DEFAULT_PRESET)
+    }
+
+    /// Ridge regression toward the prior, on encodes made for a similar VMAF target. Each is
+    /// first brought to the size it would have had at `preset` and exactly at the target.
+    /// Encodes with a CRF per scene came out 0.14 larger in the log on five files: too few to
+    /// correct for, so they count as they are.
+    pub fn fit_at_preset(records: &[Record], target_vmaf: f64, preset: u8) -> Self {
+        let mut prior = Self::prior();
+        prior.beta[0] += (preset_size(preset) / preset_size(PILOT_PRESET)).ln();
         let pts: Vec<([f64; 3], f64)> = records
             .iter()
             .filter(|r| (r.target_vmaf - target_vmaf).abs() <= 1.5)
             .filter_map(|r| {
                 let src = bpp(r.source_bitrate, r.width, r.height, r.fps);
                 let out = bpp(r.output_bitrate, r.width, r.height, r.fps);
-                (src > 0.0 && out > 0.0).then(|| (features(src, r.width as f64 * r.height as f64), out.ln()))
+                let moved = LOG_SIZE_PER_VMAF * (target_vmaf - r.target_vmaf) - (preset_size(r.preset) / preset_size(preset)).ln();
+                (src > 0.0 && out > 0.0).then(|| (features(src, r.width as f64 * r.height as f64), out.ln() + moved))
             })
             .collect();
         if pts.is_empty() {
@@ -481,12 +509,17 @@ mod tests {
         }
     }
 
+    /// The model for the preset of the records these tests make.
+    fn fit(records: &[Record], target: f64) -> Model {
+        Model::fit_at_preset(records, target, 6)
+    }
+
     /// The first guess of seconds per 1080p frame at preset 6.
     const GUESS_1080P: f64 = SPF_1080P * CHECK_AND_REPAIR;
 
     #[test]
     fn no_history_gives_prior() {
-        let m = Model::fit(&[], 93.0);
+        let m = fit(&[], 93.0);
         assert_eq!(m.samples, 0);
         let (lo, mid, hi) = m.predict_bpp(0.1, PIXELS_1080P);
         assert!((mid - BPP_1080P).abs() < 1e-9 && lo < mid && mid < hi);
@@ -519,7 +552,7 @@ mod tests {
                 rec(s, truth(s, w as f64 * h as f64) * noise, w, h)
             })
             .collect();
-        let m = Model::fit(&recs, 93.0);
+        let m = fit(&recs, 93.0);
         assert!((m.beta[1] - 0.8).abs() < 0.05, "{:?}", m.beta);
         assert!((m.beta[2] + 0.3).abs() < 0.05, "{:?}", m.beta);
         assert!(m.sigma < 0.15, "sigma {}", m.sigma);
@@ -529,7 +562,7 @@ mod tests {
 
     #[test]
     fn few_encodes_only_nudge_the_prior() {
-        let m = Model::fit(&[rec(0.1, 0.07, 1920, 1080)], 93.0);
+        let m = fit(&[rec(0.1, 0.07, 1920, 1080)], 93.0);
         let (_, mid, _) = m.predict_bpp(0.1, PIXELS_1080P);
         assert!(mid > BPP_1080P && mid < 0.07, "{mid}");
     }
@@ -749,7 +782,7 @@ mod tests {
     fn ignores_other_vmaf_targets() {
         let mut r = rec(0.1, 0.07, 1920, 1080);
         r.target_vmaf = 97.0;
-        assert_eq!(Model::fit(&[r], 93.0).samples, 0);
+        assert_eq!(fit(&[r], 93.0).samples, 0);
     }
 
     fn video(secs: f64, bitrate: f64) -> MediaInfo {
@@ -863,7 +896,7 @@ mod tests {
 
     #[test]
     fn the_range_widens_away_from_what_the_history_holds() {
-        let m = Model::fit(&varied_history(60), 93.0);
+        let m = fit(&varied_history(60), 93.0);
         let middle = (0.1, 1600.0 * 900.0);
         let beside = top_of_range(&m, middle.0, middle.1);
         // At the middle of the history nothing is added.
@@ -882,13 +915,13 @@ mod tests {
     fn with_few_encodes_every_video_counts_as_unlike_them() {
         let whole = |m: &Model| (m.sigma.powi(2) + UNKNOWN_CONTENT_SIGMA.powi(2)).sqrt();
         for n in [0, 1, 4] {
-            let m = Model::fit(&varied_history(n), 93.0);
+            let m = fit(&varied_history(n), 93.0);
             assert!(near(m.sigma_for(&features(0.1, PIXELS_1080P)), whole(&m)), "{n}");
         }
         // Five are enough to tell, and a history of one frame size and one kind of source
         // finds the same video close and another frame size far.
         let same = vec![rec(0.1, 0.03, 1920, 1080); 5];
-        let m = Model::fit(&same, 93.0);
+        let m = fit(&same, 93.0);
         assert!(near(m.sigma_for(&features(0.1, PIXELS_1080P)), m.sigma));
         assert!(near(m.sigma_for(&features(0.1, 1280.0 * 720.0)), whole(&m)));
     }
@@ -905,10 +938,33 @@ mod tests {
     }
 
     #[test]
+    fn the_size_model_learns_from_encodes_of_other_presets_and_targets() {
+        let likely = |m: &Model| m.predict_bpp(0.1, PIXELS_1080P).1;
+        let at_six = varied_history(60);
+        // Asked about preset 5, a history of preset 6 and the first guess both say 5.8% less.
+        for records in [&at_six[..], &[]] {
+            let ratio = likely(&Model::fit_at_preset(records, 93.0, 5)) / likely(&Model::fit_at_preset(records, 93.0, 6));
+            assert!(near(ratio, 0.942), "{ratio}");
+        }
+        assert!(near(likely(&Model::fit_at_preset(&at_six, 93.0, 4)) / likely(&fit(&at_six, 93.0)), 0.906));
+        // Encodes at preset 4, 9.4% smaller, teach the same as those at 6 did.
+        let at_four: Vec<Record> = at_six.iter().map(|r| Record { preset: 4, output_bitrate: r.output_bitrate * 0.906, ..r.clone() }).collect();
+        assert!(near(likely(&fit(&at_four, 93.0)), likely(&fit(&at_six, 93.0))));
+        // Encodes made for a point below the target stand for larger files at it.
+        let shift = LOG_SIZE_PER_VMAF.exp();
+        let lower: Vec<Record> = at_six.iter().map(|r| Record { target_vmaf: 92.0, output_bitrate: r.output_bitrate / shift, ..r.clone() }).collect();
+        assert!(near(likely(&fit(&lower, 93.0)), likely(&fit(&at_six, 93.0))));
+        // Presets past the last known size count as the last.
+        assert_eq!(preset_size(14), preset_size(13));
+        assert!((1..14).all(|p| preset_size(p) > preset_size(p - 1)));
+        assert_eq!(preset_size(PILOT_PRESET), 1.0);
+    }
+
+    #[test]
     fn encodes_count_within_a_point_and_a_half_of_the_target() {
         let at = |target: f64| Record { target_vmaf: target, ..rec(0.1, 0.07, 1920, 1080) };
-        assert_eq!(Model::fit(&[at(91.5), at(94.5), at(93.0)], 93.0).samples, 3);
-        assert_eq!(Model::fit(&[at(91.4), at(94.6)], 93.0).samples, 0);
+        assert_eq!(fit(&[at(91.5), at(94.5), at(93.0)], 93.0).samples, 3);
+        assert_eq!(fit(&[at(91.4), at(94.6)], 93.0).samples, 0);
     }
 
     #[test]
@@ -920,7 +976,7 @@ mod tests {
             Record { width: 0, ..rec(0.1, 0.07, 1920, 1080) },
             Record { fps: f64::NAN, ..rec(0.1, 0.07, 1920, 1080) },
         ];
-        let m = Model::fit(&bad, 93.0);
+        let m = fit(&bad, 93.0);
         assert_eq!(m.samples, 0);
         assert_eq!(m.beta, Model::prior().beta);
         assert_eq!(m.sigma, PRIOR_SIGMA);
@@ -937,7 +993,7 @@ mod tests {
                 rec(s, prior.predict_bpp(s, w as f64 * h as f64).1, w, h)
             })
             .collect();
-        let m = Model::fit(&recs, 93.0);
+        let m = fit(&recs, 93.0);
         assert_eq!(m.samples, 300);
         assert!(m.beta.iter().zip(prior.beta).all(|(a, b)| (a - b).abs() < 1e-9), "{:?}", m.beta);
         // However well they agree, a video can still surprise.

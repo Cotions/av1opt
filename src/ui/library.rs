@@ -508,7 +508,7 @@ fn replace_state(ledger: &Ledger, report: &Path, on_record: bool) -> Value {
     }
     let no = |why: String| json!({ "state": "no", "why": why });
     match replace::check_for_list(report) {
-        Check::Ready(p) => match ledger.check_ready(&p, false) {
+        Check::Ready(p) => match ledger.check_ready(&p, None) {
             Ok(()) => json!({ "state": "ready", "dest": p.dest, "copy": p.copy, "zfs": p.zfs, "removed": p.removed }),
             Err(why) => no(why),
         },
@@ -658,8 +658,8 @@ pub fn replace_original(app: &App, body: &Value) -> Result<Value> {
         bail!("the original is in the encode queue");
     }
     // The record is what says this output and this original belong together, and the output is
-    // read through here, as it is about to take the original's place.
-    let done = replace::apply_if(&report, r.allow_zfs, &|p| app.ledger.current().check_ready(p, true))?;
+    // read here through the very descriptor that makes sure it is the file that gets moved.
+    let done = replace::apply_if(&report, r.allow_zfs, &|p, output| app.ledger.current().check_ready(p, Some(output)))?;
     Ok(json!({ "dest": done.dest, "trash": done.trash, "source_bytes": done.source_bytes, "warnings": done.warnings }))
 }
 

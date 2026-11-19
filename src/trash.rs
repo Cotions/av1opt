@@ -290,9 +290,21 @@ fn holds_with(trashed: &Path, original: &Path, is_top: &dyn Fn(&Path) -> bool) -
 /// Puts a file `trash` moved away back at `to` and drops its info file. Nothing at `to` is
 /// replaced.
 pub fn restore(trashed: &Path, to: &Path) -> Result<()> {
+    restore_if(trashed, to, &|_| true)
+}
+
+/// [`restore`], for a file that has to be a particular one: `is_it` is asked of what arrived, and
+/// anything else goes back into the trash under its name, with the info file still there.
+pub fn restore_if(trashed: &Path, to: &Path, is_it: &dyn Fn(&std::fs::Metadata) -> bool) -> Result<()> {
     let files = trashed.parent().filter(|d| d.file_name().is_some_and(|n| n == "files"));
     let (Some(files), Some(name)) = (files, trashed.file_name()) else { bail!("{} is not in a trash folder", trashed.display()) };
     rename_new(trashed, to).with_context(|| format!("cannot move {} back to {}", trashed.display(), to.display()))?;
+    if !std::fs::symlink_metadata(to).is_ok_and(|m| is_it(&m)) {
+        return Err(match rename_new(to, trashed) {
+            Ok(()) => anyhow::anyhow!("{} was replaced by another file while it was being put back, so it was left in the trash", trashed.display()),
+            Err(e) => anyhow::anyhow!("{} was replaced by another file while it was being put back, and that file could not be taken away from {}: {e}", trashed.display(), to.display()),
+        });
+    }
     let mut info_name = name.to_os_string();
     info_name.push(".trashinfo");
     if let Some(bin) = files.parent() {

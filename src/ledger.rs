@@ -9,13 +9,14 @@
 use crate::source::Recorded;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+#[cfg(any(feature = "ui", test))]
 use std::io::Read;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 #[cfg(any(feature = "ui", test))]
-use crate::replace::{Plan, Replaced};
+use crate::replace::{OpenFile, Plan, Replaced};
 #[cfg(any(feature = "ui", test))]
 use std::collections::{HashMap, HashSet};
 #[cfg(any(feature = "ui", test))]
@@ -225,9 +226,9 @@ impl Ledger {
     }
 
     /// Whether the page may put this output in its original's place. `replace` has compared the
-    /// original with what the report says, so that has to be what is recorded. `read_output`
-    /// reads the whole output as well, for when something is about to be moved.
-    pub fn check_ready(&self, p: &Plan, read_output: bool) -> Result<(), String> {
+    /// original with what the report says, so that has to be what is recorded. With the output
+    /// open, for when something is about to be moved, all of it is read through that.
+    pub fn check_ready(&self, p: &Plan, output: Option<&OpenFile>) -> Result<(), String> {
         let entry = self.entry(&p.output, &p.source).ok_or_else(|| self.refusal())?;
         if entry.replaced.is_some() {
             return Err("av1opt's record says this original has already been replaced".into());
@@ -239,11 +240,9 @@ impl Ledger {
         if p.output_bytes != made.output_bytes {
             return Err("the output is not the file av1opt made: its size differs".into());
         }
-        if !read_output {
-            return Ok(());
-        }
+        let Some(output) = output else { return Ok(()) };
         let wanted = made.output_sha256.as_deref().ok_or("av1opt could not record the contents of this output when it was made, so the page will not move it; `av1opt replace` in a terminal can")?;
-        match sha256_of_file(&p.output) {
+        match output.sha256() {
             Ok(now) if now == wanted => Ok(()),
             Ok(_) => Err("the output is not the file av1opt made: its contents differ".into()),
             Err(e) => Err(format!("the output could not be read to check that it is the file av1opt made: {e}")),
@@ -489,24 +488,39 @@ fn start_page_with(history_lines: &dyn Fn() -> usize) -> Option<String> {
 pub fn sha256_of_file(path: &Path) -> std::io::Result<String> {
     let path = path.to_path_buf();
     crate::source::read_watched(move |got| {
-        let mut file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(&path)?;
+        let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(&path)?;
         if !file.metadata()?.is_file() {
             return Err(std::io::Error::other("not a plain file"));
         }
-        let mut hash = Sha256::new();
-        let mut buffer = vec![0u8; 1 << 20];
-        loop {
-            match file.read(&mut buffer) {
-                Ok(0) => return Ok(hash.finish()),
-                Ok(n) => {
-                    hash.add(&buffer[..n]);
-                    got.fetch_add(n as u64, Ordering::Relaxed);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
-            }
-        }
+        sha256_reading(&file, got)
     })
+}
+
+/// [`sha256_of_file`] of a file already open, which is then the file the answer is about,
+/// whatever has become of its name.
+#[cfg(any(feature = "ui", test))]
+pub fn sha256_of_open(file: &std::fs::File) -> std::io::Result<String> {
+    let file = file.try_clone()?;
+    crate::source::read_watched(move |got| sha256_reading(&file, got))
+}
+
+/// Reads by position, leaving alone the place in the file that others sharing it go by.
+fn sha256_reading(file: &std::fs::File, got: &std::sync::atomic::AtomicU64) -> std::io::Result<String> {
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    let mut at = 0;
+    loop {
+        match file.read_at(&mut buffer, at) {
+            Ok(0) => return Ok(hash.finish()),
+            Ok(n) => {
+                hash.add(&buffer[..n]);
+                at += n as u64;
+                got.fetch_add(n as u64, Ordering::Relaxed);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 const ROUND_CONSTANTS: [u32; 64] = [
@@ -848,11 +862,12 @@ mod tests {
         let s = Scratch::new("ready");
         let (source, output) = s.encoded("a");
         let plan = s.plan(&source, &output);
-        assert_eq!(load().check_ready(&plan, true), Ok(()));
+        let open = |p: &Path| OpenFile::open(p, 1000).unwrap();
+        assert_eq!(load().check_ready(&plan, Some(&open(&output))), Ok(()));
         // Another original under the same output is not what was encoded.
         let victim = s.0.join("victim.mp4");
         std::fs::write(&victim, vec![b'v'; 3000]).unwrap();
-        assert_eq!(load().check_ready(&s.plan(&victim, &output), true), Err(NOT_RECORDED.to_string()));
+        assert_eq!(load().check_ready(&s.plan(&victim, &output), Some(&open(&output))), Err(NOT_RECORDED.to_string()));
         // A report that describes the original otherwise has had it compared with that instead.
         for change in [
             (|k: &mut Recorded| k.whole = Some("of what is there now".into())) as fn(&mut Recorded),
@@ -862,12 +877,12 @@ mod tests {
         ] {
             let mut forged = s.plan(&source, &output);
             change(&mut forged.original);
-            assert_eq!(load().check_ready(&forged, false), Err(DISAGREES.to_string()));
+            assert_eq!(load().check_ready(&forged, None), Err(DISAGREES.to_string()));
         }
         // An output of the right size with other contents is only caught by reading it.
         std::fs::write(&output, vec![b'x'; 1000]).unwrap();
-        assert_eq!(load().check_ready(&plan, false), Ok(()));
-        assert!(load().check_ready(&plan, true).unwrap_err().contains("contents differ"));
+        assert_eq!(load().check_ready(&plan, None), Ok(()));
+        assert!(load().check_ready(&plan, Some(&open(&output))).unwrap_err().contains("contents differ"));
     }
 
     #[test]
@@ -876,7 +891,7 @@ mod tests {
         let (source, output) = (s.0.join("a.mp4"), s.0.join("a.mkv"));
         std::fs::write(&output, vec![b'o'; 1000]).unwrap();
         note_encoded(&Encode { output: &output, report: &output.with_extension("av1opt.json"), source: &source, source_bytes: 3000, original: &known(), output_bytes: 1000, output_sha256: None }).unwrap();
-        assert!(load().check_ready(&s.plan(&source, &output), true).unwrap_err().contains("could not record"));
+        assert!(load().check_ready(&s.plan(&source, &output), Some(&OpenFile::open(&output, 1000).unwrap())).unwrap_err().contains("could not record"));
     }
 
     #[test]

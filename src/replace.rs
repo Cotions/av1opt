@@ -7,11 +7,13 @@
 //! land on an existing file. Space is only freed when the trash is emptied.
 
 use crate::encode::REPORT_FORMAT;
-use crate::source::{Recorded, Verdict};
+use crate::source::{Recorded, Stamp, Verdict};
 use crate::trash;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
-use std::os::unix::fs::MetadataExt;
+use std::fs::File;
+use std::io::{Seek, SeekFrom};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -348,17 +350,79 @@ fn clear_left_behind(dest: &Path) {
     }
 }
 
-/// Copies `from` to `to` (which must not exist), flushed to disk and with the same date.
-fn copy_new(from: &Path, to: &Path, bytes: u64) -> Result<()> {
+/// A file opened once. Whoever can write to its folder can put another file under its name at
+/// any moment, so what is checked is read through this, and what is moved is compared with it.
+pub struct OpenFile {
+    file: File,
+    stamp: Stamp,
+}
+
+impl OpenFile {
+    /// Opens the plain file at `path`, which has to hold `bytes` bytes. A link is not followed.
+    pub(crate) fn open(path: &Path, bytes: u64) -> Result<OpenFile> {
+        let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path).map_err(|e| match e.raw_os_error() {
+            Some(libc::ELOOP) => anyhow!("{} is a link", path.display()),
+            _ => anyhow!("cannot open {}: {e}", path.display()),
+        })?;
+        let meta = file.metadata().with_context(|| format!("cannot look at {}", path.display()))?;
+        if !meta.is_file() {
+            bail!("{} is not a plain file", path.display());
+        }
+        if meta.len() != bytes {
+            bail!("{} is not the size it should be", path.display());
+        }
+        Ok(OpenFile { stamp: Stamp::of(&meta), file })
+    }
+
+    /// The SHA-256 of what is in this file, whatever its name leads to by now.
+    #[cfg(any(feature = "ui", test))]
+    pub fn sha256(&self) -> std::io::Result<String> {
+        crate::ledger::sha256_of_open(&self.file)
+    }
+
+    fn is(&self, meta: &std::fs::Metadata) -> bool {
+        self.stamp.same_file(meta)
+    }
+
+    /// Whether `path` leads to this file, not following a link.
+    fn is_at(&self, path: &Path) -> bool {
+        std::fs::symlink_metadata(path).is_ok_and(|m| self.is(&m))
+    }
+
+    /// Whether nothing has been written to this file, or changed about it, since it was opened.
+    fn untouched(&self) -> bool {
+        self.file.metadata().is_ok_and(|m| Stamp::of(&m) == self.stamp)
+    }
+}
+
+/// Renames `from` to `to`, where nothing is, and makes sure that what arrived is `file`. If it is
+/// not, it goes back where it came from, or under a hidden name beside that if the name has been
+/// taken again: it must not stay in a place it was never checked for.
+fn land(from: &Path, to: &Path, file: &OpenFile) -> std::io::Result<()> {
+    trash::rename_new(from, to)?;
+    if file.is_at(to) {
+        return Ok(());
+    }
+    let taken_back = trash::rename_new(to, from).or_else(|_| trash::rename_new(to, &staging_name(from)));
+    Err(std::io::Error::other(match taken_back {
+        Ok(()) => format!("{} was replaced by another file while it was being moved", from.display()),
+        Err(e) => format!("{} was replaced by another file while it was being moved, and that file could not be taken away from {}: {e}", from.display(), to.display()),
+    }))
+}
+
+/// Copies the open file `from` to `to` (which must not exist), flushed to disk and with the same
+/// date. Returns the copy, open.
+fn copy_new(from: &OpenFile, to: &Path, bytes: u64) -> Result<OpenFile> {
     let dir = to.parent().unwrap_or(Path::new("/"));
     if let Some(free) = free_space(dir)
         && free < bytes.saturating_add(16 << 20)
     {
         bail!("not enough room in {} ({} MB free, {} MB needed)", dir.display(), free >> 20, bytes >> 20);
     }
-    let run = || -> Result<()> {
-        let mut src = std::fs::File::open(from)?;
-        let mut dst = std::fs::File::options().write(true).create_new(true).open(to)?;
+    let run = || -> Result<OpenFile> {
+        let mut src = from.file.try_clone()?;
+        src.seek(SeekFrom::Start(0))?;
+        let mut dst = File::options().read(true).write(true).create_new(true).open(to)?;
         let n = std::io::copy(&mut src, &mut dst)?;
         if n != bytes {
             bail!("copied {n} bytes of {bytes}");
@@ -367,25 +431,37 @@ fn copy_new(from: &Path, to: &Path, bytes: u64) -> Result<()> {
             let _ = dst.set_modified(t);
         }
         dst.sync_all()?;
-        Ok(())
+        Ok(OpenFile { stamp: Stamp::of(&dst.metadata()?), file: dst })
     };
-    run().inspect_err(|_| drop(std::fs::remove_file(to))).with_context(|| format!("cannot copy {} to {}", from.display(), dir.display()))
+    run().inspect_err(|_| drop(std::fs::remove_file(to))).with_context(|| format!("cannot copy {} to {}", to.file_name().unwrap_or_default().to_string_lossy(), dir.display()))
 }
 
-/// Moves a file to a path nothing is at; across filesystems by a checked copy under a hidden
-/// name, after which the file is removed from where it was.
-fn move_new(from: &Path, to: &Path, bytes: u64) -> Result<()> {
-    match trash::rename_new(from, to) {
-        Ok(()) => Ok(()),
+/// How a file got to its new place.
+enum Moved {
+    Renamed,
+    /// Across filesystems: this is the copy, and the file it was made from is gone.
+    Copied(OpenFile),
+}
+
+/// Moves the open file `file` from `from` to a path nothing is at; across filesystems by a checked
+/// copy under a hidden name, after which the old name is removed if it still leads to that file.
+fn move_open(file: &OpenFile, from: &Path, to: &Path, bytes: u64) -> Result<Moved> {
+    if !file.is_at(from) {
+        bail!("{} was replaced by another file, so nothing was moved", from.display());
+    }
+    match land(from, to, file) {
+        Ok(()) => Ok(Moved::Renamed),
         Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
             let part = staging_name(to);
             clear_left_behind(to);
-            copy_new(from, &part, bytes)?;
-            trash::rename_new(&part, to).inspect_err(|_| drop(std::fs::remove_file(&part))).with_context(|| format!("cannot name the copy {}", to.display()))?;
-            if let Err(e) = std::fs::remove_file(from) {
+            let copy = copy_new(file, &part, bytes)?;
+            land(&part, to, &copy).inspect_err(|_| drop(std::fs::remove_file(&part))).with_context(|| format!("cannot name the copy {}", to.display()))?;
+            if !file.is_at(from) {
+                eprintln!("warning: copied, but {} is another file by now, so it was left there", from.display());
+            } else if let Err(e) = std::fs::remove_file(from) {
                 eprintln!("warning: copied, but could not remove {}: {e}", from.display());
             }
-            Ok(())
+            Ok(Moved::Copied(copy))
         }
         Err(e) => Err(e).with_context(|| format!("cannot move {} to {}", from.display(), to.display())),
     }
@@ -455,66 +531,79 @@ impl Drop for Lock {
 /// copied next to the original under a hidden name, so a copy that fails (no room, a read
 /// error) leaves the original untouched; its old file is removed once the copy is in place.
 /// The hidden file is only ever a copy: deleting one never loses anything.
+///
+/// The output is opened once, before `accept` is asked, and handed to it: what is read through
+/// that is what ends up at the destination, or nothing does.
 #[cfg(feature = "ui")]
-pub fn apply_if(report: &Path, allow_zfs: bool, accept: Accept<Plan>) -> Result<Done> {
+pub fn apply_if(report: &Path, allow_zfs: bool, accept: AcceptOutput) -> Result<Done> {
     apply_judging(report, allow_zfs, Judging::default(), &trash::trash, accept)
 }
 
 #[cfg(test)]
 fn apply_with(report: &Path, allow_zfs: bool, to_trash: &dyn Fn(&Path) -> Result<PathBuf>) -> Result<Done> {
-    apply_judging(report, allow_zfs, Judging::default(), to_trash, &|_| Ok(()))
+    apply_judging(report, allow_zfs, Judging::default(), to_trash, &|_, _| Ok(()))
 }
 
 /// Has the last word on what a report comes to, or says why not.
 type Accept<'a, T> = &'a dyn Fn(&T) -> Result<(), String>;
 
-fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: &dyn Fn(&Path) -> Result<PathBuf>, accept: Accept<Plan>) -> Result<Done> {
+/// [`Accept`] for a replacement, with the output as it was opened to be moved.
+type AcceptOutput<'a> = &'a dyn Fn(&Plan, &OpenFile) -> Result<(), String>;
+
+fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: &dyn Fn(&Path) -> Result<PathBuf>, accept: AcceptOutput) -> Result<Done> {
     let _lock = lock(report)?;
     let p = match check_judging(report, judging) {
         Check::Ready(p) => p,
         Check::Replaced(_) => bail!("already replaced"),
         Check::No(why) => bail!("{why}"),
     };
-    accept(&p).map_err(|why| anyhow!(why))?;
+    let output = OpenFile::open(&p.output, p.output_bytes)?;
+    accept(&p, &output).map_err(|why| anyhow!(why))?;
     if p.zfs && !allow_zfs {
         bail!("the original is on ZFS, so it was left where it is and nothing was changed; --allow-zfs replaces originals there");
     }
     let source_meta = std::fs::symlink_metadata(&p.source)?;
+    if !output.is_at(&p.output) || !output.untouched() {
+        bail!("the output was changed or replaced by another file while it was being checked, so nothing was changed");
+    }
     let in_place = p.dest == p.output;
     let staged = staging_name(&p.dest);
     let stage = || {
         // The output itself is still where it was.
         clear_left_behind(&p.dest);
-        copy_new(&p.output, &staged, p.output_bytes)
+        copy_new(&output, &staged, p.output_bytes)
     };
-    let staged_first = !in_place && p.copy;
-    if staged_first {
-        stage()?;
+    let mut staged_first = None;
+    if !in_place && p.copy {
+        staged_first = Some(stage()?);
     }
     let trashed = match to_trash(&p.source) {
         Ok(t) => t,
         Err(e) => {
-            if staged_first {
+            if staged_first.is_some() {
                 let _ = std::fs::remove_file(&staged);
             }
             return Err(e.context("the original could not be moved to the trash; nothing was changed"));
         }
     };
-    // Ok(true): the output was copied, and its old file is still in the output folder.
-    let placed: Result<bool> = if in_place {
-        Ok(false)
-    } else if staged_first {
-        trash::rename_new(&staged, &p.dest).map(|_| true).map_err(Into::into)
+    // Some(copy): the output was copied, and its old file is still in the output folder.
+    let placed: Result<Option<OpenFile>> = if in_place {
+        if output.is_at(&p.output) { Ok(None) } else { Err(anyhow!("{} was replaced by another file", p.output.display())) }
+    } else if let Some(copy) = staged_first {
+        land(&staged, &p.dest, &copy).map(|()| Some(copy)).map_err(Into::into)
     } else {
-        match trash::rename_new(&p.output, &p.dest) {
-            Ok(()) => Ok(false),
+        match land(&p.output, &p.dest, &output) {
+            Ok(()) => Ok(None),
             // Same device number but not one mount (a filesystem mounted twice): copy after all.
-            Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => stage().and_then(|_| Ok(trash::rename_new(&staged, &p.dest)?)).map(|_| true),
+            Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => stage().and_then(|copy| {
+                land(&staged, &p.dest, &copy)?;
+                Ok(Some(copy))
+            }),
             Err(e) => Err(e.into()),
         }
     };
-    let copied = match placed {
-        Ok(copied) => copied,
+    let copy = match placed {
+        Ok(copy) => copy,
         Err(e) => {
             if !in_place {
                 let _ = std::fs::remove_file(&staged);
@@ -528,12 +617,17 @@ fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: &dy
 
     // From here on both files are where they belong; what follows is tidying.
     let mut warnings = Vec::new();
-    if std::fs::set_permissions(&p.dest, source_meta.permissions()).is_err() {
+    // Through the open file: by name, this would reach whatever has been put there since.
+    if copy.as_ref().unwrap_or(&output).file.set_permissions(source_meta.permissions()).is_err() {
         warnings.push("could not give the AV1 file the original's permissions".to_string());
     }
     sync_dir(p.dest.parent().unwrap_or(Path::new("/")));
-    if copied && let Err(e) = std::fs::remove_file(&p.output) {
-        warnings.push(format!("the copy is in place, but {} could not be removed: {e}", p.output.display()));
+    if copy.is_some() {
+        if !output.is_at(&p.output) {
+            warnings.push(format!("the copy is in place, but {} is another file by now, so it was left there", p.output.display()));
+        } else if let Err(e) = std::fs::remove_file(&p.output) {
+            warnings.push(format!("the copy is in place, but {} could not be removed: {e}", p.output.display()));
+        }
     }
     let source_mtime = std::fs::symlink_metadata(&trashed).ok().and_then(|m| crate::source::modified_seconds(&m));
     let went = Recorded { modified: source_mtime.or(p.original.modified), ..p.original.clone() };
@@ -562,6 +656,11 @@ fn undo(report: &Path, allow_zfs: bool) -> Result<Replaced> {
 
 /// [`undo`], if `accept` agrees to what the report comes to, asked as [`apply_if`] asks.
 pub fn undo_if(report: &Path, allow_zfs: bool, accept: Accept<Replaced>) -> Result<Replaced> {
+    undo_watched(report, allow_zfs, accept, &|| {})
+}
+
+/// [`undo_if`], with `before_moving` called when everything has been checked and nothing moved.
+fn undo_watched(report: &Path, allow_zfs: bool, accept: Accept<Replaced>, before_moving: &dyn Fn()) -> Result<Replaced> {
     let _lock = lock(report)?;
     let d = match check(report) {
         Check::Replaced(d) => d,
@@ -577,6 +676,8 @@ pub fn undo_if(report: &Path, allow_zfs: bool, accept: Accept<Replaced>) -> Resu
     if !trash::says_came_from(&d.trash, &d.source) {
         bail!("the trash does not say that {} came from {}", d.trash.display(), d.source.display());
     }
+    // Opened before it is judged, so that the file judged can be told from one put there later.
+    let original = OpenFile::open(&d.trash, d.source_bytes).context("the file in the trash is not the original")?;
     if !trash::is_file_recorded(&d.trash, &d.original) {
         bail!("the file in the trash is not the original: it changed after the original went there");
     }
@@ -585,6 +686,7 @@ pub fn undo_if(report: &Path, allow_zfs: bool, accept: Accept<Replaced>) -> Resu
     if file_size(&d.dest) != Some(d.output_bytes) {
         bail!("the AV1 file is gone or has changed");
     }
+    let av1 = OpenFile::open(&d.dest, d.output_bytes).context("the AV1 file is gone or has changed")?;
     if d.from != d.dest {
         if std::fs::symlink_metadata(&d.from).is_ok() {
             bail!("{} already exists", d.from.display());
@@ -598,11 +700,23 @@ pub fn undo_if(report: &Path, allow_zfs: bool, accept: Accept<Replaced>) -> Resu
     if d.source != d.dest && std::fs::symlink_metadata(&d.source).is_ok() {
         bail!("{} already exists", d.source.display());
     }
-    if d.from != d.dest {
-        move_new(&d.dest, &d.from, d.output_bytes)?;
+    before_moving();
+    if !original.is_at(&d.trash) || !original.untouched() {
+        bail!("the file in the trash was changed or replaced while it was being checked, so nothing was moved");
     }
-    trash::restore(&d.trash, &d.source)
-        .with_context(|| format!("the AV1 file is back at {}, but the original is still in the trash at {}", d.from.display(), d.trash.display()))?;
+    let moved = if d.from == d.dest { None } else { Some(move_open(&av1, &d.dest, &d.from, d.output_bytes)?) };
+    if let Err(e) = trash::restore_if(&d.trash, &d.source, &|m| original.is(m)) {
+        // Both go back to where the report says they are, so that this can be tried again.
+        let at_from = match &moved {
+            Some(Moved::Copied(copy)) => copy,
+            _ => &av1,
+        };
+        let returned = if moved.is_some() { move_open(at_from, &d.from, &d.dest, d.output_bytes).map(drop) } else { Ok(()) };
+        return Err(match returned {
+            Ok(()) => e.context(format!("the original is still in the trash at {} and the AV1 file is at {}", d.trash.display(), d.dest.display())),
+            Err(back) => e.context(format!("the original is still in the trash at {}, and the AV1 file is at {} because it could not go back to {} ({back:#})", d.trash.display(), d.from.display(), d.dest.display())),
+        });
+    }
     sync_dir(d.source.parent().unwrap_or(Path::new("/")));
     if let Err(e) = crate::ledger::note_undone(&d.source, &d.dest, &d.from) {
         eprintln!("warning: the original is back, but av1opt's own record of that could not be written: {e:#}");
@@ -788,7 +902,7 @@ pub fn run(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_chan
         }
         let (mut done, mut trashed) = (0, 0u64);
         for p in &ready {
-            match apply_judging(&p.report, allow_zfs, judging, &trash::trash, &|p| named.accept(&p.source)) {
+            match apply_judging(&p.report, allow_zfs, judging, &trash::trash, &|p, _| named.accept(&p.source)) {
                 Ok(d) => {
                     done += 1;
                     trashed += d.source_bytes;
@@ -887,11 +1001,221 @@ mod tests {
         assert!(NamedFolders::of(std::slice::from_ref(&lib), false).holds(&source));
     }
 
+    /// A file of the output's size that is not the output.
+    fn swap_for_another_file(path: &Path) -> PathBuf {
+        let kept = path.with_extension("real");
+        std::fs::rename(path, &kept).unwrap();
+        std::fs::write(path, vec![b'e'; 400]).unwrap();
+        kept
+    }
+
+    fn swap_for_a_link(path: &Path, to: &Path) -> PathBuf {
+        let kept = path.with_extension("real");
+        std::fs::rename(path, &kept).unwrap();
+        std::os::unix::fs::symlink(to, path).unwrap();
+        kept
+    }
+
+    fn mode(p: &Path) -> u32 {
+        std::fs::symlink_metadata(p).unwrap().mode() & 0o7777
+    }
+
+    #[test]
+    fn an_output_swapped_after_it_was_checked_is_not_moved() {
+        // While `accept` reads it, and so before anything has moved.
+        let f = Fix::new("swap-checked");
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        let output = f.out("a.mkv");
+        let hash_seen = std::cell::RefCell::new(String::new());
+        let err = apply_judging(&report, true, Judging::default(), &trash::trash, &|_, opened| {
+            *hash_seen.borrow_mut() = opened.sha256().unwrap();
+            swap_for_another_file(&output);
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("replaced by another file"), "{err}");
+        assert_eq!(*hash_seen.borrow(), crate::ledger::sha256_of_file(&f.out("a.real")).unwrap(), "the hash is of the file opened");
+        assert_eq!(std::fs::read(&output).unwrap(), vec![b'e'; 400]);
+        assert_eq!(std::fs::read(f.lib("a.mp4")).unwrap(), vec![b's'; 1000]);
+        assert!(!f.lib("a.mkv").exists() && !f.dir.join("Trash/files/a.mp4").exists());
+    }
+
+    #[test]
+    fn an_output_rewritten_after_it_was_checked_is_not_moved() {
+        let f = Fix::new("rewrite-checked");
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        let output = f.out("a.mkv");
+        // File times move with the kernel's clock tick: a write in the tick that made the file
+        // would leave no mark to go by.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let err = apply_judging(&report, true, Judging::default(), &trash::trash, &|_, _| {
+            std::fs::write(&output, vec![b'e'; 400]).unwrap();
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("changed or replaced"), "{err}");
+        assert!(f.lib("a.mp4").exists() && !f.lib("a.mkv").exists());
+    }
+
+    #[test]
+    fn what_was_put_in_the_outputs_place_at_the_last_moment_goes_back() {
+        let home = |f: &Fix| f.dir.join("Trash");
+        // Another file, between the last look and the move.
+        let f = Fix::new("swap-file");
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        let (output, dest) = (f.out("a.mkv"), f.lib("a.mkv"));
+        let err = apply_with(&report, true, &|p| {
+            let t = trash::trash_with(p, Some(&home(&f)), 1000, "2026-11-10T22:15:03".into())?;
+            swap_for_another_file(&output);
+            Ok(t)
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("replaced by another file") && err.to_string().ends_with("the original is back in its place"), "{err}");
+        assert_eq!(std::fs::read(f.lib("a.mp4")).unwrap(), vec![b's'; 1000]);
+        assert_eq!(std::fs::read(&output).unwrap(), vec![b'e'; 400]);
+        assert_eq!(std::fs::read(f.out("a.real")).unwrap(), vec![b'o'; 400]);
+        assert!(!dest.exists());
+        assert_eq!(std::fs::read_dir(home(&f).join("files")).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(home(&f).join("info")).unwrap().count(), 0);
+
+        // A link, which would also have passed the original's permissions on to what it leads to.
+        let f = Fix::new("swap-link");
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        let (output, dest, victim) = (f.out("a.mkv"), f.lib("a.mkv"), f.dir.join("victim"));
+        std::fs::write(&victim, b"private").unwrap();
+        std::fs::set_permissions(&victim, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(f.lib("a.mp4"), std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
+        let err = apply_with(&report, true, &|p| {
+            let t = trash::trash_with(p, Some(&home(&f)), 1000, "2026-11-10T22:15:03".into())?;
+            swap_for_a_link(&output, &victim);
+            Ok(t)
+        })
+        .unwrap_err();
+        assert!(err.to_string().ends_with("the original is back in its place"), "{err}");
+        assert!(std::fs::symlink_metadata(&output).unwrap().file_type().is_symlink());
+        assert!(f.lib("a.mp4").exists() && std::fs::symlink_metadata(&dest).is_err());
+        assert_eq!((mode(&victim), std::fs::read(&victim).unwrap()), (0o600, b"private".to_vec()));
+    }
+
+    #[test]
+    fn a_link_in_the_outputs_place_before_the_check_is_refused() {
+        let f = Fix::new("link-first");
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        let target = f.dir.join("target.mkv");
+        std::fs::write(&target, vec![b't'; 400]).unwrap();
+        std::fs::remove_file(f.out("a.mkv")).unwrap();
+        std::os::unix::fs::symlink(&target, f.out("a.mkv")).unwrap();
+        assert!(matches!(check(&report), Check::No(_)));
+        assert!(OpenFile::open(&f.out("a.mkv"), 400).err().unwrap().to_string().ends_with("is a link"));
+        assert!(f.apply(&report).is_err() && f.lib("a.mp4").exists());
+    }
+
+    #[test]
+    fn landing_refuses_what_is_not_the_file_opened_and_leaves_it_where_it_was() {
+        let f = Fix::new("land");
+        let (from, to) = (f.out("a.mkv"), f.lib("a.mkv"));
+        std::fs::write(&from, vec![b'o'; 400]).unwrap();
+        let opened = OpenFile::open(&from, 400).unwrap();
+        swap_for_another_file(&from);
+        assert!(land(&from, &to, &opened).is_err());
+        assert_eq!(std::fs::read(&from).unwrap(), vec![b'e'; 400]);
+        assert!(!to.exists());
+        // With the name taken again, it still leaves the place it had no business in.
+        std::fs::remove_file(&from).unwrap();
+        std::fs::rename(f.out("a.real"), &from).unwrap();
+        let opened = OpenFile::open(&from, 400).unwrap();
+        std::fs::rename(&from, f.dir.join("kept")).unwrap();
+        std::fs::write(&to, b"not it").unwrap();
+        std::fs::remove_file(&to).unwrap();
+        std::fs::write(f.out("b.mkv"), b"not it").unwrap();
+        trash::rename_new(&f.out("b.mkv"), &from).unwrap();
+        assert!(land(&from, &to, &opened).is_err());
+        assert!(!to.exists() && from.exists());
+    }
+
+    #[test]
+    fn the_permissions_go_to_the_file_that_was_moved() {
+        let f = Fix::new("modes");
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        std::fs::set_permissions(f.lib("a.mp4"), std::os::unix::fs::PermissionsExt::from_mode(0o640)).unwrap();
+        let done = f.apply(&report).unwrap();
+        assert_eq!(mode(&done.dest), 0o640);
+    }
+
+    #[test]
+    fn what_is_swapped_during_an_undo_stays_out_and_both_files_stay_as_they_were() {
+        let run = |name: &str, swap: &dyn Fn(&Fix, &Path)| {
+            let f = Fix::new(name);
+            let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+            let done = f.apply(&report).unwrap();
+            let err = undo_watched(&report, true, &|_| Ok(()), &|| swap(&f, &done.trash)).unwrap_err();
+            (f, report, done, err.to_string())
+        };
+        // The AV1 file, for another of its size: nothing has moved.
+        let (f, report, done, why) = run("undo-av1", &|f, _| {
+            swap_for_another_file(&f.lib("a.mkv"));
+        });
+        assert!(why.contains("replaced by another file"), "{why}");
+        assert_eq!(std::fs::read(f.lib("a.mkv")).unwrap(), vec![b'e'; 400]);
+        assert!(!f.out("a.mkv").exists() && !f.lib("a.mp4").exists() && done.trash.exists());
+        assert!(matches!(check(&report), Check::Replaced(_)));
+
+        // For a link.
+        let (f, _, done, why) = run("undo-link", &|f, _| {
+            swap_for_a_link(&f.lib("a.mkv"), &f.dir.join("elsewhere"));
+        });
+        assert!(why.contains("replaced by another file"), "{why}");
+        assert!(std::fs::symlink_metadata(f.lib("a.mkv")).unwrap().file_type().is_symlink());
+        assert!(!f.out("a.mkv").exists() && !f.lib("a.mp4").exists() && done.trash.exists());
+
+        // The file in the trash: the AV1 file has not moved either.
+        let (f, report, done, why) = run("undo-trash", &|_, trashed| {
+            let kept = trashed.with_extension("real");
+            std::fs::rename(trashed, kept).unwrap();
+            std::fs::write(trashed, vec![b'x'; 1000]).unwrap();
+        });
+        assert!(why.contains("the file in the trash was changed or replaced"), "{why}");
+        assert_eq!(std::fs::read(f.lib("a.mkv")).unwrap(), vec![b'o'; 400]);
+        assert_eq!(std::fs::read(&done.trash).unwrap(), vec![b'x'; 1000]);
+        assert!(!f.lib("a.mp4").exists() && !f.out("a.mkv").exists());
+        assert!(matches!(check(&report), Check::Replaced(_)));
+    }
+
+    #[test]
+    fn an_original_that_cannot_come_back_leaves_the_av1_file_where_it_was() {
+        let f = Fix::new("undo-back");
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        let done = f.apply(&report).unwrap();
+        // Something takes the original's place once everything has been looked at.
+        let err = undo_watched(&report, true, &|_| Ok(()), &|| std::fs::write(f.lib("a.mp4"), b"newcomer").unwrap()).unwrap_err();
+        assert!(format!("{err:#}").contains("still in the trash"), "{err:#}");
+        assert_eq!(std::fs::read(f.lib("a.mkv")).unwrap(), vec![b'o'; 400]);
+        assert!(!f.out("a.mkv").exists() && done.trash.exists());
+        assert_eq!(std::fs::read(f.lib("a.mp4")).unwrap(), b"newcomer");
+        // With the place free again, it simply works.
+        std::fs::remove_file(f.lib("a.mp4")).unwrap();
+        undo(&report, false).unwrap();
+        assert!(f.lib("a.mp4").exists() && f.out("a.mkv").exists());
+    }
+
+    #[test]
+    fn a_file_put_in_the_trash_entrys_place_is_not_restored() {
+        let f = Fix::new("restore-if");
+        let (bin, to) = (f.dir.join("Trash"), f.lib("a.mp4"));
+        std::fs::write(&to, vec![b's'; 1000]).unwrap();
+        let trashed = trash::trash_with(&to, Some(&bin), 1000, "2026-11-10T22:15:03".into()).unwrap();
+        assert!(trash::restore_if(&trashed, &to, &|_| false).is_err());
+        assert!(trashed.exists() && !to.exists());
+        assert!(bin.join("info/a.mp4.trashinfo").exists(), "the entry is whole again");
+        trash::restore_if(&trashed, &to, &|_| true).unwrap();
+        assert!(to.exists() && !bin.join("info/a.mp4.trashinfo").exists());
+    }
+
     #[test]
     fn what_is_refused_at_the_last_moment_moves_nothing() {
         let f = Fix::new("refused");
         let report = f.encode("a.mp4", "a.mkv", 1000, 400);
-        let err = apply_judging(&report, true, Judging::default(), &trash::trash, &|_| Err("not this one".into())).unwrap_err();
+        let err = apply_judging(&report, true, Judging::default(), &trash::trash, &|_, _| Err("not this one".into())).unwrap_err();
         assert_eq!(err.to_string(), "not this one");
         assert!(f.lib("a.mp4").exists() && f.out("a.mkv").exists());
         f.apply(&report).unwrap();

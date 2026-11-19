@@ -59,6 +59,30 @@ pub struct Recorded {
     pub fingerprint_failed: bool,
 }
 
+/// Which file this is and how it stands: its place on the drive, its size, the exact time it was
+/// last written, and the time anything about it last changed, which nobody can set back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Stamp {
+    device: u64,
+    inode: u64,
+    size: u64,
+    written: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl Stamp {
+    pub fn of(meta: &std::fs::Metadata) -> Stamp {
+        use std::os::unix::fs::MetadataExt;
+        Stamp { device: meta.dev(), inode: meta.ino(), size: meta.len(), written: (meta.mtime(), meta.mtime_nsec()), changed: (meta.ctime(), meta.ctime_nsec()) }
+    }
+
+    /// Whether `meta` is this very file, wherever it is now.
+    pub fn same_file(&self, meta: &std::fs::Metadata) -> bool {
+        let now = Stamp::of(meta);
+        meta.is_file() && (now.device, now.inode) == (self.device, self.inode)
+    }
+}
+
 /// The time a file was last changed, in the whole seconds a report keeps.
 pub fn modified_seconds(meta: &std::fs::Metadata) -> Option<u64> {
     Some(meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_secs())

@@ -23,6 +23,10 @@ const LIMIT_PER_GIGABYTE: Duration = Duration::from_secs(60);
 /// is getting through the file is not a stalled one, however long the file takes.
 const READ_STALL: Duration = Duration::from_secs(120);
 
+/// The slowest a run over a whole file is expected to read, in bytes per second. A demuxer going
+/// round in a damaged file reads for ever, so going on reading does not earn time without end.
+const SLOWEST_READ: u64 = 1_000_000;
+
 /// What the system says when reading failed for a reason outside the file. ffprobe prints
 /// these as they are, and they can be over by the next try.
 const NOT_THE_FILES_FAULT: &[&str] = &[
@@ -199,7 +203,14 @@ fn run_until(mut command: Command, mut stop: impl FnMut(u32) -> Option<String>) 
             break status;
         }
         if let Some(why) = stop(child.id()) {
+            // Looked up before the kill: a child whose parent is gone cannot be found any more,
+            // and one left behind would go on reading.
+            let family = process_and_descendants(child.id());
             let _ = child.kill();
+            for process in family.into_iter().skip(1) {
+                // SAFETY: kill takes plain numbers and touches no memory of ours.
+                unsafe { libc::kill(process as libc::pid_t, libc::SIGKILL) };
+            }
             // A process stuck in a stalled mount ends only once the mount answers. It is
             // reaped then, by this thread, and nobody waits for that here.
             std::thread::spawn(move || drop(child.wait()));
@@ -222,11 +233,41 @@ fn too_long(limit: Duration) -> String {
     format!("the probe took too long (over {} s) and was stopped; the drive may have stalled", limit.as_secs_f64().round())
 }
 
-/// How many bytes a running process has read so far, from any file. None where the system does
-/// not say.
-fn bytes_read_by(process: u32) -> Option<u64> {
+/// A process and those it started, the process first. Only itself where the system does not say.
+fn process_and_descendants(process: u32) -> Vec<u32> {
+    // More than any wrapper around ffprobe starts, so that a tree changing under this walk ends it.
+    const MOST: usize = 256;
+    let mut family = vec![process];
+    let mut next = 0;
+    while next < family.len() && family.len() < MOST {
+        let parent = family[next];
+        next += 1;
+        let Ok(threads) = std::fs::read_dir(format!("/proc/{parent}/task")) else { continue };
+        for thread in threads.flatten() {
+            let Ok(children) = std::fs::read_to_string(thread.path().join("children")) else { continue };
+            for child in children.split_ascii_whitespace().filter_map(|c| c.parse().ok()) {
+                if !family.contains(&child) {
+                    family.push(child);
+                }
+            }
+        }
+    }
+    family
+}
+
+/// How many bytes one process has read so far, from any file.
+fn bytes_read_by_one(process: u32) -> Option<u64> {
     let io = std::fs::read_to_string(format!("/proc/{process}/io")).ok()?;
     io.lines().find_map(|l| l.strip_prefix("rchar:"))?.trim().parse().ok()
+}
+
+/// How many bytes a running process and those it started have read so far: what is called ffprobe
+/// may be a script that waits for the real one while that does the reading. None where the system
+/// does not say.
+fn bytes_read_by(process: u32) -> Option<u64> {
+    let own = bytes_read_by_one(process)?;
+    let others = process_and_descendants(process).into_iter().skip(1).filter_map(bytes_read_by_one);
+    Some(others.fold(own, u64::saturating_add))
 }
 
 /// Decides when a run that reads a whole file has stopped getting anywhere.
@@ -235,19 +276,24 @@ struct ReadWatch {
     quiet: Duration,
     /// How long it gets in all, for when its reading cannot be seen.
     limit: Duration,
+    /// How long it gets in all however much it reads.
+    most: Duration,
     started: Instant,
     read: Option<u64>,
     since: Instant,
 }
 
 impl ReadWatch {
-    fn new(quiet: Duration, limit: Duration) -> ReadWatch {
+    fn new(quiet: Duration, limit: Duration, most: Duration) -> ReadWatch {
         let now = Instant::now();
-        ReadWatch { quiet, limit, started: now, read: None, since: now }
+        ReadWatch { quiet, limit, most, started: now, read: None, since: now }
     }
 
     /// Why to stop it, now that it has read `read` bytes (None: that cannot be seen).
     fn stop(&mut self, read: Option<u64>) -> Option<String> {
+        if self.started.elapsed() >= self.most {
+            return Some(format!("the probe was still reading after {} s, far longer than a file of this size takes, and was stopped; the file may be damaged, or the drive very slow", self.most.as_secs_f64().round()));
+        }
         if read.is_none() {
             return (self.started.elapsed() >= self.limit).then(|| too_long(self.limit));
         }
@@ -278,6 +324,14 @@ impl Reads {
             Reads::AllOf(bytes) => PROBE_LIMIT + LIMIT_PER_GIGABYTE * u32::try_from(bytes.div_ceil(1_000_000_000)).unwrap_or(u32::MAX / 120),
         }
     }
+
+    /// How long a run gets even while it goes on reading.
+    fn most(&self) -> Duration {
+        match self {
+            Reads::Little => PROBE_LIMIT,
+            Reads::AllOf(bytes) => self.limit().max(PROBE_LIMIT + Duration::from_secs(bytes / SLOWEST_READ)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -290,15 +344,14 @@ thread_local! {
 /// Runs ffprobe with a limit, so that a stalled mount costs the file and not the whole run, and
 /// returns what it printed.
 pub fn run_ffprobe(command: Command, reads: Reads) -> Result<Output> {
-    let limit = reads.limit();
+    let (limit, most) = (reads.limit(), reads.most());
     let quiet = READ_STALL;
     #[cfg(test)]
     let (limit, quiet) = LIMIT_IN_TESTS.get().map_or((limit, quiet), |l| (l, l));
     let run = match reads {
         Reads::Little => run_within(command, limit).map(|out| out.ok_or_else(|| too_long(limit))),
         Reads::AllOf(_) => {
-            let mut watch = ReadWatch::new(quiet, limit);
-            run_until(command, |process| watch.stop(bytes_read_by(process)))
+            run_watched(command, ReadWatch::new(quiet, limit, most))
         }
     };
     match run {
@@ -388,6 +441,10 @@ pub fn hdr_data(ffprobe: &str, path: &Path, stream: usize) -> Result<(HdrData, H
     }
     let j: Value = serde_json::from_slice(&out.stdout).context("ffprobe returned invalid JSON")?;
     Ok((HdrData::from_side_data(&j["streams"][0]["side_data_list"]), HdrData::from_side_data(&j["frames"][0]["side_data_list"])))
+}
+
+fn run_watched(command: Command, mut watch: ReadWatch) -> std::io::Result<Result<Output, String>> {
+    run_until(command, |process| watch.stop(bytes_read_by(process)))
 }
 
 pub fn probe(ffprobe: &str, path: &Path, file_size: u64) -> Result<MediaInfo> {
@@ -952,20 +1009,75 @@ mod tests {
     #[test]
     fn progress_decides_where_it_can_be_seen_and_the_clock_where_it_cannot() {
         let short = Duration::from_millis(30);
-        let mut watch = ReadWatch::new(short, Duration::from_secs(600));
+        let long = Duration::from_secs(600);
+        let mut watch = ReadWatch::new(short, long, long);
         assert!(watch.stop(Some(1)).is_none());
         std::thread::sleep(short * 2);
         assert!(watch.stop(Some(2)).is_none(), "it read something");
         assert!(watch.stop(Some(2)).is_none(), "and has only just stopped");
         std::thread::sleep(short * 2);
         assert!(watch.stop(Some(2)).is_some_and(|why| why.contains("read nothing")));
-        let mut blind = ReadWatch::new(Duration::ZERO, short);
+        let mut blind = ReadWatch::new(Duration::ZERO, short, long);
         assert!(blind.stop(None).is_none());
         std::thread::sleep(short * 2);
         assert!(blind.stop(None).is_some_and(|why| why.contains("took too long")));
         // This system does say what a process has read.
         assert!(bytes_read_by(std::process::id()).is_some());
         assert_eq!(bytes_read_by(u32::MAX), None);
+    }
+
+    /// Waits for a process to be gone, or a zombie nobody has collected yet.
+    fn ends_soon(process: &str) -> bool {
+        let gone = || std::fs::read_to_string(format!("/proc/{process}/stat")).map_or(true, |stat| stat.rsplit(')').next().is_some_and(|rest| rest.trim_start().starts_with('Z')));
+        let started = Instant::now();
+        while !gone() && started.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        gone()
+    }
+
+    #[test]
+    fn a_run_that_never_stops_reading_is_stopped_with_what_it_started() {
+        let dir = std::env::temp_dir().join(format!("av1opt-probe-reader-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (ffprobe, pid_file) = (dir.join("ffprobe"), dir.join("reader"));
+        crate::files::write_script(&ffprobe, &format!("cat /dev/zero > /dev/null &\necho $! > '{}'\nwait\n", pid_file.display()));
+        let long = Duration::from_secs(600);
+        let started = Instant::now();
+        let why = run_watched(Command::new(&ffprobe), ReadWatch::new(long, long, Duration::from_millis(400))).unwrap().unwrap_err();
+        assert!(why.contains("still reading"), "{why}");
+        assert!(started.elapsed() < Duration::from_secs(60), "{:?}", started.elapsed());
+        let reader = std::fs::read_to_string(&pid_file).unwrap();
+        assert!(ends_soon(reader.trim()), "the reader the script started is still running");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn what_a_wrapper_waits_for_counts_as_its_reading() {
+        let dir = std::env::temp_dir().join(format!("av1opt-probe-wrapper-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (ffprobe, reader, data) = (dir.join("ffprobe"), dir.join("reader"), dir.join("data"));
+        std::fs::write(&data, "line\n".repeat(100)).unwrap();
+        crate::files::write_script(&reader, &format!("exec 3< '{}'\ni=0\nwhile [ $i -lt 30 ]; do read -r line <&3; sleep 0.1; i=$((i+1)); done\n", data.display()));
+        // It does not exec, so that the process watched reads nothing while its child goes on,
+        // for three times as long as a run may go without reading.
+        crate::files::write_script(&ffprobe, &format!("'{}'\necho read\n", reader.display()));
+        let long = Duration::from_secs(600);
+        let out = run_watched(Command::new(&ffprobe), ReadWatch::new(Duration::from_secs(1), long, long)).unwrap().unwrap();
+        assert_eq!(out.stdout, b"read\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_time_a_run_gets_while_reading_grows_with_the_file_at_a_megabyte_a_second() {
+        assert_eq!(Reads::Little.most(), Duration::from_secs(120));
+        assert_eq!(Reads::AllOf(0).most(), Duration::from_secs(120));
+        // Never less than a run gets that cannot be seen reading.
+        assert_eq!(Reads::AllOf(1).most(), Reads::AllOf(1).limit());
+        assert_eq!(Reads::AllOf(40_000_000_000).most(), Duration::from_secs(120 + 40_000));
+        assert!(Reads::AllOf(u64::MAX).most() > Duration::from_secs(120));
     }
 
     #[test]

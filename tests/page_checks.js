@@ -704,6 +704,26 @@ checks["compare: the output does not play before its source is there to play bes
   page.run("leave()");
 };
 
+checks["compare: Play is there as soon as both sides can play, while they are still being lined up"] = async () => {
+  const page = openPage(() => ({}));
+  await settled();
+  page.context.__root = page.document.createElement("div");
+  page.run(`var leave = comparePlayer(__root, { output_path: "/o.mp4", input_path: "/i.mp4", output_info: { fps: 25, duration_s: 10 }, input_info: { fps: 25, duration_s: 10 }, target_vmaf: 93, verify_vmaf: [94] })`);
+  await settled();
+  const root = page.context.__root;
+  const videos = root.all().filter((e) => e.tag === "video");
+  const vs = videos.find((v) => "muted" in v.attrs), vo = videos.find((v) => !("muted" in v.attrs));
+  const play = root.named("button", "Play");
+  // With a picture size the alignment starts, and here it never ends: its own copies of the
+  // two videos never load.
+  for (const v of [vo, vs]) { v.videoWidth = 64; v.dispatch("loadeddata"); await settled(); }
+  assert(root.all().some((e) => e.textContent === "aligning…"), "no alignment started");
+  assert(!play.disabled, "Play waits for the alignment");
+  play.click();
+  assert(!vo.paused && !vs.paused);
+  page.run("leave()");
+};
+
 // Answers held back until the check lets them go, so that they can arrive in any order.
 const heldAnswers = () => {
   const waiting = [];

@@ -9,7 +9,7 @@ const source = readFileSync(new URL("../ui/app.js", import.meta.url), "utf8");
 const from = source.indexOf("// ---------- numbers and names ----------");
 const to = source.indexOf("// ---------- end of the part that runs alone ----------");
 assert.ok(from >= 0 && to > from, "the markers of the part that runs alone are in ui/app.js");
-const names = ["bytes", "pct", "floorPct", "sizeChange", "savedPct", "num", "rel", "times", "plural", "pathList", "leftOutOfList", "shownPath", "copiesLeft", "newestOnly", "refusalText", "presetFrom", "NAME_ORDER", "rowOrder", "numberProblem", "RANGES", "sameKind", "rememberedForm", "rememberedOptions", "oneCrfText"];
+const names = ["bytes", "pct", "floorPct", "sizeChange", "savedPct", "num", "rel", "times", "plural", "pathList", "leftOutOfList", "shownPath", "copiesLeft", "newestOnly", "refusalText", "presetFrom", "NAME_ORDER", "rowOrder", "numberProblem", "RANGES", "sameKind", "rememberedForm", "rememberedOptions", "oneCrfText", "searchShift"];
 const page = new Function(`"use strict";\n${source.slice(from, to)}\nreturn { ${names.join(", ")} };`)();
 
 // Each case is [argument, what is shown]; arguments in an array are spread.
@@ -221,4 +221,41 @@ test("a one-CRF encode says the CRF that made the file, after a second encode or
   assert.equal(some.mode, "one CRF, 2 stretches encoded again");
   assert.equal(some.short, "30 · 24–26");
   assert.equal(some.crf, "30; 24–26 in 2 stretches (0:06 of 10:00) after the check");
+});
+
+test("two copies of unknown offset are lined up however much was cut from the front, within the budget", async () => {
+  const { searchShift } = page;
+  // The left copy is the right one less its first `cut` seconds: right time t is left time
+  // t - cut. Frames differ in proportion to how far apart they are, up to a point.
+  const pair = (cut) => ({ diff: async (t, shift) => Math.min(100, Math.abs(shift + cut) * 200), leftAt: (t, shift) => t + shift });
+  const common = { points: [10.25, 20, 29.75], leftSecs: 30, rightSecs: 40, fps: 25, wide: true };
+  // Cut at the start only: the two ends meet (a "same" pair began at 0 and stayed there).
+  assert.equal(await searchShift({ ...common, ...pair(10) }), -10);
+  // Cut at both ends: found by the scan and the finer steps after it, to the frame.
+  const heard = [];
+  assert.equal(await searchShift({ ...common, ...pair(4.36), found: (s) => heard.push(s) }), -4.36);
+  assert.equal(heard.at(-1), -4.36);
+  // Each comparison taking 100 ms of a 1 s budget: what was found by then is what comes back.
+  let clock = 0;
+  const slow = pair(4.36), diff = async (t, s) => { clock += 100; return slow.diff(t, s); };
+  const early = await searchShift({ ...common, ...slow, diff, budgetMs: 1000, now: () => clock });
+  assert(clock <= 1300, `went on to ${clock} ms`);
+  assert.notEqual(early, -4.36);
+  // Stopped from outside, it ends at once.
+  let asked = 0;
+  await searchShift({ ...common, ...pair(4.36), diff: async () => { asked++; return 1; }, stopped: () => asked >= 3 });
+  assert(asked <= 4, `${asked} comparisons after the stop`);
+});
+
+test("an encode's own files move only to a frame that is clearly better", async () => {
+  const { searchShift } = page;
+  const common = { points: [2, 5, 8], leftAt: (t, shift) => t + shift, leftSecs: 10, rightSecs: 10, fps: 25 };
+  // 2% better two frames on: noise, so nothing moves.
+  assert.equal(await searchShift({ ...common, diff: async (t, s) => (Math.round(s * 25) === 2 ? 98 : 100) }), 0);
+  // Half the difference two frames on: that is where the source lines up.
+  assert.equal(await searchShift({ ...common, diff: async (t, s) => (Math.round(s * 25) === 2 ? 50 : 100) }), 0.08);
+  // Only the three frames to either side are looked at.
+  const seen = new Set();
+  await searchShift({ ...common, base: 0.4, diff: async (t, s) => { seen.add(Math.round(s * 25)); return 1; } });
+  assert.deepEqual([...seen].sort((a, b) => a - b), [7, 8, 9, 10, 11, 12, 13]);
 });

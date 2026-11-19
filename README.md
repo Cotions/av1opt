@@ -872,7 +872,12 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
   had encoded again, and the CRF row says the CRF of the file as kept: the stretches' CRFs, the
   first CRF where the whole video was encoded a second time, and where the check encoded all
   of it again, that it did. History's CRF column says the same in short. Play waits until the
-  source has loaded beside the output (or has failed to, when the output plays alone). Sources the browser can't decode (HEVC in some browsers, MPEG-2, ...) are shown as a
+  source has loaded beside the output (or has failed to, when the output plays alone), and
+  for nothing else: the two are lined up meanwhile on copies of their own that are not on
+  the page, read in a worker. An encode's output moves at most three frames from where its
+  report puts it, and only for a clear match; two duplicates, whose offset nobody knows, are
+  searched across the whole left copy for about 4 s of work (15 s at most), each better offset
+  used as soon as it is found, also while playing. Sources the browser can't decode (HEVC in some browsers, MPEG-2, ...) are shown as a
   20 s near-lossless H.264 preview made on demand in `~/.cache/av1opt/previews`, never next to
   the source; MKV outputs the browser won't open are remuxed to MP4 there too. The **Original**
   panel replaces this one original by its output (after a confirmation that shows the new

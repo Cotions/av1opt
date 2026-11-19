@@ -236,14 +236,100 @@ function oneCrfText({ crf, first_crf: first, stretches, video_secs: length }) {
   const of = isNumber(length) && length > 0 ? ` of ${hms(length)}` : "";
   return { mode: `one CRF, ${n} encoded again`, crf: `${crf}${second}; ${range} in ${n} (${hms(secs)}${of}) after the check`, short: `${crf} · ${range}` };
 }
+// The shift of the left picture against the right one (left time = leftAt(t, shift) for right
+// time t) whose frames differ least, in seconds and whole frames. `diff(t, shift)` resolves to
+// how much the two frames differ there. `points` are the right-hand times compared; a shift
+// that puts fewer than two of them inside the left copy (0 to `leftSecs`) does not count.
+// Narrow: only the three frames to either side of `base`, and only for a clear win (3% less
+// difference), so that noise and static scenes move nothing; for an encode's own files.
+// Wide: also no shift, the shift that lines up the two ends (copies cut at the start), and a
+// scan across the whole left copy, then finer steps around the best; for two copies whose
+// offset is unknown. It stops when `stopped()` says so or after `budgetMs` (by `now()`), with
+// the best found until then. `found(shift)` hears of each better shift on the way.
+async function searchShift({ diff, points, leftAt, leftSecs, rightSecs, fps, base = 0, wide = false, budgetMs = 4000, now = () => Date.now(), stopped = () => false, found = () => {} }) {
+  const frame = 1 / fps, start = now();
+  const late = () => stopped() || now() - start > budgetMs;
+  const snap = (x) => Math.round(x * fps) / fps;
+  const inside = (t) => t >= 0 && t <= leftSecs;
+  const scores = new Map();
+  const score = async (shift) => {
+    shift = snap(shift);
+    const key = Math.round(shift * fps);
+    if (scores.has(key)) return scores.get(key);
+    const usable = points.filter((t) => inside(leftAt(t, shift)));
+    let total = Infinity;
+    if (usable.length >= Math.min(2, points.length)) {
+      total = 0;
+      for (const t of usable) total += await diff(t, shift);
+      total /= usable.length;
+    }
+    scores.set(key, total);
+    return total;
+  };
+  let best = snap(base), bestScore = await score(best);
+  const offer = async (shift) => {
+    if (late()) return false;
+    const v = await score(shift);
+    if (v < bestScore) { best = snap(shift); bestScore = v; if (wide) found(best); }
+    return true;
+  };
+  if (!wide) {
+    const baseScore = bestScore;
+    for (let k = -3; k <= 3; k++) if (!(await offer(base + k * frame))) break;
+    if (bestScore >= baseScore * 0.97) best = snap(base);
+    return best;
+  }
+  for (const shift of [0, leftSecs - rightSecs]) if (!(await offer(shift))) return best;
+  // One right-hand frame against the left copy at even steps: where it matches, the shift is.
+  const mid = points[Math.floor(points.length / 2)], at0 = leftAt(mid, 0);
+  const step = Math.max(0.5, leftSecs / 60);
+  const single = [];
+  for (let t = 0; t <= leftSecs && !late(); t += step) single.push([t - at0, await diff(mid, snap(t - at0))]);
+  single.sort((a, b) => a[1] - b[1]);
+  for (const [shift] of single.slice(0, 3)) if (!(await offer(shift))) return best;
+  for (let d = step / 2; d >= frame / 2; d /= 2) {
+    const around = best;
+    if (!(await offer(around - d)) || !(await offer(around + d))) return best;
+  }
+  for (let k = -3; k <= 3; k++) if (!(await offer(best + k * frame))) break;
+  return best;
+}
 function hms(sec) {
   if (sec == null || isNaN(sec)) return "–";
   sec = Math.max(0, Math.round(sec));
   const hh = Math.floor(sec / 3600), mm = Math.floor(sec / 60) % 60, ss = sec % 60;
   return (hh ? hh + ":" + String(mm).padStart(2, "0") : mm) + ":" + String(ss).padStart(2, "0");
 }
+// The brightness of a picture on a coarse grid, which is what Compare matches frames by.
+const GRID_W = 64, GRID_H = 36;
+function gridOf(rgba) {
+  const out = new Float32Array(GRID_W * GRID_H);
+  for (let i = 0; i < out.length; i++) out[i] = 0.299 * rgba[i * 4] + 0.587 * rgba[i * 4 + 1] + 0.114 * rgba[i * 4 + 2];
+  return out;
+}
 
 // ---------- end of the part that runs alone ----------
+
+// Compare reads pictures of its videos to line them up, and in Chromium drawing a frame just
+// taken from a video holds the thread that draws it for one to four seconds. That thread is a
+// worker's, and the worker is this same file, since the page's policy runs no script but its own
+// files: run as a worker, it only answers with the grid of each picture (a VideoFrame or an
+// ImageBitmap) it is handed, and closes it.
+const IN_WORKER = typeof window === "undefined" && typeof self === "object" && typeof self.postMessage === "function";
+if (IN_WORKER) {
+  self.onmessage = ({ data: { id, picture } }) => {
+    try {
+      const g = new OffscreenCanvas(GRID_W, GRID_H).getContext("2d", { willReadFrequently: true });
+      g.drawImage(picture, 0, 0, GRID_W, GRID_H);
+      const grid = gridOf(g.getImageData(0, 0, GRID_W, GRID_H).data);
+      self.postMessage({ id, grid }, [grid.buffer]);
+    } catch (e) {
+      self.postMessage({ id, error: String(e && e.message || e) });
+    } finally {
+      try { picture.close(); } catch { /* already closed */ }
+    }
+  };
+}
 
 function savedClass(x) { return x < 0 ? "warn" : "ok"; }
 function span(sec) { // a length of time for people: minutes, hours, then days
@@ -501,7 +587,7 @@ function renderBanner() {
 // array then says which of them are files in its `files` (a Set).
 // In the desktop app, folders come from the system's own dialog. Files and folders mixed
 // ("multi") stay with the in-page picker, which can select both at once.
-const desktop = window.av1optDesktop || null;
+const desktop = (!IN_WORKER && window.av1optDesktop) || null;
 
 function pick({ title, mode = "dir", start }) {
   if (desktop && mode === "dir") {
@@ -2935,6 +3021,43 @@ views.compare = (root, params) => {
 
 function mediaUrl(p) { return "/media?path=" + encodeURIComponent(p); }
 
+// How much one comparison of two pictures counts against Compare's alignment budget (4 s of
+// work in searchShift), and how long the alignment may take in all.
+const WORK_PER_DIFF_MS = 150, ALIGN_WALL_MS = 15000;
+// The worker that reads Compare's pictures (see IN_WORKER), started the first time it is needed
+// and kept. null where the browser has no worker or no OffscreenCanvas, or it failed.
+let pictureReader;
+function reader() {
+  if (pictureReader !== undefined) return pictureReader;
+  pictureReader = null;
+  if (typeof Worker !== "function" || typeof OffscreenCanvas !== "function") return null;
+  try {
+    const w = new Worker("/app.js");
+    const waiting = new Map();
+    let next = 0;
+    w.onmessage = ({ data }) => {
+      const p = waiting.get(data.id);
+      if (!p) return;
+      waiting.delete(data.id);
+      if (data.error) p.reject(new Error(data.error)); else p.resolve(data.grid);
+    };
+    w.onerror = () => {
+      pictureReader = null;
+      w.terminate();
+      for (const p of waiting.values()) p.reject(new Error("the picture reader stopped"));
+      waiting.clear();
+    };
+    pictureReader = {
+      read: (picture) => new Promise((resolve, reject) => {
+        const id = ++next;
+        waiting.set(id, { resolve, reject });
+        w.postMessage({ id, picture }, [picture]);
+      }),
+    };
+  } catch { pictureReader = null; }
+  return pictureReader;
+}
+
 function comparePlayer(root, r) {
   const ii = r.input_info || {}, oi = r.output_info || {};
   const fps = oi.fps || ii.fps || 25;
@@ -3026,8 +3149,10 @@ function comparePlayer(root, r) {
     vs.currentTime = srcTime(vo.currentTime);
   }
   if (nudge) setNudge(nudge, "from the lengths");
-  // Picks the source shift (−3..+3 frames) whose picture differs least from the output at a
-  // few paused positions. Ties keep the current shift, so static scenes change nothing.
+  // The two sides are lined up on copies of their own that are not on the page, seeked and
+  // read while the ones on the page play or wait, and each picture is drawn in the worker
+  // (reader()). Drawn on the page, each picture taken just after a seek held the whole page for
+  // about a second (Chromium, a 320x240 clip: 24 seeks, 24 s with Play off).
   const seekWait = (v, t) => new Promise((res) => {
     if (Math.abs(v.currentTime - t) < 1e-4 && !v.seeking) return res();
     const done = () => { clearTimeout(tm); res(); };
@@ -3035,54 +3160,90 @@ function comparePlayer(root, r) {
     v.addEventListener("seeked", done, { once: true });
     v.currentTime = t;
   });
-  const grab = (v) => {
-    const c = document.createElement("canvas"); c.width = 128; c.height = 72;
-    const g = c.getContext("2d", { willReadFrequently: true }); g.drawImage(v, 0, 0, 128, 72);
-    return g.getImageData(0, 0, 128, 72).data;
+  // On the page itself (no worker, or it failed) a picture is drawn small and read there.
+  const gridHere = (v) => {
+    const c = document.createElement("canvas"); c.width = GRID_W; c.height = GRID_H;
+    const g = c.getContext("2d", { willReadFrequently: true }); g.drawImage(v, 0, 0, GRID_W, GRID_H);
+    return gridOf(g.getImageData(0, 0, GRID_W, GRID_H).data);
   };
-  const pixDiff = (a, b) => { let d = 0; for (let i = 0; i < a.length; i += 4) d += Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]); return d; };
+  const grab = async (v) => {
+    const w = reader();
+    if (!w) return gridHere(v);
+    // Taking the picture is quick; it is drawing it that holds a thread.
+    const picture = typeof VideoFrame === "function" ? new VideoFrame(v) : await createImageBitmap(v);
+    return w.read(picture);
+  };
+  const pixDiff = (a, b) => { let d = 0; for (let i = 0; i < a.length; i++) d += Math.abs(a[i] - b[i]); return d; };
+  // The copies, made once for each pair of files the page shows; `stops` cancels what waits.
+  const copies = { o: null, s: null };
+  const stops = new Set();
+  const copyOf = (key, from) => {
+    const url = from.currentSrc || from.src;
+    const had = copies[key];
+    if (had && had.url === url) return had.ready;
+    if (had) { had.v.removeAttribute("src"); had.v.load(); }
+    const v = h("video", { preload: "auto", playsinline: true, muted: true });
+    v.muted = true;
+    const ready = new Promise((resolve, reject) => {
+      const stop = (why) => { clearTimeout(timer); stops.delete(stop); v.removeEventListener("loadeddata", onData); why ? reject(new Error(why)) : resolve(v); };
+      const onData = () => stop(v.videoWidth > 0 ? null : "no picture");
+      const timer = setTimeout(() => stop("timed out"), 20000);
+      stops.add(stop);
+      v.addEventListener("loadeddata", onData);
+      v.addEventListener("error", () => stop("cannot load"), { once: true });
+    });
+    copies[key] = { url, v, ready };
+    v.src = url;
+    v.load();
+    return ready;
+  };
+  // Play never waits for this: until it is done the shift is what it was, and with two copies
+  // of unknown offset each better one found is used at once.
   let aligning = false;
-  // The output plays only beside its source. Until the source has loaded, or has failed to
-  // for good, while a preview clip of it is made, and while the two are aligned, Play waits:
-  // the output would otherwise run on alone, and an alignment would move it under the person.
-  let srcSettled = false;
-  const canPlay = () => srcSettled && srcMode !== "loading" && !aligning;
-  const syncPlay = () => { playBtn.disabled = !canPlay(); if (!canPlay() && !vo.paused) vo.pause(); };
   async function autoAlign() {
     if (closed || aligning || srcMode === "loading" || !vs.videoWidth || !vo.videoWidth) return;
     aligning = true;
-    const was = vo.currentTime;
-    vo.pause();
-    syncPlay();
+    const was = alignEl.textContent;
     alignEl.textContent = "aligning…";
+    let failed = false;
     try {
+      const [o, sv] = await Promise.all([copyOf("o", vo), copyOf("s", vs)]);
       const lo = srcMode === "preview" ? offset : 0, hi = srcMode === "preview" ? segEnd : duration;
       const span = Math.max(0, hi - lo - 1);
       const points = [0.25, 0.5, 0.75].map((f) => lo + 0.5 + span * f);
-      const score = new Map();
-      const base = Math.round(nudge * fps);
-      for (const t of points) {
-        await seekWait(vo, t);
-        const o = grab(vo);
-        for (let k = base - 3; k <= base + 3; k++) {
-          await seekWait(vs, Math.max(0, toSrc(t) - srcOff + k / fps));
-          score.set(k, (score.get(k) || 0) + pixDiff(o, grab(vs)));
-        }
-      }
-      let best = base;
-      for (const [k, v] of score) if (v < score.get(best)) best = k;
-      // Only move for a clear win (3% less difference), so noise doesn't shift the source.
-      if (score.get(best) >= score.get(base) * 0.97) best = base;
-      setNudge(best / fps, "auto");
+      const rightFrames = new Map();
+      const leftAt = (t, shift) => toSrc(t) - srcOff + shift;
+      // The search's time is that of its own work. Chromium without a GPU takes about a second
+      // for each picture while the page's players load or play (and 2 ms otherwise), so each
+      // comparison counts for no more than WORK_PER_DIFF_MS, and the whole search stops after
+      // ALIGN_WALL_MS however it went.
+      let worked = 0;
+      const began = Date.now();
+      const diff = async (t, shift) => {
+        if (closed) throw new Error("closed");
+        const from = Date.now();
+        if (!rightFrames.has(t)) { await seekWait(o, t); rightFrames.set(t, await grab(o)); }
+        await seekWait(sv, Math.max(0, leftAt(t, shift)));
+        const d = pixDiff(rightFrames.get(t), await grab(sv));
+        worked += Math.min(Date.now() - from, WORK_PER_DIFF_MS);
+        return d;
+      };
+      const best = await searchShift({ diff, points, leftAt, leftSecs: sv.duration || ii.duration_s || duration, rightSecs: hi, fps, base: nudge, wide: !!r.pair,
+        now: () => worked, stopped: () => closed || Date.now() - began > ALIGN_WALL_MS, found: (shift) => { setNudge(shift, "aligning…"); } });
+      if (!closed) setNudge(best, "auto");
     } catch (e) {
-      alignEl.textContent = "align failed";
+      failed = true;
     } finally {
-      await seekWait(vo, was);
-      vs.currentTime = srcTime(was);
       aligning = false;
-      syncPlay();
+      if (!closed && failed) alignEl.textContent = was === "aligning…" ? "align failed" : `${was} · align failed`;
     }
   }
+  // The output plays only beside its source. Until the source has loaded, or has failed to
+  // for good, and while a preview clip of it is made, Play waits: the output would otherwise
+  // run on alone.
+  let srcSettled = false;
+  const canPlay = () => srcSettled && srcMode !== "loading";
+  const syncPlay = () => { playBtn.disabled = !canPlay(); if (!canPlay() && !vo.paused) vo.pause(); };
 
   const controls = h("div", { class: "controls" },
     playBtn, h("button", { title: "Previous frame (,)", onclick: () => step(-1) }, "◀ frame"), h("button", { title: "Next frame (.)", onclick: () => step(1) }, "frame ▶"),
@@ -3387,8 +3548,7 @@ function comparePlayer(root, r) {
       tagL.textContent = `${leftName} preview · ${ii.codec || "?"} → H.264 near-lossless`;
       seekTo(offset);
       busy(null);
-      await autoAlign();
-      seekTo(offset);
+      autoAlign();
     } catch (e) {
       if (closed) return;
       ({ offset, segEnd, srcOff, srcMode } = prev);
@@ -3443,7 +3603,8 @@ function comparePlayer(root, r) {
     closed = true;
     cancelAnimationFrame(raf);
     document.removeEventListener("keydown", onKey);
-    for (const v of [vo, vs]) { v.pause(); v.removeAttribute("src"); v.load(); }
+    for (const stop of [...stops]) stop("closed");
+    for (const v of [vo, vs, ...[copies.o, copies.s].filter(Boolean).map((c) => c.v)]) { v.pause(); v.removeAttribute("src"); v.load(); }
   };
 }
 
@@ -3506,17 +3667,20 @@ views.settings = (root) => {
 
 // ---------- start ----------
 
-window.addEventListener("hashchange", route);
-// Without the state the views have no folders or defaults: it is asked for until it comes.
-function retryState() {
-  setTimeout(async () => {
-    if (isSignedOut) return;
-    try { await loadState(); route(); } catch { retryState(); }
-  }, EVENTS_RETRY_MS);
+// The worker that reads Compare's pictures has no page to start.
+if (!IN_WORKER) {
+  window.addEventListener("hashchange", route);
+  // Without the state the views have no folders or defaults: it is asked for until it comes.
+  function retryState() {
+    setTimeout(async () => {
+      if (isSignedOut) return;
+      try { await loadState(); route(); } catch { retryState(); }
+    }, EVENTS_RETRY_MS);
+  }
+  (async () => {
+    try { await loadState(); } catch (e) { toast("Cannot reach av1opt: " + e.message, true); retryState(); }
+    connect();
+    refreshBadge();
+    route();
+  })();
 }
-(async () => {
-  try { await loadState(); } catch (e) { toast("Cannot reach av1opt: " + e.message, true); retryState(); }
-  connect();
-  refreshBadge();
-  route();
-})();

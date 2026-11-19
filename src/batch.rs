@@ -985,7 +985,7 @@ mod tests {
         // Every file fails without anything being written, and the run says why.
         let mut o = options();
         o.out_dir_must_exist = true;
-        let jobs = vec![Job { input: source.0.join("c.mkv"), out_dir: out.0.clone() }];
+        let jobs = vec![Job { input: source.0.join("c.mkv"), out_dir: out.0.clone(), also_at: None }];
         let tools = Tools::new("false".into(), "false".into(), None);
         let sum = run_placed(&tools, &jobs, &out.0, Some(&away), &o, false).unwrap();
         assert_eq!(sum.failed, 1);
@@ -1000,7 +1000,7 @@ mod tests {
         let gone = out.0.join("drive");
         let mut o = options();
         o.out_dir_must_exist = true;
-        let jobs: Vec<Job> = ["a.mkv", "b.mkv"].iter().map(|n| Job { input: source.0.join(n), out_dir: gone.clone() }).collect();
+        let jobs: Vec<Job> = ["a.mkv", "b.mkv"].iter().map(|n| Job { input: source.0.join(n), out_dir: gone.clone(), also_at: None }).collect();
         // The drive is back as soon as the first file has failed for its absence.
         let mut tools = Tools::new("false".into(), "false".into(), None);
         let back = gone.clone();
@@ -1160,7 +1160,7 @@ mod tests {
 
     #[test]
     fn a_file_reached_twice_is_one_job_placed_by_the_first_input() {
-        let f = Folder::new("once", &["top.mkv"]);
+        let f = Folder::new("reached-twice", &["top.mkv"]);
         let sub = f.0.join("sub");
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(sub.join("x.mkv"), b"video").unwrap();

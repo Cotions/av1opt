@@ -48,7 +48,9 @@ Every successful `encode` appends its source and output bitrates to
 whose sizes would mislead. `scan` fits its size model to that history (a log-linear
 fit of AV1 bits per pixel against source bits per pixel and resolution, pulled toward the
 built-in model while there are few encodes), so estimates and their ranges tighten as
-you encode more.
+you encode more. Past encodes are first brought to the preset and target asked about, and a
+video unlike those encoded so far gets a wider range. The range of a total allows for files
+erring in different directions, so it is narrower than their ranges added up.
 
 `scan` also says how long the candidates would take to search and encode, in one pass and
 with a CRF per scene (a multiple learned from the per-scene encodes made here), and with
@@ -420,20 +422,24 @@ videos.
    clock.
 3. **Compare at equal quality** – a setting's size and time at exactly the target are read
    between the last CRF that passes and the first that fails. Settings are then compared with
-   the default per video and averaged as ratios (geometric mean), for all videos and per size
-   class. A setting that fails or cannot reach the target on a video the default manages is
+   the default per video and averaged as ratios (geometric mean, the *size* column: the typical
+   video), for all videos and per size class; *bytes* is the ratio of the sums, which counts large
+   videos for more and is nearer what a library saves. A setting that fails or cannot reach the target on a video the default manages is
    shown with a note and never picked.
 4. **Pick winners** – *smallest* (whatever the time), *balanced* (smallest within 10% of the
    default's encode time) and *fastest* (within 2% of the default's size). The default stays
-   unless *smallest* or *balanced* gains more than 1%, or *fastest* more than 5%.
+   unless *smallest* or *balanced* gains more than 1%, or *fastest* more than 5%. A setting whose
+   worst clip falls more than 0.5 VMAF below the default's is not picked.
 
 The table lists every setting with size and time against the default, the best and worst video,
 and marks the ones no other setting beats on both counts. `--csv` writes one row per video and
 setting, `--json` everything including each sample encode.
 
 `--save [balanced|smallest|fastest]` stores the winner of each size class in
-`~/.local/share/av1opt/tuning.json`, with the default it beat and the target; a class the default
-wins gets no entry, and loses the one it had. `av1opt encode --tuned` then takes preset and
+`~/.local/share/av1opt/tuning.json`, with the default it beat and the target. The winner is
+chosen on every other video and saved only if it also gains on the rest; a class of fewer than 3
+videos goes by the winner of all videos. A class the default wins gets no entry, and loses the
+one it had. `av1opt encode --tuned` then takes preset and
 parameters from there by the video's size (classes without an entry use `--preset` and
 `--svt-params`). An entry measured against another default than today's, or for a target more
 than 1 VMAF from the encode's, is not used, and the encode says so: `av1opt bench` measures it

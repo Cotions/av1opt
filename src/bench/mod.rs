@@ -499,16 +499,59 @@ pub struct ClassPick {
     pub why: String,
 }
 
-/// The chosen pick of every resolution class the report has videos for. The default settings
-/// winning makes no entry: one would keep them when the default moves on.
+/// A class with fewer videos than this says too little for an entry of its own: two videos
+/// leave a standard error of about 3.2%, above the 1 and 2% a pick has to win by.
+pub const MIN_VIDEOS_OF_A_CLASS: usize = 3;
+
+/// The pick of `scope` (a class, or all videos), if it holds up. The winner of many settings owes
+/// part of its lead to luck, 0.5 to 3 points of it here, so it is chosen on every other video and
+/// has to gain on the rest too. Its numbers are those of all the videos.
+fn confirmed_pick(report: &Report, scope: Option<Class>, pick: Pick) -> Result<Choice, String> {
+    let configs = report.configs.len();
+    let whole = report.summaries.iter().find(|s| s.class == scope).ok_or("no video of this size has a result under the default settings")?;
+    let points: Vec<Vec<Option<Point>>> = report
+        .videos
+        .iter()
+        .filter(|v| scope.is_none_or(|c| v.class == c))
+        .map(|v| v.cells.iter().map(|c| c.point).collect::<Vec<_>>())
+        .filter(|p: &Vec<Option<Point>>| p.len() == configs && p.get(report.baseline).is_some_and(Option::is_some))
+        .collect();
+    let half = |first: usize| points.iter().skip(first).step_by(2).map(Vec::as_slice).collect::<Vec<_>>();
+    let (chosen_on, checked_on) = (half(0), half(1));
+    let judged = |videos: &[&[Option<Point>]]| stats::summarize(scope, videos, configs, report.baseline);
+    let (Some(chosen), Some(checked)) = (judged(&chosen_on), judged(&checked_on)) else {
+        return Err("one video is too few: a winner has to hold on other videos".into());
+    };
+    let config = pick.of(&chosen);
+    if config == report.baseline {
+        return Err("nothing measured beats the default settings".into());
+    }
+    let label = report.configs[config].label();
+    let row_of = |s: &Summary| s.rows.iter().find(|r| r.config == config).cloned();
+    let (Some(check), Some(all)) = (row_of(&checked), row_of(whole)) else {
+        return Err(format!("{label} has no result to compare"));
+    };
+    let gain = if pick == Pick::Fastest { check.time } else { check.size };
+    if check.missing > 0 || all.missing > 0 || gain.is_nan() || gain >= 1.0 {
+        return Err(format!("{label} won on half of the videos and gained nothing on the other half"));
+    }
+    if all.hurts_the_worst_clip() {
+        return Err(format!("{label} lowers the worst clip by {:.1} VMAF", all.vmaf_min_drop));
+    }
+    choice(report, whole, config).ok_or_else(|| format!("{label} has no result to compare"))
+}
+
+/// What to do for every resolution class the report has videos for. The default settings
+/// winning makes no entry: one would keep them when the default moves on. A class of few videos
+/// goes by the pick of all videos.
 pub fn tuning_picks(report: &Report, pick: Pick) -> Vec<ClassPick> {
     let of = |s: &Summary| {
         let class = s.class?;
-        let config = pick.of(s);
-        if config == report.baseline {
-            return Some(ClassPick { class, choice: None, why: "nothing measured beats the default settings".into() });
-        }
-        Some(ClassPick { class, choice: Some(choice(report, s, config)?), why: String::new() })
+        let scope = (s.videos >= MIN_VIDEOS_OF_A_CLASS).then_some(class);
+        Some(match confirmed_pick(report, scope, pick) {
+            Ok(choice) => ClassPick { class, choice: Some(choice), why: String::new() },
+            Err(why) => ClassPick { class, choice: None, why },
+        })
     };
     report.summaries.iter().filter_map(of).collect()
 }
@@ -539,8 +582,8 @@ pub fn print(r: &Report) {
     let width = r.configs.iter().map(|c| c.label().chars().count()).max().unwrap_or(10).max(10);
     for s in &r.summaries {
         let title = s.class.map_or("All videos", Class::label);
-        println!("\n{title}: {} video{}{}", s.videos, if s.videos == 1 { "" } else { "s" }, if s.class.is_some() && s.videos < 3 { " (few: treat with care)" } else { "" });
-        println!("  {:<width$}  {:>8}  {:>17}  {:>7}  {:>7}  {:>9}  {:>5}", "setting", "size", "per video", "time", "clock", "speed", "CRF");
+        println!("\n{title}: {} video{}{}", s.videos, if s.videos == 1 { "" } else { "s" }, if s.class.is_some() && s.videos < MIN_VIDEOS_OF_A_CLASS { " (few: --save goes by all videos)" } else { "" });
+        println!("  {:<width$}  {:>8}  {:>8}  {:>17}  {:>7}  {:>7}  {:>9}  {:>5}", "setting", "size", "bytes", "per video", "time", "clock", "speed", "CRF");
         let mut rows: Vec<&stats::Row> = s.rows.iter().collect();
         // Smallest first; settings without a result on every video after the others.
         rows.sort_by(|a, b| (a.missing > 0).cmp(&(b.missing > 0)).then(a.size.total_cmp(&b.size)));
@@ -556,14 +599,18 @@ pub fn print(r: &Report) {
             if row.missing > 0 {
                 marks.push("no result on some videos");
             }
+            if row.hurts_the_worst_clip() {
+                marks.push("lowers the worst clip");
+            }
             if row.size.is_nan() {
-                println!("  {:<width$}  {:>8}  {:>17}  {:>7}  {:>7}  {:>9}  {:>5}  no result", c.label(), "", "", "", "", "", "");
+                println!("  {:<width$}  {:>8}  {:>8}  {:>17}  {:>7}  {:>7}  {:>9}  {:>5}  no result", c.label(), "", "", "", "", "", "", "");
                 continue;
             }
             let range = if s.videos - row.missing > 1 && row.config != r.baseline { format!("{} to {}", percent(row.size_best), percent(row.size_worst)) } else { String::new() };
             let clock = if row.wall_time.is_nan() { String::new() } else { format!("{:.2}x", row.wall_time) };
+            let bytes = if row.size_total.is_nan() { String::new() } else { percent(row.size_total) };
             println!(
-                "  {:<width$}  {:>8}  {:>17}  {:>6.2}x  {clock:>7}  {:>8.2}x  {:>5.1}  {}",
+                "  {:<width$}  {:>8}  {bytes:>8}  {:>17}  {:>6.2}x  {clock:>7}  {:>8.2}x  {:>5.1}  {}",
                 c.label(), percent(row.size), range, row.time, row.speed, row.crf, marks.join(", ")
             );
         }
@@ -578,7 +625,8 @@ pub fn print(r: &Report) {
         say("smallest at about the default's time (balanced)", s.picks.balanced);
         say("fastest at about the default's size", s.picks.fastest);
     }
-    println!("\nsize and time are against the default settings at equal VMAF; time is processor time, which ranks the settings, and clock the same by the clock, which other work on the machine disturbs; speed is video seconds per second by the clock; \"front\": nothing else is both smaller and faster");
+    println!("\nsize is the typical video (geometric mean of each video's ratio); bytes is all the videos together (ratio of the sums), nearer what a library saves");
+    println!("size and time are against the default settings at equal VMAF; time is processor time, which ranks the settings, and clock the same by the clock, which other work on the machine disturbs; speed is video seconds per second by the clock; \"front\": nothing else is both smaller and faster");
 }
 
 /// One row per video and setting.
@@ -652,7 +700,7 @@ mod tests {
     fn video(class: Class, kbps: &[Option<f64>]) -> Video {
         let cells = kbps
             .iter()
-            .map(|k| Cell { point: k.map(|k| Point { crf: 35.0, bitrate: k * 1000.0, cost: 1.0, wall_cost: 2.0, vmaf: 93.0, capped: false }), trials: Vec::new(), error: None })
+            .map(|k| Cell { point: k.map(|k| Point { crf: 35.0, bitrate: k * 1000.0, cost: 1.0, wall_cost: 2.0, vmaf: 93.0, vmaf_min: 92.0, capped: false }), trials: Vec::new(), error: None })
             .collect();
         Video { path: "v.mkv".into(), class, codec: "h264".into(), width: 1920, height: 1080, fps: 30.0, duration_s: 60.0, source_bitrate: 5e6, hdr: false, cells, error: None }
     }
@@ -678,13 +726,10 @@ mod tests {
             configs: vec![Config::baseline(), Config { preset: 6, params: "tune=1".into() }], baseline: 0,
             videos: videos.to_vec(), summaries: s, skipped: Vec::new(), elapsed_secs: 1.0, fresh: 0, cached: 0,
         };
-        // 1080p gains 10% at the same time; the others keep the default, which saves nothing.
+        // Every class is too small to go by, and the second setting fails on a video of the
+        // whole, so the default stays and nothing is saved.
         let picks = tuning_picks(&report, Pick::Balanced);
-        assert_eq!(picks.iter().map(|p| (p.class, p.choice.as_ref().map(|c| c.params.as_str()))).collect::<Vec<_>>(), [(Class::Sd, None), (Class::Hd, Some("tune=1")), (Class::Uhd, None)]);
-        let hd = picks[1].choice.as_ref().unwrap();
-        assert_eq!(hd.videos, 2);
-        assert!((hd.size - 0.9).abs() < 1e-12);
-        assert_eq!(hd.baseline, Some(Baseline { preset: search::DEFAULT_PRESET, params: search::DEFAULT_PARAMS.into() }));
+        assert_eq!(picks.iter().map(|p| (p.class, p.choice.is_some())).collect::<Vec<_>>(), [(Class::Sd, false), (Class::Hd, false), (Class::Uhd, false)]);
         assert!(choice(&report, &report.summaries[0], 7).is_none());
     }
 
@@ -772,12 +817,69 @@ mod tests {
     #[test]
     fn saved_settings_are_the_chosen_winner_of_each_class_and_not_of_the_whole() {
         // Setting 1 is smaller but slow, setting 2 fast at about the same size.
-        let r = report(vec![timed_video(Class::Hd, &[(1000.0, 1.0), (800.0, 3.0), (1010.0, 0.5)])], settings(3));
+        let r = report(vec![timed_video(Class::Hd, &[(1000.0, 1.0), (800.0, 3.0), (1010.0, 0.5)]); 4], settings(3));
         let params = |pick| tuning_picks(&r, pick).into_iter().map(|p| (p.class, p.choice.map(|c| c.params))).collect::<Vec<_>>();
         assert_eq!(params(Pick::Smallest), [(Class::Hd, Some("tune=1".to_string()))]);
         assert_eq!(params(Pick::Balanced), [(Class::Hd, None)]);
         assert_eq!(params(Pick::Fastest), [(Class::Hd, Some("tune=2".to_string()))]);
         assert!(tuning_picks(&report(Vec::new(), settings(3)), Pick::Balanced).is_empty());
+    }
+
+    /// Videos of a class on which setting 1 has these sizes against 1000 for the baseline.
+    fn sized(class: Class, sizes: &[f64]) -> Vec<Video> {
+        sizes.iter().map(|&s| video(class, &[Some(1000.0), Some(s)])).collect()
+    }
+
+    fn saved(r: &Report, class: Class) -> ClassPick {
+        tuning_picks(r, Pick::Balanced).into_iter().find(|p| p.class == class).unwrap()
+    }
+
+    #[test]
+    fn a_pick_that_holds_on_both_halves_is_saved_with_the_numbers_of_all_its_videos() {
+        let r = report(sized(Class::Hd, &[900.0, 880.0, 920.0, 900.0]), settings(2));
+        let c = saved(&r, Class::Hd).choice.unwrap();
+        assert_eq!((c.params.as_str(), c.videos), ("tune=1", 4));
+        assert!((c.size - 0.9).abs() < 2e-3, "{}", c.size);
+        assert_eq!(c.baseline, Some(Baseline { preset: 4, params: "tune=0".into() }));
+    }
+
+    #[test]
+    fn a_win_the_other_half_of_the_videos_does_not_share_is_not_saved() {
+        // Every other video gains 20%, and the ones between lose 1%.
+        let r = report(sized(Class::Hd, &[800.0, 1010.0, 800.0, 1010.0]), settings(2));
+        let p = saved(&r, Class::Hd);
+        assert_eq!(p.choice, None);
+        assert!(p.why.contains("other half"), "{}", p.why);
+        // The whole would have taken it.
+        assert_eq!(r.summaries[1].picks.balanced, 1);
+    }
+
+    #[test]
+    fn a_class_of_few_videos_goes_by_the_pick_of_all_videos() {
+        let mut videos = sized(Class::Sd, &[900.0, 900.0, 900.0, 900.0]);
+        videos.extend(sized(Class::Hd, &[1100.0, 900.0]));
+        let r = report(videos, settings(2));
+        // 1080p on its own would lose on one video of two; all six say otherwise.
+        let hd = saved(&r, Class::Hd).choice.unwrap();
+        assert_eq!((hd.params.as_str(), hd.videos), ("tune=1", 6));
+        assert_eq!(saved(&r, Class::Sd).choice.unwrap().videos, 4);
+    }
+
+    #[test]
+    fn a_single_video_is_not_enough_to_change_the_settings() {
+        let p = saved(&report(sized(Class::Hd, &[500.0]), settings(2)), Class::Hd);
+        assert_eq!(p.choice, None);
+        assert!(p.why.contains("one video"), "{}", p.why);
+    }
+
+    #[test]
+    fn a_pick_that_lowers_the_worst_clip_is_not_saved() {
+        let mut videos = sized(Class::Hd, &[900.0; 4]);
+        for v in &mut videos {
+            v.cells[1].point.as_mut().unwrap().vmaf_min = 91.0;
+        }
+        let r = report(videos, settings(2));
+        assert_eq!(saved(&r, Class::Hd).choice, None);
     }
 
     #[test]

@@ -63,7 +63,7 @@ reads.
 | `--csv` | none | Write one row per file to this CSV file. |
 | `--top` | 15 | Number of top candidates listed. |
 | `--target-vmaf` | 93 | VMAF target the estimates assume. |
-| `--preset` | 4 | SVT-AV1 preset the time estimates assume. |
+| `--preset` | 5 | SVT-AV1 preset the time estimates assume. |
 | `--sort` | `savings` | Order of the top list: `savings` or `per-hour` (saving per hour of encoding). |
 | `--hours` | none | Also list the candidates that save the most together in this many hours of encoding. |
 | `--list` | none | Write the paths `--hours` picked to this file, one per line. |
@@ -89,7 +89,7 @@ erring in different directions, so it is narrower than their ranges added up.
 with a CRF per scene (a multiple learned from the per-scene encodes made here), and with
 `--scenes=auto` (the share of videos that end up per scene: a third at first, then what the
 encodes made that way here say; the queue of the UI counts each file at that average)
-(`--preset`, default 4) and lists the time per file; `--sort per-hour` orders the top candidates by bytes saved per
+(`--preset`, default 5) and lists the time per file; `--sort per-hour` orders the top candidates by bytes saved per
 hour of encoding, the place to start when the library is larger than your patience. The time
 is seconds per frame by frame size: a guess from one six-core machine at first, then fitted to
 the encode times in the history, so it becomes this machine's speed after a few encodes.
@@ -187,7 +187,7 @@ the picture are not seen either: a copy with them groups with a clean one and ca
 ## encode
 
 ```
-av1opt encode movie.mkv some/folder -o /out [--target-vmaf 93] [--preset 4] [--container mp4|mkv]
+av1opt encode movie.mkv some/folder -o /out [--target-vmaf 93] [--preset 5] [--container mp4|mkv]
 ```
 
 For each file:
@@ -256,7 +256,7 @@ For each file:
    not kept: such a file plays as HDR10, and the report says so. They are encoded in one
    pass even with `--scenes`, with a note in the report: a video joined from scenes would
    lose that metadata from its container.
-4. **Encode** – SVT-AV1, 10-bit, `--preset` 4 with `tune=0` unless `--svt-params` or `--tuned`
+4. **Encode** – SVT-AV1, 10-bit, `--preset` 5 with `tune=0` unless `--svt-params` or `--tuned`
    say otherwise (see [bench](#bench)). Two parameters are added to whatever set is in
    use unless it names them itself: `keyint=10s` (a key frame every 10 seconds instead of
    every 5, counted in frames where a video's frames come at another rate than it declares) and `enable-qm=1` (quantization matrices). Audio already in AAC/Opus/MP3 is copied, anything else becomes
@@ -518,7 +518,7 @@ folder), the file is refused before any sample is cut, with a message to rename 
 | `-o`, `--out-dir` | required | Folder for the finished files and their `.av1opt.json` reports; not on ZFS. |
 | `--container` | `mp4` | `mp4` (plays in browsers; image subtitles dropped) or `mkv` (keeps every subtitle but TTML, and attachments). |
 | `--target-vmaf` | 93 | Mean VMAF the output must reach: over the whole video where it is scored whole, over the samples where not. |
-| `--preset` | 4 | SVT-AV1 preset: lower is slower and smaller. |
+| `--preset` | 5 | SVT-AV1 preset: lower is slower and smaller. |
 | `--svt-params` | `tune=0` | SVT-AV1 parameters besides the CRF, as `key=value:key=value`. |
 | `--tuned` | off | Use the preset and parameters `bench --save` picked for each resolution class. |
 | `--min-crf` | 20 | Lowest CRF the search tries. |
@@ -561,7 +561,7 @@ videos.
    three size classes: 720p and below, 1080p, above 1080p (by pixel count, so portrait and
    cropped videos count with their landscape peers). Dolby Vision and very short files are left out.
 2. **Measure** – `--samples` (2) lossless clips of `--sample-secs` (6) seconds per video. Every
-   setting (each preset with each parameter set, plus the default: preset 4 with `tune=0`) gets
+   setting (each preset with each parameter set, plus the default: preset 5 with `tune=0`) gets
    a CRF search of its own, which goes on until two neighbouring CRFs are measured (`encode`
    stops sooner), so each ends at the target VMAF; every sample encode is timed, in processor time and by the
    clock.
@@ -1224,12 +1224,15 @@ ignored, as the XDG specification says, and the default under the home folder is
   the encode. One real 15-minute video through the whole of `encode` at preset 5: 191.3 MB
   at a mean of 93.1 instead of 205.1 MB at 93.2, the lowest five seconds at 89.0 and 89.1,
   in 54 minutes instead of 52 (search, check and repairs take the same time at either; the
-  machine was busy both times). The default went from 6 to 5 on that, and on 2026-11-19
-  from 5 to 4: a further 3.3%, 4.4% and 3.4% smaller on the three sets, on every clip and
-  by all four measures, for 22 to 29% more processor time in the encode, about a fifth more
-  for a whole run. That step was the owner's choice of bytes over time, and it pays less
-  on fast-moving 60 frames a second (1% on the one such clip measured). `--preset 5` or
-  `--preset 6` gets the quicker encode back, and `--preset 3` goes further still: 16.0% smaller than 6 on the first set of clips (8 to 26% by
+  machine was busy both times). The default went from 6 to 5 on that; `--preset 6` gets
+  the quicker encode back. Preset 4 was the default for a morning (2026-11-19) and went
+  back: against 5 the clips say 3.3%, 4.4% and 3.4% smaller for 22 to 29% more processor
+  time in the encode, but two whole 15-minute videos through `encode` came out only 1.6%
+  and 1.0% smaller (108.9 MB against 110.6, 77.0 against 77.8, at the same mean and lowest
+  five seconds) for 23% and 20% more time. A quarter of each was encoded again by the
+  repairs at either preset, and both needed a CRF above 42; why whole videos gain a third
+  of what clips do is not known. `--preset 4` is there for a library that can wait, and
+  `--preset 3` further still: 16.0% smaller than 6 on the first set of clips (8 to 26% by
   clip; 14 to 16% by the other three metrics) for three times the processor time.
 - **A container's length is not the picture's.** One recording had 7:40 of video under 17:32
   of sound. Samples and spot checks were placed along the 17:32 and asked for frames that

@@ -1963,7 +1963,7 @@ fn a_benchmark_ranks_settings_remembers_its_encodes_and_tunes_the_encoder() {
     let b: Value = serde_json::from_slice(&std::fs::read(&json).unwrap()).unwrap();
     // The default settings are measured too, as what the others are compared with.
     let configs: Vec<(u64, &str)> = b["configs"].as_array().unwrap().iter().map(|k| (k["preset"].as_u64().unwrap(), k["params"].as_str().unwrap())).collect();
-    assert_eq!(configs, [(4, "tune=0"), (8, "tune=0"), (10, "tune=0")]);
+    assert_eq!(configs, [(5, "tune=0"), (8, "tune=0"), (10, "tune=0")]);
     assert_eq!(b["videos"].as_array().unwrap().len(), 2);
     let rows = b["summaries"][0]["rows"].as_array().unwrap();
     assert_eq!((rows[0]["size"].as_f64(), rows[0]["time"].as_f64()), (Some(1.0), Some(1.0)));
@@ -1980,7 +1980,7 @@ fn a_benchmark_ranks_settings_remembers_its_encodes_and_tunes_the_encoder() {
     let tuning_file = c.dir.join("data/av1opt/tuning.json");
     let tuning: Value = serde_json::from_slice(&std::fs::read(&tuning_file).unwrap()).unwrap();
     // A class the default settings win has no entry, and is encoded with the default.
-    let pick = tuning["classes"]["sd"]["preset"].as_u64().unwrap_or(4);
+    let pick = tuning["classes"]["sd"]["preset"].as_u64().unwrap_or(5);
     let encode = |c: &Case, extra: &str| {
         let out = c.dir.join(extra);
         let r = c.av1opt(&["encode".as_ref(), "-o".as_ref(), out.as_os_str(), "--tuned".as_ref(), "--samples".as_ref(), "2".as_ref(), "--sample-secs".as_ref(), "2".as_ref(), c.videos().join("a.mp4").as_os_str()]);
@@ -1995,7 +1995,7 @@ fn a_benchmark_ranks_settings_remembers_its_encodes_and_tunes_the_encoder() {
     std::fs::write(&tuning_file, r#"{"format":1,"classes":{"sd":{"preset":6,"params":"tune=0","size":1.0,"time":1.0,"videos":2,"target_vmaf":93.0,"made":1}}}"#).unwrap();
     let (r, report) = encode(&c, "stale");
     r.ok().has("encoded 1,").has("tuned settings for 720p and below are not used").has("av1opt bench");
-    assert_eq!(report["preset"].as_u64(), Some(4));
+    assert_eq!(report["preset"].as_u64(), Some(5));
 }
 
 impl Case {

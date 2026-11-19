@@ -23,10 +23,9 @@ use std::time::Instant;
 /// changes meaning or is removed.
 pub const REPORT_FORMAT: u32 = 1;
 
-/// Presets tried by default: the one `encode` uses, the next quicker one and a much quicker
-/// one, so that every parameter set is also measured at the preset it would be used at. The
-/// next slower one, 3, takes about twice the time of the default for the whole benchmark.
-pub const DEFAULT_PRESETS: [u8; 3] = [search::DEFAULT_PRESET, 5, 8];
+/// Presets tried by default: the one `encode` uses and one either side of it, so that every
+/// parameter set is also measured at the preset it would be used at.
+pub const DEFAULT_PRESETS: [u8; 3] = [4, search::DEFAULT_PRESET, 8];
 
 /// Parameter sets tried by default: the three tunes that suit video, and two additions to the
 /// default tune that cost no encode time.
@@ -694,11 +693,11 @@ mod tests {
     #[test]
     fn matrix_starts_with_the_baseline_and_has_no_repeats() {
         let sets: Vec<String> = ["tune=0", "tune=1"].map(String::from).to_vec();
-        let m = matrix(&[5, 6], &sets);
+        let m = matrix(&[4, 6], &sets);
         assert_eq!(m[0], Config::baseline());
         let labels: Vec<String> = m.iter().map(Config::label).collect();
-        assert_eq!(labels, ["preset 4 · tune=0", "preset 5 · tune=0", "preset 5 · tune=1", "preset 6 · tune=0", "preset 6 · tune=1"]);
-        assert_eq!(matrix(&[4], &sets).len(), 2, "the baseline is not measured twice");
+        assert_eq!(labels, ["preset 5 · tune=0", "preset 4 · tune=0", "preset 4 · tune=1", "preset 6 · tune=0", "preset 6 · tune=1"]);
+        assert_eq!(matrix(&[5], &sets).len(), 2, "the baseline is not measured twice");
         assert_eq!(matrix(&[], &sets), [Config::baseline()]);
         assert_eq!(Config { preset: 8, params: String::new() }.label(), "preset 8 · SVT-AV1 defaults");
     }

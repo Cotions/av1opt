@@ -572,7 +572,7 @@ fn benchmark_requests_and_tuned_settings() {
     assert!(b["run"].is_null(), "{b}");
     assert_eq!(b["report"]["configs"][1]["preset"], 4, "{b}");
     assert_eq!(b["tuning"], json!([]));
-    assert_eq!(b["defaults"]["baseline"], json!({ "preset": 4, "params": "tune=0" }));
+    assert_eq!(b["defaults"]["baseline"], json!({ "preset": 5, "params": "tune=0" }));
     assert_eq!(b["defaults"]["presets"], json!([4, 5, 8]));
     assert!(b["defaults"]["param_sets"].as_array().unwrap().contains(&json!("tune=0")));
     let st = s.get("/api/state").json();

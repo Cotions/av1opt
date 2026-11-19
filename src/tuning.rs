@@ -62,7 +62,7 @@ impl std::str::FromStr for Class {
 
 /// The default of the versions that saved no baseline, for telling their entries apart: before
 /// the default moved to preset 5, a benchmark won by the default saved these very settings. Kept
-/// now they would pin preset 6, about a tenth larger than today's default.
+/// now they would pin preset 6, 6.2% larger than the default.
 const OLD_DEFAULT_PRESET: u8 = 6;
 const OLD_DEFAULT_PARAMS: &str = "tune=0";
 /// How far an encode's VMAF target may be from the one a choice was measured at.
@@ -280,7 +280,7 @@ mod tests {
         let today = (crate::search::DEFAULT_PRESET, crate::search::DEFAULT_PARAMS);
         assert_eq!(measured(4, Some(today)).out_of_date(93.0), None);
         let why = measured(4, Some((6, "tune=0"))).out_of_date(93.0).unwrap();
-        assert!(why.contains("preset 6") && why.contains("now preset 4"), "{why}");
+        assert!(why.contains("preset 6") && why.contains("now preset 5"), "{why}");
         assert!(measured(4, Some((today.0, "tune=1"))).out_of_date(93.0).is_some());
     }
 

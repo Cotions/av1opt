@@ -159,34 +159,27 @@ fn remove_abandoned_folders_of(parent: &Path, prefix: &str, me: u32) {
     }
 }
 
-/// Whether the work folder at `path`, kept from an earlier run so that it can go on from it,
-/// can be believed: true if it can, false if there is none yet, and otherwise why not. Its
-/// name can be worked out by anyone, and what is in it decides what ends up in the output.
-pub fn check_kept_folder(path: &Path) -> Result<bool, String> {
+/// The work folder at `path`, kept from an earlier run so that it can go on from it, held open
+/// if it can be believed; None if there is none yet, and otherwise why not. Its name can be
+/// worked out by anyone, and what is in it decides what ends up in the output.
+pub fn check_kept_folder(path: &Path) -> Result<Option<HeldFolder>, String> {
     check_kept_folder_of(path, my_user())
 }
 
-fn check_kept_folder_of(path: &Path, me: u32) -> Result<bool, String> {
-    let folder = match std::fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+fn check_kept_folder_of(path: &Path, me: u32) -> Result<Option<HeldFolder>, String> {
+    let folder = match open_folder(path) {
+        Ok(folder) => folder,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err("it is a link".into()),
+        Err(e) if e.raw_os_error() == Some(libc::ENOTDIR) => return Err("it is not a folder".into()),
         Err(e) => return Err(format!("it cannot be looked at ({e})")),
     };
-    if folder.file_type().is_symlink() {
-        return Err("it is a link".into());
-    }
-    if !folder.is_dir() {
-        return Err("it is not a folder".into());
-    }
-    if folder.uid() != me {
-        return Err("it belongs to another user".into());
-    }
     // Folders made by earlier versions follow the umask. One only its owner can write to is
-    // as good as a private one, and may hold days of encoding.
-    if folder.mode() & 0o022 != 0 {
-        return Err("other users can write to it".into());
-    }
-    let entries = std::fs::read_dir(path).map_err(|e| format!("it cannot be read ({e})"))?;
+    // as good as a private one, and may hold days of encoding. It is closed by way of the
+    // descriptor: by name, a link put there meanwhile would be followed.
+    let mode = folder.metadata().map_err(|e| format!("it cannot be looked at ({e})"))?.mode();
+    let held = HeldFolder::hold(folder, me, 0o022).map_err(|e| e.to_string())?;
+    let entries = std::fs::read_dir(held.path()).map_err(|e| format!("it cannot be read ({e})"))?;
     for entry in entries {
         let entry = entry.map_err(|e| format!("it cannot be read ({e})"))?;
         let file = std::fs::symlink_metadata(entry.path()).map_err(|e| format!("it cannot be read ({e})"))?;
@@ -194,16 +187,172 @@ fn check_kept_folder_of(path: &Path, me: u32) -> Result<bool, String> {
             return Err(format!("{} in it is not a plain file of this user's", entry.file_name().to_string_lossy()));
         }
     }
-    if folder.mode() & 0o777 != 0o700 {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|e| format!("it cannot be made private ({e})"))?;
+    if mode & 0o777 != 0o700 {
+        held.folder.set_permissions(std::fs::Permissions::from_mode(0o700)).map_err(|e| format!("it cannot be made private ({e})"))?;
     }
-    Ok(true)
+    Ok(Some(held))
 }
 
-/// Makes the folder `path` for work kept between runs, private and new. Fails if something
-/// is there already.
-pub fn make_kept_folder(path: &Path) -> std::io::Result<()> {
-    std::fs::DirBuilder::new().mode(0o700).create(path)
+/// Makes the folder `path` for work kept between runs, private and new, and holds it. Fails if
+/// something is there already.
+pub fn make_kept_folder(path: &Path) -> std::io::Result<HeldFolder> {
+    std::fs::DirBuilder::new().mode(0o700).create(path)?;
+    HeldFolder::open(path)
+}
+
+/// The folder at `path`, opened. A link at that name is refused (`ELOOP`) and so is anything
+/// but a folder (`ENOTDIR`), without waiting on a pipe.
+fn open_folder(path: &Path) -> std::io::Result<std::fs::File> {
+    match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC).open(path) {
+        // Linux answers a link with ENOTDIR when a folder is asked for; it is told apart here so
+        // that the message says what is there.
+        Err(e) if e.raw_os_error() == Some(libc::ENOTDIR) && std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) => {
+            Err(std::io::Error::from_raw_os_error(libc::ELOOP))
+        }
+        opened => opened,
+    }
+}
+
+/// A folder of this user's held open, so that everything done in it goes by way of its
+/// descriptor and not by its name. In a folder others can write to and that lacks the sticky
+/// bit (a shared output folder made with mode 0777, say), anyone may rename a folder of ours
+/// and put a link to one of theirs at its name: whatever went by the name after that would be
+/// written into, read from and removed in their folder, and what av1opt then records as its
+/// own encode could be their file.
+///
+/// [`HeldFolder::path`] is `/proc/<this process>/fd/<descriptor>`, which leads to the folder
+/// itself wherever it has gone. That path is given to ffmpeg and ffprobe as well: they run as
+/// this user, and the system lets a process of the same user go through another's descriptors,
+/// one started by `systemd-run --scope` under the memory cap included. Under `/proc/self` the
+/// path would only work for a program that inherited the descriptor, and none does: every
+/// descriptor is closed for the programs av1opt starts.
+#[derive(Debug)]
+pub struct HeldFolder {
+    folder: std::fs::File,
+    inside: PathBuf,
+}
+
+impl HeldFolder {
+    /// Opens the folder at `path`: a real folder (a link there is refused), of this user's,
+    /// that nobody else can enter. Judged on the open descriptor, so that what is judged is
+    /// what is then used.
+    pub fn open(path: &Path) -> std::io::Result<HeldFolder> {
+        Self::open_of(path, my_user())
+    }
+
+    fn open_of(path: &Path, me: u32) -> std::io::Result<HeldFolder> {
+        Self::hold(open_folder(path)?, me, 0o077)
+    }
+
+    /// `folder` held, if it is a folder of user `me` without any of the bits in `refused`.
+    fn hold(folder: std::fs::File, me: u32, refused: u32) -> std::io::Result<HeldFolder> {
+        use std::os::fd::AsRawFd;
+        let meta = folder.metadata()?;
+        if !meta.is_dir() {
+            return Err(std::io::Error::other("it is not a folder"));
+        }
+        if meta.uid() != me {
+            return Err(std::io::Error::other("it belongs to another user"));
+        }
+        if meta.mode() & refused != 0 {
+            return Err(std::io::Error::other(if meta.mode() & refused & 0o022 != 0 { "other users can write to it" } else { "other users can enter it" }));
+        }
+        let inside = PathBuf::from(format!("/proc/{}/fd/{}", std::process::id(), folder.as_raw_fd()));
+        // Without the system's list of processes (a container without /proc) the descriptor
+        // cannot be gone through by path: the caller is told, and decides.
+        let through = std::fs::metadata(&inside).is_ok_and(|m| (m.dev(), m.ino()) == (meta.dev(), meta.ino()));
+        if !through {
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, format!("{} does not lead to the folder (is /proc there?)", inside.display())));
+        }
+        Ok(HeldFolder { folder, inside })
+    }
+
+    /// The path that leads into this folder, whatever has become of its name.
+    pub fn path(&self) -> &Path {
+        &self.inside
+    }
+
+    /// The device and the number of the folder.
+    fn identity(&self) -> std::io::Result<(u64, u64)> {
+        self.folder.metadata().map(|m| (m.dev(), m.ino()))
+    }
+
+    /// Where the folder is now, if it is still there under some name.
+    fn location(&self) -> Option<PathBuf> {
+        use std::os::fd::AsRawFd;
+        let now = std::fs::read_link(format!("/proc/self/fd/{}", self.folder.as_raw_fd())).ok()?;
+        let identity = self.identity().ok()?;
+        std::fs::symlink_metadata(&now).is_ok_and(|m| m.is_dir() && (m.dev(), m.ino()) == identity).then_some(now)
+    }
+
+    /// The plain file `name` in this folder, opened to be read; a link or anything else at
+    /// that name is refused.
+    pub fn open_file(&self, name: &OsStr) -> std::io::Result<std::fs::File> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let c = std::ffi::CString::new(name.as_bytes()).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        // SAFETY: a descriptor we own and a valid NUL-terminated name; the new descriptor is
+        // ours alone and is handed to a File, which closes it.
+        let file = unsafe {
+            let fd = libc::openat(self.folder.as_raw_fd(), c.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            std::fs::File::from_raw_fd(fd)
+        };
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(std::io::Error::other(format!("not a plain file: it is {}", kind_of(&meta))));
+        }
+        Ok(file)
+    }
+
+    /// Moves `name`, in this folder, to `to`. Unless `replace`, fails with `AlreadyExists` when
+    /// something has that name. The move starts from the descriptor, so what is moved is what
+    /// was made in this folder.
+    pub fn move_out(&self, name: &OsStr, to: &Path, replace: bool) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let c = |b: &[u8]| std::ffi::CString::new(b).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        let (from, to_c) = (c(name.as_bytes())?, c(to.as_os_str().as_bytes())?);
+        let fd = self.folder.as_raw_fd();
+        // SAFETY: a descriptor we own and valid NUL-terminated paths that outlive each call.
+        let plain = || if unsafe { libc::renameat(fd, from.as_ptr(), libc::AT_FDCWD, to_c.as_ptr()) } == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) };
+        if replace {
+            return plain();
+        }
+        // SAFETY: as above.
+        if unsafe { libc::renameat2(fd, from.as_ptr(), libc::AT_FDCWD, to_c.as_ptr(), libc::RENAME_NOREPLACE) } == 0 {
+            return Ok(());
+        }
+        let e = std::io::Error::last_os_error();
+        match e.raw_os_error() {
+            // Old kernels and some filesystems (FUSE ones like ntfs-3g) don't know the flag.
+            Some(libc::EINVAL | libc::ENOSYS | libc::ENOTSUP) => {
+                if std::fs::symlink_metadata(to).is_ok() {
+                    return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
+                }
+                plain()
+            }
+            _ => Err(e),
+        }
+    }
+
+    /// Removes the folder and all it holds. What it holds is reached by way of the descriptor;
+    /// the folder itself goes from wherever it is now, if that is still this folder.
+    pub fn remove_all(&self) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(&self.inside)? {
+            let entry = entry?;
+            // Removing does not follow links, neither one at the entry's name nor ones below it.
+            if entry.file_type()?.is_dir() {
+                std::fs::remove_dir_all(entry.path())?;
+            } else {
+                std::fs::remove_file(entry.path())?;
+            }
+        }
+        match self.location() {
+            Some(now) => std::fs::remove_dir(now),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Puts `data` at `path` by way of a file beside it that then takes its name: a reader
@@ -368,7 +517,7 @@ pub fn read_regular(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
 
 /// A size limit in words: whole MiB where it is one, bytes otherwise.
 fn size_words(limit: u64) -> String {
-    if limit >= 1 << 20 && limit % (1 << 20) == 0 { format!("{} MiB", limit >> 20) } else { format!("{limit} bytes") }
+    if limit >= 1 << 20 && limit.is_multiple_of(1 << 20) { format!("{} MiB", limit >> 20) } else { format!("{limit} bytes") }
 }
 
 /// The right to one piece of work, held by a lock on the file at its path. The system lets go of
@@ -691,9 +840,22 @@ pub(crate) mod tests {
         make_kept_folder(&kept).unwrap();
         assert_eq!(std::fs::metadata(&kept).unwrap().mode() & 0o777, 0o700);
         std::fs::write(kept.join("plan.json"), b"{}").unwrap();
-        assert_eq!(check_kept_folder(&kept), Ok(true));
-        assert_eq!(check_kept_folder(&dir.join("none")), Ok(false));
+        assert_eq!(std::fs::read(check_kept_folder(&kept).unwrap().unwrap().path().join("plan.json")).unwrap(), b"{}");
+        assert!(check_kept_folder(&dir.join("none")).unwrap().is_none());
         assert!(check_kept_folder_of(&kept, my_user() + 1).unwrap_err().contains("another user"));
+        // One an earlier version left open to reading is closed, by way of its descriptor.
+        std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(check_kept_folder(&kept).unwrap().is_some());
+        assert_eq!(std::fs::metadata(&kept).unwrap().mode() & 0o777, 0o700);
+        std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(check_kept_folder(&kept).unwrap_err().contains("can write to it"));
+        std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // A link or something other than a folder at the name is never gone through, a pipe
+        // included, which would never finish opening.
+        std::os::unix::fs::symlink(&kept, dir.join("link")).unwrap();
+        assert_eq!(check_kept_folder(&dir.join("link")).unwrap_err(), "it is a link");
+        make_pipe(&dir.join("pipe"));
+        assert_eq!(check_kept_folder(&dir.join("pipe")).unwrap_err(), "it is not a folder");
         // A file nobody made here counts as much as a link.
         std::fs::create_dir(kept.join("sub")).unwrap();
         assert!(check_kept_folder(&kept).unwrap_err().contains("sub in it"));
@@ -849,6 +1011,64 @@ pub(crate) mod tests {
         let stopped = whole_digest(&file, size, &AtomicU64::new(0), &AtomicBool::new(true)).unwrap_err();
         assert_eq!(stopped.kind(), std::io::ErrorKind::Interrupted);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_held_folder_is_reached_through_its_descriptor_whatever_is_done_to_its_name() {
+        use std::os::unix::fs::symlink;
+        let dir = room("held");
+        let (made, moved, theirs) = (dir.join("made"), dir.join("moved"), dir.join("theirs"));
+        let held = make_kept_folder(&made).unwrap();
+        std::fs::create_dir(&theirs).unwrap();
+        std::fs::write(theirs.join("partial.mp4"), b"theirs").unwrap();
+        // Someone renames the folder and puts a link to one of theirs at its name.
+        std::fs::rename(&made, &moved).unwrap();
+        symlink(&theirs, &made).unwrap();
+        write_new(&held.path().join("partial.mp4"), b"ours").unwrap();
+        std::fs::create_dir(held.path().join("inner")).unwrap();
+        std::fs::write(held.path().join("inner/x"), b"x").unwrap();
+        assert_eq!(std::fs::read(moved.join("partial.mp4")).unwrap(), b"ours");
+        assert_eq!(std::fs::read(theirs.join("partial.mp4")).unwrap(), b"theirs");
+        // What is read and what is moved out is what was made in it.
+        let opened = held.open_file(OsStr::new("partial.mp4")).unwrap();
+        let mut read = String::new();
+        (&opened).read_to_string(&mut read).unwrap();
+        assert_eq!(read, "ours");
+        assert!(held.open_file(OsStr::new("inner")).unwrap_err().to_string().contains("it is a folder"));
+        symlink(theirs.join("partial.mp4"), moved.join("link")).unwrap();
+        assert_eq!(held.open_file(OsStr::new("link")).unwrap_err().raw_os_error(), Some(libc::ELOOP));
+        std::fs::write(dir.join("taken"), b"taken").unwrap();
+        assert_eq!(held.move_out(OsStr::new("partial.mp4"), &dir.join("taken"), false).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+        held.move_out(OsStr::new("partial.mp4"), &dir.join("out.mp4"), false).unwrap();
+        assert_eq!(std::fs::read(dir.join("out.mp4")).unwrap(), b"ours");
+        assert_eq!(std::fs::read(dir.join("taken")).unwrap(), b"taken");
+        let (landed, kept) = (std::fs::metadata(dir.join("out.mp4")).unwrap(), opened.metadata().unwrap());
+        assert_eq!((landed.dev(), landed.ino()), (kept.dev(), kept.ino()));
+        // Removing it removes the real folder where it now is, and nothing of theirs.
+        held.remove_all().unwrap();
+        assert!(!moved.exists());
+        assert_eq!(std::fs::read(theirs.join("partial.mp4")).unwrap(), b"theirs");
+        assert!(std::fs::symlink_metadata(&made).unwrap().file_type().is_symlink());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn only_a_private_folder_of_this_users_is_held() {
+        let dir = room("hold-refused");
+        let open = dir.join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(HeldFolder::open(&open).unwrap_err().to_string().contains("enter"));
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(HeldFolder::open(&open).unwrap_err().to_string().contains("write"));
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(HeldFolder::open_of(&open, my_user() + 1).unwrap_err().to_string().contains("another user"));
+        assert!(HeldFolder::open(&open).is_ok());
+        std::os::unix::fs::symlink(&open, dir.join("link")).unwrap();
+        assert_eq!(HeldFolder::open(&dir.join("link")).err().and_then(|e| e.raw_os_error()), Some(libc::ELOOP));
+        std::fs::write(dir.join("file"), b"").unwrap();
+        assert_eq!(HeldFolder::open(&dir.join("file")).err().and_then(|e| e.raw_os_error()), Some(libc::ENOTDIR));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -1357,6 +1357,87 @@ fn a_finished_chunk_swapped_for_another_stream_is_encoded_again_on_resuming() {
     assert_in_step(&out, &src, "1");
 }
 
+/// Names and contents of everything under `dir`, with each one's date, to show it was left as
+/// it was.
+fn everything_under(dir: &Path) -> Vec<(PathBuf, Vec<u8>, std::time::SystemTime)> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        if meta.is_dir() {
+            found.push((path.clone(), Vec::new(), meta.modified().unwrap()));
+            found.extend(everything_under(&path));
+        } else {
+            found.push((path.clone(), std::fs::read(&path).unwrap(), meta.modified().unwrap()));
+        }
+    }
+    found.sort();
+    found
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_temporary_folder_renamed_and_replaced_by_a_link_in_a_shared_output_folder_changes_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let c = Case::new("shared-output");
+    let src = c.clip("a.mp4", "640x360", 6);
+    // An output folder anyone can write to, without the sticky bit: anyone may rename what is
+    // in it. Somebody else's folder, with a file at the name av1opt's encode has.
+    std::fs::set_permissions(c.out(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    let theirs = c.dir.join("theirs");
+    std::fs::create_dir(&theirs).unwrap();
+    std::fs::write(theirs.join("partial.mp4"), b"not a video").unwrap();
+    std::fs::create_dir(theirs.join("inner")).unwrap();
+    std::fs::write(theirs.join("inner/kept"), b"kept").unwrap();
+    let before = everything_under(&theirs);
+
+    // As soon as the temporary folder is there, it is renamed and a link to their folder put at
+    // its name.
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let swapper = {
+        let (out, theirs, stop) = (c.out(), theirs.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let made = std::fs::read_dir(&out).unwrap().filter_map(|e| e.ok()).find(|e| {
+                    e.file_name().to_string_lossy().starts_with(".av1opt-tmp-") && e.file_type().is_ok_and(|t| t.is_dir())
+                });
+                if let Some(made) = made {
+                    let moved = out.join(format!("moved{}", made.file_name().to_string_lossy()));
+                    std::fs::rename(made.path(), &moved).unwrap();
+                    std::os::unix::fs::symlink(&theirs, made.path()).unwrap();
+                    return Some((made.path(), moved));
+                }
+            }
+            None
+        })
+    };
+    let r = c.encode(&[&src], &[]);
+    stop.store(true, Ordering::Relaxed);
+    let (link, moved) = swapper.join().unwrap().expect("the temporary folder was never seen");
+
+    // Either the encode's own bytes are the output and its record, or the run stops and says why.
+    let out = c.out().join("a.mp4");
+    if r.code == Some(0) {
+        r.has("encoded 1, skipped 0, failed 0");
+        assert_eq!(frames(&out), 144);
+        assert_in_step(&out, &src, "1");
+        let hash = Command::new("sha256sum").arg(&out).output().unwrap();
+        let hash = String::from_utf8_lossy(&hash.stdout).split_whitespace().next().unwrap().to_string();
+        let ledger = std::fs::read_to_string(c.dir.join("data/av1opt/ledger.jsonl")).unwrap();
+        let record = ledger.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|v| v["output"].as_str() == out.to_str()).unwrap_or_else(|| panic!("no record of {}:\n{ledger}", out.display()));
+        assert_eq!(record["output_sha256"].as_str(), Some(hash.as_str()), "{record}");
+        // The renamed folder was the one av1opt worked in, and it removed it where it had gone.
+        assert!(!moved.exists(), "{} was left", moved.display());
+    } else {
+        r.has("cannot hold the temporary folder");
+        assert!(!out.exists());
+    }
+    // Nothing in their folder was written, removed or replaced.
+    assert_eq!(everything_under(&theirs), before);
+    assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+}
+
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn scenes_get_their_own_crf_and_a_killed_run_goes_on_where_it_stopped() {

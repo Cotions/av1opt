@@ -256,7 +256,7 @@ impl<'a> ReportedSource<'a> {
 /// Chunks made from the earlier state are of no use to the next run and go with it, but only
 /// when the file was seen to hold something else: a drive that dropped out or a file only
 /// touched says nothing against them, and they may be days of work.
-fn check_source_unchanged(input: &Path, before: &Recorded, work: Option<&Path>, keep_temp: bool) -> Result<()> {
+fn check_source_unchanged(input: &Path, before: &Recorded, work: Option<&WorkDir>, keep_temp: bool) -> Result<()> {
     let shown = input.display();
     let meta = match std::fs::metadata(input) {
         Ok(meta) => meta,
@@ -269,7 +269,7 @@ fn check_source_unchanged(input: &Path, before: &Recorded, work: Option<&Path>, 
     match crate::source::samples_match(before, input, &meta) {
         Some(false) => {
             if let Some(work) = work.filter(|_| !keep_temp) {
-                let _ = std::fs::remove_dir_all(work);
+                let _ = work.remove();
             }
             bail!("{changed}")
         }
@@ -306,18 +306,71 @@ fn finish_source_hash(tools: &Tools, input: &Path, hash: WholeHash, notes: &mut 
     }
 }
 
-/// Deletes the temp folder when dropped, unless asked to keep it.
+/// The folder of this run's temporary files, in the output folder. Deletes it when dropped,
+/// unless asked to keep it.
 struct TempDir {
+    /// The path everything in it goes by: by way of its descriptor (see
+    /// [`crate::files::HeldFolder`]), or where that cannot be, its name.
     path: PathBuf,
+    held: Option<crate::files::HeldFolder>,
     keep: bool,
+}
+
+impl TempDir {
+    /// Makes the folder in `out_dir` and holds it open. Where the system offers no way through a
+    /// descriptor (no /proc), the name is gone by, but only in a folder where nobody else can
+    /// rename it.
+    fn make(out_dir: &Path, keep: bool) -> Result<TempDir> {
+        let made = crate::files::make_run_folder(out_dir, TEMP_PREFIX).with_context(|| format!("cannot make a temporary folder in {}", out_dir.display()))?;
+        match crate::files::HeldFolder::open(&made) {
+            Ok(held) => Ok(TempDir { path: held.path().to_path_buf(), held: Some(held), keep }),
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported && !others_may_rename_in(out_dir) => Ok(TempDir { path: made, held: None, keep }),
+            Err(e) => {
+                // Only removed if it is still the folder that was made: see `remove_abandoned_folders`.
+                crate::files::remove_abandoned_folders(out_dir, TEMP_PREFIX);
+                bail!(
+                    "cannot hold the temporary folder {} open ({e}); in an output folder that others can write to and that lacks the sticky bit, its name alone cannot be trusted. Run `chmod +t {}`, or choose a folder only you can write to",
+                    made.display(), out_dir.display()
+                )
+            }
+        }
+    }
+
+    /// The plain file `name` in it, opened to be read.
+    fn open_file(&self, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+        use std::os::unix::fs::OpenOptionsExt;
+        match &self.held {
+            Some(held) => held.open_file(name),
+            None => std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC).open(self.path.join(name)),
+        }
+    }
+
+    /// Moves `name` out of it to `to`; unless `replace`, only to a name nothing has.
+    fn move_out(&self, name: &std::ffi::OsStr, to: &Path, replace: bool) -> std::io::Result<()> {
+        match (&self.held, replace) {
+            (Some(held), _) => held.move_out(name, to, replace),
+            (None, true) => std::fs::rename(self.path.join(name), to),
+            (None, false) => crate::trash::rename_new(&self.path.join(name), to),
+        }
+    }
 }
 
 impl Drop for TempDir {
     fn drop(&mut self) {
         if !self.keep {
-            let _ = std::fs::remove_dir_all(&self.path);
+            let _ = match &self.held {
+                Some(held) => held.remove_all(),
+                None => std::fs::remove_dir_all(&self.path),
+            };
         }
     }
+}
+
+/// Whether others can rename what is in `folder`: it is open to their writing and lacks the
+/// sticky bit, which would keep each to their own names.
+fn others_may_rename_in(folder: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(folder).is_ok_and(|m| m.mode() & 0o022 != 0 && m.mode() & 0o1000 == 0)
 }
 
 /// A deliberate decision not to encode (as opposed to a failure). Batch runs remember these
@@ -562,7 +615,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     if output.exists() && !o.overwrite {
         return Err(InUse("another av1opt finished this a moment ago").into());
     }
-    let tmp = TempDir { path: crate::files::make_run_folder(out_dir, TEMP_PREFIX).with_context(|| format!("cannot make a temporary folder in {}", out_dir.display()))?, keep: o.keep_temp };
+    let tmp = TempDir::make(out_dir, o.keep_temp)?;
     fits_beside_output(&output, &tmp.path)?;
 
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
@@ -780,7 +833,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
             w.remove_outdated_folders();
         }
         tools.emit(Event::Phase { phase: "scenes".into(), detail: "finding scene changes".into() });
-        let found = scenes::detect(tools, input, &info, &w.path)?;
+        let found = scenes::detect(tools, input, &info, w.inside())?;
         // The frames don't keep the constant rate chunks are cut at (see `Pace`). They are
         // cut by their own timestamps then, if those can be gone by and the frames are
         // shown about as long as each other (see `Times::steady`).
@@ -791,7 +844,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
                     "frames come at uneven times ({} frames; at a constant {} fps {} would be dropped and {} shown twice): encoded in one pass instead of per scene",
                     p.source_frames, search::cfr_label(&info), p.dropped, p.repeated
                 ));
-                let _ = std::fs::remove_dir_all(&w.path);
+                let _ = w.remove();
                 work = None;
                 // One CRF after all, so it is the one that has to carry the worst stretch.
                 let was = best.crf;
@@ -830,7 +883,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
                 };
                 eprintln!("{} scene cuts, {total_frames} frames, {} chunks", found.cuts.len(), chunks.len());
                 let p = scenes::Plan { key: w.key.clone(), best, trials: trials.clone(), bias, first_pts, total_frames, chunks, timed, source_fingerprint: source.fingerprint.clone(), source_mtime: source.modified };
-                crate::files::write_new(&w.path.join("plan.json"), &serde_json::to_vec_pretty(&p)?)?;
+                crate::files::write_new(&w.inside().join("plan.json"), &serde_json::to_vec_pretty(&p)?)?;
                 plan = Some(p);
             }
         }
@@ -848,7 +901,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
         search_secs = t0.secs(tools);
         t1 = tools.stopwatch();
         let ctx = scenes::Ctx {
-            tools, input, info: &info, work: &work.path, enc: &enc, probe: &probe, target: o.target_vmaf,
+            tools, input, info: &info, work: work.inside(), enc: &enc, probe: &probe, target: o.target_vmaf,
             min_crf: o.min_crf, max_crf: o.max_crf, vmaf_threads, workers: o.workers,
         };
         let chunks = scenes::encode_all(&ctx, &plan)?;
@@ -860,10 +913,10 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
             ));
         }
         tools.emit(Event::Phase { phase: "muxing".into(), detail: format!("joining {} chunks", chunks.len()) });
-        let joined = scenes::concat(&work.path, chunks.len())?;
+        let joined = scenes::concat(work.inside(), chunks.len())?;
         let video = match plan.timed {
             Some(_) => {
-                let stamped = scenes::stamp(tools, &work.path, &joined, &info)?;
+                let stamped = scenes::stamp(tools, work.inside(), &joined, &info)?;
                 let _ = std::fs::remove_file(&joined);
                 stamped
             }
@@ -1038,7 +1091,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
         notes.push(n);
     }
 
-    let source_hash = hash_then_check(|| finish_source_hash(tools, input, whole_hash, &mut notes), || check_source_unchanged(input, &source, work.as_ref().map(|w| w.path.as_path()), o.keep_temp))?;
+    let source_hash = hash_then_check(|| finish_source_hash(tools, input, whole_hash, &mut notes), || check_source_unchanged(input, &source, work.as_ref(), o.keep_temp))?;
 
     // What the samples promised is the video stream at one CRF; the file is that, the
     // stretches encoded again, the other streams and the container.
@@ -1055,15 +1108,25 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
             if let Some(w) = &work
                 && !o.keep_temp
             {
-                let _ = std::fs::remove_dir_all(&w.path);
+                let _ = w.remove();
             }
             skip!("{why}")
         }
     }
 
-    // Read here, before the file is in a folder others may be able to write to: what av1opt
-    // records of its output has to be what it made.
-    let output_sha256 = crate::ledger::sha256_of_file(&partial).inspect_err(|e| eprintln!("warning: could not read the encode back for av1opt's own record: {e}")).ok();
+    // Read here, by way of a descriptor opened in this run's own folder and before the file is
+    // in a folder others may be able to write to: what av1opt records of its output has to be
+    // what it made.
+    let partial_name = partial.file_name().context("the encode has no file name")?.to_owned();
+    let made_file = tmp.open_file(&partial_name).with_context(|| format!("cannot open the finished encode {}", partial.display()))?;
+    let output_sha256 = crate::ledger::sha256_of_open(&made_file).inspect_err(|e| eprintln!("warning: could not read the encode back for av1opt's own record: {e}")).ok();
+    // Set on the descriptor too: by name, once the file is in the output folder, it could be
+    // somebody else's file by then.
+    if o.meta.keep_dates
+        && let Err(e) = std::fs::metadata(input).and_then(|m| m.modified()).and_then(|t| made_file.set_modified(t))
+    {
+        eprintln!("warning: could not copy the file date: {e}");
+    }
 
     // The place was free when the encode began, hours ago perhaps. A file that has turned up
     // there since is not this run's to write over: the encode is kept under another name.
@@ -1071,21 +1134,28 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     if o.overwrite && crate::batch::overwrite_refused(&output, &std::fs::canonicalize(input)?).is_none() {
         // A rename takes the place of whatever has the name, a link included, and never writes
         // through one. The two are in one folder tree, so there is nothing to fall back on.
-        std::fs::rename(&partial, &output).with_context(|| format!("cannot put the encode at {}", output.display()))?;
-    } else if let Err(e) = crate::trash::rename_new(&partial, &output) {
+        tmp.move_out(&partial_name, &output, true).with_context(|| format!("cannot put the encode at {}", output.display()))?;
+    } else if let Err(e) = tmp.move_out(&partial_name, &output, false) {
         if e.kind() != std::io::ErrorKind::AlreadyExists {
             return Err(e).with_context(|| format!("cannot put the encode at {}", output.display()));
         }
         let aside = out_dir.join(format!("{stem}.av1opt-{}.{}", std::process::id(), o.container.ext()));
-        crate::trash::rename_new(&partial, &aside).with_context(|| format!("{} appeared during the encode, and the encode could not be kept", output.display()))?;
+        tmp.move_out(&partial_name, &aside, false).with_context(|| format!("{} appeared during the encode, and the encode could not be kept", output.display()))?;
         bail!("{} appeared during the encode; the finished encode is at {}", output.display(), aside.display());
     }
-    if o.meta.keep_dates
-        && let Err(e) = metadata::copy_mtime(input, &output)
-    {
-        eprintln!("warning: could not copy the file date: {e}");
+    // What has the output's name now has to be the file that was made and hashed: in a folder
+    // others can write to, the name can be taken over the moment the encode lands there, and
+    // the record would then speak for their file.
+    use std::os::unix::fs::MetadataExt;
+    let ours = made_file.metadata()?;
+    let landed = std::fs::symlink_metadata(&output).with_context(|| format!("the encode was put at {} and is gone", output.display()))?;
+    if !landed.is_file() || (landed.dev(), landed.ino()) != (ours.dev(), ours.ino()) {
+        bail!(
+            "{} was replaced by something else as soon as the encode was put there, so nothing was recorded; someone else can write to {}: choose a folder only you can write to, or run `chmod +t` on it",
+            output.display(), out_dir.display()
+        );
     }
-    let output_bytes = std::fs::metadata(&output)?.len();
+    let output_bytes = ours.len();
     let abs_input = std::fs::canonicalize(input)?;
     // From the folder and the name this run wrote to: the name itself can have been made a link
     // since, and what the record says of it is what the page serves and moves.
@@ -1163,7 +1233,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     if let Some(w) = &work
         && !o.keep_temp
     {
-        let _ = std::fs::remove_dir_all(&w.path);
+        let _ = w.remove();
     }
     if let Some(c) = &chunks {
         let crfs = c.iter().map(|r| r.crf);
@@ -1195,9 +1265,23 @@ struct WorkDir {
     /// these settings.
     key_start: String,
     key_end: String,
+    /// The folder, held open once it is there: everything in it is done by way of this, since
+    /// the folder others can write to that it lies in lets them rename it and put a link to
+    /// one of theirs at its name.
+    held: Option<crate::files::HeldFolder>,
 }
 
 impl WorkDir {
+    /// The path its contents go by.
+    fn inside(&self) -> &Path {
+        self.held.as_ref().expect("a work folder in use is held").path()
+    }
+
+    /// Removes it and what it holds, wherever it is now.
+    fn remove(&self) -> std::io::Result<()> {
+        self.held.as_ref().map_or(Ok(()), crate::files::HeldFolder::remove_all)
+    }
+
     /// Removes what earlier runs left for this same source and these same settings, which no
     /// run will go on from now that a new plan is begun: chunks of the file as it was when it
     /// had another size or, under the keys of earlier versions, another date. Only folders of
@@ -1207,11 +1291,12 @@ impl WorkDir {
         for entry in std::fs::read_dir(parent).into_iter().flatten().flatten() {
             let path = entry.path();
             let is_work_folder = entry.file_name().to_string_lossy().starts_with(WORK_PREFIX);
-            if !is_work_folder || path == self.path || !crate::files::check_kept_folder(&path).is_ok_and(|there| there) {
+            if !is_work_folder || path == self.path {
                 continue;
             }
-            if plan_key(&path).is_some_and(|key| self.is_same_work(&key)) {
-                match std::fs::remove_dir_all(&path) {
+            let Ok(Some(found)) = crate::files::check_kept_folder(&path) else { continue };
+            if plan_key(found.path()).is_some_and(|key| self.is_same_work(&key)) {
+                match found.remove_all() {
                     Ok(()) => eprintln!("removed {}: the chunks in it were of an earlier state of this file", path.display()),
                     Err(e) => eprintln!("warning: could not remove the outdated work folder {}: {e}", path.display()),
                 }
@@ -1231,16 +1316,17 @@ impl WorkDir {
     /// but belongs to no plan of this encode, and chunks without one must not be taken for its
     /// own. Something turning up at the name meanwhile is left there for another name.
     fn start_afresh(&mut self) -> Result<()> {
-        if crate::files::check_kept_folder(&self.path).is_ok_and(|there| there) {
-            std::fs::remove_dir_all(&self.path)?;
+        if let Some(found) = self.held.take() {
+            found.remove_all()?;
         }
-        if let Err(e) = crate::files::make_kept_folder(&self.path) {
-            if e.kind() != std::io::ErrorKind::AlreadyExists {
-                return Err(e.into());
+        self.held = Some(match crate::files::make_kept_folder(&self.path) {
+            Ok(held) => held,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                self.path = beside(&self.path)?;
+                crate::files::make_kept_folder(&self.path)?
             }
-            self.path = beside(&self.path)?;
-            crate::files::make_kept_folder(&self.path)?;
-        }
+            Err(e) => return Err(e.into()),
+        });
         Ok(())
     }
 }
@@ -1255,12 +1341,15 @@ fn beside(path: &Path) -> Result<PathBuf> {
 /// The folder to work in, given the one the settings lead to. That name follows from the
 /// settings so that the next run finds the folder, and anyone can work it out too: what is
 /// found there is only gone on from if it can be believed.
-fn believed_work_path(path: PathBuf, notes: &mut Vec<String>) -> Result<PathBuf> {
-    let Err(why) = crate::files::check_kept_folder(&path) else { return Ok(path) };
+fn believed_work_path(path: PathBuf, notes: &mut Vec<String>) -> Result<(PathBuf, Option<crate::files::HeldFolder>)> {
+    let why = match crate::files::check_kept_folder(&path) {
+        Ok(held) => return Ok((path, held)),
+        Err(why) => why,
+    };
     let note = format!("the work folder {} was left alone and not gone on from: {why}; this encode starts over in a new one beside it", path.display());
     eprintln!("note: {note}");
     notes.push(note);
-    beside(&path)
+    Ok((beside(&path)?, None))
 }
 
 /// The key saved in a work folder, for looking at folders that may be someone else's.
@@ -1275,7 +1364,7 @@ fn plan_key(folder: &Path) -> Option<String> {
 
 /// The plan in a work folder, if it is one for these settings and for the source as it is now.
 fn saved_plan(w: &WorkDir, source: &Recorded) -> Option<scenes::Plan> {
-    let p: scenes::Plan = serde_json::from_slice(&crate::files::read_regular(&w.path.join("plan.json"), PLAN_LIMIT).ok()?).ok()?;
+    let p: scenes::Plan = serde_json::from_slice(&crate::files::read_regular(&w.held.as_ref()?.path().join("plan.json"), PLAN_LIMIT).ok()?).ok()?;
     (p.key == w.key && plan_fits(&p, source)).then_some(p)
 }
 
@@ -1299,16 +1388,19 @@ fn work_dir(input: &Path, out_dir: &Path, size: u64, o: &Options, preset: u8, sv
     let folder_for = |key: &str| out_dir.join(format!("{WORK_PREFIX}{:016x}", scenes::fnv1a(key)));
     let key = format!("{key_start}{size}{key_end}");
     // Created only when chunk work starts, so skipped files leave nothing behind.
-    let path = believed_work_path(folder_for(&key), notes)?;
-    let mut work = WorkDir { path, key, key_start, key_end };
+    let (path, held) = believed_work_path(folder_for(&key), notes)?;
+    let mut work = WorkDir { path, key, key_start, key_end, held };
     // A folder from when the key held the source's date goes on being used, for that same date.
-    if !work.path.exists() {
+    if work.held.is_none() && !work.path.exists() {
         let mtime = std::fs::metadata(input)?.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
         let earlier_key = format!("{}{size}|{mtime}{}", work.key_start, work.key_end);
         let earlier = folder_for(&earlier_key);
-        if crate::files::check_kept_folder(&earlier).is_ok_and(|there| there) && plan_key(&earlier).as_deref() == Some(earlier_key.as_str()) {
+        if let Ok(Some(held)) = crate::files::check_kept_folder(&earlier)
+            && plan_key(held.path()).as_deref() == Some(earlier_key.as_str())
+        {
             work.path = earlier;
             work.key = earlier_key;
+            work.held = Some(held);
         }
     }
     Ok(work)
@@ -2629,7 +2721,7 @@ mod tests {
         assert!(plan_fits(&plan(None, None), &now));
 
         // What a run goes on from is the plan that fits, in the folder of its settings.
-        std::fs::create_dir_all(&first.path).unwrap();
+        let first = WorkDir { held: Some(crate::files::make_kept_folder(&first.path).unwrap()), ..first };
         let write_plan = |p: scenes::Plan| std::fs::write(first.path.join("plan.json"), serde_json::to_vec(&scenes::Plan { key: first.key.clone(), ..p }).unwrap()).unwrap();
         write_plan(plan(Some("same"), Some(1_000_000)));
         assert!(saved_plan(&first, &now).is_some(), "only touched");
@@ -2758,12 +2850,13 @@ mod tests {
         // Nothing there yet, or a folder of this user's that only they can write to: the name
         // is kept, and a folder from before this was checked becomes private.
         let free = dir.join(".av1opt-work-free");
-        assert_eq!(believed_work_path(free.clone(), &mut notes).unwrap(), free);
+        assert_eq!(believed_work_path(free.clone(), &mut notes).unwrap().0, free);
         let old = dir.join(".av1opt-work-old");
         std::fs::create_dir(&old).unwrap();
         std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::write(old.join("plan.json"), b"{}").unwrap();
-        assert_eq!(believed_work_path(old.clone(), &mut notes).unwrap(), old);
+        let (kept, held) = believed_work_path(old.clone(), &mut notes).unwrap();
+        assert!(kept == old && held.is_some());
         assert_eq!(std::fs::metadata(&old).unwrap().permissions().mode() & 0o777, 0o700);
         assert!(notes.is_empty(), "{notes:?}");
 
@@ -2779,7 +2872,8 @@ mod tests {
         std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
         for (planted, why) in [(&link, "it is a link"), (&holding, "plan.json in it"), (&open, "other users can write")] {
             let mut said = Vec::new();
-            let used = believed_work_path(planted.clone(), &mut said).unwrap();
+            let (used, held) = believed_work_path(planted.clone(), &mut said).unwrap();
+            assert!(held.is_none());
             assert_ne!(&used, planted);
             assert_eq!(used.parent(), planted.parent());
             assert!(said[0].contains(why) && said[0].contains("left alone"), "{said:?}");
@@ -2792,8 +2886,8 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("elsewhere/plan.json")).unwrap(), b"precious");
 
         // A run with no plan to go on from takes nothing over from what lies in its folder.
-        let mut w = WorkDir { path: old.clone(), ..WorkDir::default() };
         std::fs::write(old.join("chunk00000.obu"), b"from another video").unwrap();
+        let mut w = WorkDir { path: old.clone(), held: crate::files::check_kept_folder(&old).unwrap(), ..WorkDir::default() };
         w.start_afresh().unwrap();
         assert_eq!(w.path, old);
         assert_eq!(std::fs::read_dir(&old).unwrap().count(), 0);
@@ -2809,13 +2903,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let input = dir.join("a.mkv");
         let work = dir.join(".av1opt-work-1");
-        let chunks = || std::fs::create_dir_all(&work).unwrap();
+        let chunks = || drop(crate::files::make_kept_folder(&work));
         std::fs::write(&input, b"video").unwrap();
         let then = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         std::fs::File::options().write(true).open(&input).unwrap().set_modified(then).unwrap();
         let before = Recorded::of(&input).unwrap().1;
         chunks();
-        let check = |keep| check_source_unchanged(&input, &before, Some(work.as_path()), keep).map_err(|e| e.to_string());
+        let held = |work: &Path| WorkDir { held: crate::files::check_kept_folder(work).unwrap(), ..WorkDir::default() };
+        let check = |keep| check_source_unchanged(&input, &before, Some(&held(&work)), keep).map_err(|e| e.to_string());
         check(false).unwrap();
         assert_eq!(before.modified, Some(1_700_000_000));
 
@@ -2828,7 +2923,7 @@ mod tests {
         }
         // Nothing to compare with: said so, and the chunks stay.
         let no_samples = Recorded { fingerprint: None, ..before.clone() };
-        let e = check_source_unchanged(&input, &no_samples, Some(work.as_path()), false).unwrap_err().to_string();
+        let e = check_source_unchanged(&input, &no_samples, Some(&held(&work)), false).unwrap_err().to_string();
         assert!(e.contains("changed or went away") && e.contains("could not be checked") && e.contains("kept"), "{e}");
         assert!(work.is_dir());
 

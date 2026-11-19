@@ -283,12 +283,6 @@ pub fn missing(r: &Resolved, out: &BTreeMap<String, String>) -> Vec<String> {
     r.tags.iter().filter(|(k, _)| !out.keys().any(|o| o.eq_ignore_ascii_case(k))).map(|(k, _)| k.clone()).collect()
 }
 
-/// Copies the source's modification time to the output.
-pub fn copy_mtime(input: &Path, output: &Path) -> std::io::Result<()> {
-    let t = std::fs::metadata(input)?.modified()?;
-    std::fs::File::options().write(true).open(output)?.set_modified(t)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

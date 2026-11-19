@@ -940,6 +940,15 @@ environment, so set the ffmpeg path once in Settings.
   can't freeze the desktop.
 - Temp files live in a hidden folder in the output directory and are removed afterwards; leftovers
   from crashed runs are cleaned up on the next run.
+- The temporary folder and a scene-mode work folder are made private to you (mode 0700) and held
+  open from the moment they are made: everything in them, by av1opt, ffmpeg and ffprobe alike, is
+  reached through `/proc/<av1opt's process number>/fd/<number>`, never by their name. In an
+  output folder others can write to, someone who renames one and puts a link at its name changes
+  nothing: the encode is still made, hashed and moved in av1opt's own folder, and nothing in the
+  folder the link leads to is written or removed. The encode's SHA-256 is taken before it is put
+  in the output folder, and if what has its name there a moment later is another file, nothing
+  is recorded. Without `/proc`, an output folder that others can write to needs the sticky bit
+  (`chmod +t`), or the file is refused.
 - Output that nobody reads stops no work. When standard error is gone (a `tee` that has ended, a
   terminal closed under a program that outlives it) messages are dropped and the work goes
   on. When standard output is gone, as in `av1opt scan /videos | head`, the command ends
@@ -966,7 +975,8 @@ benchmark is said once, until saving works again.
 
 ### Debugging
 
-`AV1OPT_DEBUG=1` prints every ffmpeg command. `--keep-temp` keeps the temporary folder in the
+`AV1OPT_DEBUG=1` prints every ffmpeg command; files in the temporary and work folders appear
+in them as `/proc/<number>/fd/<number>/...` (see Safety). `--keep-temp` keeps the temporary folder in the
 output folder (`.av1opt-tmp-<number>`, until a later run there clears it), with the partial
 encode if the encode fails, and the work folder of a per-scene encode. Sample clips are deleted
 all the same once the search is done with them.

@@ -9,7 +9,7 @@ const source = readFileSync(new URL("../ui/app.js", import.meta.url), "utf8");
 const from = source.indexOf("// ---------- numbers and names ----------");
 const to = source.indexOf("// ---------- end of the part that runs alone ----------");
 assert.ok(from >= 0 && to > from, "the markers of the part that runs alone are in ui/app.js");
-const names = ["bytes", "pct", "floorPct", "sizeChange", "savedPct", "num", "rel", "times", "plural", "pathList", "leftOutOfList", "shownPath", "copiesLeft", "newestOnly"];
+const names = ["bytes", "pct", "floorPct", "sizeChange", "savedPct", "num", "rel", "times", "plural", "pathList", "leftOutOfList", "shownPath", "copiesLeft", "newestOnly", "refusalText"];
 const page = new Function(`"use strict";\n${source.slice(from, to)}\nreturn { ${names.join(", ")} };`)();
 
 // Each case is [argument, what is shown]; arguments in an array are spread.
@@ -147,6 +147,17 @@ test("only the answer to the latest question counts", () => {
   const first = ask(), second = ask();
   assert.equal(first(), false);
   assert.equal(second(), true);
+});
+
+test("a refusal is told in the server's words", () => {
+  const said = (status, type, text, json = null) => page.refusalText(status, "Status", type, text, json);
+  assert.equal(said(400, "application/json", "{}", { error: "no such file" }), "no such file");
+  assert.equal(said(403, "text/plain", "forbidden: other pages\n"), "forbidden: other pages");
+  assert.equal(said(415, "text/plain; charset=utf-8", "expected application/json"), "expected application/json");
+  assert.equal(said(401, "text/html", "<p>Not signed in</p>"), "Not signed in: open the page again from the link av1opt printed");
+  assert.equal(said(500, "text/html", "<p>oops</p>"), "500 Status");
+  assert.equal(said(502, "text/plain", "x".repeat(301)), "502 Status");
+  assert.equal(said(404, "text/plain", ""), "404 Status");
 });
 
 test("counts name one thing or several", () => {

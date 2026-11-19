@@ -32,9 +32,10 @@ function s(tag, attrs) {
 async function api(path, body) {
   const opt = body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
   const r = await fetch(path, opt);
+  const text = await r.text().catch(() => "");
   let j = null;
-  try { j = await r.json(); } catch { /* not JSON */ }
-  if (!r.ok) throw new Error((j && j.error) || `${r.status} ${r.statusText}`);
+  try { j = JSON.parse(text); } catch { /* not JSON */ }
+  if (!r.ok) throw new Error(refusalText(r.status, r.statusText, r.headers.get("Content-Type"), text, j));
   return j;
 }
 
@@ -133,6 +134,16 @@ function copiesLeft(groups, files, marked, gone) {
 function newestOnly() {
   let last = 0;
   return () => { const mine = ++last; return () => mine === last; };
+}
+
+// Why the server said no: its own words where it gave some, in JSON or as a short plain text.
+const SHORT_TEXT = 300;
+function refusalText(status, statusText, type, text, json) {
+  if (json && json.error) return json.error;
+  if (status === 401) return "Not signed in: open the page again from the link av1opt printed";
+  const said = String(text || "").trim();
+  if (/^text\/plain/i.test(type || "") && said && said.length <= SHORT_TEXT) return said;
+  return `${status} ${statusText}`.trim();
 }
 
 // ---------- end of the part that runs alone ----------

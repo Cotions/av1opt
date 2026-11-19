@@ -98,7 +98,7 @@ function openPage(answer, stored = {}) {
     const body = options.body ? JSON.parse(options.body) : undefined;
     if (body) page.posts.push({ path, body });
     const reply = (path === "/api/state" ? state : await answer(path, body)) || {};
-    return { ok: !reply.refuse, status: reply.refuse ? 400 : 200, statusText: "", json: async () => (reply.refuse ? { error: reply.refuse } : reply) };
+    return { ok: !reply.refuse, status: reply.refuse ? 400 : 200, statusText: "", headers: { get: () => "application/json" }, text: async () => JSON.stringify(reply.refuse ? { error: reply.refuse } : reply) };
   };
   const world = {
     Node, document, console, URLSearchParams, setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {}, requestAnimationFrame() {}, performance,

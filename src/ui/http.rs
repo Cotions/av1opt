@@ -43,6 +43,18 @@ const SECURITY_HEADERS: [(&str, &str); 6] = [
     ("Content-Security-Policy", CONTENT_SECURITY_POLICY),
 ];
 
+/// The largest request body. A list of paths is what gets big: this holds some tens of
+/// thousands of them.
+const MAX_BODY: usize = 8 << 20;
+
+/// What to say about a request over [`MAX_BODY`], of which `start` was read: the paths in that
+/// part are about as many as fit.
+fn too_large(start: &[u8]) -> String {
+    let items = start.windows(3).filter(|w| w == b"\",\"").count() + 1;
+    let fits = if items > 1 { format!(", which is about {items} items of this length") } else { String::new() };
+    format!("this selection is too large to send at once: a request can hold {} MiB{fits}. Select fewer and do the rest afterwards", MAX_BODY >> 20)
+}
+
 fn hardened<R: Read>(r: Response<R>) -> Response<R> {
     SECURITY_HEADERS.iter().fold(r, |r, (name, value)| r.with_header(header(name, value)))
 }
@@ -167,10 +179,16 @@ pub fn handle(app: &Arc<App>, mut req: Request) {
         }
     }
     let body: Value = if method == Method::Post {
-        let mut s = String::new();
-        if req.as_reader().take(1 << 20).read_to_string(&mut s).is_err() {
-            return reply(req, 400, "text/plain", "bad body");
+        let mut bytes = Vec::new();
+        if req.as_reader().take(MAX_BODY as u64 + 1).read_to_end(&mut bytes).is_err() {
+            return reply(req, 400, "text/plain", "the request could not be read");
         }
+        if bytes.len() > MAX_BODY {
+            return reply_json(req, 413, &json!({ "error": too_large(&bytes) }));
+        }
+        let Ok(s) = String::from_utf8(bytes) else {
+            return reply(req, 400, "text/plain", "the request is not valid text");
+        };
         match serde_json::from_str(&s) {
             Ok(v) => v,
             Err(e) => return reply_json(req, 400, &json!({ "error": format!("bad JSON: {e}") })),
@@ -436,6 +454,14 @@ mod tests {
         assert!(!may(6, 0) && !may(7, 0));
         // No row at all.
         assert!(!may(9, 1000));
+    }
+
+    #[test]
+    fn a_request_too_large_is_told_how_much_fits() {
+        assert!(too_large(br#"{"paths":["/a","/b","/c"#).contains("about 3 items"));
+        // Without a list there is nothing to count.
+        let one = too_large(br#"{"note":"xxxx"#);
+        assert!(one.contains("8 MiB") && !one.contains("items"), "{one}");
     }
 
     #[test]

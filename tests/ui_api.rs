@@ -2453,6 +2453,22 @@ fn watched_folders_are_kept_looked_at_and_never_queue_what_was_there() {
     assert_eq!(state["folders"], json!({}));
 }
 
+#[test]
+fn a_request_too_large_is_refused_with_how_much_fits() {
+    let s = Server::start("big-body", |_| {});
+    let path = format!("/videos/{}.mkv", "a".repeat(200));
+    let many = |n: usize| json!({ "paths": vec![path.as_str(); n] });
+    let r = s.post("/api/dups/1/trash", &many(50_000));
+    assert_eq!(r.status, 413, "{}", &r.body[..r.body.len().min(200)]);
+    let message = r.json()["error"].as_str().unwrap().to_string();
+    assert!(message.contains("too large") && message.contains("8 MiB"), "{message}");
+    let fits: usize = message.split("about ").nth(1).and_then(|m| m.split(' ').next()).and_then(|n| n.parse().ok()).unwrap_or(0);
+    assert!((38_000..40_000).contains(&fits), "{message}");
+    // Up to there a request is read as any other: this one is about a search that is not there.
+    let r = s.post("/api/dups/1/trash", &many(20_000));
+    assert_eq!(r.status, 404, "{}", &r.body[..r.body.len().min(200)]);
+}
+
 /// What only the page decides is checked by tests/page_checks.js, on a stand-in for the browser.
 #[test]
 fn the_page_checks_pass() {
@@ -2466,6 +2482,8 @@ fn the_page_checks_pass() {
     let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
     assert!(output.status.success(), "{text}");
     assert!(text.contains("ok: "), "{text}");
+    let numbers = std::process::Command::new("node").arg("--test").arg(root.join("tests/page_numbers.mjs")).output().unwrap();
+    assert!(numbers.status.success(), "{}{}", String::from_utf8_lossy(&numbers.stdout), String::from_utf8_lossy(&numbers.stderr));
 }
 
 #[test]

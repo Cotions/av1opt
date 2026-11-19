@@ -415,6 +415,81 @@ checks["remembering: full storage neither stops anything nor throws"] = async ()
   page.run(`localStorage.setItem = () => { throw new Error("full"); }; prefs.set("x", 1)`);
 };
 
+checks["queue: forgetting saved jobs asks first"] = async () => {
+  const page = openPage((path, body) => {
+    if (body) return { restored: 0, unrestored: [] };
+    if (path === "/api/jobs") return { jobs: [], unrestored: [{ inputs: ["/v/a.mp4"], out_dir: "/out", error: "gone" }], queue: holdReply };
+    return path === "/api/watch" ? { watches: [] } : {};
+  });
+  await settled();
+  const root = page.show("queue");
+  await settled();
+  const answer = async (button) => {
+    root.named("button", "Forget").click();
+    await settled();
+    page.document.body.all().filter((e) => e.classList.contains("modal-bg")).pop().named("button", button).click();
+    await settled();
+  };
+  await answer("Cancel");
+  assert.deepStrictEqual(posted(page, "/api/jobs/unrestored/forget"), []);
+  await answer("Forget");
+  assert.strictEqual(posted(page, "/api/jobs/unrestored/forget").length, 1);
+};
+checks["scan: a remembered preset of 0 is the one asked for"] = async () => {
+  const page = openPage((path, body) => (body ? { id: 1 } : { id: 1, status: "running" }), { scanRoots: ["/videos"], encodeOptions: { preset: 0 } });
+  await settled();
+  const root = page.show("scan");
+  await settled();
+  await root.named("button", "Scan").click();
+  await settled();
+  assert.strictEqual(posted(page, "/api/scans")[0].body.preset, 0);
+};
+checks["scan table: dashes sort last, names as people count, and select all stops at what is drawn"] = async () => {
+  const page = openPage(() => ({}), { scanFilter: "all" });
+  await settled();
+  const row = (rel, verdict, likely) => ({ path: "/v/" + rel, rel, verdict, verdict_label: verdict, size: 1000, estimate: { likely, low: likely, high: likely }, est_secs: 10, duration_s: 60, video_mbps: 1 });
+  const table = (rows) => {
+    page.context.__out = page.document.createElement("div");
+    page.context.__scan = { id: 1, preset: 5, rows, paths: [], totals: {} };
+    page.run("renderScan(__out, __scan)");
+    return page.context.__out;
+  };
+  const out = table([row("a10", "Candidate", 900), row("B", "Skip", 0), row("a9", "Candidate", 700)]);
+  const order = () => out.querySelectorAll(".path").map((e) => e.textContent);
+  assert.deepStrictEqual(order(), ["a9", "a10", "B"]);
+  out.named("th", "Saves").click();
+  assert.deepStrictEqual(order(), ["a10", "a9", "B"]);
+  out.named("th", "File").click();
+  assert.deepStrictEqual(order(), ["a9", "a10", "B"]);
+  out.named("th", "File").click();
+  assert.deepStrictEqual(order(), ["B", "a10", "a9"]);
+
+  const many = table(Array.from({ length: 502 }, (_, i) => row(`v${i}`, "Candidate", 500)));
+  const all = many.all().find((e) => e.tag === "input" && e.attrs.title === "Select all shown");
+  all.checked = true;
+  all.onchange();
+  assert(many.textContent.includes("500 selected"), many.textContent.slice(0, 300));
+  assert(all.checked);
+  many.named("button", "Show all").click();
+  assert(!all.checked, "two rows on screen are not ticked");
+};
+checks["compare: a failed load and a player that cannot start both say why"] = async () => {
+  const refused = openPage(() => ({ refuse: "no such report" }));
+  await settled();
+  refused.context.__root = refused.document.createElement("div");
+  refused.run(`views.compare(__root, new URLSearchParams("report=/r.json"))`);
+  await settled();
+  assert(refused.context.__root.textContent.includes("no such report"));
+  assert.strictEqual(lastToast(refused), "no such report");
+  const broken = openPage(() => ({}));
+  await settled();
+  broken.context.__root = broken.document.createElement("div");
+  broken.run(`comparePlayer = () => { throw new Error("cannot draw it"); }; views.compare(__root, new URLSearchParams("report=/r.json"))`);
+  await settled();
+  assert(broken.context.__root.textContent.includes("cannot draw it"));
+  assert.strictEqual(lastToast(broken), "cannot draw it");
+};
+
 // Answers held back until the check lets them go, so that they can arrive in any order.
 const heldAnswers = () => {
   const waiting = [];

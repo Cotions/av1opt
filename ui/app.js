@@ -147,6 +147,24 @@ function refusalText(status, statusText, type, text, json) {
   return `${status} ${statusText}`.trim();
 }
 
+// The preset remembered from the encode dialog. 0 is a preset like the others: only what is
+// no whole number at all gives way to the usual one.
+function presetFrom(remembered, usual = 5) {
+  const text = String(remembered ?? "").trim();
+  return text !== "" && Number.isInteger(Number(text)) ? Number(text) : usual;
+}
+
+// Names as people count: "a9" before "a10", and capitals among the small letters.
+const NAME_ORDER = new Intl.Collator(undefined, { numeric: true });
+// Compares rows by `key`, `direction` being 1 or -1. Rows without a value come last either way.
+function rowOrder(key, direction, compare = (a, b) => (a < b ? -1 : a > b ? 1 : 0)) {
+  return (a, b) => {
+    const ka = key(a), kb = key(b);
+    if (ka == null || kb == null) return (ka == null) - (kb == null);
+    return compare(ka, kb) * direction;
+  };
+}
+
 // ---------- end of the part that runs alone ----------
 
 function savedClass(x) { return x < 0 ? "warn" : "ok"; }
@@ -1024,7 +1042,7 @@ views.scan = (root) => {
     syncStart();
     askResult(); // what is still on its way is about the scan before this one
     try {
-      const r = await api("/api/scans", { paths: [...roots], min_savings: minSavings / 100, target_vmaf: targetVmaf, preset: Number(defaultOptions().preset) || 5 });
+      const r = await api("/api/scans", { paths: [...roots], min_savings: minSavings / 100, target_vmaf: targetVmaf, preset: presetFrom(defaultOptions().preset) });
       // Only now: values the server refused would come back at the next visit.
       prefs.set("scanMinSavings", minSavings);
       prefs.set("scanVmaf", targetVmaf);
@@ -1111,8 +1129,10 @@ function renderScan(out, r) {
 
   const shown = () => {
     let v = rows.filter((x) => filter === "all" || (filter === "candidate" ? tried(x) : !tried(x)));
-    const key = { saved: savedOf, size: (x) => x.size, name: (x) => x.rel, mbps: (x) => x.video_mbps || 0, dur: (x) => x.duration_s || 0, time: (x) => x.est_secs || 0, rate: (x) => rateOf(x) * (x.order_weight ?? 1) }[sortKey];
-    v.sort((a, b) => { const ka = key(a), kb = key(b); return (ka < kb ? -1 : ka > kb ? 1 : 0) * sortDir; });
+    // What the table shows as a dash has no value to sort by.
+    const ifTried = (x, value) => (tried(x) ? value : null);
+    const key = { saved: (x) => ifTried(x, savedOf(x)), size: (x) => x.size, name: (x) => x.rel, mbps: (x) => x.video_mbps, dur: (x) => x.duration_s, time: (x) => ifTried(x, x.est_secs), rate: (x) => rateOf(x) * (x.order_weight ?? 1) || null }[sortKey];
+    v.sort(rowOrder(key, sortDir, sortKey === "name" ? NAME_ORDER.compare : undefined));
     return v;
   };
   const updateSel = () => {
@@ -1152,7 +1172,8 @@ function renderScan(out, r) {
   let limit = 500; // more rows make every sort and filter click slow
   const draw = () => {
     const v = shown();
-    body.replaceChildren(...v.slice(0, limit).map((x) => {
+    const drawn = v.slice(0, limit);
+    body.replaceChildren(...drawn.map((x) => {
       const cb = h("input", { type: "checkbox", checked: selected.has(x.path), onchange: () => { if (cb.checked) selected.add(x.path); else selected.delete(x.path); updateSel(); } });
       const cls = x.verdict === "Candidate" ? "ok" : x.verdict === "Maybe" ? "warn" : x.verdict === "Unreadable" ? "bad" : "";
       return h("tr", {},
@@ -1172,9 +1193,10 @@ function renderScan(out, r) {
     if (v.length > limit) body.append(h("tr", {}, h("td", { colspan: 12, class: "dim" }, `${v.length - limit} more not shown. `,
       h("button", { class: "small", onclick: () => { limit = Infinity; draw(); } }, "Show all"))));
     if (!v.length) body.append(h("tr", {}, h("td", { colspan: 12, class: "empty" }, "Nothing here.")));
-    allBox.checked = v.length > 0 && v.every((x) => selected.has(x.path));
+    allBox.checked = drawn.length > 0 && drawn.every((x) => selected.has(x.path));
   };
-  allBox.onchange = () => { for (const x of shown()) { if (allBox.checked) selected.add(x.path); else selected.delete(x.path); } draw(); updateSel(); };
+  // Only the rows on screen: what is ticked here is what the person can see.
+  allBox.onchange = () => { for (const x of shown().slice(0, limit)) { if (allBox.checked) selected.add(x.path); else selected.delete(x.path); } draw(); updateSel(); };
   const th = (label, key, cls, title) => h("th", { class: "sort " + (cls || ""), title, onclick: () => { if (sortKey === key) sortDir *= -1; else { sortKey = key; sortDir = key === "name" ? 1 : -1; } draw(); } }, label);
   const filt = h("select", { onchange: (e) => { filter = e.target.value; prefs.set("scanFilter", filter); draw(); } },
     h("option", { value: "candidate" }, "Candidates"), h("option", { value: "skip" }, "Skipped"), h("option", { value: "all" }, "All files"));
@@ -1863,8 +1885,8 @@ function renderBench(out, data, ui) {
         h("button", { class: "small", onclick: () => setTuning([t.class], null, `Tuned settings for ${t.label} forgotten`) }, "Forget"));
     }),
     h("p", { class: "dim" }, tuning.length
-      ? "Encodes with “Use tuned settings” ticked take the preset and parameters from here by the video's size. Sizes not listed use what the encode dialog says."
-      : "None yet. When a result is in, “Use for…” on a setting makes it the one for videos of that size; encodes with “Use tuned settings” ticked then take it."));
+      ? "Encodes with “Use the benchmark's settings by video size” ticked take the preset and parameters from here by the video's size. Sizes not listed use what the encode dialog says."
+      : "None yet. When a result is in, “Use for…” on a setting makes it the one for videos of that size; encodes with “Use the benchmark's settings by video size” ticked then take it."));
 
   if (!rep) {
     kids.push(tunedPanel);
@@ -2180,9 +2202,14 @@ views.queue = (root) => {
         load();
       } catch (e) { toast(e.message, true); }
     };
+    const forget = async () => {
+      const sure = await confirmDialog({ title: `Forget ${plural(un.length, "saved job")}?`, action: "Forget",
+        body: [h("p", {}, `${un.length === 1 ? "It leaves" : "They leave"} the saved queue for good and will not come back when the files do. No video is touched.`)] });
+      if (sure) act("forget")();
+    };
     missing.replaceChildren(h("div", { class: "panel" },
       h("div", { class: "row" }, h("strong", { class: "warn grow" }, `${un.length} saved job${un.length === 1 ? "" : "s"} not in the queue, kept for when ${un.length === 1 ? "its files are" : "their files are"} back`),
-        h("button", { onclick: act("retry") }, "Try again"), h("button", { class: "danger", onclick: act("forget") }, "Forget")),
+        h("button", { onclick: act("retry") }, "Try again"), h("button", { class: "danger", onclick: forget }, "Forget")),
       cutList(un, UNRESTORED_SHOWN, (u) => {
         const inputs = Array.isArray(u.inputs) ? cutList(u.inputs, UNRESTORED_INPUTS_SHOWN, (p) => p, (n) => `and ${n} more`).join(", ") : "(its list of videos cannot be read)";
         return h("div", { class: "dim mono long-text" }, `${inputs} → ${u.out_dir ?? "(no output folder)"}: ${u.error}`);
@@ -2734,7 +2761,14 @@ views.compare = (root, params) => {
   });
   load
     .then((r) => { if (closed) return; wrap.remove(); destroy = comparePlayer(root, r); })
-    .catch((e) => { wrap.className = "panel bad"; wrap.textContent = e.message; });
+    .catch((e) => {
+      if (closed) return;
+      // The player can fail after the waiting line is gone: the reason takes the page's place.
+      wrap.className = "panel bad";
+      wrap.textContent = e.message;
+      root.replaceChildren(wrap);
+      toast(e.message, true);
+    });
   return () => { closed = true; destroy(); };
 };
 
@@ -3190,7 +3224,6 @@ function comparePlayer(root, r) {
       await tryLoad(vs, mediaUrl(r.input_path));
       if (closed) return;
       srcStatus.replaceChildren(h("span", { class: "ok" }, `${leftName}: original file`), " played directly.");
-      previewBtn.hidden = false;
       busy(null);
       autoAlign();
     } catch (e) {

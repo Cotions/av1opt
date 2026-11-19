@@ -9,7 +9,7 @@ const source = readFileSync(new URL("../ui/app.js", import.meta.url), "utf8");
 const from = source.indexOf("// ---------- numbers and names ----------");
 const to = source.indexOf("// ---------- end of the part that runs alone ----------");
 assert.ok(from >= 0 && to > from, "the markers of the part that runs alone are in ui/app.js");
-const names = ["bytes", "pct", "floorPct", "sizeChange", "savedPct", "num", "rel", "times", "plural", "pathList", "leftOutOfList", "shownPath", "copiesLeft", "newestOnly", "refusalText"];
+const names = ["bytes", "pct", "floorPct", "sizeChange", "savedPct", "num", "rel", "times", "plural", "pathList", "leftOutOfList", "shownPath", "copiesLeft", "newestOnly", "refusalText", "presetFrom", "NAME_ORDER", "rowOrder"];
 const page = new Function(`"use strict";\n${source.slice(from, to)}\nreturn { ${names.join(", ")} };`)();
 
 // Each case is [argument, what is shown]; arguments in an array are spread.
@@ -158,6 +158,18 @@ test("a refusal is told in the server's words", () => {
   assert.equal(said(500, "text/html", "<p>oops</p>"), "500 Status");
   assert.equal(said(502, "text/plain", "x".repeat(301)), "502 Status");
   assert.equal(said(404, "text/plain", ""), "404 Status");
+});
+
+test("a remembered preset of 0 stays 0, and what is no number gives the usual one", () => {
+  cases(page.presetFrom, [[0, 0], ["0", 0], [8, 8], ["8", 8], ["", 5], ["  ", 5], [null, 5], [undefined, 5], ["fast", 5], [2.5, 5]]);
+});
+
+test("names sort as people count, and rows without a value come last both ways", () => {
+  assert.deepEqual(["a10.mkv", "B.mkv", "a9.mkv", "a.mkv"].sort(page.NAME_ORDER.compare), ["a.mkv", "a9.mkv", "a10.mkv", "B.mkv"]);
+  const rows = [{ v: 2 }, { v: null }, { v: 1 }, {}, { v: 3 }];
+  const sorted = (direction) => [...rows].sort(page.rowOrder((x) => x.v, direction)).map((x) => x.v ?? null);
+  assert.deepEqual(sorted(1), [1, 2, 3, null, null]);
+  assert.deepEqual(sorted(-1), [3, 2, 1, null, null]);
 });
 
 test("counts name one thing or several", () => {

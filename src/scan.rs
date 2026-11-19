@@ -163,7 +163,9 @@ fn collect_with_cache(
         let c = cache.lock().unwrap();
         files.iter().any(|(path, _, size, mtime)| !c.get(path).is_some_and(|e| e.size == *size && e.mtime == *mtime))
     };
-    if unknown && std::process::Command::new(ffprobe).arg("-version").stdin(std::process::Stdio::null()).output().is_err() {
+    let mut version = std::process::Command::new(ffprobe);
+    version.arg("-version");
+    if unknown && crate::probe::run_ffprobe(version, crate::probe::Reads::Little).is_err() {
         anyhow::bail!("cannot run ffprobe ({ffprobe}); nothing was scanned");
     }
 
@@ -346,6 +348,23 @@ fn save_cache(path: &Path, cache: &HashMap<PathBuf, CacheEntry>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ffprobe_that_hangs_when_asked_its_version_stops_the_scan() {
+        let dir = std::env::temp_dir().join(format!("av1opt-scan-hang-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("videos")).unwrap();
+        std::fs::write(dir.join("videos/a.mkv"), b"x").unwrap();
+        let ffprobe = dir.join("ffprobe");
+        crate::files::write_script(&ffprobe, "exec sleep 60\n");
+        crate::probe::LIMIT_IN_TESTS.set(Some(std::time::Duration::from_millis(100)));
+        let started = std::time::Instant::now();
+        let scan = collect_with_cache(&dir.join("cache.json"), &[dir.join("videos")], ffprobe.to_str().unwrap(), 1, 0.15, &estimate::Model::fit(&[], 93.0), &|_, _| {});
+        crate::probe::LIMIT_IN_TESTS.set(None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+        assert!(scan.err().is_some_and(|e| e.to_string().contains("cannot run ffprobe")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn only_a_probe_that_really_ran_is_remembered() {

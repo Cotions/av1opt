@@ -148,10 +148,12 @@ fn scenes_clip(dir: &Path, name: &str) {
     let o = Command::new(ffmpeg_bin())
         .current_dir(dir)
         .args(["-v", "error", "-nostdin", "-y"])
-        .args(["-f", "lavfi", "-i", "testsrc2=s=640x360:r=24:d=6", "-f", "lavfi", "-i", "mandelbrot=s=640x360:r=24,trim=duration=6"])
+        // Two samples of 2 s lie at 5.5 s and 16.5 s of these 24: each wholly inside one scene,
+        // the second and the third, which score far apart.
+        .args(["-f", "lavfi", "-i", "testsrc2=s=640x360:r=24:d=5", "-f", "lavfi", "-i", "mandelbrot=s=640x360:r=24,trim=duration=7"])
         // Seeded: these two draw at random otherwise, and a test must see the same clip twice.
-        .args(["-f", "lavfi", "-i", "sierpinski=s=640x360:r=24:seed=1,trim=duration=6"])
-        .args(["-f", "lavfi", "-i", "life=s=640x360:r=24:mold=10:ratio=0.1:seed=1:death_color=#C83232:life_color=#00ff00,trim=duration=6"])
+        .args(["-f", "lavfi", "-i", "sierpinski=s=640x360:r=24:seed=1,trim=duration=7"])
+        .args(["-f", "lavfi", "-i", "life=s=640x360:r=24:mold=10:ratio=0.1:seed=1:death_color=#C83232:life_color=#00ff00,trim=duration=5"])
         .args(["-f", "lavfi", "-i", "sine=f=440:d=24"])
         .args(["-filter_complex", "[0:v]format=yuv420p[a];[1:v]format=yuv420p[b];[2:v]format=yuv420p[c];[3:v]format=yuv420p[d];[a][b][c][d]concat=n=4:v=1:a=0[v]"])
         .args(["-map", "[v]", "-map", "4:a", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "16", "-c:a", "aac", "-b:a", "64k", "-bitexact", "-fflags", "+bitexact", name])
@@ -377,9 +379,9 @@ fn the_search_takes_many_short_clips_where_the_whole_video_is_checked() {
         c.av1opt(&args)
     };
     // One pass, checked along its whole length: the search wants the mean, from one-second
-    // clips over all of the video, its start and end too.
+    // clips, and a video this short is all of them.
     let r = run(&[]);
-    r.ok().has("sample 1/8 at 0:00:01 (1s)").has("sample 8/8 at 0:00:17 (1s)").has("verifying: the whole video against its source").has("encoded 1,");
+    r.ok().has("sample 1/20 at 0:00:00 (1s)").has("sample 20/20 at 0:00:19 (1s)").has("verifying: the whole video against its source").has("encoded 1,");
     assert_eq!(c.report("a")["mode"], "whole");
     // A search that has to mind the worst stretch (scenes may be encoded apart) keeps clips
     // long enough to score like one, as does a search told what clips to take.
@@ -1545,17 +1547,20 @@ fn scenes_are_encoded_apart_only_where_the_samples_disagree() {
     assert!(rep["verify_vmaf"].as_array().unwrap().iter().all(|v| v.as_f64().unwrap() >= 89.0), "{rep}");
     assert!(entries(&own, ".av1opt-").is_empty());
 
-    // A picture that gets harder as it goes (the zoom into the Mandelbrot set), so that
-    // five seconds of it score lower than the two the samples saw: the spot check fails,
-    // its stretch becomes a sample, and the second encode at the CRF found with it stands.
+    // Three hard seconds between the two samples (at 5.5 s and 16.5 s) and inside the spot
+    // check at 13 s: the samples agree, the spot check fails, its stretch becomes a sample,
+    // and the second encode at the CRF found with it stands.
     c.ffmpeg(&[
-        "-i", "uneven.mp4", "-vf", "select='mod(n,6)'", "-fps_mode", "vfr",
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "12", "-pix_fmt", "yuv420p", "-c:a", "copy", "zoom.mkv",
+        "-f", "lavfi", "-i", "testsrc2=s=640x360:r=24:d=13",
+        "-f", "lavfi", "-i", "life=s=640x360:r=24:mold=10:ratio=0.1:seed=1:death_color=#C83232:life_color=#00ff00,trim=duration=3",
+        "-f", "lavfi", "-i", "testsrc2=s=640x360:r=24:d=8",
+        "-filter_complex", "[0:v]format=yuv420p[a];[1:v]format=yuv420p[b];[2:v]format=yuv420p[c];[a][b][c]concat=n=3:v=1:a=0[v]",
+        "-map", "[v]", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "12", "hidden.mkv",
     ]);
     let again = c.dir.join("again");
-    let r = c.encode_into(&again, &[&c.videos().join("zoom.mkv")], &["--scenes=auto"]);
+    let r = c.encode_into(&again, &[&c.videos().join("hidden.mkv")], &["--scenes=auto"]);
     r.ok().has("encoded 1,").has("a stretch the samples missed: searching again with it as a sample");
-    let rep = c.report_in(&again, "zoom");
+    let rep = c.report_in(&again, "hidden");
     assert_eq!(rep["mode"], "whole");
     assert!(notes(&rep).contains("encoded a second time, after a spot check at"), "{rep}");
     assert!(rep["verify_vmaf"].as_array().unwrap().iter().all(|v| v.as_f64().unwrap() >= 89.0), "{rep}");
@@ -1563,7 +1568,7 @@ fn scenes_are_encoded_apart_only_where_the_samples_disagree() {
     let chosen = rep["crf"].as_f64().unwrap();
     let first: f64 = r.err.split("chose crf ").nth(1).and_then(|t| t.split_whitespace().next()?.parse().ok()).unwrap();
     assert!(chosen < first, "CRF {chosen} after {first}");
-    assert_eq!(c.outputs_in(&again), ["av1opt-log.tsv", "zoom.av1opt.json", "zoom.mp4"]);
+    assert_eq!(c.outputs_in(&again), ["av1opt-log.tsv", "hidden.av1opt.json", "hidden.mp4"]);
 }
 
 #[test]

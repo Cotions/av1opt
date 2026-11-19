@@ -354,21 +354,23 @@ pub fn sample_count(duration: f64) -> usize {
     ((duration / 120.0).round() as usize).clamp(8, 32)
 }
 
-/// Sample start times: up to `count` clips of `secs` seconds, spread over the video and
-/// skipping the first and last 5% (intros, credits). Returns (start, length) pairs.
-pub fn sample_positions(duration: f64, count: usize, secs: f64) -> Vec<(f64, f64)> {
+/// Up to `count` clips of `secs` seconds, at least their own length apart, each in the middle
+/// of its share of the whole video. Returns (start, length) pairs.
+fn spread_clips(duration: f64, count: usize, secs: f64) -> Vec<(f64, f64)> {
     if duration <= 0.0 {
         return Vec::new();
     }
     let secs = secs.min(duration);
     let n = ((duration / (secs * 2.0)) as usize).clamp(1, count.max(1));
-    let span = (duration * 0.9 - secs).max(0.0);
-    (0..n)
-        .map(|i| {
-            let start = if span == 0.0 { 0.0 } else { duration * 0.05 + span * (i as f64 + 0.5) / n as f64 };
-            (start, secs)
-        })
-        .collect()
+    let span = duration - secs;
+    (0..n).map(|i| (span * (i as f64 + 0.5) / n as f64, secs)).collect()
+}
+
+/// Sample start times: up to `count` clips of `secs` seconds, spread over the whole video.
+/// The start and the end count like the rest: leaving 5% out at each end read 0.13 to 0.37
+/// VMAF high on the three videos it was measured on.
+pub fn sample_positions(duration: f64, count: usize, secs: f64) -> Vec<(f64, f64)> {
+    spread_clips(duration, count, secs)
 }
 
 /// How long a sample clip is when the search only has to find the video's mean, which is
@@ -393,25 +395,36 @@ pub fn clip_secs(info: &MediaInfo, secs: f64) -> f64 {
     if rate > 0.0 { secs.max(MIN_SAMPLE_FRAMES / rate) } else { secs }
 }
 
+/// A video shorter than this is sampled whole: it costs no more seconds of encoding than the
+/// 64 clips of a long video, and leaves nothing for the clips to miss.
+const SAMPLED_WHOLE_BELOW: f64 = 64.0;
+
 /// How many sample clips a search for the mean alone takes: one for about every 8 seconds
-/// of video, 8 at least and 64 at most. A short video holds fewer: see
-/// [`mean_sample_positions`].
+/// of video, 8 at least and 64 at most; for a video shorter than [`SAMPLED_WHOLE_BELOW`], as
+/// many as fill it.
 pub fn mean_sample_count(duration: f64) -> usize {
+    if duration < SAMPLED_WHOLE_BELOW {
+        return ((duration / MEAN_SAMPLE_SECS) as usize).max(1);
+    }
     ((duration / 8.0).round() as usize).clamp(8, 64)
 }
 
 /// Sample start times for a search that only needs the video's mean: `count` clips of `secs`
 /// seconds, each in the middle of its share of the whole video. The start and the end are
 /// part of the mean like the rest (leaving 5% out at each end read 0.24 VMAF high on a
-/// video whose first minute was its hardest).
+/// video whose first minute was its hardest). Clips that can fill the video do: they lie
+/// side by side, a little longer than `secs` so that nothing is left over. They stay
+/// separate clips because weak ones are counted one by one (see [`lifted_mean`]).
 pub fn mean_sample_positions(duration: f64, count: usize, secs: f64) -> Vec<(f64, f64)> {
     if duration <= 0.0 {
         return Vec::new();
     }
-    let secs = secs.min(duration);
-    let n = ((duration / (secs * 2.0)) as usize).clamp(1, count.max(1));
-    let span = duration - secs;
-    (0..n).map(|i| (span * (i as f64 + 0.5) / n as f64, secs)).collect()
+    let fitting = ((duration / secs.min(duration)) as usize).max(1);
+    if count >= fitting {
+        let share = duration / fitting as f64;
+        return (0..fitting).map(|i| (i as f64 * share, share)).collect();
+    }
+    spread_clips(duration, count, secs)
 }
 
 /// Cuts the sample clips at `pos` ((start, length) pairs in source seconds), a few at a time:
@@ -1728,8 +1741,8 @@ mod tests {
         // A short one gets what fits, with as much between two samples as they are long.
         assert_eq!(sample_positions(20.0, sample_count(20.0), SAMPLE_SECS).len(), 2);
         // For the mean alone: many short clips over the whole length, apart from each other.
-        assert_eq!([10.0, 60.0, 240.0, 512.0, 900.0, 7200.0].map(mean_sample_count), [8, 8, 30, 64, 64, 64]);
-        for dur in [3.0, 10.0, 61.0, 900.0, 7200.0] {
+        assert_eq!([64.0, 240.0, 512.0, 900.0, 7200.0].map(mean_sample_count), [8, 30, 64, 64, 64]);
+        for dur in [64.0, 100.0, 900.0, 7200.0] {
             let pos = mean_sample_positions(dur, mean_sample_count(dur), MEAN_SAMPLE_SECS);
             assert_eq!(pos.len(), mean_sample_count(dur).min((dur / 2.0) as usize).max(1), "{dur}");
             assert!(pos[0].0 >= 0.0 && pos.last().unwrap().0 + pos.last().unwrap().1 <= dur + 1e-9, "{dur}");
@@ -1738,5 +1751,30 @@ mod tests {
             let share = (dur - pos[0].1) / pos.len() as f64;
             assert!(pos.iter().enumerate().all(|(i, p)| (p.0 - share * (i as f64 + 0.5)).abs() < 1e-9), "{dur}");
         }
+    }
+
+    #[test]
+    fn a_short_video_is_sampled_whole() {
+        for dur in [0.4, 1.0, 3.5, 10.0, 47.3, 63.9] {
+            let pos = mean_sample_positions(dur, mean_sample_count(dur), MEAN_SAMPLE_SECS);
+            assert_eq!(pos.len(), (dur as usize).max(1), "{dur}");
+            // Side by side from the first frame to the last, nothing left over.
+            assert_eq!(pos[0].0, 0.0, "{dur}");
+            assert!(pos.windows(2).all(|w| (w[0].0 + w[0].1 - w[1].0).abs() < 1e-9), "{dur}: {pos:?}");
+            let (start, secs) = pos[pos.len() - 1];
+            assert!((start + secs - dur).abs() < 1e-9, "{dur}: {pos:?}");
+            // Clips of a second at least, so that each still says something of its own.
+            assert!(dur < 1.0 || pos.iter().all(|p| p.1 >= MEAN_SAMPLE_SECS), "{dur}: {pos:?}");
+        }
+    }
+
+    #[test]
+    fn clips_reach_both_ends_of_the_video() {
+        // The first and last 5% used to be left out: 45 s at each end of this one.
+        let pos = sample_positions(900.0, 8, 4.0);
+        let share = (900.0 - 4.0) / 8.0;
+        assert_eq!(pos.len(), 8);
+        assert!(pos.iter().enumerate().all(|(i, p)| (p.0 - share * (i as f64 + 0.5)).abs() < 1e-9), "{pos:?}");
+        assert!(pos[0].0 < 45.0 * 2.0 && pos[7].0 + 4.0 > 900.0 - 45.0 * 2.0, "{pos:?}");
     }
 }

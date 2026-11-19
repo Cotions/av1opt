@@ -742,9 +742,9 @@ mod tests {
         let hour = guess.secs(&info(1920, 1080, 3600.0));
         // 64 sample clips of a second, encoded about twice.
         assert!((hour / (GUESS_1080P * 30.0 * 3600.0) - 1.0 - 128.0 / 3600.0).abs() < 1e-9, "{hour}");
-        // A short video is searched on most of it: the search outweighs the encode.
+        // A short video is searched on all of it: the search outweighs the encode.
         let short = guess.secs(&info(1920, 1080, 10.0));
-        assert!((short / (GUESS_1080P * 300.0) - 2.6).abs() < 1e-9, "{short}");
+        assert!((short / (GUESS_1080P * 300.0) - 3.0).abs() < 1e-9, "{short}");
         assert_eq!(guess.secs(&info(0, 0, 60.0)), 0.0);
         assert_eq!(guess.secs(&info(1920, 1080, 0.0)), 0.0);
 

@@ -190,8 +190,8 @@ For each file:
    is scored along its whole length afterwards (step 5), so the search only has to find the
    video's mean, and what throws that off is where the clips lie, not how long they are: one
    clip of 1 second for every 8 seconds of video, 8 at least and 64 at most, spread evenly
-   from the first second to the last. A video under 16 seconds holds fewer than 8 such clips
-   apart from each other: it gets one for every 2 seconds, at least one. Where one CRF has to carry its worst stretch
+   from the first second to the last; a video under 64 seconds is sampled whole, as clips of
+   a second side by side. Where one CRF has to carry its worst stretch
    (`--scenes`, HDR, removed sections), clips of 4 seconds, long enough to show a stretch: 8
    of them up to about 17 minutes, then one for every two minutes more, 32 at most.
    `--samples` and `--sample-secs` set both by hand, and with them the 4-second scheme.

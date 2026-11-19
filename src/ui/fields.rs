@@ -33,7 +33,8 @@ const fn whole(key: &'static str, label: &'static str, low: f64, high: f64) -> F
 pub const TARGET_VMAF: Field = Field { low_allowed: false, ..number("target_vmaf", "target VMAF", 0.0, 100.0) };
 pub const PRESET: Field = whole("preset", "preset", 0.0, 13.0);
 pub const WORKERS: Field = whole("workers", "workers", 1.0, 8.0);
-const MIN_SAVINGS: Field = Field { note: " (0.2 is 20%)", ..number("min_savings", "minimum savings", 0.0, 1.0) };
+/// As `parse_min_savings` in main.rs: near 1 no encode could pass.
+const MIN_SAVINGS: Field = Field { note: " (0.2 is 20%)", ..number("min_savings", "minimum savings", 0.0, 0.95) };
 const PRESETS: Field = Field { list: true, ..whole("presets", "each of the presets", 0.0, 13.0) };
 // The command line narrows these two to the same ranges with a clamp. It takes any number of
 // videos; the page's limit stays, a benchmark of more would run for days.
@@ -116,7 +117,7 @@ mod tests {
         assert_eq!(refusal(json!({ "preset": 14 }), JOB), "preset must be a whole number from 0 to 13; it was 14");
         assert_eq!(refusal(json!({ "preset": 1.5 }), SCAN), "preset must be a whole number from 0 to 13; it was 1.5");
         assert_eq!(refusal(json!({ "workers": 0 }), JOB), "workers must be a whole number from 1 to 8; it was 0");
-        assert_eq!(refusal(json!({ "min_savings": 1.2 }), JOB), "minimum savings must be a number from 0 to 1 (0.2 is 20%); it was 1.2");
+        assert_eq!(refusal(json!({ "min_savings": 1.2 }), JOB), "minimum savings must be a number from 0 to 0.95 (0.2 is 20%); it was 1.2");
         assert_eq!(refusal(json!({ "tolerance": -1 }), DUPS), "tolerance must be a whole number from 0 to 20; it was -1");
         assert_eq!(refusal(json!({ "presets": [4, 14] }), BENCH), "each of the presets must be a whole number from 0 to 13; it was 14");
         assert!(refusal(json!({ "presets": 4 }), BENCH).contains("it was 4"));
@@ -138,7 +139,7 @@ mod tests {
     fn good_and_left_out_values_pass() {
         check(&json!({}), JOB).unwrap();
         check(&json!({ "target_vmaf": 100, "preset": 0, "workers": 8, "min_savings": 0 }), JOB).unwrap();
-        check(&json!({ "target_vmaf": 0.5, "preset": 13, "min_savings": 1 }), SCAN).unwrap();
+        check(&json!({ "target_vmaf": 0.5, "preset": 13, "min_savings": 0.95 }), SCAN).unwrap();
         check(&json!({ "presets": [0, 13], "max_videos": 50, "samples": 1, "sample_secs": 2.5 }), BENCH).unwrap();
         check(&json!({ "tolerance": 0 }), DUPS).unwrap();
     }
@@ -148,6 +149,10 @@ mod tests {
         for text in ["0", "0.01", "50", "99.9", "100", "100.01", "-1", "nan", "inf"] {
             let n: f64 = text.parse().unwrap();
             assert_eq!(TARGET_VMAF.check(n).is_ok(), crate::parse_target(text).is_ok(), "{text}");
+        }
+        for text in ["0", "0.2", "0.95", "0.951", "1", "-0.1"] {
+            let n: f64 = text.parse().unwrap();
+            assert_eq!(MIN_SAVINGS.check(n).is_ok(), crate::parse_min_savings(text).is_ok(), "min savings {text}");
         }
         let takes = |args: &[&str]| crate::Cli::try_parse_from([&["av1opt"], args].concat()).is_ok();
         for n in -1..=25 {

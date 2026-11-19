@@ -894,7 +894,9 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
   something was encoded (hover it, or use the arrow keys, for a day's numbers); it appears
   once there are encodes from two different days.
   **Replace originals…** lists the outputs that can take their original's place (the rules of
-  `replace` above), all ticked; it works through the ticked ones one by one and keeps the ones
+  `replace` above), all ticked but those whose output leaves sections of the original out
+  (marked, and said above the list): those are replaced only when ticked one by one, and
+  **All / none** leaves them alone. It works through the ticked ones one by one and keeps the ones
   that failed on screen with the reason. Replaced encodes carry a "replaced" mark. An original
   that is still in the encode queue is refused. The page acts only on outputs in av1opt's private
   record (see `replace`). Others are marked "not made here" until `av1opt adopt` has been run on

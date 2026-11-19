@@ -2920,7 +2920,11 @@ views.history = (root) => {
 // Outputs take the place of their originals: one request per file, so the dialog can say
 // which one it is on and which ones failed.
 function replaceDialog(rows, reload) {
-  const picked = new Set(rows.map((x) => x.report));
+  // An output that leaves sections of its original out is not the same video: its row starts
+  // unticked and All leaves it alone, so that only its own tick replaces that original.
+  const cut = (x) => x.replace.removed > 0;
+  const picked = new Set(rows.filter((x) => !cut(x)).map((x) => x.report));
+  const cuts = rows.filter(cut).length;
   const anyZfs = rows.some((x) => x.replace.zfs);
   let allowZfs = false, busy = false, finished = false;
   const usable = (x) => !x.replace.zfs || allowZfs;
@@ -2941,16 +2945,26 @@ function replaceDialog(rows, reload) {
       const cb = h("input", { type: "checkbox", onchange: () => { if (cb.checked) picked.add(x.report); else picked.delete(x.report); sum(); } });
       cb.checked = picked.has(x.report) && usable(x);
       cb.disabled = !usable(x) || busy;
-      const notes = [x.replace.copy ? "copied from another drive" : null, x.replace.removed ? `${plural(x.replace.removed, "section")} left out` : null, x.replace.zfs ? "on ZFS" : null].filter(Boolean);
+      const notes = [x.replace.copy ? ["copied from another drive", ""] : null, cut(x) ? [`${plural(x.replace.removed, "section")} left out`, " warn"] : null, x.replace.zfs ? ["on ZFS", ""] : null].filter(Boolean);
       const newName = basename(x.replace.dest);
+      // The name wraps however long it is; what is said about the file sits on its own line
+      // below it, where no name can push it out of sight.
       return h("label", { class: "replace-row" + (usable(x) ? "" : " off") }, cb,
-        h("span", { class: "grow path", title: `${x.input}\n→ ${x.replace.dest}` }, basename(x.input),
-          newName !== basename(x.input) ? h("span", { class: "dim" }, ` → ${newName}`) : null, notes.map((n) => h("span", { class: "pill" }, n))),
+        h("span", { class: "grow what", title: `${x.input}\n→ ${x.replace.dest}` },
+          h("span", { class: "path" }, basename(x.input), newName !== basename(x.input) ? h("span", { class: "dim" }, ` → ${newName}`) : null),
+          notes.length ? h("span", { class: "notes" }, notes.map(([n, c]) => h("span", { class: "pill" + c }, n))) : null),
         h("span", { class: "num dim" }, `${bytes(x.source_bytes)} → ${bytes(x.output_bytes)}`));
     }));
     sum();
   };
-  const all = h("button", { class: "small", onclick: () => { const on = chosen().length < rows.filter(usable).length; for (const x of rows) { if (on) picked.add(x.report); else picked.delete(x.report); } draw(); } }, "All / none");
+  // All ticks every row it may (not those with sections left out); none unticks every row.
+  const all = h("button", { class: "small", onclick: () => {
+    const whole = rows.filter((x) => usable(x) && !cut(x));
+    const on = whole.some((x) => !picked.has(x.report));
+    picked.clear();
+    if (on) for (const x of whole) picked.add(x.report);
+    draw();
+  } }, "All / none");
   const zfs = h("input", { type: "checkbox", onchange: () => { allowZfs = zfs.checked; draw(); } });
   go.onclick = async () => {
     const c = chosen();
@@ -2986,6 +3000,7 @@ function replaceDialog(rows, reload) {
         h("p", {}, "Each original moves to the trash of the drive it is on, and its AV1 file takes its name in its folder. Nothing is deleted or written over: the space is freed when you empty the trash, and until then an original can be put back from its page in Compare (or with ", h("code", {}, "av1opt replace --undo"), ")."),
         h("p", { class: "dim" }, "Listed are the outputs whose report still matches both files. Subtitles, covers and other files next to an original stay where they are."),
         anyZfs ? h("label", { class: "check" }, zfs, "Also replace originals stored on ZFS") : null,
+        cuts ? h("p", { class: "warn" }, `${plural(cuts, "output")} ${cuts === 1 ? "leaves" : "leave"} sections of ${cuts === 1 ? "its original" : "their originals"} out, as asked when ${cuts === 1 ? "it was" : "they were"} encoded: what was left out goes to the trash with the original. ${cuts === 1 ? "It is" : "They are"} not ticked; tick ${cuts === 1 ? "it" : "each"} yourself to replace ${cuts === 1 ? "it" : "them"}.`) : null,
         list),
       h("div", { class: "foot" }, total, cancel, go)));
   document.body.append(bg);
@@ -3353,7 +3368,7 @@ function comparePlayer(root, r) {
             h("p", {}, `The original (${bytes(r.source_bytes)}) moves to the trash of its drive and the AV1 file (${bytes(r.output_bytes)}) becomes:`),
             h("div", { class: "mono trash-list" }, rp.dest),
             rp.copy ? h("p", { class: "dim" }, "The AV1 file is on another drive: it is copied there first, then removed from the output folder.") : null,
-            rp.removed ? h("p", { class: "dim" }, `The AV1 file leaves out ${plural(rp.removed, "section")} of the original.`) : null,
+            rp.removed ? h("p", { class: "warn" }, `The AV1 file leaves out ${plural(rp.removed, "section")} of the original, and what it leaves out goes to the trash with it.`) : null,
             rp.zfs ? h("p", { class: "warn" }, "The original is on ZFS, which av1opt writes to only when asked. Replacing it here is asking.") : null,
             h("p", { class: "dim" }, "The space is freed when you empty the trash. Until then this page can put the original back.")],
         });

@@ -740,6 +740,39 @@ checks["toast: a long message scrolls in its own box, beside a Close button"] = 
   assert(t.hidden, "Close leaves the message");
 };
 
+checks["replace originals: an output with sections left out starts unticked, and says so beside any name"] = async () => {
+  const page = openPage(() => ({}));
+  await settled();
+  const long = "a".repeat(300) + ".mkv";
+  const row = (name, removed) => ({ report: `/out/${name}.json`, input: `/v/${name}`, source_bytes: 2e9, output_bytes: 1e9, replace: { dest: `/v/${name}`, removed, copy: false, zfs: false } });
+  page.context.__rows = [row(long, 2), row("whole.mkv", 0)];
+  page.run("replaceDialog(__rows, () => {})");
+  const body = page.document.body;
+  const rows = body.all().filter((e) => e.tag === "label" && e.names().includes("replace-row"));
+  const box = (r) => r.all().find((e) => e.tag === "input");
+  const [cut, whole] = rows;
+  assert(!box(cut).checked, "the row with sections left out starts ticked");
+  assert(box(whole).checked);
+  const pill = cut.all().find((e) => e.names().includes("pill") && e.textContent === "2 sections left out");
+  assert(pill, "no pill for the sections left out");
+  const name = cut.all().find((e) => e.names().includes("path"));
+  assert(name.textContent.startsWith("aaa") && !name.contains(pill), "the pill shares the name's line");
+  assert(body.all().some((e) => e.tag === "p" && e.names().includes("warn") && e.textContent.startsWith("1 output leaves sections")), "no word about it above the list");
+  const all = body.named("button", "All / none");
+  const go = () => body.all().find((e) => e.tag === "button" && e.names().includes("danger"));
+  // All leaves it alone, both ways; its own tick puts it in.
+  const now = () => body.all().filter((e) => e.tag === "label" && e.names().includes("replace-row"));
+  all.click();
+  assert(now().every((r) => !box(r).checked));
+  all.click();
+  const [cut2, whole2] = now();
+  assert(!box(cut2).checked && box(whole2).checked);
+  assert.strictEqual(go().textContent, "Replace 1 original");
+  box(cut2).checked = true;
+  box(cut2).dispatch("change");
+  assert.strictEqual(go().textContent, "Replace 2 originals");
+};
+
 // Answers held back until the check lets them go, so that they can arrive in any order.
 const heldAnswers = () => {
   const waiting = [];

@@ -482,3 +482,13 @@ fn a_history_that_is_a_folder_is_mentioned_once() {
     run.ended(0);
     assert_eq!(run.said.matches("is a folder, so no past encodes are used").count(), 1, "{}", run.said);
 }
+
+#[test]
+fn progress_written_to_a_file_is_plain_lines() {
+    let c = Case::new("plain-progress");
+    c.video("a.mkv");
+    // Standard error is a pipe here, as it is for a log file.
+    let run = c.run(&["scan", "videos"]);
+    run.ended(0).has("probed 1/1\n");
+    assert!(!run.said.contains('\r'), "{:?}", run.said);
+}

@@ -99,11 +99,48 @@ impl Capabilities {
 /// have ffmpeg read those and encode them into the output. None of these leads anywhere else.
 ///
 /// Matroska and WebM, the MP4 family, AVI, ASF (`.wmv`), FLV, MPEG transport and program
-/// streams (`.ts`, `.m2ts`, `.mpg`, `.vob`) are what the scan looks for. Ogg, RealMedia, WTV,
+/// streams (`.ts`, `.m2ts`, `.mts`, `.mpg`, `.vob`) are what the scan looks for. Ogg, RealMedia, WTV,
 /// MXF, DV and NUT are what else is found in libraries and can be named to `encode`, as are
 /// bare streams: MPEG video, MPEG-4 (`.m4v`), H.264, HEVC, VC-1, YUV4MPEG, AV1 as IVF or OBU.
 /// The last two are also what av1opt's own chunks and repairs are stored as.
 pub const VIDEO_FORMATS: &str = "matroska,webm,mov,mp4,m4a,3gp,3g2,mj2,avi,asf,flv,mpegts,mpeg,ogg,rm,wtv,mxf,dv,nut,mpegvideo,m4v,h264,hevc,vc1,yuv4mpegpipe,ivf,obu,av1";
+
+/// A progress line. On a terminal it is written over in place; anywhere else (a log file, a
+/// pipe) carriage returns would pile up on one endless line, so a plain line is written now
+/// and then instead.
+pub struct Ticker {
+    on_terminal: bool,
+    last: std::sync::Mutex<Option<Instant>>,
+}
+
+impl Ticker {
+    /// How often a plain line is written where nobody watches it change.
+    const PLAIN_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+    pub fn new() -> Ticker {
+        use std::io::IsTerminal;
+        Ticker { on_terminal: std::io::stderr().is_terminal(), last: std::sync::Mutex::new(None) }
+    }
+
+    pub fn show(&self, text: &str) {
+        if self.on_terminal {
+            eprint!("\r{text}   ");
+            return;
+        }
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_none_or(|at| at.elapsed() >= Self::PLAIN_EVERY) {
+            *last = Some(Instant::now());
+            eprintln!("{text}");
+        }
+    }
+
+    /// Ends the line written over in place.
+    pub fn end(&self) {
+        if self.on_terminal {
+            eprintln!();
+        }
+    }
+}
 
 /// `-format_whitelist` and `-protocol_whitelist` for an input forced to `format` (`-f`), or for
 /// a video whose format ffmpeg is to find out. Files only: nothing av1opt opens is reached
@@ -628,6 +665,7 @@ impl Tools {
         let listened_to = self.hooks.as_ref().is_some_and(|h| !h.is_on_terminal());
         let (mut done_secs, mut fps, mut frames) = (0.0_f64, String::new(), 0u64);
         let mut progress_lines = ProgressLines::default();
+        let ticker = Ticker::new();
         // Read errors end the loop instead of returning, so the child is always reaped
         // (and untracked) below.
         for line in BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok) {
@@ -647,12 +685,12 @@ impl Tools {
                 if listened_to {
                     self.emit(Event::Progress { label: label.to_string(), frac, fps: fps.trim().parse().unwrap_or(0.0), eta_secs: eta });
                 } else {
-                    eprint!("\r{label} {:5.1}%  {fps:>6} fps  ETA {}   ", frac * 100.0, hms(eta));
+                    ticker.show(&format!("{label} {:5.1}%  {fps:>6} fps  ETA {}", frac * 100.0, hms(eta)));
                 }
             }
         }
         if !listened_to {
-            eprintln!();
+            ticker.end();
         }
         let out = self.finish(child)?;
         let status = out.status;
@@ -1099,12 +1137,13 @@ mod tests {
         let dir = room("accepted");
         let mpeg4: &[&str] = &["-c:v", "mpeg4", "-pix_fmt", "yuv420p"];
         let made: &[(&str, &[&str])] = &[
-            ("mp4", mpeg4), ("mkv", mpeg4), ("m4v", mpeg4), ("mov", mpeg4), ("avi", mpeg4), ("ts", mpeg4), ("m2ts", mpeg4), ("3gp", mpeg4),
+            ("mp4", mpeg4), ("mkv", mpeg4), ("m4v", mpeg4), ("mov", mpeg4), ("avi", mpeg4), ("ts", mpeg4), ("m2ts", mpeg4), ("mts", mpeg4), ("3gp", mpeg4),
             ("webm", &["-c:v", "libsvtav1", "-preset", "12", "-pix_fmt", "yuv420p"]),
             ("wmv", &["-c:v", "wmv2", "-pix_fmt", "yuv420p"]),
             ("flv", &["-c:v", "flv1", "-pix_fmt", "yuv420p"]),
             ("mpg", &["-c:v", "mpeg1video", "-pix_fmt", "yuv420p"]),
             ("mpeg", &["-c:v", "mpeg2video", "-pix_fmt", "yuv420p"]),
+            ("vob", &["-c:v", "mpeg2video", "-pix_fmt", "yuv420p"]),
         ];
         // Every one the scan knows is made here, so a new one cannot be forgotten.
         let mut named: Vec<&str> = made.iter().map(|m| m.0).collect();

@@ -14,7 +14,7 @@ use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
 
 pub const VIDEO_EXTS: &[&str] = &[
-    "mp4", "mkv", "m4v", "mov", "webm", "avi", "wmv", "flv", "ts", "m2ts", "mpg", "mpeg", "3gp",
+    "mp4", "mkv", "m4v", "mov", "webm", "avi", "wmv", "flv", "ts", "m2ts", "mts", "mpg", "mpeg", "vob", "3gp",
 ];
 const SKIP_DIRS: &[&str] = &["System Volume Information", "$RECYCLE.BIN", "lost+found"];
 
@@ -487,6 +487,14 @@ mod tests {
         let note = many.unreadable_note().unwrap();
         assert!(note.starts_with("8 folders") && note.contains("/f4") && !note.contains("/f5") && note.ends_with(" and 3 more"), "{note}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dvd_and_camcorder_files_are_looked_at() {
+        for name in ["a.vob", "b.VOB", "c.mts", "d.MTS", "e.m2ts"] {
+            assert!(is_video(Path::new(name)), "{name}");
+        }
+        assert!(!is_video(Path::new("a.srt")) && !is_video(Path::new("vob")));
     }
 
     #[test]

@@ -273,7 +273,8 @@ enum Cmd {
         #[arg(long, default_value_t = 55, value_parser = clap::value_parser!(u8).range(1..=63))]
         max_crf: u8,
         /// Number of sample clips the CRF search goes by. Without it and --sample-secs: 1 s
-        /// clips, one for about every 8 seconds of video (8 at least, 64 at most), where the
+        /// clips, one for about every 8 seconds of video (64 at most, and 8 at least where the
+        /// video is 16 seconds or longer; a shorter one gets one for every 2 seconds), where the
         /// whole video is checked after its encode; one 4 s clip for about every two minutes
         /// (8 to 32) where it is not (--scenes, removed sections, HDR).
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..=200))]
@@ -314,10 +315,12 @@ enum Cmd {
         /// `--scenes=auto` does it only for videos whose samples differ in quality at one CRF.
         #[arg(long, value_enum, value_name = "WHEN", num_args = 0..=1, require_equals = true, default_value_t, default_missing_value = "always")]
         scenes: encode::Scenes,
-        /// Chunks encoded in parallel with --scenes. Chunks running at once share --memory-limit.
+        /// Chunks encoded in parallel with --scenes; a video encoded in one pass is not split, so
+        /// there it changes nothing. Chunks running at once share --memory-limit.
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=8))]
         workers: u8,
-        /// Memory cap for each ffmpeg run (systemd MemoryMax syntax, e.g. 12G). "auto" = 40% of RAM, "none" = no cap.
+        /// Memory cap for each ffmpeg run: "auto" (40% of RAM), "none" or "infinity" (no cap), a
+        /// whole number of bytes, or a number with K, M, G or T (12G, 1.5G) or % of RAM (40%).
         #[arg(long, default_value = "auto", value_parser = parse_memory)]
         memory_limit: String,
         /// CPU priority for encodes (0-19, higher = more polite to the desktop).
@@ -485,7 +488,7 @@ fn parse_memory(s: &str) -> Result<String, String> {
     if matches!(s, "auto" | "none" | "infinity") || amount {
         Ok(s.to_string())
     } else {
-        Err("a memory cap is auto, none, or an amount such as 12G, 1.5G, 800M or 40%".into())
+        Err("a memory cap is auto, none, infinity, or an amount such as 12G, 1.5G, 800M or 40%".into())
     }
 }
 
@@ -537,15 +540,22 @@ fn run_command(command: Cmd) -> Result<()> {
             let tools = signals::stopping_on_signals(tools::Tools::new(ffmpeg, ffprobe, memory_cap(&memory_limit, jobs as u8)));
             let opts = dups::Options { jobs, max_dist: tolerance, prefs: dups::matching::Prefs { prefer: prefer.iter().map(abs).collect(), avoid }, refresh };
             let start = std::time::Instant::now();
+            let ticker = tools::Ticker::new();
             let progress = |p: dups::Progress| match p {
                 dups::Progress::Probing { done: 0, total } => eprintln!("found {total} video files"),
-                dups::Progress::Probing { done, total } if done.is_multiple_of(250) || done == total => eprint!("\rprobed {done}/{total}"),
-                dups::Progress::Fingerprinting { done: 0, total } => eprintln!("\nreading frames of {total} videos (cached ones are instant)"),
+                dups::Progress::Probing { done, total } if done.is_multiple_of(250) || done == total => ticker.show(&format!("probed {done}/{total}")),
+                dups::Progress::Fingerprinting { done: 0, total } => {
+                    ticker.end();
+                    eprintln!("reading frames of {total} videos (cached ones are instant)");
+                }
                 dups::Progress::Fingerprinting { done, total } if done.is_multiple_of(10) || done == total => {
                     let el = start.elapsed().as_secs_f64();
-                    eprint!("\rfingerprinted {done}/{total}  ETA {}   ", tools::hms(el / done as f64 * (total - done) as f64));
+                    ticker.show(&format!("fingerprinted {done}/{total}  ETA {}", tools::hms(el / done as f64 * (total - done) as f64)));
                 }
-                dups::Progress::Comparing { videos } => eprintln!("\ncomparing {videos} videos"),
+                dups::Progress::Comparing { videos } => {
+                    ticker.end();
+                    eprintln!("comparing {videos} videos");
+                }
                 _ => {}
             };
             let report = dups::find(&paths, &tools, &opts, &progress)?;
@@ -954,15 +964,16 @@ fn scan(
 ) -> Result<()> {
     let list = pick.as_ref().and_then(|(_, list)| list.as_deref());
     check_reports(&[(list, Kind::List), (csv, report::CSV)], paths)?;
+    let ticker = tools::Ticker::new();
     let progress = |n: usize, total: usize| {
         if n == 0 {
             eprintln!("found {total} video files");
         } else if n.is_multiple_of(250) || n == total {
-            eprint!("\rprobed {n}/{total}");
+            ticker.show(&format!("probed {n}/{total}"));
         }
     };
     let (results, stats) = scan::collect(paths, ffprobe, jobs, min_savings, model, &progress)?;
-    eprintln!();
+    ticker.end();
     if stats.dropped > 0 {
         eprintln!("dropped {} cache entries for files that no longer exist", stats.dropped);
     }

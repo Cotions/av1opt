@@ -37,6 +37,12 @@ but comes after the others: orders by saving weigh every file by its chance of b
 expected gain means even the kind end of the range falls short. Never writes to the scanned
 folders.
 
+A walk through a folder, in `scan`, `dups`, `bench` and `encode`, looks at files whose names
+end in `.mp4`, `.mkv`, `.m4v`, `.mov`, `.webm`, `.avi`, `.wmv`, `.flv`, `.ts`, `.m2ts`,
+`.mts`, `.mpg`, `.mpeg`, `.vob` or `.3gp`, in any case. `encode` also takes a file of
+another name when it is named on its own, as long as what is in it is a video format ffmpeg
+reads.
+
 Every run of ffprobe on a video, here and in the other commands, has a time limit that only
 a stalled drive should reach: at most two minutes, and for a run that reads every packet of a
 file, as counting its frames does, a minute more for each gigabyte begun. A file ffprobe could
@@ -146,7 +152,8 @@ For each file:
    is scored along its whole length afterwards (step 5), so the search only has to find the
    video's mean, and what throws that off is where the clips lie, not how long they are: one
    clip of 1 second for every 8 seconds of video, 8 at least and 64 at most, spread evenly
-   from the first second to the last. Where one CRF has to carry its worst stretch
+   from the first second to the last. A video under 16 seconds holds fewer than 8 such clips
+   apart from each other: it gets one for every 2 seconds, at least one. Where one CRF has to carry its worst stretch
    (`--scenes`, HDR, removed sections), clips of 4 seconds, long enough to show a stretch: 8
    of them up to about 17 minutes, then one for every two minutes more, 32 at most.
    `--samples` and `--sample-secs` set both by hand, and with them the 4-second scheme.

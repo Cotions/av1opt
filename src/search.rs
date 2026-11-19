@@ -376,7 +376,8 @@ pub fn clip_secs(info: &MediaInfo, secs: f64) -> f64 {
 }
 
 /// How many sample clips a search for the mean alone takes: one for about every 8 seconds
-/// of video, 8 at least and 64 at most.
+/// of video, 8 at least and 64 at most. A short video holds fewer: see
+/// [`mean_sample_positions`].
 pub fn mean_sample_count(duration: f64) -> usize {
     ((duration / 8.0).round() as usize).clamp(8, 64)
 }

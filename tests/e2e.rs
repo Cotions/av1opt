@@ -46,6 +46,11 @@ impl Run {
         assert!(self.err.contains(text), "expected {text:?} in:\n{}", self.err);
         self
     }
+
+    fn lacks(&self, text: &str) -> &Run {
+        assert!(!self.err.contains(text), "did not expect {text:?} in:\n{}", self.err);
+        self
+    }
 }
 
 impl Case {
@@ -2649,18 +2654,23 @@ fn a_full_range_video_stays_full_range_where_stretches_are_encoded_again() {
     ]);
     let src = c.videos().join("full.mp4");
     assert_eq!(video(&src)["color_range"], "pc");
-    c.encode(&[&src], &[]).ok().has("encoding again:");
-    let out = c.out().join("full.mp4");
-    let keys = key_frames(&out);
+    // The stretches went in: a piece in the other range would be refused (see
+    // `sequence_header::joinable`), and every header would still say full.
+    c.encode(&[&src], &[]).ok().has("encoding again:").has("encoded again at CRF").lacks("could not be encoded again");
+    assert_one_range(&c.out().join("full.mp4"), &src, true);
+}
+
+/// Every GOP of `out` says the range `full` in its own sequence header, the container agrees,
+/// and its brightness against `src` is the same GOP by GOP: what is encoded again sits where
+/// the one pass does. Two steps of 1023 are half a step of 8-bit video; encoding alone moved
+/// the darkest scene by 1.4.
+fn assert_one_range(out: &Path, src: &Path, full: bool) {
+    let keys = key_frames(out);
     assert!(keys.len() >= 3, "{keys:?}");
-    // Every GOP says full range in its own sequence header, and the container agrees.
-    let ranges = sequence_header_field(&out, "color_range");
-    assert!(ranges.len() >= keys.len() && ranges.iter().all(|r| *r == 1), "{ranges:?} for GOPs at {keys:?}");
-    assert_eq!(video(&out)["color_range"], "pc");
-    // Brightness against the source, GOP by GOP: what is encoded again sits where the one
-    // pass does. Two steps of 1023 are half a step of 8-bit video; encoding alone moved the
-    // darkest scene by 1.4.
-    let (got, want) = (luma_means(&out), luma_means(&src));
+    let ranges = sequence_header_field(out, "color_range");
+    assert!(ranges.len() >= keys.len() && ranges.iter().all(|r| *r == u64::from(full)), "{ranges:?} for GOPs at {keys:?}");
+    assert_eq!(video(out)["color_range"], if full { "pc" } else { "tv" });
+    let (got, want) = (luma_means(out), luma_means(src));
     assert_eq!(got.len(), want.len());
     let bounds: Vec<usize> = keys.iter().copied().chain([got.len()]).collect();
     let offsets: Vec<f64> = bounds.windows(2).map(|w| (w[0]..w[1]).map(|i| got[i] - want[i]).sum::<f64>() / (w[1] - w[0]) as f64).collect();

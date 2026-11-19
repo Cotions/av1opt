@@ -6,8 +6,8 @@
 //! API and one Server-Sent-Events stream, so a desktop wrapper (Electron-style) can load the same
 //! URL later. Every request must carry the session token (as a cookie set on first visit), a
 //! localhost Host header and, if present, a localhost Origin. Media are only served for files the
-//! user picked (scan and duplicate results, queued encodes, reports in history folders) and
-//! previews.
+//! user picked (scan and duplicate results, queued encodes), files in av1opt's own record of what
+//! it made (see `ledger`) and previews. A report found in a folder adds nothing to these.
 
 mod bench;
 mod dups;
@@ -94,6 +94,8 @@ pub struct App {
     settings_save: Mutex<()>,
     /// Canonical paths the media endpoint may serve.
     pub allowed: Mutex<HashSet<PathBuf>>,
+    /// What av1opt itself recorded making and moving.
+    pub ledger: crate::ledger::Shared,
     /// Open event streams; dead ones are dropped on the next send.
     subscribers: Mutex<Vec<Sender<String>>>,
     pub jobs: jobs::Queue,
@@ -153,7 +155,8 @@ impl App {
 
     pub fn is_allowed(&self, p: &Path) -> Option<PathBuf> {
         let c = std::fs::canonicalize(p).ok()?;
-        if c.starts_with(&self.preview_dir) || self.allowed.lock().unwrap().contains(&c) { Some(c) } else { None }
+        let listed = c.starts_with(&self.preview_dir) || self.allowed.lock().unwrap().contains(&c);
+        (listed || self.ledger.current().covers(&c)).then_some(c)
     }
 
     pub fn tools(&self, workers: u8) -> Tools {
@@ -382,6 +385,10 @@ pub fn run(cfg: Config) -> Result<()> {
     let mut notices = Vec::new();
     let mut settings = read_settings(&mut notices);
     let settings_were_lost = !notices.is_empty();
+    if let Some(told) = crate::ledger::start_page() {
+        eprintln!("{told}");
+        notices.push(told);
+    }
     // A program chosen on the page was safe to start when it was chosen; it has to be still.
     for (name, tool) in [("ffmpeg", &mut settings.ffmpeg), ("ffprobe", &mut settings.ffprobe)] {
         // What runs is the file found safe, not whatever the path leads to later.
@@ -402,6 +409,7 @@ pub fn run(cfg: Config) -> Result<()> {
         settings: Mutex::new(settings),
         settings_save: Mutex::new(()),
         allowed: Mutex::new(HashSet::new()),
+        ledger: crate::ledger::Shared::default(),
         subscribers: Mutex::new(Vec::new()),
         jobs: jobs::Queue::default(),
         hold: hold::State::default(),

@@ -17,6 +17,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const REPORT_SUFFIX: &str = ".av1opt.json";
 
+/// The most a report may hold. The longest encodes make reports of some hundreds of kilobytes.
+pub const REPORT_LIMIT: u64 = 8 << 20;
+
 /// What replacing one original would do. Made by `check`; nothing has changed yet.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Plan {
@@ -34,6 +37,8 @@ pub struct Plan {
     pub zfs: bool,
     /// Sections of the original that the output leaves out.
     pub removed: usize,
+    /// What the report says of the original, which it was found to match.
+    pub original: Recorded,
 }
 
 /// An original that was replaced earlier, as its report tells it.
@@ -43,8 +48,11 @@ pub struct Replaced {
     pub source: PathBuf,
     /// Where the AV1 file is now.
     pub dest: PathBuf,
-    /// Where the AV1 file was before.
+    /// Where the AV1 file goes back to.
     pub from: PathBuf,
+    /// Where the report says the AV1 file was before. Another place than `from` when a newer
+    /// encode has taken that one.
+    pub recorded_from: PathBuf,
     /// Where the original is in the trash.
     pub trash: PathBuf,
     pub source_bytes: u64,
@@ -71,7 +79,7 @@ fn file_size(p: &Path) -> Option<u64> {
 }
 
 fn read_report(report: &Path) -> Result<Value, String> {
-    let bytes = std::fs::read(report).map_err(|e| format!("no report ({e})"))?;
+    let bytes = crate::files::read_regular(report, REPORT_LIMIT).map_err(|e| format!("no report ({e})"))?;
     let r: Value = serde_json::from_slice(&bytes).map_err(|_| "unreadable report".to_string())?;
     if r["format"].as_u64().unwrap_or(1) > u64::from(REPORT_FORMAT) {
         return Err("report written by a newer av1opt".into());
@@ -215,7 +223,7 @@ fn check_inner(report: &Path, judging: Judging) -> Result<Check, String> {
         let in_trash = if judging.for_list { trash::holds_for_list(&trash, &source, &original) } else { trash::holds(&trash, &source, &original) };
         let can_undo = file_size(&output) == Some(output_bytes) && in_trash;
         let zfs = source.parent().is_some_and(crate::fsguard::on_zfs);
-        return Ok(Check::Replaced(Replaced { report: report.to_path_buf(), source, dest: output, from, trash, source_bytes, output_bytes, original, can_undo, zfs }));
+        return Ok(Check::Replaced(Replaced { report: report.to_path_buf(), source, dest: output, from, recorded_from: recorded, trash, source_bytes, output_bytes, original, can_undo, zfs }));
     }
     if source == output {
         return Err("output and original are the same file".into());
@@ -274,7 +282,7 @@ fn check_inner(report: &Path, judging: Judging) -> Result<Check, String> {
     let copy = dest != output && dev(dir)? != dev(&output)?;
     let zfs = crate::fsguard::ensure_writable_location(dir, false).is_err();
     let removed = r["removed"].as_array().map_or(0, Vec::len);
-    Ok(Check::Ready(Plan { report: report.to_path_buf(), source, output, dest, source_bytes, output_bytes, copy, zfs, removed }))
+    Ok(Check::Ready(Plan { report: report.to_path_buf(), source, output, dest, source_bytes, output_bytes, copy, zfs, removed, original: then }))
 }
 
 /// A replacement that went through.
@@ -412,7 +420,9 @@ fn write_report(report: &Path, r: &Value) -> Result<()> {
 /// and the page at once) never work on the same pair. Gone when the returned lock is dropped.
 fn lock(report: &Path) -> Result<Lock> {
     use std::os::fd::AsRawFd;
-    let f = std::fs::File::open(report).with_context(|| format!("no report at {}", report.display()))?;
+    use std::os::unix::fs::OpenOptionsExt;
+    // Without waiting: a pipe left under a report's name would never finish opening.
+    let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(report).with_context(|| format!("no report at {}", report.display()))?;
     // SAFETY: flock on a descriptor we own; no memory is involved.
     if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0
         && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock
@@ -436,7 +446,9 @@ impl Drop for Lock {
     }
 }
 
-/// Replaces the original named in `report` by its output, after checking both again.
+/// Replaces the original named in `report` by its output, after checking both again, if
+/// `accept` agrees to what the report comes to. It is asked with the report locked and read for
+/// the last time, so what it agreed to is what is done.
 ///
 /// The original goes to the trash, then the output is renamed into its place; if that fails
 /// the original is taken back out of the trash. An output on another filesystem is first
@@ -444,22 +456,26 @@ impl Drop for Lock {
 /// error) leaves the original untouched; its old file is removed once the copy is in place.
 /// The hidden file is only ever a copy: deleting one never loses anything.
 #[cfg(feature = "ui")]
-pub fn apply(report: &Path, allow_zfs: bool) -> Result<Done> {
-    apply_with(report, allow_zfs, &trash::trash)
+pub fn apply_if(report: &Path, allow_zfs: bool, accept: Accept<Plan>) -> Result<Done> {
+    apply_judging(report, allow_zfs, Judging::default(), &trash::trash, accept)
 }
 
-#[cfg(any(feature = "ui", test))]
+#[cfg(test)]
 fn apply_with(report: &Path, allow_zfs: bool, to_trash: &dyn Fn(&Path) -> Result<PathBuf>) -> Result<Done> {
-    apply_judging(report, allow_zfs, Judging::default(), to_trash)
+    apply_judging(report, allow_zfs, Judging::default(), to_trash, &|_| Ok(()))
 }
 
-fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: &dyn Fn(&Path) -> Result<PathBuf>) -> Result<Done> {
+/// Has the last word on what a report comes to, or says why not.
+type Accept<'a, T> = &'a dyn Fn(&T) -> Result<(), String>;
+
+fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: &dyn Fn(&Path) -> Result<PathBuf>, accept: Accept<Plan>) -> Result<Done> {
     let _lock = lock(report)?;
     let p = match check_judging(report, judging) {
         Check::Ready(p) => p,
         Check::Replaced(_) => bail!("already replaced"),
         Check::No(why) => bail!("{why}"),
     };
+    accept(&p).map_err(|why| anyhow!(why))?;
     if p.zfs && !allow_zfs {
         bail!("the original is on ZFS, so it was left where it is and nothing was changed; --allow-zfs replaces originals there");
     }
@@ -519,10 +535,15 @@ fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: &dy
     if copied && let Err(e) = std::fs::remove_file(&p.output) {
         warnings.push(format!("the copy is in place, but {} could not be removed: {e}", p.output.display()));
     }
+    let source_mtime = std::fs::symlink_metadata(&trashed).ok().and_then(|m| crate::source::modified_seconds(&m));
+    let went = Recorded { modified: source_mtime.or(p.original.modified), ..p.original.clone() };
+    let move_noted = crate::ledger::note_replaced(&crate::ledger::Replacement { original: &p.source, trash: &trashed, output: &p.dest, from: &p.output, source_bytes: p.source_bytes, known: &went, output_bytes: p.output_bytes });
+    if let Err(e) = move_noted {
+        warnings.push(format!("av1opt's own record of this could not be written ({e:#}), so the page will not offer to put the original back; `av1opt replace --undo` in a terminal can"));
+    }
     let noted = read_report(report).map_err(|e| anyhow!(e)).and_then(|mut r| {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
         r["output"] = json!(p.dest);
-        let source_mtime = std::fs::symlink_metadata(&trashed).ok().and_then(|m| crate::source::modified_seconds(&m));
         r["replaced"] = json!({ "time": now, "from": p.output, "trash": trashed, "source_mtime": source_mtime });
         write_report(report, &r)
     });
@@ -534,13 +555,20 @@ fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: &dy
 
 /// Undoes `apply` while the original is still in the trash: the AV1 file goes back where it
 /// was, the original back to its place, and the report forgets the replacement.
-pub fn undo(report: &Path, allow_zfs: bool) -> Result<Replaced> {
+#[cfg(test)]
+fn undo(report: &Path, allow_zfs: bool) -> Result<Replaced> {
+    undo_if(report, allow_zfs, &|_| Ok(()))
+}
+
+/// [`undo`], if `accept` agrees to what the report comes to, asked as [`apply_if`] asks.
+pub fn undo_if(report: &Path, allow_zfs: bool, accept: Accept<Replaced>) -> Result<Replaced> {
     let _lock = lock(report)?;
     let d = match check(report) {
         Check::Replaced(d) => d,
         Check::Ready(_) => bail!("this original has not been replaced, so there is nothing to put back"),
         Check::No(why) => bail!("{why}"),
     };
+    accept(&d).map_err(|why| anyhow!(why))?;
     match file_size(&d.trash) {
         None => bail!("the original is no longer in the trash"),
         Some(n) if n != d.source_bytes => bail!("the file in the trash is not the original"),
@@ -576,6 +604,9 @@ pub fn undo(report: &Path, allow_zfs: bool) -> Result<Replaced> {
     trash::restore(&d.trash, &d.source)
         .with_context(|| format!("the AV1 file is back at {}, but the original is still in the trash at {}", d.from.display(), d.trash.display()))?;
     sync_dir(d.source.parent().unwrap_or(Path::new("/")));
+    if let Err(e) = crate::ledger::note_undone(&d.source, &d.dest, &d.from) {
+        eprintln!("warning: the original is back, but av1opt's own record of that could not be written: {e:#}");
+    }
     let mut r = read_report(report).map_err(|e| anyhow!(e))?;
     // Undone from a report set aside: the AV1 file did not go back to where it came from, as
     // a newer encode is there, and that encode's report is the one to go by.
@@ -628,17 +659,48 @@ pub fn reports_for(paths: &[PathBuf]) -> Vec<PathBuf> {
     out
 }
 
-/// The `replace` command: lists what would happen, and does it with `go`.
-pub fn run(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_changed_date: bool) -> Result<()> {
+/// The folders a `replace` was pointed at. A report is only a file, and whoever could put one
+/// in those folders chose what it names: it is not followed out of them unless that was asked for.
+struct NamedFolders(Option<Vec<PathBuf>>);
+
+impl NamedFolders {
+    /// The folders named, and the folder of each file named. None of them with `anywhere`.
+    fn of(paths: &[PathBuf], anywhere: bool) -> NamedFolders {
+        let folder = |p: &PathBuf| std::fs::canonicalize(if p.is_dir() { p.as_path() } else { p.parent()? }).ok();
+        NamedFolders((!anywhere).then(|| paths.iter().filter_map(folder).collect()))
+    }
+
+    /// Whether the original at `source` may be touched. It may be gone (it is in the trash), so
+    /// it is its folder that is looked up.
+    fn holds(&self, source: &Path) -> bool {
+        let Some(folders) = &self.0 else { return true };
+        let parent = source.parent().and_then(|p| std::fs::canonicalize(p).ok());
+        parent.is_some_and(|p| folders.iter().any(|f| p.starts_with(f)))
+    }
+
+    fn accept(&self, source: &Path) -> Result<(), String> {
+        if self.holds(source) { Ok(()) } else { Err(outside_named(source)) }
+    }
+}
+
+fn outside_named(source: &Path) -> String {
+    format!("the original {} is outside the folders named here; name its folder too, or add --anywhere if you trust this report", source.display())
+}
+
+/// The `replace` command: lists what would happen, and does it with `go`. Originals outside the
+/// folders in `paths` are left alone unless `anywhere` is set.
+pub fn run(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_changed_date: bool, anywhere: bool) -> Result<()> {
     use crate::report::gb;
     let judging = Judging { accept_changed_date, on_command_line: true, ..Judging::default() };
     let reports = reports_for(paths);
     if reports.is_empty() {
         bail!("no av1opt reports (*.av1opt.json) found there");
     }
+    let named = NamedFolders::of(paths, anywhere);
     let (mut ready, mut replaced, mut stay) = (Vec::new(), Vec::new(), Vec::new());
     for r in &reports {
         match check_judging(r, judging) {
+            Check::Ready(p) if !named.holds(&p.source) => stay.push((p.output.clone(), outside_named(&p.source))),
             Check::Ready(p) if p.zfs && !allow_zfs => stay.push((p.output.clone(), "the original is on ZFS (--allow-zfs replaces there too)".to_string())),
             Check::Ready(p) => ready.push(p),
             Check::Replaced(d) => replaced.push(d),
@@ -650,6 +712,7 @@ pub fn run(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_chan
 
     if back {
         let (can, cannot): (Vec<_>, Vec<_>) = replaced.into_iter().partition(|d| d.can_undo);
+        let (can, outside): (Vec<_>, Vec<_>) = can.into_iter().partition(|d| named.holds(&d.source));
         let (can, on_zfs): (Vec<_>, Vec<_>) = can.into_iter().partition(|d| !d.zfs || allow_zfs);
         println!("{} can go back to their place", plural(can.len(), "original", "originals"));
         for d in &can {
@@ -658,6 +721,12 @@ pub fn run(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_chan
         if !on_zfs.is_empty() {
             println!("{} on ZFS (--allow-zfs puts back there too)", plural(on_zfs.len(), "original was", "originals were"));
             for d in &on_zfs {
+                println!("  {}", d.source.display());
+            }
+        }
+        if !outside.is_empty() {
+            println!("{} outside the folders named here (name their folders too, or add --anywhere if you trust these reports)", plural(outside.len(), "original is", "originals are"));
+            for d in &outside {
                 println!("  {}", d.source.display());
             }
         }
@@ -675,7 +744,7 @@ pub fn run(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_chan
         }
         let mut done = 0;
         for d in &can {
-            match undo(&d.report, allow_zfs) {
+            match undo_if(&d.report, allow_zfs, &|d| named.accept(&d.source)) {
                 Ok(_) => done += 1,
                 Err(e) => {
                     failed += 1;
@@ -719,7 +788,7 @@ pub fn run(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_chan
         }
         let (mut done, mut trashed) = (0, 0u64);
         for p in &ready {
-            match apply_judging(&p.report, allow_zfs, judging, &trash::trash) {
+            match apply_judging(&p.report, allow_zfs, judging, &trash::trash, &|p| named.accept(&p.source)) {
                 Ok(d) => {
                     done += 1;
                     trashed += d.source_bytes;
@@ -791,6 +860,57 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[test]
+    fn a_report_is_followed_only_into_the_folders_named() {
+        let f = Fix::new("named");
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        let source = f.lib("a.mp4");
+        let out = f.dir.join("out");
+        let lib = f.dir.join("lib");
+        assert!(!NamedFolders::of(std::slice::from_ref(&out), false).holds(&source));
+        // A file named stands for its folder.
+        assert!(!NamedFolders::of(std::slice::from_ref(&report), false).holds(&source));
+        assert!(NamedFolders::of(&[out.clone(), lib.clone()], false).holds(&source));
+        assert!(NamedFolders::of(std::slice::from_ref(&f.dir), false).holds(&source), "a folder holds what is below it");
+        assert!(NamedFolders::of(std::slice::from_ref(&out), true).holds(&source));
+        // Not by a name that only starts the same, nor by a way through `..` or a link.
+        let twin = f.dir.join("lib2");
+        std::fs::create_dir(&twin).unwrap();
+        assert!(!NamedFolders::of(std::slice::from_ref(&twin), false).holds(&source));
+        assert!(!NamedFolders::of(std::slice::from_ref(&out), false).holds(&out.join("../lib/a.mp4")));
+        std::os::unix::fs::symlink(&lib, out.join("way")).unwrap();
+        assert!(!NamedFolders::of(std::slice::from_ref(&out), false).holds(&out.join("way/a.mp4")));
+        // An original already in the trash is still judged by the folder it came from.
+        std::fs::remove_file(&source).unwrap();
+        assert!(NamedFolders::of(std::slice::from_ref(&lib), false).holds(&source));
+    }
+
+    #[test]
+    fn what_is_refused_at_the_last_moment_moves_nothing() {
+        let f = Fix::new("refused");
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        let err = apply_judging(&report, true, Judging::default(), &trash::trash, &|_| Err("not this one".into())).unwrap_err();
+        assert_eq!(err.to_string(), "not this one");
+        assert!(f.lib("a.mp4").exists() && f.out("a.mkv").exists());
+        f.apply(&report).unwrap();
+        let err = undo_if(&report, true, &|_| Err("not this one".into())).unwrap_err();
+        assert_eq!(err.to_string(), "not this one");
+        assert!(!f.lib("a.mp4").exists() && f.lib("a.mkv").exists());
+    }
+
+    #[test]
+    fn a_report_that_is_a_pipe_or_too_large_is_refused_without_waiting() {
+        let f = Fix::new("pipe");
+        let pipe = f.out("a.av1opt.json");
+        let name = std::ffi::CString::new(pipe.to_str().unwrap()).unwrap();
+        // SAFETY: `name` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o644) }, 0);
+        assert!(no(&pipe).starts_with("no report"), "{}", no(&pipe));
+        let huge = f.out("b.av1opt.json");
+        std::fs::File::create(&huge).unwrap().set_len(REPORT_LIMIT + 1).unwrap();
+        assert!(no(&huge).contains("larger than"), "{}", no(&huge));
     }
 
     fn no(report: &Path) -> String {

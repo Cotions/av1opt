@@ -592,6 +592,8 @@ fn originals_are_replaced_and_put_back_through_reports_in_history() {
             std::fs::write(d.join(dir).join("film.av1opt.json"), r.to_string()).unwrap();
         }
         std::fs::write(d.join("out/film.mkv"), vec![b'o'; 1000]).unwrap();
+        // The encode as av1opt would have recorded it.
+        write_record(d, &[encoded_line(&d.join("videos/film.mp4"), &d.join("out/film.mkv"))]);
     });
     let (original, output, new) = (s.dir.join("videos/film.mp4"), s.dir.join("out/film.mkv"), s.dir.join("videos/film.mkv"));
     let report = s.dir.join("out/film.av1opt.json");
@@ -644,6 +646,328 @@ fn originals_are_replaced_and_put_back_through_reports_in_history() {
     let r = s.post("/api/replace", &json!({ "report": report }));
     assert!(r.status == 400 && r.body.contains("changed since the encode"), "{}", r.body);
     assert_eq!(sizes(), [Some(6), Some(1000), None]);
+}
+
+/// Puts lines in av1opt's own record, private as av1opt keeps it.
+fn write_record(d: &Path, lines: &[Value]) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = d.join("data/av1opt/ledger.jsonl");
+    let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    std::fs::write(&path, text).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn sha256(p: &Path) -> String {
+    let o = std::process::Command::new("sha256sum").arg(p).output().unwrap();
+    String::from_utf8(o.stdout).unwrap().split(' ').next().unwrap().to_string()
+}
+
+/// The line an encode of `source` to `output` leaves, both files being there.
+fn encoded_line(source: &Path, output: &Path) -> Value {
+    let size = |p: &Path| std::fs::metadata(p).unwrap().len();
+    json!({
+        "format": 1, "time": 1, "event": "encoded", "output": output, "report": output.with_extension("av1opt.json"), "source": source,
+        "source_bytes": size(source), "output_bytes": size(output), "output_sha256": sha256(output),
+    })
+}
+
+/// A file in the (scratch) trash that says it came from `original`, as a real entry does.
+fn in_the_trash(d: &Path, original: &Path, bytes: usize) -> PathBuf {
+    let name = original.file_name().unwrap().to_str().unwrap();
+    std::fs::create_dir_all(d.join("data/Trash/files")).unwrap();
+    std::fs::create_dir_all(d.join("data/Trash/info")).unwrap();
+    let trashed = d.join("data/Trash/files").join(name);
+    std::fs::write(&trashed, vec![b's'; bytes]).unwrap();
+    let info = format!("[Trash Info]\nPath={}\nDeletionDate=2026-11-10T22:15:03\n", original.display());
+    std::fs::write(d.join("data/Trash/info").join(format!("{name}.trashinfo")), info).unwrap();
+    trashed
+}
+
+fn write_report(at: &Path, report: Value) {
+    std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+    std::fs::write(at, report.to_string()).unwrap();
+}
+
+fn add_history_folder(s: &Server, name: &str) {
+    assert_eq!(s.post("/api/history/dirs", &json!({ "path": s.dir.join(name) })).status, 200);
+}
+
+fn nothing_in_the_trash(s: &Server) -> bool {
+    std::fs::read_dir(s.dir.join("data/Trash/files")).map_or(true, |mut d| d.next().is_none())
+}
+
+#[test]
+fn a_planted_report_cannot_send_a_video_to_the_trash() {
+    let s = Server::start("planted-replace", |d| {
+        std::fs::write(d.join("videos/movie.mp4"), vec![b's'; 3000]).unwrap();
+        std::fs::create_dir_all(d.join("drop")).unwrap();
+        std::fs::write(d.join("drop/evil.mkv"), vec![b'e'; 500]).unwrap();
+        let r = json!({ "format": 1, "input": d.join("videos/movie.mp4"), "output": d.join("drop/evil.mkv"), "source_bytes": 3000, "output_bytes": 500, "crf": 30.0 });
+        write_report(&d.join("drop/evil.av1opt.json"), r);
+    });
+    add_history_folder(&s, "drop");
+    let (victim, evil, report) = (s.dir.join("videos/movie.mp4"), s.dir.join("drop/evil.mkv"), s.dir.join("drop/evil.av1opt.json"));
+
+    // Still listed, as what it is, with nothing offered and nothing looked up.
+    let row = s.get("/api/history").json()["reports"][0].clone();
+    assert_eq!((&row["on_record"], &row["replace"]["state"]), (&json!(false), &json!("not_recorded")), "{row}");
+    assert!(row["replace"]["why"].as_str().unwrap().contains("`av1opt replace`"), "{row}");
+    assert_eq!((&row["input_exists"], &row["output_exists"]), (&Value::Null, &Value::Null), "{row}");
+
+    let r = s.post("/api/replace", &json!({ "report": report }));
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert!(r.body.contains("no record of making this output") && r.body.contains("`av1opt replace`"), "{}", r.body);
+    assert_eq!(std::fs::read(&victim).unwrap(), vec![b's'; 3000]);
+    assert_eq!(std::fs::read(&evil).unwrap(), vec![b'e'; 500]);
+    assert!(!s.dir.join("videos/movie.mkv").exists() && nothing_in_the_trash(&s));
+}
+
+#[test]
+fn a_recorded_output_swapped_for_another_file_does_not_take_the_originals_place() {
+    let s = Server::start("planted-swap", |d| {
+        std::fs::write(d.join("videos/movie.mp4"), vec![b's'; 3000]).unwrap();
+        std::fs::write(d.join("videos/other.mp4"), vec![b't'; 3000]).unwrap();
+        std::fs::create_dir_all(d.join("out")).unwrap();
+        std::fs::write(d.join("out/movie.mkv"), vec![b'o'; 1000]).unwrap();
+        write_record(d, &[encoded_line(&d.join("videos/movie.mp4"), &d.join("out/movie.mkv"))]);
+        let r = json!({ "format": 1, "input": d.join("videos/movie.mp4"), "output": d.join("out/movie.mkv"), "source_bytes": 3000, "output_bytes": 1000 });
+        write_report(&d.join("out/movie.av1opt.json"), r);
+        // Someone who can write to the output folder changes the file, keeping its size.
+        std::fs::write(d.join("out/movie.mkv"), vec![b'e'; 1000]).unwrap();
+    });
+    add_history_folder(&s, "out");
+    let report = s.dir.join("out/movie.av1opt.json");
+    let r = s.post("/api/replace", &json!({ "report": report }));
+    assert!(r.status == 400 && r.body.contains("not the file av1opt made"), "{}", r.body);
+    assert_eq!(std::fs::read(s.dir.join("videos/movie.mp4")).unwrap(), vec![b's'; 3000]);
+    assert!(nothing_in_the_trash(&s));
+
+    // The report rewritten to claim another original is no better.
+    let forged = json!({ "format": 1, "input": s.dir.join("videos/other.mp4"), "output": s.dir.join("out/movie.mkv"), "source_bytes": 3000, "output_bytes": 1000 });
+    write_report(&report, forged);
+    assert_eq!(s.get("/api/history").json()["reports"][0]["replace"]["state"], "not_recorded");
+    let r = s.post("/api/replace", &json!({ "report": report }));
+    assert!(r.status == 400 && r.body.contains("no record of making this output"), "{}", r.body);
+    assert_eq!(std::fs::read(s.dir.join("videos/other.mp4")).unwrap(), vec![b't'; 3000]);
+    assert!(nothing_in_the_trash(&s));
+}
+
+#[test]
+fn a_planted_report_cannot_pull_a_file_out_through_undo() {
+    let plant = |d: &Path| {
+        let (original, placed) = (d.join("videos/movie.mp4"), d.join("videos/movie.mkv"));
+        std::fs::write(&placed, vec![b'a'; 1000]).unwrap();
+        let trashed = in_the_trash(d, &original, 3000);
+        let r = json!({
+            "format": 1, "input": original, "output": placed, "source_bytes": 3000, "output_bytes": 1000,
+            "replaced": { "time": 1, "from": d.join("drop/stolen.mkv"), "trash": trashed },
+        });
+        write_report(&d.join("drop/stolen.av1opt.json"), r);
+        (original, placed, trashed)
+    };
+    let attempt = |s: &Server| {
+        add_history_folder(s, "drop");
+        let r = s.post("/api/replace/undo", &json!({ "report": s.dir.join("drop/stolen.av1opt.json") }));
+        assert!(r.status == 400 && (r.body.contains("no record of making this output") || r.body.contains("does not say what av1opt recorded")), "{}", r.body);
+        assert_eq!(std::fs::read(s.dir.join("videos/movie.mkv")).unwrap(), vec![b'a'; 1000]);
+        assert!(!s.dir.join("drop/stolen.mkv").exists() && !s.dir.join("videos/movie.mp4").exists());
+        assert_eq!(std::fs::metadata(s.dir.join("data/Trash/files/movie.mp4")).unwrap().len(), 3000);
+    };
+    // Nothing on record at all.
+    let s = Server::start("planted-undo", |d| {
+        plant(d);
+    });
+    attempt(&s);
+    // The replacement is on record, and the report only lies about where the file goes back to.
+    let s = Server::start("planted-undo-recorded", |d| {
+        let (original, placed, trashed) = plant(d);
+        let replaced = json!({ "format": 1, "time": 2, "event": "replaced", "source": original, "trash": trashed, "output": placed, "from": d.join("out/movie.mkv"), "source_bytes": 3000, "output_bytes": 1000 });
+        write_record(d, &[replaced]);
+    });
+    attempt(&s);
+}
+
+#[test]
+fn what_only_a_report_names_is_neither_served_nor_opened() {
+    let probed = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("planted-read-probed");
+    let _ = std::fs::remove_file(&probed);
+    let (ffmpeg, ffprobe) = stand_in_tools("planted-read", &format!("touch {}\nexit 1", probed.display()));
+    let s = Server::start_with_tools("planted-read", &ffmpeg, &ffprobe, |d| {
+        std::fs::write(d.join("videos/secret.mkv"), b"private video").unwrap();
+        std::fs::write(d.join("videos/notes.txt"), b"private notes").unwrap();
+        let r = json!({ "format": 1, "input": d.join("videos/notes.txt"), "output": d.join("videos/secret.mkv"), "source_bytes": 13, "output_bytes": 13 });
+        write_report(&d.join("drop/read.av1opt.json"), r);
+    });
+    add_history_folder(&s, "drop");
+    let q = |p: &Path| format!("/media?path={}", p.display());
+    let (notes, secret) = (s.dir.join("videos/notes.txt"), s.dir.join("videos/secret.mkv"));
+
+    // Listing history, and opening the report, give access to nothing.
+    assert_eq!(s.get("/api/history").json()["reports"].as_array().unwrap().len(), 1);
+    let r = s.get(&format!("/api/report?path={}", s.dir.join("drop/read.av1opt.json").display()));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let r = r.json();
+    assert_eq!(r["replace"]["state"], "not_recorded", "{r}");
+    for side in ["input_info", "output_info"] {
+        assert!(r[side]["error"].as_str().unwrap().contains("was not opened"), "{r}");
+        assert!(r[side].get("size").is_none(), "{r}");
+    }
+    assert_eq!(s.get(&q(&secret)).status, 403);
+    assert_eq!(s.get(&q(&notes)).status, 403);
+    assert!(!probed.exists(), "ffprobe was run on a file only a report names");
+
+    // Picked by the person, the same video can be looked at.
+    assert_eq!(s.post("/api/source", &json!({ "path": secret })).status, 200);
+    assert_eq!(s.get(&q(&secret)).status, 200);
+    assert_eq!(s.get(&q(&notes)).status, 403);
+}
+
+#[test]
+fn a_report_has_to_be_a_plain_file_of_a_sensible_size() {
+    let s = Server::start("planted-pipe", |d| {
+        std::fs::create_dir_all(d.join("drop")).unwrap();
+        let pipe = std::ffi::CString::new(d.join("drop/pipe.av1opt.json").to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(pipe.as_ptr(), 0o644) }, 0);
+        std::fs::write(d.join("drop/huge.av1opt.json"), vec![b' '; (8 << 20) + 1]).unwrap();
+    });
+    add_history_folder(&s, "drop");
+    let (pipe, huge) = (s.dir.join("drop/pipe.av1opt.json"), s.dir.join("drop/huge.av1opt.json"));
+    let started = Instant::now();
+    let r = s.get(&format!("/api/report?path={}", pipe.display()));
+    assert!(r.status == 400 && r.body.contains("not a plain file"), "{}", r.body);
+    for route in ["/api/replace", "/api/replace/undo"] {
+        let r = s.post(route, &json!({ "report": pipe }));
+        assert!(r.status == 400 && r.body.contains("not a plain file"), "{}", r.body);
+    }
+    let r = s.get(&format!("/api/report?path={}", huge.display()));
+    assert!(r.status == 400 && r.body.contains("larger than"), "{}", r.body);
+    assert_eq!(s.get("/api/history").json()["reports"], json!([]));
+    assert!(started.elapsed() < Duration::from_secs(5), "a request waited on the pipe");
+}
+
+/// A past encode as the history file holds it.
+fn history_line(time: u64) -> Value {
+    json!({
+        "format": 1, "time": time, "codec": "h264", "width": 640, "height": 360, "fps": 24.0, "duration_s": 60.0, "source_bitrate": 2e6, "output_bitrate": 5e5,
+        "target_vmaf": 93.0, "preset": 6, "mode": "whole", "crf": 30.0, "svt_params": "tune=0",
+    })
+}
+
+#[test]
+fn the_encode_history_is_looked_at_once_and_vouches_for_no_report() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ui-takeover");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("data/av1opt")).unwrap();
+    std::fs::create_dir_all(dir.join("cache")).unwrap();
+    std::fs::create_dir_all(dir.join("videos")).unwrap();
+    std::fs::write(dir.join("videos/old.mp4"), vec![b's'; 3000]).unwrap();
+    std::fs::create_dir_all(dir.join("out")).unwrap();
+    std::fs::write(dir.join("out/old.mkv"), vec![b'o'; 1000]).unwrap();
+    // A report that agrees with a line of the history in every number the line has.
+    let r = json!({ "format": 1, "input": dir.join("videos/old.mp4"), "output": dir.join("out/old.mkv"), "source_bytes": 3000, "output_bytes": 1000, "crf": 30.0, "preset": 6, "target_vmaf": 93.0, "mode": "whole", "svt_params": "tune=0" });
+    write_report(&dir.join("out/old.av1opt.json"), r);
+    std::fs::write(dir.join("data/av1opt/history.jsonl"), format!("{}\nnot json\n{}\n", history_line(100), history_line(200))).unwrap();
+    std::fs::write(dir.join("data/av1opt/ui.json"), json!({ "format": 1, "history_dirs": [dir.join("out")] }).to_string()).unwrap();
+
+    let first_words = |name: &str| -> String {
+        let log = dir.join(name);
+        let mut c = Server::command(&dir, "false", "false").stderr(std::fs::File::create(&log).unwrap()).spawn().unwrap();
+        let started = Instant::now();
+        while !std::fs::read_to_string(&log).unwrap().contains("av1opt ui on") {
+            assert!(started.elapsed() < Duration::from_secs(20), "the page did not start");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        c.kill().unwrap();
+        c.wait().unwrap();
+        std::fs::read_to_string(&log).unwrap()
+    };
+    let said = first_words("first.log");
+    assert!(said.contains("0 of 2 past encodes") && said.contains("no file names") && said.contains("`av1opt replace`"), "{said}");
+    let record = dir.join("data/av1opt/ledger.jsonl");
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!((mode(&record), mode(&dir.join("data/av1opt"))), (0o600, 0o700));
+    let text = std::fs::read_to_string(&record).unwrap();
+    assert_eq!(text.lines().count(), 1, "{text}");
+    assert!(text.contains("\"taken_over\"") && text.contains("\"taken\":0"), "{text}");
+
+    // Once only, and the report stays what it was.
+    let said = first_words("second.log");
+    assert!(!said.contains("past encodes"), "{said}");
+    assert_eq!(std::fs::read_to_string(&record).unwrap(), text);
+    let keep = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ui-takeover");
+    let s = Server::start_in(&keep, "false", "false");
+    assert_eq!(s.get("/api/state").json()["notices"], json!([]));
+    let row = s.get("/api/history").json()["reports"][0].clone();
+    assert_eq!(row["replace"]["state"], "not_recorded", "{row}");
+    assert_eq!(s.post("/api/replace", &json!({ "report": s.dir.join("out/old.av1opt.json") })).status, 400);
+    assert!(s.dir.join("videos/old.mp4").exists());
+}
+
+#[test]
+fn the_page_says_it_when_past_encodes_could_not_be_taken_over() {
+    let s = Server::start("takeover-notice", |d| {
+        std::fs::write(d.join("data/av1opt/history.jsonl"), format!("{}\n", history_line(100))).unwrap();
+    });
+    let notices = s.get("/api/state").json()["notices"].to_string();
+    assert!(notices.contains("0 of 1 past encodes"), "{notices}");
+}
+
+/// `av1opt replace` on the folders below `dir`, with its trash and record there.
+fn replace_command(dir: &Path, args: &[&std::ffi::OsStr]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_av1opt"))
+        .arg("replace")
+        .args(args)
+        .env("XDG_DATA_HOME", dir.join("data"))
+        .env("XDG_CACHE_HOME", dir.join("cache"))
+        .env("AV1OPT_HISTORY", dir.join("data/av1opt/history.jsonl"))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn the_command_follows_a_report_only_into_the_folders_it_was_given() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ui-replace-command");
+    let _ = std::fs::remove_dir_all(&dir);
+    for folder in ["videos", "out", "data"] {
+        std::fs::create_dir_all(dir.join(folder)).unwrap();
+    }
+    let (original, output, placed) = (dir.join("videos/film.mp4"), dir.join("out/film.mkv"), dir.join("videos/film.mkv"));
+    std::fs::write(&original, vec![b's'; 3000]).unwrap();
+    std::fs::write(&output, vec![b'o'; 1000]).unwrap();
+    write_report(&dir.join("out/film.av1opt.json"), json!({ "format": 1, "input": original, "output": output, "source_bytes": 3000, "output_bytes": 1000 }));
+    let (out, videos) = (dir.join("out"), dir.join("videos"));
+    let apply = std::ffi::OsStr::new("--apply");
+    let undo = std::ffi::OsStr::new("--undo");
+    let anywhere = std::ffi::OsStr::new("--anywhere");
+
+    // The output folder alone does not reach the original.
+    let run = replace_command(&dir, &[out.as_os_str(), apply]);
+    let said = String::from_utf8_lossy(&run.stdout).into_owned();
+    assert!(run.status.success() && said.contains("outside the folders named") && said.contains("--anywhere"), "{said}");
+    assert!(original.exists() && output.exists() && !placed.exists());
+    // A report named by itself does not either.
+    let run = replace_command(&dir, &[dir.join("out/film.av1opt.json").as_os_str(), apply]);
+    assert!(String::from_utf8_lossy(&run.stdout).contains("outside the folders named"));
+    assert!(original.exists());
+
+    // Named as well, it does, and what was done is on record.
+    let run = replace_command(&dir, &[out.as_os_str(), videos.as_os_str(), apply]);
+    assert!(run.status.success() && placed.exists() && !original.exists(), "{}", String::from_utf8_lossy(&run.stdout));
+    let record = std::fs::read_to_string(dir.join("data/av1opt/ledger.jsonl")).unwrap();
+    assert!(record.contains("\"event\":\"replaced\""), "{record}");
+
+    // Putting back follows the same rule.
+    let run = replace_command(&dir, &[out.as_os_str(), undo, apply]);
+    assert!(String::from_utf8_lossy(&run.stdout).contains("outside the folders named"), "{}", String::from_utf8_lossy(&run.stdout));
+    assert!(placed.exists() && !original.exists());
+    let run = replace_command(&dir, &[out.as_os_str(), undo, apply, anywhere]);
+    assert!(run.status.success() && original.exists() && output.exists() && !placed.exists(), "{}", String::from_utf8_lossy(&run.stdout));
+
+    // Asked for, a report is followed wherever it leads.
+    let run = replace_command(&dir, &[out.as_os_str(), apply, anywhere]);
+    assert!(run.status.success() && placed.exists() && !original.exists(), "{}", String::from_utf8_lossy(&run.stdout));
 }
 
 #[test]

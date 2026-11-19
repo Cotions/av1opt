@@ -2289,8 +2289,9 @@ views.history = (root) => {
       h("td", { class: "dim" }, when(x.time)),
       h("td", { class: "path", title: x.input }, h("span", {}, basename(x.input)),
         stateOf(x) === "replaced" ? h("span", { class: "pill ok", title: `The AV1 file is where the original was: ${x.output}\n${x.input_exists ? "The original is in the trash" : "The original is no longer in the trash"}` }, "replaced")
-          : x.input_exists ? null : h("span", { class: "pill warn", title: "source no longer at this path" }, "source gone"),
-        x.output_exists ? null : h("span", { class: "pill bad" }, "output gone")),
+          : x.input_exists === false ? h("span", { class: "pill warn", title: "source no longer at this path" }, "source gone") : null,
+        x.output_exists === false ? h("span", { class: "pill bad" }, "output gone") : null,
+        stateOf(x) === "not_recorded" ? h("span", { class: "pill", title: x.replace.why }, "not made here") : null),
       h("td", {}, x.mode === "scenes" ? `scenes (${x.chunks})` : "whole"),
       h("td", { class: "num" }, x.crf),
       h("td", { class: "num" }, x.target_vmaf),
@@ -2687,6 +2688,7 @@ function comparePlayer(root, r) {
         await act("/api/replace/undo", { report: r.report_path, allow_zfs: !!rp.zfs }, "Original back in its place");
         btn.disabled = false;
       } }, "Put original back")) : null]
+    : rp.state === "not_recorded" ? h("p", { class: "dim" }, `${rp.why}.`)
     : h("p", { class: "dim" }, `The AV1 file can't take the original's place: ${rp.why}.`));
 
   const side = h("div", {},

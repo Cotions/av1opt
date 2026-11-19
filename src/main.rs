@@ -11,6 +11,7 @@ mod events;
 mod files;
 mod fsguard;
 mod history;
+mod ledger;
 mod metadata;
 mod probe;
 mod repair;
@@ -126,9 +127,11 @@ enum Cmd {
     /// Put finished AV1 outputs where their originals were: the original goes to the trash,
     /// the output takes its name in its folder. Lists what would happen and changes nothing
     /// until --apply is given. Only outputs whose report (`.av1opt.json`) still matches both
-    /// files are touched, and no existing file is ever written over.
+    /// files are touched, and no existing file is ever written over. A report is followed only
+    /// to originals inside the folders named here: name the originals' folder as well as the
+    /// output folder, or give --anywhere.
     Replace {
-        /// Output folders, reports (`.av1opt.json`) or output files.
+        /// Output folders, the folders of the originals, reports (`.av1opt.json`) or output files.
         #[arg(required = true)]
         paths: Vec<PathBuf>,
         /// Do it. Without this the command only lists.
@@ -147,6 +150,10 @@ enum Cmd {
         /// in favour of an encode of the older ones. Originals seen to differ are still refused.
         #[arg(long, conflicts_with = "undo")]
         accept_changed_date: bool,
+        /// Follow reports to originals wherever they are, not only in the folders named. A
+        /// report can name any file: use this only for reports you trust.
+        #[arg(long)]
+        anywhere: bool,
     },
     /// Compare encoder settings on your own videos: for every preset and SVT-AV1 parameter set,
     /// find the CRF that reaches the target VMAF on sample clips, then rank the settings by
@@ -461,9 +468,9 @@ fn main() -> Result<()> {
             dups::print(&report, top);
             written
         }
-        Cmd::Replace { paths, apply, undo, allow_zfs, accept_changed_date } => {
+        Cmd::Replace { paths, apply, undo, allow_zfs, accept_changed_date, anywhere } => {
             let paths: Vec<PathBuf> = paths.iter().map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone())).collect();
-            replace::run(&paths, apply, undo, allow_zfs, accept_changed_date)
+            replace::run(&paths, apply, undo, allow_zfs, accept_changed_date, anywhere)
         }
         Cmd::Bench {
             paths, presets, param_sets, target_vmaf, max_videos, samples, sample_secs, min_crf, max_crf, refresh, work_dir, save, csv, json,

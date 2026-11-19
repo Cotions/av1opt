@@ -96,7 +96,7 @@ fn wait_for_read<T>(answer: &Receiver<std::io::Result<T>>, got: &AtomicU64, give
 /// Runs `read` on a thread of its own, so that a drive that stops answering costs this file and
 /// not whoever asked. The thread of such a read stays behind until the drive answers; it holds
 /// nothing but the file.
-fn read_watched<T: Send + 'static>(read: impl FnOnce(&AtomicU64) -> std::io::Result<T> + Send + 'static) -> std::io::Result<T> {
+pub fn read_watched<T: Send + 'static>(read: impl FnOnce(&AtomicU64) -> std::io::Result<T> + Send + 'static) -> std::io::Result<T> {
     let (tell, answer) = channel();
     let got = Arc::new(AtomicU64::new(0));
     let counted = got.clone();

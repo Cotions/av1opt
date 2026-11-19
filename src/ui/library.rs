@@ -3,6 +3,7 @@
 use super::{App, now, text_path};
 use crate::estimate::{Model, TimeModel, Verdict};
 use crate::history;
+use crate::ledger::{Entry, Ledger};
 use crate::replace::{self, Check};
 use crate::scan::{self, FileResult, is_video};
 use crate::search;
@@ -471,73 +472,77 @@ pub fn scan_result(app: &App, id: u64) -> Result<Value> {
     }))
 }
 
-/// Report paths are relative to wherever `encode` ran in older versions; find the file
-/// relative to the report's folder or one of its parents.
-fn resolve(report: &Path, p: &str, same_dir: bool) -> PathBuf {
+/// A path from a report, to show. Reports of older versions hold paths relative to where
+/// `encode` ran. Nothing is looked up: what a report names is not touched for being named.
+fn shown_path(report: &Path, p: &str, same_dir: bool) -> PathBuf {
     let p = PathBuf::from(p);
     if p.is_absolute() {
         return p;
     }
     let dir = report.parent().unwrap_or(Path::new("/"));
-    if same_dir && let Some(name) = p.file_name() {
-        return dir.join(name);
+    match p.file_name() {
+        Some(name) if same_dir => dir.join(name),
+        _ => dir.join(p),
     }
-    dir.ancestors().map(|a| a.join(&p)).find(|c| c.exists()).unwrap_or_else(|| dir.join(&p))
 }
 
-/// Reports are plain JSON on disk; only let them unlock video files, never arbitrary ones.
-fn allow_video(app: &App, p: &Path) {
-    app.allow_video(p);
-}
-
-/// What `replace` would do with a report, for the history table and the compare view.
-fn replace_state(report: &Path) -> Value {
+/// What `replace` would do with a report, for the history table and the compare view. A report
+/// of an output not on record is not looked into: its paths are only somebody's claim.
+fn replace_state(ledger: &Ledger, report: &Path, on_record: bool) -> Value {
+    if !on_record {
+        return json!({ "state": "not_recorded", "why": ledger.refusal() });
+    }
+    let no = |why: String| json!({ "state": "no", "why": why });
     match replace::check_for_list(report) {
-        Check::Ready(p) => json!({ "state": "ready", "dest": p.dest, "copy": p.copy, "zfs": p.zfs, "removed": p.removed }),
-        Check::Replaced(d) => json!({ "state": "replaced", "trash": d.trash, "from": d.from, "can_undo": d.can_undo, "zfs": d.zfs }),
-        Check::No(why) => json!({ "state": "no", "why": why }),
+        Check::Ready(p) => match ledger.check_ready(&p, false) {
+            Ok(()) => json!({ "state": "ready", "dest": p.dest, "copy": p.copy, "zfs": p.zfs, "removed": p.removed }),
+            Err(why) => no(why),
+        },
+        Check::Replaced(d) => match ledger.check_replaced(&d) {
+            Ok(()) => json!({ "state": "replaced", "trash": d.trash, "from": d.from, "can_undo": d.can_undo, "zfs": d.zfs }),
+            Err(why) => no(why),
+        },
+        Check::No(why) => no(why),
     }
 }
 
-/// The file to show as the source of a report: the original, or its copy in the trash once
-/// the output has taken its place. Trash names can carry a counter after the extension.
-fn source_of(app: &App, report: &Path, r: &Value) -> PathBuf {
-    let input = resolve(report, r["input"].as_str().unwrap_or(""), false);
-    let Some(trash) = r["replaced"]["trash"].as_str().map(PathBuf::from) else {
-        allow_video(app, &input);
-        return input;
-    };
-    // Only a file the trash itself says came from the original: the report alone could name
-    // any file of the right size.
-    if is_video(&input) && replace::original_in_trash(r).is_some_and(|known| crate::trash::holds_for_list(&trash, &input, &known)) {
-        app.allow(&trash);
-    }
-    trash
+/// The file to show as the source of an output on record: the original, or its copy in the
+/// trash once the output has taken its place.
+fn source_on_record(entry: &Entry) -> &Path {
+    entry.replaced.as_ref().map_or(&entry.source, |m| &m.trash)
+}
+
+/// A report's contents, if it is a plain file of a sensible size.
+fn read_report_file(p: &Path) -> Result<Value> {
+    let bytes = crate::files::read_regular(p, replace::REPORT_LIMIT).with_context(|| format!("cannot read the report {}", p.display()))?;
+    serde_json::from_slice(&bytes).context("unreadable report")
 }
 
 pub fn history(app: &App) -> Value {
     let dirs = app.settings.lock().unwrap().history_dirs.clone();
+    let ledger = app.ledger.current();
     let mut rows: Vec<Value> = replace::report_files(&dirs)
         .into_iter()
         .filter_map(|p| {
             p.to_str()?;
-            let r: Value = serde_json::from_slice(&std::fs::read(&p).ok()?).ok()?;
+            let r = read_report_file(&p).ok()?;
             // Reports from before versioning have no `format`; newer layouts are skipped.
             if r["format"].as_u64().unwrap_or(1) > u64::from(crate::encode::REPORT_FORMAT) {
                 return None;
             }
-            let input = resolve(&p, r["input"].as_str()?, false);
-            let output = resolve(&p, r["output"].as_str()?, true);
+            let input = shown_path(&p, r["input"].as_str()?, false);
+            let output = shown_path(&p, r["output"].as_str()?, true);
             let mtime = std::fs::metadata(&p).ok()?.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_secs();
-            let source = source_of(app, &p, &r);
-            allow_video(app, &output);
+            let entry = ledger.entry(&output, &input);
             Some(json!({
                 "report": p,
                 "input": input,
                 "output": output,
-                "replace": replace_state(&p),
-                "input_exists": source.exists(),
-                "output_exists": output.exists(),
+                "on_record": entry.is_some(),
+                "replace": replace_state(&ledger, &p, entry.is_some()),
+                // Not asked of paths only a report names (null: not looked at).
+                "input_exists": entry.map(|e| source_on_record(e).exists()),
+                "output_exists": entry.map(|_| output.exists()),
                 "source_bytes": r["source_bytes"],
                 "output_bytes": r["output_bytes"],
                 "savings": r["savings"],
@@ -592,12 +597,31 @@ fn known_report(app: &App, p: &Path) -> Result<PathBuf> {
     if !c.to_string_lossy().ends_with(".av1opt.json") {
         bail!("not a report");
     }
+    // Asked of the name, which cannot hang: opening a pipe would wait for someone to write to it.
+    let meta = std::fs::metadata(&c).with_context(|| format!("not found: {}", c.display()))?;
+    if !meta.is_file() {
+        bail!("{} is not a plain file, so it is not a report", c.display());
+    }
+    if meta.len() > replace::REPORT_LIMIT {
+        bail!("{} is larger than the {} MiB a report can be", c.display(), replace::REPORT_LIMIT >> 20);
+    }
     let dirs = app.settings.lock().unwrap().history_dirs.clone();
     let in_history = dirs.iter().any(|d| std::fs::canonicalize(d).is_ok_and(|d| c.starts_with(d)));
     if !in_history {
         bail!("report is outside the history folders");
     }
     Ok(c)
+}
+
+/// Refuses a report whose output and original are not a pair on record, before anything it
+/// names is looked at.
+fn refuse_unless_on_record(ledger: &Ledger, report: &Path) -> Result<()> {
+    let r = read_report_file(report)?;
+    let named = |key: &str| r[key].as_str().map(PathBuf::from);
+    match (named("output"), named("input")) {
+        (Some(output), Some(input)) if ledger.entry(&output, &input).is_some() => Ok(()),
+        _ => bail!("{}", ledger.refusal()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -613,12 +637,15 @@ struct ReplaceRequest {
 pub fn replace_original(app: &App, body: &Value) -> Result<Value> {
     let r: ReplaceRequest = serde_json::from_value(body.clone())?;
     let report = known_report(app, &r.report)?;
+    refuse_unless_on_record(&app.ledger.current(), &report)?;
     if let Check::Ready(p) = replace::check_for_list(&report)
         && crate::ui::jobs::waiting_on(app, &p.source)
     {
         bail!("the original is in the encode queue");
     }
-    let done = replace::apply(&report, r.allow_zfs)?;
+    // The record is what says this output and this original belong together, and the output is
+    // read through here, as it is about to take the original's place.
+    let done = replace::apply_if(&report, r.allow_zfs, &|p| app.ledger.current().check_ready(p, true))?;
     Ok(json!({ "dest": done.dest, "trash": done.trash, "source_bytes": done.source_bytes, "warnings": done.warnings }))
 }
 
@@ -626,7 +653,8 @@ pub fn replace_original(app: &App, body: &Value) -> Result<Value> {
 pub fn restore_original(app: &App, body: &Value) -> Result<Value> {
     let r: ReplaceRequest = serde_json::from_value(body.clone())?;
     let report = known_report(app, &r.report)?;
-    let d = replace::undo(&report, r.allow_zfs)?;
+    refuse_unless_on_record(&app.ledger.current(), &report)?;
+    let d = replace::undo_if(&report, r.allow_zfs, &|d| app.ledger.current().check_replaced(d))?;
     Ok(json!({ "source": d.source, "output": d.from }))
 }
 
@@ -642,18 +670,30 @@ pub fn media_info(app: &App, p: &Path) -> Value {
     }
 }
 
+/// What the compare view gets to know of a file: only one the page may serve is opened.
+fn listed_media_info(app: &App, p: &Path, on_record: bool, gone: &str) -> Value {
+    match app.is_allowed(p) {
+        Some(file) => media_info(app, &file),
+        None if on_record && !p.exists() => json!({ "error": gone }),
+        None => json!({ "error": NOT_OPENED }),
+    }
+}
+
 pub fn report(app: &App, path: &str) -> Result<Value> {
     let p = known_report(app, Path::new(path))?;
-    let mut r: Value = serde_json::from_slice(&std::fs::read(&p)?).context("unreadable report")?;
-    let input = source_of(app, &p, &r);
-    let output = resolve(&p, r["output"].as_str().unwrap_or(""), true);
-    allow_video(app, &output);
-    r["replace"] = replace_state(&p);
+    let mut r = read_report_file(&p)?;
+    let ledger = app.ledger.current();
+    let input = shown_path(&p, r["input"].as_str().unwrap_or(""), false);
+    let output = shown_path(&p, r["output"].as_str().unwrap_or(""), true);
+    let entry = ledger.entry(&output, &input);
+    let shown_input = entry.map_or_else(|| input.clone(), |e| source_on_record(e).to_path_buf());
+    r["on_record"] = json!(entry.is_some());
+    r["replace"] = replace_state(&ledger, &p, entry.is_some());
     r["report_path"] = json!(p);
-    r["input_path"] = json!(input);
+    r["input_path"] = json!(shown_input);
     r["output_path"] = json!(output);
-    r["input_info"] = if input.exists() { media_info(app, &input) } else { json!({ "error": "source file is gone" }) };
-    r["output_info"] = if output.exists() { media_info(app, &output) } else { json!({ "error": "output file is gone" }) };
+    r["input_info"] = listed_media_info(app, &shown_input, entry.is_some(), "source file is gone");
+    r["output_info"] = listed_media_info(app, &output, entry.is_some(), "output file is gone");
     Ok(r)
 }
 
@@ -672,6 +712,9 @@ struct PreviewRequest {
 fn d_secs() -> f64 {
     20.0
 }
+
+/// What the compare view says of a file only a report names.
+const NOT_OPENED: &str = "this file was not opened: only a report names it, and av1opt has no record of it. Pick it in a scan or the encode dialog to see it here";
 
 /// What the page gets for a path it did not list in this session, or one that has since gone.
 pub const NOT_LISTED: &str = "this file is not among those the page has listed, or it has moved; reload the page or pick the file again";

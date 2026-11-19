@@ -124,6 +124,26 @@ fn read_counting(file: &mut std::fs::File, buffer: &mut [u8], got: &AtomicU64) -
     Ok(have)
 }
 
+/// The contents of the plain file at `path`, of at most `limit` bytes. What lies in a folder
+/// others can write to may be a pipe, which would never finish opening, or a link, or endless.
+pub fn read_regular(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::other("not a plain file"));
+    }
+    if meta.len() > limit {
+        return Err(std::io::Error::other(format!("larger than the {} MiB allowed", limit >> 20)));
+    }
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(std::io::Error::other(format!("larger than the {} MiB allowed", limit >> 20)));
+    }
+    Ok(bytes)
+}
+
 /// A hash (FNV-1a, the same in every build) of a file's size and of `chunk` bytes at its start,
 /// its middle and its end: enough to tell files of one size apart without reading gigabytes
 /// from a slow drive.

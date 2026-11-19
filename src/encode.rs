@@ -907,6 +907,10 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
         }
     }
 
+    // Read here, before the file is in a folder others may be able to write to: what av1opt
+    // records of its output has to be what it made.
+    let output_sha256 = crate::ledger::sha256_of_file(&partial).inspect_err(|e| eprintln!("warning: could not read the encode back for av1opt's own record: {e}")).ok();
+
     // The place was free when the encode began, hours ago perhaps. A file that has turned up
     // there since is not this run's to write over: the encode is kept under another name.
     if o.overwrite {
@@ -968,6 +972,18 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
         }
     }
     crate::files::write_new(&report_at, &serde_json::to_vec_pretty(&report)?)?;
+    let recorded = crate::ledger::note_encoded(&crate::ledger::Encode {
+        output: &abs_output,
+        report: &abs_output.with_extension("av1opt.json"),
+        source: &abs_input,
+        source_bytes: size,
+        original: &Recorded { whole: source_hash.clone(), ..source.clone() },
+        output_bytes,
+        output_sha256,
+    });
+    if let Err(e) = recorded {
+        eprintln!("warning: this encode could not be added to av1opt's own record ({e:#}), so the page will not replace its original; `av1opt replace` in a terminal can");
+    }
     // Chunk sizes are exact; container-reported bitrates can include audio (Matroska).
     let video_bitrate = match &chunks {
         Some(c) => c.iter().map(|r| r.bytes).sum::<u64>() as f64 * 8.0 / info.picture_secs(),

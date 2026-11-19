@@ -1453,7 +1453,8 @@ fn an_output_takes_its_originals_place_and_gives_it_back() {
     let trash = c.dir.join("data/Trash/files");
     let out_arg = c.out();
     let replace = |extra: &[&str]| {
-        let mut a: Vec<std::ffi::OsString> = vec!["replace".into(), out_arg.clone().into()];
+        // The originals' folder is named too: a report is not followed out of the folders given.
+        let mut a: Vec<std::ffi::OsString> = vec!["replace".into(), out_arg.clone().into(), c.videos().into()];
         a.extend(extra.iter().map(Into::into));
         c.av1opt(&a)
     };
@@ -1505,7 +1506,8 @@ fn a_source_completed_after_its_encode_is_not_replaced_and_one_only_touched_is()
     let trash = c.dir.join("data/Trash/files");
     let out_arg = c.out();
     let replace = |extra: &[&str]| {
-        let mut a: Vec<std::ffi::OsString> = vec!["replace".into(), out_arg.clone().into()];
+        // The originals' folder is named too: a report is not followed out of the folders given.
+        let mut a: Vec<std::ffi::OsString> = vec!["replace".into(), out_arg.clone().into(), c.videos().into()];
         a.extend(extra.iter().map(Into::into));
         c.av1opt(&a)
     };
@@ -1911,7 +1913,7 @@ fn a_long_track_that_is_not_kept_passes_the_length_check_and_a_cut_picture_does_
 fn a_report_set_aside_for_a_newer_encode_still_brings_the_original_back() {
     let c = Case::new("aside");
     let replace = |what: &Path, extra: &[&str]| {
-        let mut a: Vec<std::ffi::OsString> = vec!["replace".into(), what.into()];
+        let mut a: Vec<std::ffi::OsString> = vec!["replace".into(), what.into(), "--anywhere".into()];
         a.extend(extra.iter().map(Into::into));
         c.av1opt(&a)
     };

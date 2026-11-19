@@ -667,6 +667,11 @@ single output files.
   to agree: a file goes back only if the trash's own record says it came from that place, and
   only if all of it is still what was recorded of the original (read whole against its hash, or
   against its samples where a report has only those), whatever its date says.
+- av1opt's own record notes each replacement and undo before the report is rewritten. A
+  report left behind (the disk was full, or the run was killed in between) is set right by
+  the next `replace`, `--undo` or the page, once the record, the trash and the files (read
+  whole) all show what happened; a replacement whose report could not be written ends with
+  an error that says where both files are and what puts them back.
 - Originals on ZFS are left alone unless `--allow-zfs` is given, and are put back there by
   `--undo` only with it.
 - A later `encode` or `scan` over the library sees the replaced files as AV1 and skips them.

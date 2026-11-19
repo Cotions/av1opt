@@ -71,6 +71,25 @@ impl Original {
         Original { source_bytes, source_mtime: known.modified, source_fingerprint: known.fingerprint.clone(), source_hash: known.whole.clone() }
     }
 
+    pub fn source_bytes(&self) -> u64 {
+        self.source_bytes
+    }
+
+    /// The original's date as recorded: for one that went to the trash, the date it had then.
+    pub fn modified(&self) -> Option<u64> {
+        self.source_mtime
+    }
+
+    /// What is recorded of the original, as a report holds it.
+    pub fn as_recorded(&self) -> Recorded {
+        Recorded { size: Some(self.source_bytes), modified: self.source_mtime, fingerprint: self.source_fingerprint.clone(), whole: self.source_hash.clone(), ..Recorded::default() }
+    }
+
+    /// Whether a report says the same of the original's contents, whatever date it gives.
+    pub fn has_contents_of(&self, said: &Recorded) -> bool {
+        said.size == Some(self.source_bytes) && said.fingerprint == self.source_fingerprint && said.whole == self.source_hash
+    }
+
     /// Whether a report says the same of the original. `replace` compares the file with what the
     /// report says, so a report that says this has had the file compared with the record.
     fn is_what(&self, said: &Recorded) -> bool {
@@ -174,6 +193,9 @@ pub struct Entry {
     /// None for an output only known from a replacement made on the command line.
     pub made: Option<Made>,
     pub replaced: Option<Moved>,
+    /// The replacement undone last, while none is in force: what a report that could not be
+    /// rewritten after the undo still says.
+    pub undone: Option<Moved>,
 }
 
 /// How an output stands for being taken on record.
@@ -213,19 +235,19 @@ impl Ledger {
     fn apply(&mut self, event: Event) {
         match event {
             Event::Encoded { output, report: _, source, original, output_bytes, output_sha256 } => {
-                self.outputs.insert(output, Entry { source, made: Some(Made { original, output_bytes, output_sha256 }), replaced: None });
+                self.outputs.insert(output, Entry { source, made: Some(Made { original, output_bytes, output_sha256 }), replaced: None, undone: None });
             }
             Event::Replaced { source, trash, output, from, original, output_bytes } => {
                 // A replacement on the command line can start from a report naming anything: it
                 // takes over what is known of `from` only if that is this same pair.
                 let made = if self.outputs.get(&from).is_some_and(|e| e.source == source) { self.outputs.remove(&from).and_then(|e| e.made) } else { None };
-                self.outputs.insert(output, Entry { source, made, replaced: Some(Moved { trash, from, original, output_bytes }) });
+                self.outputs.insert(output, Entry { source, made, replaced: Some(Moved { trash, from, original, output_bytes }), undone: None });
             }
             Event::Undone { source, output, back_to } => {
                 if self.outputs.get(&output).is_some_and(|e| e.source == source)
                     && let Some(mut entry) = self.outputs.remove(&output)
                 {
-                    entry.replaced = None;
+                    entry.undone = entry.replaced.take();
                     self.outputs.insert(back_to, entry);
                 }
             }
@@ -233,7 +255,7 @@ impl Ledger {
             Event::Adopted { output, report: _, source, original, output_bytes, output_sha256, replaced } => {
                 if self.known_at(&output).is_none() {
                     let replaced = replaced.map(|m| Moved { trash: m.trash, from: m.from, original: m.original, output_bytes });
-                    self.outputs.insert(output, Entry { source, made: Some(Made { original, output_bytes, output_sha256: Some(output_sha256) }), replaced });
+                    self.outputs.insert(output, Entry { source, made: Some(Made { original, output_bytes, output_sha256: Some(output_sha256) }), replaced, undone: None });
                 }
             }
             Event::TakenOver { .. } => self.taken_over = true,

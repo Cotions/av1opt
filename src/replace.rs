@@ -179,6 +179,9 @@ struct Judging<'a> {
     /// Only listed: an original in the trash is looked at as for a list of many, and what puts
     /// it back reads it in full first.
     listing: bool,
+    /// For a list: a report behind what this record and the files show is listed as it would
+    /// be once set right (see [`stranded`]). What acts sets it right first, reading in full.
+    ledger: Option<&'a crate::ledger::Ledger>,
 }
 
 const CHANGED_WHILE_CHECKED: &str = "the original changed while it was being checked";
@@ -190,9 +193,105 @@ pub fn check(report: &Path) -> Check {
 
 /// [`check`] for a list of reports, which does not read whole originals: one that would have to
 /// be read is listed as ready, and replacing it checks it in full.
-#[cfg(any(feature = "ui", test))]
+#[cfg(test)]
 pub fn check_for_list(report: &Path) -> Check {
     check_judging(report, Judging { for_list: true, ..Judging::default() })
+}
+
+/// [`check_for_list`] of a report as it would be once set right by what `ledger` and the files
+/// show (see [`stranded`]).
+#[cfg(any(feature = "ui", test))]
+pub fn check_for_list_on_record(report: &Path, ledger: &crate::ledger::Ledger) -> Check {
+    check_judging(report, Judging { for_list: true, ledger: Some(ledger), ..Judging::default() })
+}
+
+/// A report's contents as they would be once set right by what `ledger` and the files show
+/// (see [`stranded`]), looked at as for a list; the contents as they are otherwise.
+#[cfg(feature = "ui")]
+pub fn as_recorded(report: &Path, r: Value, ledger: &crate::ledger::Ledger) -> Value {
+    stranded(report, &r, ledger, false).map_or(r, |(fixed, _)| fixed)
+}
+
+/// What happened to a pair that its report does not say yet.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Stranded {
+    /// The original went to the trash and the AV1 file took its place, and the record says so.
+    Replaced,
+    /// Both files went back, and the record says so.
+    Undone,
+}
+
+/// The report as it would be had it been rewritten after the last replacement or undo of its
+/// pair, when av1opt's record and the files both show that one went through and the report was
+/// left behind: the run was killed between the record and the report, or the report could not
+/// be written. Only what the record says counts, never the report's word: the report's facts of
+/// the original have to be the recorded ones, the file in the trash has to say it came from the
+/// original's place and be the recorded original, and the AV1 file has to have the recorded
+/// hash. `full` reads all of the files compared; without it this is the look of a list, by
+/// sizes and samples.
+fn stranded(report: &Path, r: &Value, ledger: &crate::ledger::Ledger, full: bool) -> Option<(Value, Stranded)> {
+    let source = full_path(r, "input").ok()?;
+    let holds_output = |path: &Path, bytes: u64, hash: &str| {
+        if !full {
+            return file_size(path) == Some(bytes);
+        }
+        OpenFile::open(path, bytes).ok().and_then(|f| f.sha256().ok()).is_some_and(|now| now == hash)
+    };
+    let mut fixed = r.clone();
+    if let Some(done) = r.get("replaced").filter(|d| d.is_object()) {
+        // Put back, with the report still saying replaced.
+        let dest = full_path(r, "output").ok()?;
+        let from = full_path(done, "from").ok()?;
+        let trash_path = full_path(done, "trash").ok()?;
+        if !beside(report, &from) {
+            return None;
+        }
+        let entry = ledger.entry(&from, &source).filter(|e| e.replaced.is_none())?;
+        let undone = entry.undone.as_ref().filter(|m| m.trash == trash_path && m.from == from)?;
+        let hash = entry.made.as_ref()?.output_sha256.as_deref()?;
+        let back = file_size(&source) == Some(undone.original.source_bytes()) && std::fs::symlink_metadata(&trash_path).is_err();
+        let left = dest == source || dest == from || std::fs::symlink_metadata(&dest).is_err();
+        if !back || !left || !holds_output(&from, undone.output_bytes, hash) {
+            return None;
+        }
+        fixed["output"] = json!(from);
+        fixed.as_object_mut()?.remove("replaced");
+        return Some((fixed, Stranded::Undone));
+    }
+    // Replaced, with the report still saying not.
+    let from = full_path(r, "output").ok()?;
+    if !beside(report, &from) || r["superseded"].as_bool() == Some(true) {
+        return None;
+    }
+    let dest = source.with_extension(from.extension()?);
+    let entry = ledger.entry(&dest, &source)?;
+    let moved = entry.replaced.as_ref().filter(|m| m.from == from)?;
+    let hash = entry.made.as_ref()?.output_sha256.as_deref()?;
+    if !moved.original.has_contents_of(&Recorded::in_report(r)) || r["output_bytes"].as_u64() != Some(moved.output_bytes) {
+        return None;
+    }
+    if dest != source && std::fs::symlink_metadata(&source).is_ok() {
+        return None;
+    }
+    let known = moved.original.as_recorded();
+    let in_trash = if full { trash::holds(&moved.trash, &source, &known) } else { trash::holds_for_list(&moved.trash, &source, &known) };
+    if !in_trash || !holds_output(&dest, moved.output_bytes, hash) {
+        return None;
+    }
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    fixed["output"] = json!(dest);
+    fixed["replaced"] = json!({ "time": now, "from": from, "trash": moved.trash, "source_mtime": moved.original.modified() });
+    Some((fixed, Stranded::Replaced))
+}
+
+/// Rewrites a report that is behind what av1opt's record and the files show (see [`stranded`]),
+/// reading in full what that rests on. Called with the report's lock held.
+fn set_right(report: &Path) -> Result<Option<Stranded>> {
+    let Ok(r) = read_report(report) else { return Ok(None) };
+    let ledger = crate::ledger::load();
+    let Some((fixed, what)) = stranded(report, &r, &ledger, true) else { return Ok(None) };
+    write_report(report, &fixed).context("the report is behind what av1opt's record and the files show, and could not be set right")?;
+    Ok(Some(what))
 }
 
 fn check_judging(report: &Path, judging: Judging) -> Check {
@@ -218,6 +317,10 @@ fn check_inner(report: &Path, judging: Judging) -> Result<Check, String> {
         return Err("the report is a link".into());
     }
     let r = read_report(report)?;
+    let r = match judging.ledger {
+        Some(ledger) => stranded(report, &r, ledger, !(judging.for_list || judging.listing)).map_or(r, |(fixed, _)| fixed),
+        None => r,
+    };
     let source = full_path(&r, "input")?;
     let output = full_path(&r, "output")?;
     let source_bytes = r["source_bytes"].as_u64().ok_or("report has no sizes")?;
@@ -337,6 +440,9 @@ pub struct Done {
     pub source_bytes: u64,
     /// Things that went wrong after the files were in place (none of them lose anything).
     pub warnings: Vec<String>,
+    /// The report could not be rewritten: what to do about it. It still says that nothing was
+    /// replaced, so the run that did this has not done all it should.
+    pub report_behind: Option<String>,
 }
 
 /// Bytes a new file in `dir` may take.
@@ -598,26 +704,27 @@ impl Drop for Lock {
 /// that is what ends up at the destination, or nothing does.
 #[cfg(feature = "ui")]
 pub fn apply_if(report: &Path, allow_zfs: bool, accept: AcceptOutput) -> Result<Done> {
-    apply_judging(report, allow_zfs, Judging::default(), &trash::trash, accept)
+    apply_judging(report, allow_zfs, Judging::default(), &trash::trash, accept, &|| {})
 }
 
 /// [`check_for_list`] on behalf of someone who says that only the original's date changed, as
-/// `--accept-changed-date` does: what the report cannot tell about counts as the same.
+/// `--accept-changed-date` does: what the report cannot tell about counts as the same. The report
+/// is looked at as it would be once set right by what `ledger` and the files show.
 #[cfg(feature = "ui")]
-pub fn check_for_list_accepting_changed_date(report: &Path) -> Check {
-    check_judging(report, Judging { for_list: true, accept_changed_date: true, ..Judging::default() })
+pub fn check_for_list_accepting_changed_date(report: &Path, ledger: &crate::ledger::Ledger) -> Check {
+    check_judging(report, Judging { for_list: true, accept_changed_date: true, ledger: Some(ledger), ..Judging::default() })
 }
 
 /// [`apply_if`] on behalf of someone who says that only the original's date changed. An original
 /// known to differ is still refused.
 #[cfg(feature = "ui")]
 pub fn apply_if_date_accepted(report: &Path, allow_zfs: bool, accept: AcceptOutput) -> Result<Done> {
-    apply_judging(report, allow_zfs, Judging { accept_changed_date: true, ..Judging::default() }, &trash::trash, accept)
+    apply_judging(report, allow_zfs, Judging { accept_changed_date: true, ..Judging::default() }, &trash::trash, accept, &|| {})
 }
 
 #[cfg(test)]
 fn apply_with(report: &Path, allow_zfs: bool, to_trash: &dyn Fn(&Path) -> Result<PathBuf>) -> Result<Done> {
-    apply_judging(report, allow_zfs, Judging::default(), to_trash, &|_, _| Ok(()))
+    apply_judging(report, allow_zfs, Judging::default(), to_trash, &|_, _| Ok(()), &|| {})
 }
 
 /// Has the last word on what a report comes to, or says why not.
@@ -626,11 +733,22 @@ type Accept<'a, T> = &'a dyn Fn(&T) -> Result<(), String>;
 /// [`Accept`] for a replacement, with the output as it was opened to be moved.
 type AcceptOutput<'a> = &'a dyn Fn(&Plan, &OpenFile) -> Result<(), String>;
 
-fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: &dyn Fn(&Path) -> Result<PathBuf>, accept: AcceptOutput) -> Result<Done> {
+/// `before_report` is called once the files are in place and on record, before the report is
+/// rewritten.
+fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: &dyn Fn(&Path) -> Result<PathBuf>, accept: AcceptOutput, before_report: &dyn Fn()) -> Result<Done> {
     let _lock = lock(report)?;
     let reads_of_this_one = WholeReads::default();
-    let judging = Judging { acting: true, remember: judging.remember.or(Some(&reads_of_this_one)), ..judging };
-    let p = match check_judging(report, judging) {
+    // The report as it is on disk: one that is behind the record is set right, and then read.
+    let judging = Judging { acting: true, remember: judging.remember.or(Some(&reads_of_this_one)), ledger: None, ..judging };
+    let mut checked = check_judging(report, judging);
+    if !matches!(checked, Check::Ready(_)) {
+        match set_right(report)? {
+            Some(Stranded::Undone) => checked = check_judging(report, judging),
+            Some(Stranded::Replaced) => bail!("already replaced: av1opt's record and the files show that this original went to the trash, and its report now says so too"),
+            None => {}
+        }
+    }
+    let p = match checked {
         Check::Ready(p) => p,
         Check::Replaced(_) => bail!("already replaced"),
         Check::No(why) => bail!("{why}"),
@@ -712,7 +830,11 @@ fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: &dy
         }
     };
 
-    // From here on both files are where they belong; what follows is tidying.
+    // From here on both files are where they belong. On record first: if what follows does
+    // not get done, the record is what the report can be set right by.
+    let source_mtime = std::fs::symlink_metadata(&trashed).ok().and_then(|m| crate::source::modified_seconds(&m));
+    let went = Recorded { modified: source_mtime.or(p.original.modified), ..p.original.clone() };
+    let move_noted = crate::ledger::note_replaced(&crate::ledger::Replacement { original: &p.source, trash: &trashed, output: &p.dest, from: &p.output, source_bytes: p.source_bytes, known: &went, output_bytes: p.output_bytes });
     let mut warnings = Vec::new();
     // Through the open file: by name, this would reach whatever has been put there since.
     if copy.as_ref().unwrap_or(&output).file.set_permissions(source_meta.permissions()).is_err() {
@@ -726,22 +848,26 @@ fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: &dy
             warnings.push(format!("the copy is in place, but {} could not be removed: {e}", p.output.display()));
         }
     }
-    let source_mtime = std::fs::symlink_metadata(&trashed).ok().and_then(|m| crate::source::modified_seconds(&m));
-    let went = Recorded { modified: source_mtime.or(p.original.modified), ..p.original.clone() };
-    let move_noted = crate::ledger::note_replaced(&crate::ledger::Replacement { original: &p.source, trash: &trashed, output: &p.dest, from: &p.output, source_bytes: p.source_bytes, known: &went, output_bytes: p.output_bytes });
-    if let Err(e) = move_noted {
+    if let Err(e) = &move_noted {
         warnings.push(format!("av1opt's own record of this could not be written ({e:#}), so the page will not offer to put the original back; `av1opt replace --undo` in a terminal can"));
     }
+    before_report();
     let noted = read_report(report).map_err(|e| anyhow!(e)).and_then(|mut r| {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
         r["output"] = json!(p.dest);
         r["replaced"] = json!({ "time": now, "from": p.output, "trash": trashed, "source_mtime": source_mtime });
         write_report(report, &r)
     });
-    if let Err(e) = noted {
-        warnings.push(format!("the report could not be updated ({e:#}); the original is in the trash at {}", trashed.display()));
-    }
-    Ok(Done { dest: p.dest, trash: trashed, source_bytes: p.source_bytes, warnings })
+    let report_behind = noted.err().map(|e| {
+        let at = format!("the original is in the trash at {} and the AV1 file at {}", trashed.display(), p.dest.display());
+        let folder = |p: &Path| p.parent().map_or_else(String::new, |d| d.display().to_string());
+        if move_noted.is_ok() {
+            format!("the report could not be updated ({e:#}), so it still says that nothing was replaced: {at}. `av1opt replace --undo --apply {} {}` puts them back by av1opt's record, and the page can too", folder(report), folder(&p.source))
+        } else {
+            format!("the report could not be updated ({e:#}), and neither could av1opt's record: {at}; to put them back, move {} to {}, then take the original out of the trash", p.dest.display(), p.output.display())
+        }
+    });
+    Ok(Done { dest: p.dest, trash: trashed, source_bytes: p.source_bytes, warnings, report_behind })
 }
 
 /// Undoes `apply` while the original is still in the trash: the AV1 file goes back where it
@@ -753,16 +879,34 @@ fn undo(report: &Path, allow_zfs: bool) -> Result<Replaced> {
 
 /// [`undo`], if `accept` agrees to what the report comes to, asked as [`apply_if`] asks.
 pub fn undo_if(report: &Path, allow_zfs: bool, accept: Accept<Replaced>) -> Result<Replaced> {
-    undo_watched(report, allow_zfs, accept, &|| {})
+    undo_watched(report, allow_zfs, accept, &|| {}, &|| {})
 }
 
-/// [`undo_if`], with `before_moving` called when everything has been checked and nothing moved.
-fn undo_watched(report: &Path, allow_zfs: bool, accept: Accept<Replaced>, before_moving: &dyn Fn()) -> Result<Replaced> {
+/// [`undo_if`], with `before_moving` called when everything has been checked and nothing moved,
+/// and `before_report` once both files are back and on record, before the report is rewritten.
+fn undo_watched(report: &Path, allow_zfs: bool, accept: Accept<Replaced>, before_moving: &dyn Fn(), before_report: &dyn Fn()) -> Result<Replaced> {
     let _lock = lock(report)?;
-    let d = match check(report) {
-        Check::Replaced(d) => d,
-        Check::Ready(_) => bail!("this original has not been replaced, so there is nothing to put back"),
-        Check::No(why) => bail!("{why}"),
+    let first = check(report);
+    let d = match first {
+        Check::Replaced(d) if d.can_undo => d,
+        first => match set_right(report)? {
+            // What was asked is done already, by an undo whose report was left behind: what
+            // `accept` would compare with the record, the record has been compared with.
+            Some(Stranded::Undone) => match first {
+                Check::Replaced(d) => return Ok(d),
+                _ => bail!("this original has not been replaced, so there is nothing to put back"),
+            },
+            Some(Stranded::Replaced) => match check(report) {
+                Check::Replaced(d) => d,
+                Check::Ready(_) => bail!("this original has not been replaced, so there is nothing to put back"),
+                Check::No(why) => bail!("{why}"),
+            },
+            None => match first {
+                Check::Replaced(d) => d,
+                Check::Ready(_) => bail!("this original has not been replaced, so there is nothing to put back"),
+                Check::No(why) => bail!("{why}"),
+            },
+        },
     };
     accept(&d).map_err(|why| anyhow!(why))?;
     match file_size(&d.trash) {
@@ -819,6 +963,7 @@ fn undo_watched(report: &Path, allow_zfs: bool, accept: Accept<Replaced>, before
     if let Err(e) = crate::ledger::note_undone(&d.source, &d.dest, &d.from) {
         eprintln!("warning: the original is back, but av1opt's own record of that could not be written: {e:#}");
     }
+    before_report();
     let mut r = read_report(report).map_err(|e| anyhow!(e))?;
     // Undone from a report set aside: the AV1 file did not go back to where it came from, as
     // a newer encode is there, and that encode's report is the one to go by.
@@ -829,7 +974,7 @@ fn undo_watched(report: &Path, allow_zfs: bool, accept: Accept<Replaced>, before
     if let Some(o) = r.as_object_mut() {
         o.remove("replaced");
     }
-    write_report(report, &r).context("both files are back, but the report could not be updated")?;
+    write_report(report, &r).context("both files are back, but the report could not be updated, so it still says that the original was replaced; `av1opt replace` or the page sets it right by av1opt's record")?;
     Ok(d)
 }
 
@@ -915,16 +1060,21 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 /// record says that this output and this original belong together: then it is the record that
 /// vouches for the original's path, and not the report.
 pub fn run(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_changed_date: bool, anywhere: bool) -> Result<()> {
+    run_watched(paths, go, back, allow_zfs, accept_changed_date, anywhere, &|| {})
+}
+
+/// [`run`], with `before_report` called as [`apply_judging`] calls it.
+fn run_watched(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_changed_date: bool, anywhere: bool, before_report: &dyn Fn()) -> Result<()> {
     use crate::report::gb;
     // Only what is going to be replaced is worth keeping reads for.
     let reads = WholeReads::default();
-    let judging = Judging { accept_changed_date, on_command_line: true, remember: go.then_some(&reads), listing: true, ..Judging::default() };
     let reports = reports_for(paths);
     if reports.is_empty() {
         bail!("no av1opt reports (*.av1opt.json) found there");
     }
     let named = NamedFolders::of(paths, anywhere);
     let ledger = crate::ledger::load();
+    let judging = Judging { accept_changed_date, on_command_line: true, remember: go.then_some(&reads), listing: true, ledger: Some(&ledger), ..Judging::default() };
     let (mut ready, mut replaced, mut stay) = (Vec::new(), Vec::new(), Vec::new());
     for r in &reports {
         match check_judging(r, judging) {
@@ -935,7 +1085,8 @@ pub fn run(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_chan
             Check::No(why) => stay.push((r.clone(), why)),
         }
     }
-    let mut failed = 0;
+    // Replaced, with a report that could not be rewritten.
+    let (mut failed, mut behind) = (0, 0);
 
     if back {
         let (can, cannot): (Vec<_>, Vec<_>) = replaced.into_iter().partition(|d| d.can_undo);
@@ -1023,7 +1174,12 @@ pub fn run(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_chan
         for p in &ready {
             // Outside the folders named, all of the output has to be what the record says.
             let accept = |p: &Plan, output: &OpenFile| if named.holds(&p.source) { Ok(()) } else { crate::ledger::load().check_ready(p, Some(output)).map_err(|why| format!("{} ({why})", outside_named(&p.source))) };
-            match apply_judging(&p.report, allow_zfs, judging, &trash::trash, &accept) {
+            match apply_judging(&p.report, allow_zfs, judging, &trash::trash, &accept, before_report) {
+                Ok(Done { report_behind: Some(why), source_bytes, .. }) => {
+                    (done, behind) = (done + 1, behind + 1);
+                    trashed += source_bytes;
+                    eprintln!("FAILED {}: {why}", p.source.display());
+                }
                 Ok(d) => {
                     done += 1;
                     trashed += d.source_bytes;
@@ -1043,6 +1199,9 @@ pub fn run(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_chan
     if failed > 0 {
         let what = if back { "put back" } else { "replaced" };
         bail!("{} not be {what}; the lines starting with FAILED above say why and where each file is now", plural(failed, "original could", "originals could"));
+    }
+    if behind > 0 {
+        bail!("{} not be updated, and still say that nothing was replaced; the lines starting with FAILED above say where each file is and what puts it back", plural(behind, "report could", "reports could"));
     }
     Ok(())
 }
@@ -1384,7 +1543,7 @@ mod tests {
             *hash_seen.borrow_mut() = opened.sha256().unwrap();
             swap_for_another_file(&output);
             Ok(())
-        })
+        }, &|| {})
         .unwrap_err();
         assert!(err.to_string().contains("replaced by another file"), "{err}");
         assert_eq!(*hash_seen.borrow(), crate::ledger::sha256_of_file(&f.out("a.real")).unwrap(), "the hash is of the file opened");
@@ -1404,7 +1563,7 @@ mod tests {
         let err = apply_judging(&report, true, Judging::default(), &trash::trash, &|_, _| {
             std::fs::write(&output, vec![b'e'; 400]).unwrap();
             Ok(())
-        })
+        }, &|| {})
         .unwrap_err();
         assert!(err.to_string().contains("changed or replaced"), "{err}");
         assert!(f.lib("a.mp4").exists() && !f.lib("a.mkv").exists());
@@ -1538,7 +1697,7 @@ mod tests {
             let f = Fix::new(name);
             let report = f.encode("a.mp4", "a.mkv", 1000, 400);
             let done = f.apply(&report).unwrap();
-            let err = undo_watched(&report, true, &|_| Ok(()), &|| swap(&f, &done.trash)).unwrap_err();
+            let err = undo_watched(&report, true, &|_| Ok(()), &|| swap(&f, &done.trash), &|| {}).unwrap_err();
             (f, report, done, err.to_string())
         };
         // The AV1 file, for another of its size: nothing has moved.
@@ -1577,7 +1736,7 @@ mod tests {
         let report = f.encode("a.mp4", "a.mkv", 1000, 400);
         let done = f.apply(&report).unwrap();
         // Something takes the original's place once everything has been looked at.
-        let err = undo_watched(&report, true, &|_| Ok(()), &|| std::fs::write(f.lib("a.mp4"), b"newcomer").unwrap()).unwrap_err();
+        let err = undo_watched(&report, true, &|_| Ok(()), &|| std::fs::write(f.lib("a.mp4"), b"newcomer").unwrap(), &|| {}).unwrap_err();
         assert!(format!("{err:#}").contains("still in the trash"), "{err:#}");
         assert_eq!(std::fs::read(f.lib("a.mkv")).unwrap(), vec![b'o'; 400]);
         assert!(!f.out("a.mkv").exists() && done.trash.exists());
@@ -1646,7 +1805,7 @@ mod tests {
         let err = apply_judging(&report, true, Judging::default(), &trash::trash, &|_, _| {
             std::os::unix::fs::FileExt::write_all_at(&File::options().write(true).open(&source).unwrap(), b"x", 999).unwrap();
             Ok(())
-        })
+        }, &|| {})
         .unwrap_err();
         assert_eq!(err.to_string(), "the original changed while it was being checked, so nothing was changed");
         assert!(source.exists() && f.out("a.mkv").exists() && !f.lib("a.mkv").exists());
@@ -1675,7 +1834,7 @@ mod tests {
         let run = |f: &Fix, report: &Path, reads: &WholeReads| {
             let judging = Judging { remember: Some(reads), ..Judging::default() };
             assert!(matches!(check_judging(report, judging), Check::Ready(_)), "listed first, as the command does");
-            apply_judging(report, true, judging, &|p| trash::trash_with(p, Some(&home(f)), 1000, "2026-11-10T22:15:03".into()), &|_, _| Ok(()))
+            apply_judging(report, true, judging, &|p| trash::trash_with(p, Some(&home(f)), 1000, "2026-11-10T22:15:03".into()), &|_, _| Ok(()), &|| {})
         };
         // Its date as recorded: the list leaves the reading to the replacement.
         let f = Fix::new("once-same-date");
@@ -1703,7 +1862,7 @@ mod tests {
         let judging = Judging { remember: Some(&reads), ..Judging::default() };
         assert!(matches!(check_judging(&report, judging), Check::Ready(_)));
         set_time(&f.lib("a.mp4"), time - 2000);
-        apply_judging(&report, true, judging, &|p| trash::trash_with(p, Some(&home(&f)), 1000, "2026-11-10T22:15:03".into()), &|_, _| Ok(())).unwrap();
+        apply_judging(&report, true, judging, &|p| trash::trash_with(p, Some(&home(&f)), 1000, "2026-11-10T22:15:03".into()), &|_, _| Ok(()), &|| {}).unwrap();
         assert_eq!(reads.reads_made(), 2);
     }
 
@@ -1711,7 +1870,7 @@ mod tests {
     fn what_is_refused_at_the_last_moment_moves_nothing() {
         let f = Fix::new("refused");
         let report = f.encode("a.mp4", "a.mkv", 1000, 400);
-        let err = apply_judging(&report, true, Judging::default(), &trash::trash, &|_, _| Err("not this one".into())).unwrap_err();
+        let err = apply_judging(&report, true, Judging::default(), &trash::trash, &|_, _| Err("not this one".into()), &|| {}).unwrap_err();
         assert_eq!(err.to_string(), "not this one");
         assert!(f.lib("a.mp4").exists() && f.out("a.mkv").exists());
         f.apply(&report).unwrap();
@@ -2478,5 +2637,102 @@ mod tests {
         let r = json!({ "input": "/videos/a/../b.mp4", "output": "/videos/./a/b.mkv" });
         assert!(full_path(&r, "input").unwrap_err().contains("with `..` in it"));
         assert_eq!(full_path(&r, "output").unwrap(), PathBuf::from("/videos/a/b.mkv"));
+    }
+
+    /// `report`'s pair on record as an encode, with the hash of its output, as `encode` leaves it.
+    fn on_record(report: &Path) {
+        let r = read_report(report).unwrap();
+        let (source, output) = (full_path(&r, "input").unwrap(), full_path(&r, "output").unwrap());
+        let original = Recorded::in_report(&r);
+        let output_sha256 = Some(crate::ledger::sha256_of_file(&output).unwrap());
+        let (source_bytes, output_bytes) = (file_size(&source).unwrap(), file_size(&output).unwrap());
+        crate::ledger::note_encoded(&crate::ledger::Encode { output: &output, report, source: &source, source_bytes, original: &original, output_bytes, output_sha256 }).unwrap();
+    }
+
+    /// Runs `act` as a run killed at the point where it calls `kill`.
+    fn killed(act: impl FnOnce(&dyn Fn())) {
+        let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| act(&|| std::panic::panic_any("killed here"))));
+        assert!(stopped.is_err(), "the run went past the point it was to be killed at");
+    }
+
+    fn says_replaced(report: &Path) -> bool {
+        read_report(report).unwrap().get("replaced").is_some()
+    }
+
+    #[test]
+    fn a_replacement_killed_before_its_report_was_rewritten_is_put_back_by_the_record() {
+        let f = Fix::new("stranded-apply");
+        let _record = record_in(&f);
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        on_record(&report);
+        let home = f.dir.join("Trash");
+        let to_trash = |p: &Path| trash::trash_with(p, Some(&home), 1000, "2026-11-10T22:15:03".into());
+        killed(|kill| drop(apply_judging(&report, true, Judging::default(), &to_trash, &|_, _| Ok(()), kill)));
+        assert!(!f.lib("a.mp4").exists() && f.lib("a.mkv").exists() && !says_replaced(&report));
+
+        // The report alone has the original gone; with the record, it is a replacement to undo.
+        assert!(matches!(check(&report), Check::No(why) if why.contains("the original is gone")));
+        let ledger = crate::ledger::load();
+        assert!(matches!(check_for_list_on_record(&report, &ledger), Check::Replaced(d) if d.can_undo));
+        // Nothing is put right on a word the files do not bear out.
+        std::fs::write(f.lib("a.mkv"), vec![b'x'; 400]).unwrap();
+        assert!(set_right(&report).unwrap().is_none() && !says_replaced(&report));
+        std::fs::write(f.lib("a.mkv"), vec![b'o'; 400]).unwrap();
+
+        undo(&report, true).unwrap();
+        assert_eq!(std::fs::read(f.lib("a.mp4")).unwrap(), vec![b's'; 1000]);
+        assert!(f.out("a.mkv").exists() && !f.lib("a.mkv").exists() && !says_replaced(&report));
+        assert!(matches!(check(&report), Check::Ready(_)));
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
+
+    #[test]
+    fn an_undo_killed_before_its_report_was_rewritten_is_set_right_by_the_record() {
+        let f = Fix::new("stranded-undo");
+        let _record = record_in(&f);
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        on_record(&report);
+        f.apply(&report).unwrap();
+        killed(|kill| drop(undo_watched(&report, true, &|_| Ok(()), &|| {}, kill)));
+        assert!(f.lib("a.mp4").exists() && f.out("a.mkv").exists() && says_replaced(&report));
+        assert!(matches!(check(&report), Check::Replaced(d) if !d.can_undo));
+        assert!(matches!(check_for_list_on_record(&report, &crate::ledger::load()), Check::Ready(_)));
+
+        // Replacing it again sets the report right first.
+        f.apply(&report).unwrap();
+        assert!(!f.lib("a.mp4").exists() && f.lib("a.mkv").exists() && says_replaced(&report));
+
+        // And an undo asked of a report left behind by an undo is done already.
+        killed(|kill| drop(undo_watched(&report, true, &|_| Ok(()), &|| {}, kill)));
+        assert!(says_replaced(&report));
+        let d = undo(&report, true).unwrap();
+        assert_eq!(d.source, f.lib("a.mp4"));
+        assert!(f.lib("a.mp4").exists() && f.out("a.mkv").exists() && !says_replaced(&report));
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
+
+    #[test]
+    fn a_replacement_whose_report_could_not_be_written_fails_and_says_what_puts_it_back() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fix::new("report-unwritten");
+        let _record = record_in(&f);
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        on_record(&report);
+        let unreadable = || std::fs::set_permissions(&report, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let home = f.dir.join("Trash");
+        let to_trash = |p: &Path| trash::trash_with(p, Some(&home), 1000, "2026-11-10T22:15:03".into());
+        let done = apply_judging(&report, true, Judging::default(), &to_trash, &|_, _| Ok(()), &unreadable).unwrap();
+        std::fs::set_permissions(&report, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let why = done.report_behind.unwrap();
+        assert!(why.contains("still says that nothing was replaced") && why.contains("av1opt replace --undo --apply"), "{why}");
+        undo(&report, true).unwrap();
+        assert!(f.lib("a.mp4").exists() && f.out("a.mkv").exists() && !says_replaced(&report));
+
+        // The command says so in its exit status.
+        let failed = run_watched(std::slice::from_ref(&f.dir), true, false, true, false, false, &unreadable).unwrap_err();
+        std::fs::set_permissions(&report, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(failed.to_string().contains("1 report could not be updated"), "{failed:#}");
+        assert!(f.lib("a.mkv").exists() && !f.lib("a.mp4").exists());
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
     }
 }

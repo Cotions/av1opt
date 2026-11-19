@@ -506,13 +506,13 @@ fn replace_state(ledger: &Ledger, report: &Path, on_record: bool) -> Value {
         return json!({ "state": "not_recorded", "why": ledger.refusal() });
     }
     let no = |why: String| json!({ "state": "no", "why": why });
-    match replace::check_for_list(report) {
+    match replace::check_for_list_on_record(report, ledger) {
         Check::Ready(p) => match ledger.check_ready(&p, None) {
             Ok(()) => json!({ "state": "ready", "dest": p.dest, "copy": p.copy, "zfs": p.zfs, "removed": p.removed }),
             Err(why) => no(why),
         },
         // What only the person can settle is offered to them, with what cannot be checked.
-        Check::No(why) => match replace::check_for_list_accepting_changed_date(report) {
+        Check::No(why) => match replace::check_for_list_accepting_changed_date(report, ledger) {
             Check::Ready(p) if ledger.check_ready(&p, None).is_ok() => json!({ "state": "needs_confirming", "why": why, "dest": p.dest, "copy": p.copy, "zfs": p.zfs, "removed": p.removed }),
             _ => no(why),
         },
@@ -542,7 +542,7 @@ pub fn history(app: &App) -> Value {
         .into_iter()
         .filter_map(|p| {
             p.to_str()?;
-            let r = read_report_file(&p).ok()?;
+            let r = replace::as_recorded(&p, read_report_file(&p).ok()?, &ledger);
             // Reports from before versioning have no `format`; newer layouts are skipped.
             if r["format"].as_u64().unwrap_or(1) > u64::from(crate::encode::REPORT_FORMAT) {
                 return None;
@@ -633,7 +633,7 @@ fn known_report(app: &App, p: &Path) -> Result<PathBuf> {
 /// Refuses a report whose output and original are not a pair on record, before anything it
 /// names is looked at.
 fn refuse_unless_on_record(ledger: &Ledger, report: &Path) -> Result<()> {
-    let r = read_report_file(report)?;
+    let r = replace::as_recorded(report, read_report_file(report)?, ledger);
     let named = |key: &str| r[key].as_str().map(PathBuf::from);
     match (named("output"), named("input")) {
         (Some(output), Some(input)) if ledger.entry(&output, &input).is_some() => Ok(()),
@@ -659,7 +659,8 @@ pub fn replace_original(app: &App, body: &Value) -> Result<Value> {
     let r: ReplaceRequest = serde_json::from_value(body.clone())?;
     let report = known_report(app, &r.report)?;
     refuse_unless_on_record(&app.ledger.current(), &report)?;
-    let listed = if r.accept_changed_date { replace::check_for_list_accepting_changed_date(&report) } else { replace::check_for_list(&report) };
+    let ledger = app.ledger.current();
+    let listed = if r.accept_changed_date { replace::check_for_list_accepting_changed_date(&report, &ledger) } else { replace::check_for_list_on_record(&report, &ledger) };
     if let Check::Ready(p) = listed
         && crate::ui::jobs::waiting_on(app, &p.source)
     {
@@ -669,7 +670,8 @@ pub fn replace_original(app: &App, body: &Value) -> Result<Value> {
     // read here through the very descriptor that makes sure it is the file that gets moved.
     let on_record = |p: &replace::Plan, output: &replace::OpenFile| app.ledger.current().check_ready(p, Some(output));
     let done = if r.accept_changed_date { replace::apply_if_date_accepted(&report, r.allow_zfs, &on_record) } else { replace::apply_if(&report, r.allow_zfs, &on_record) }?;
-    Ok(json!({ "dest": done.dest, "trash": done.trash, "source_bytes": done.source_bytes, "warnings": done.warnings }))
+    let warnings: Vec<&String> = done.warnings.iter().chain(&done.report_behind).collect();
+    Ok(json!({ "dest": done.dest, "trash": done.trash, "source_bytes": done.source_bytes, "warnings": warnings }))
 }
 
 /// Takes a replaced original back out of the trash and returns the AV1 file to where it was.

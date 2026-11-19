@@ -673,7 +673,9 @@ fn an_original_with_only_its_date_changed_is_replaced_once_someone_says_so() {
                 "savings": 0.667, "mode": "whole", "crf": 30.0, "preset": 6, "target_vmaf": 93.0,
             });
             let mut line = encoded_line(&source, &output);
+            // The record holds what the report holds, as an encode of that version left both.
             line["source_mtime"] = json!(1000);
+            line.as_object_mut().unwrap().remove("source_fingerprint");
             for (k, v) in extra(name).as_object().unwrap() {
                 report[k] = v.clone();
                 line[k] = v.clone();
@@ -1288,6 +1290,59 @@ fn a_file_changed_in_the_trash_at_its_size_and_date_is_not_put_back() {
     let said = out_of(&run);
     assert!(!run.status.success() && said.contains("FAILED") && said.contains("the file in the trash is not the original"), "{said}");
     assert!(!original.exists() && placed.exists() && trashed.exists());
+}
+
+#[test]
+fn a_pair_whose_report_was_left_behind_is_set_right_by_the_record() {
+    let s = Server::start("stranded", |d| {
+        std::fs::write(d.join("videos/movie.mp4"), vec![b's'; 3000]).unwrap();
+        std::fs::create_dir_all(d.join("out")).unwrap();
+        std::fs::write(d.join("out/movie.mkv"), vec![b'o'; 1000]).unwrap();
+        write_record(d, &[encoded_line(&d.join("videos/movie.mp4"), &d.join("out/movie.mkv"))]);
+        write_report(&d.join("out/movie.av1opt.json"), knowing(&d.join("videos/movie.mp4"), json!({ "format": 1, "input": d.join("videos/movie.mp4"), "output": d.join("out/movie.mkv"), "source_bytes": 3000, "output_bytes": 1000 })));
+    });
+    add_history_folder(&s, "out");
+    let (original, output, placed, report) = (s.dir.join("videos/movie.mp4"), s.dir.join("out/movie.mkv"), s.dir.join("videos/movie.mkv"), s.dir.join("out/movie.av1opt.json"));
+    let (out, videos) = (s.dir.join("out"), s.dir.join("videos"));
+    let (apply, undo) = (std::ffi::OsStr::new("--apply"), std::ffi::OsStr::new("--undo"));
+    let state = || s.get("/api/history").json()["reports"][0]["replace"].clone();
+    let not_replaced = std::fs::read(&report).unwrap();
+
+    // Replaced, with the report as a run killed before rewriting it leaves it.
+    let r = s.post("/api/replace", &json!({ "report": report }));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let replaced = std::fs::read(&report).unwrap();
+    std::fs::write(&report, &not_replaced).unwrap();
+    assert!(state()["state"] == json!("replaced") && state()["can_undo"] == json!(true), "{}", state());
+    let r = s.post("/api/replace/undo", &json!({ "report": report }));
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(std::fs::read(&original).unwrap(), vec![b's'; 3000]);
+    assert!(output.exists() && !placed.exists() && !std::fs::read_to_string(&report).unwrap().contains("\"replaced\""));
+
+    // Put back, with the report as an undo killed before rewriting it leaves it: replacing it
+    // again goes by the record.
+    std::fs::write(&report, &replaced).unwrap();
+    assert_eq!(state()["state"], json!("ready"), "{}", state());
+    let r = s.post("/api/replace", &json!({ "report": report }));
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(placed.exists() && !original.exists());
+
+    // The same on the command line, both ways.
+    std::fs::write(&report, &not_replaced).unwrap();
+    let run = replace_command(&s.dir, &[out.as_os_str(), videos.as_os_str(), undo, apply]);
+    assert!(run.status.success() && out_of(&run).contains("1 original back in place"), "{}", out_of(&run));
+    assert!(original.exists() && output.exists() && !placed.exists());
+    std::fs::write(&report, &replaced).unwrap();
+    let run = replace_command(&s.dir, &[out.as_os_str(), videos.as_os_str(), apply]);
+    assert!(run.status.success() && out_of(&run).contains("1 original replaced"), "{}", out_of(&run));
+    assert!(placed.exists() && !original.exists() && std::fs::read_to_string(&report).unwrap().contains("\"replaced\""));
+
+    // A word the files do not bear out sets nothing right: the AV1 file changed at its size.
+    std::fs::write(&report, &not_replaced).unwrap();
+    std::fs::write(&placed, vec![b'x'; 1000]).unwrap();
+    let r = s.post("/api/replace/undo", &json!({ "report": report }));
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert!(placed.exists() && !original.exists() && std::fs::read(&report).unwrap() == not_replaced);
 }
 
 #[test]

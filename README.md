@@ -300,7 +300,7 @@ On a 60 s test clip mixing six kinds of footage, `--scenes` gave a 6% smaller fi
 full-length VMAF (93.07), with per-segment VMAF between 91.9 and 94.1 instead of 90.8 to 95.9.
 On a single continuous shot it gives no gain. It takes about 1.5-2x as long on short clips
 and about 3x on real 15-minute recordings (six of them: 180 minutes where one pass was
-estimated at 58); `--workers 2` encodes two chunks at once (each ffmpeg then gets half of `--memory-limit`).
+estimated at 58); `--workers 2` encodes two chunks at once (those two then share `--memory-limit`; every other ffmpeg run has all of it).
 
 `--scenes=auto` spends that time only where it buys something: on videos whose samples score
 far apart at one CRF (the worst one 4 VMAF or more below their mean), and one CRF for the
@@ -335,7 +335,7 @@ Folders are walked recursively and their layout is mirrored under `--out-dir`: o
 contents directly below it, several folders each below a folder of their own name
 (`encode -o out lib/Kay lib/Sofia` writes `out/Kay/...` and `out/Sofia/...`). Every result is
 appended to `av1opt-log.tsv` there; re-running the same command resumes: a finished file is
-skipped, whatever settings made it (`--overwrite` makes it again, over the old one), and files
+skipped, whatever settings made it (`--overwrite` makes it again, over an earlier encode of the same file, and leaves anything else at that name alone), and files
 skipped for a reason (low savings, ...) are not searched again with the same settings (target,
 preset, CRF range, `--min-savings`, `--force`, and `--scenes`, `--audio`, `--svt-params`,
 `--tuned`, `--remove` and the samples where set) unless
@@ -362,6 +362,12 @@ are counted towards a mark that depends on the target, so they are measured agai
 `--fresh-search`
 measures everything again. If two inputs would produce the same output name (same file name
 from two input folders), the second is reported as a name collision instead of being skipped.
+
+### Exit status
+
+`encode` ends with 0 when no file failed (files skipped or already done are no failure), 1 on
+an error that stopped the run, 2 on wrong usage, 3 when some files failed and the others were
+dealt with, and 130 or 143 when Ctrl-C or SIGTERM stopped it.
 
 ### File names
 
@@ -644,7 +650,7 @@ environment, so set the ffmpeg path once in Settings.
 - An output file that appears in the output folder while its encode runs is not written
   over: the finished encode is kept next to it under another name, and the run says where.
 - Each ffmpeg run gets a memory cap (`--memory-limit`: `12G`, `1.5G`, `800M` or `40%`, shared
-  between `--workers`, or `none` for no cap; default 40% of RAM) and low CPU priority (`--nice 10`), so a 4K encode
+  by the chunks `--workers` runs at the same time, or `none` for no cap; default 40% of RAM) and low CPU priority (`--nice 10`), so a 4K encode
   can't freeze the desktop.
 - Temp files live in a hidden folder in the output directory and are removed afterwards; leftovers
   from crashed runs are cleaned up on the next run.

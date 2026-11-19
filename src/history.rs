@@ -15,6 +15,11 @@ fn format_one() -> u32 {
     1
 }
 
+/// What `encode_secs` covers. Raise it whenever that changes, so that the time estimates stop
+/// taking older lines for the same thing. 1: the encode, the check of the whole video and the
+/// repairs it led to. Lines without a number timed the encode alone.
+pub const TIMING_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Record {
     #[serde(default = "format_one")]
@@ -48,6 +53,16 @@ pub struct Record {
     /// `mode` it says how often "auto" ends in a CRF per scene.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scenes: Option<String>,
+    /// The av1opt that made the line (absent in lines from before it was recorded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// [`TIMING_VERSION`] of the av1opt that made the line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing_version: Option<u32>,
+    /// Seconds of `encode_secs` that went to the check of the whole video and to the repairs
+    /// it led to, which are timed together (absent: no such check was made).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_secs: Option<f64>,
 }
 
 impl Record {
@@ -71,6 +86,9 @@ impl Record {
             search_secs: None,
             encode_secs: None,
             scenes: None,
+            version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            timing_version: Some(TIMING_VERSION),
+            check_secs: None,
         }
     }
 }
@@ -157,7 +175,8 @@ mod tests {
         assert_eq!((r.format, r.codec.as_str(), r.width, r.height, r.fps), (FORMAT, "hevc", 1920, 1080, 25.0));
         assert_eq!((r.duration_s, r.source_bitrate, r.output_bitrate, r.target_vmaf), (40.0, 4e6, 2e6, 93.0));
         assert_eq!((r.preset, r.mode.as_str(), r.crf, r.svt_params.as_deref()), (5, "scenes", Some(31.5), Some("tune=0")));
-        assert_eq!((r.search_secs, r.encode_secs, r.scenes), (None, None, None));
+        assert_eq!((r.search_secs, r.encode_secs, r.scenes, r.check_secs), (None, None, None, None));
+        assert_eq!((r.version.as_deref(), r.timing_version), (Some(env!("CARGO_PKG_VERSION")), Some(TIMING_VERSION)));
         assert!(r.time > 1_700_000_000);
     }
 
@@ -182,16 +201,25 @@ mod tests {
     }
 
     #[test]
+    fn a_line_from_before_timings_had_a_version_still_loads_and_has_none() {
+        let old = r#"{"format":1,"time":1763000000,"codec":"h264","width":1920,"height":1080,"fps":30.0,"duration_s":900.0,"source_bitrate":5000000.0,"output_bitrate":1500000.0,"target_vmaf":93.0,"preset":6,"mode":"whole","crf":35.0,"svt_params":"tune=0","search_secs":120.0,"encode_secs":900.0,"scenes":"off"}"#;
+        let got = read_bytes("untimed", old.as_bytes());
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].version.as_deref(), got[0].timing_version, got[0].check_secs, got[0].encode_secs), (None, None, None, Some(900.0)));
+    }
+
+    #[test]
     fn times_not_known_are_not_written_and_known_ones_come_back() {
         let info = MediaInfo { codec: "h264".into(), width: 640, height: 360, fps: 24.0, duration_s: 60.0, ..Default::default() };
         let mut r = Record::new(&info, 1e6, 93.0, 5, "whole", 30.0, "tune=0");
         let text = serde_json::to_string(&r).unwrap();
-        for absent in ["search_secs", "encode_secs", "scenes"] {
+        for absent in ["search_secs", "encode_secs", "scenes", "check_secs"] {
             assert!(!text.contains(absent), "{text}");
         }
-        (r.search_secs, r.encode_secs, r.scenes) = (Some(12.5), Some(600.0), Some("auto".into()));
+        (r.search_secs, r.encode_secs, r.scenes, r.check_secs) = (Some(12.5), Some(600.0), Some("auto".into()), Some(200.0));
         let got = read_bytes("times", serde_json::to_string(&r).unwrap().as_bytes());
-        assert_eq!((got[0].search_secs, got[0].encode_secs, got[0].scenes.as_deref()), (Some(12.5), Some(600.0), Some("auto")));
+        assert_eq!((got[0].search_secs, got[0].encode_secs, got[0].scenes.as_deref(), got[0].check_secs), (Some(12.5), Some(600.0), Some("auto"), Some(200.0)));
+        assert_eq!(got[0].timing_version, Some(TIMING_VERSION));
     }
 
     #[test]

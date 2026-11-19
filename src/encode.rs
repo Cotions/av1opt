@@ -1052,6 +1052,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     // With sections removed the times are for a shorter video than the record describes.
     if cut.is_none() {
         (record.search_secs, record.encode_secs) = (Some(search_secs), Some(encode_secs));
+        record.check_secs = repaired.as_ref().map(|r| r.secs);
     }
     record.scenes = Some(match o.scenes { Scenes::Off => "off", Scenes::Auto => "auto", Scenes::Always => "always" }.to_string());
     // A cut encoded below the target would teach the size model wrong sizes for it.

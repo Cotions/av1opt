@@ -7,7 +7,7 @@
 //! spend few bits themselves. A few encodes only
 //! nudge that prior; many encodes replace it. Every estimate is a range from the data's spread.
 
-use crate::history::Record;
+use crate::history::{Record, TIMING_VERSION};
 use crate::probe::MediaInfo;
 use serde::Serialize;
 
@@ -173,8 +173,9 @@ impl CrfModel {
 /// Predicts how long a file takes to encode on this machine:
 /// ln(seconds per frame) = beta[0] + beta[1]·ln(pixels / 1080p), for one preset.
 /// Without history it is a guess from one machine (a 6-core Ryzen 5 5600X: 22 ms per 1080p
-/// frame at preset 6, 9 ms at 720p, 62 ms at 4K); every whole-file encode recorded here
-/// pulls it toward this machine's real speed.
+/// frame at preset 6, 9 ms at 720p, 62 ms at 4K, for the encode alone, and
+/// [`CHECK_AND_REPAIR`] times that with what follows it); every whole-file encode recorded
+/// here pulls it toward this machine's real speed.
 #[derive(Debug, Clone, Copy)]
 pub struct TimeModel {
     pub beta: [f64; 2],
@@ -199,9 +200,21 @@ pub struct TimeModel {
 /// enough for a CRF per scene.
 const AUTO_SHARE: f64 = 1.0 / 3.0;
 
+/// How many times the encode alone an encode takes with the check of the whole video and the
+/// repairs that follow it, which `encode_secs` has held since they came: the middle of the 1.4
+/// to 2.2 measured on whole runs of this build (2026-11-18), against 1.0 before. It stands in
+/// for lines older than that, and for the first guess, until there are lines of this build.
+const CHECK_AND_REPAIR: f64 = 1.7;
+/// Lines of this build that are enough to go by alone.
+const ENOUGH_CURRENT: usize = 3;
+/// A line counts half as much for every this many newer lines, while lines of this build are
+/// too few to go by alone.
+const HALF_WEIGHT_AFTER: f64 = 5.0;
+
 /// Six 15-minute 1080p recordings (2026-11-15) took 180 minutes per scene where one pass was
-/// predicted, and for 55 others measured, at 58.
-const SCENES_FACTOR: f64 = 3.0;
+/// predicted, and for 55 others measured, at 58. Per-scene encodes have no check of the whole
+/// video, so against a pass that now includes one they are the smaller multiple.
+const SCENES_FACTOR: f64 = 3.0 / CHECK_AND_REPAIR;
 
 const SPF_1080P: f64 = 0.022;
 const SPF_EXPONENT: f64 = 0.85;
@@ -221,8 +234,8 @@ fn preset_time(preset: u8) -> f64 {
 
 impl TimeModel {
     pub fn fit(records: &[Record], preset: u8) -> Self {
-        let prior = [(SPF_1080P * preset_time(preset)).ln(), SPF_EXPONENT];
-        let pts: Vec<(f64, f64)> = records
+        let prior = [(SPF_1080P * CHECK_AND_REPAIR * preset_time(preset)).ln(), SPF_EXPONENT];
+        let timed: Vec<(&Record, f64, f64)> = records
             .iter()
             .filter(|r| r.mode == "whole")
             .filter_map(|r| {
@@ -231,18 +244,19 @@ impl TimeModel {
                 let secs = r.encode_secs.filter(|s| *s >= MIN_TIMED_SECS)?;
                 let pixels = r.width as f64 * r.height as f64;
                 let per_frame = secs / frames * preset_time(preset) / preset_time(r.preset);
-                (frames >= 1.0 && pixels > 0.0).then(|| ((pixels / PIXELS_1080P).ln(), per_frame.ln()))
+                (frames >= 1.0 && pixels > 0.0).then(|| (r, (pixels / PIXELS_1080P).ln(), per_frame.ln()))
             })
             .collect();
+        let pts = time_points(&timed);
         // Ridge regression toward the prior, two unknowns.
         let (mut a, mut b, mut d) = (PRIOR_WEIGHT, 0.0, PRIOR_WEIGHT);
         let (mut r0, mut r1) = (PRIOR_WEIGHT * prior[0], PRIOR_WEIGHT * prior[1]);
-        for (x, y) in &pts {
-            a += 1.0;
-            b += x;
-            d += x * x;
-            r0 += y;
-            r1 += x * y;
+        for (x, y, w) in &pts {
+            a += w;
+            b += w * x;
+            d += w * x * x;
+            r0 += w * y;
+            r1 += w * x * y;
         }
         let det = a * d - b * b;
         let beta = if det.abs() > 1e-9 { [(r0 * d - b * r1) / det, (a * r1 - b * r0) / det] } else { prior };
@@ -301,6 +315,30 @@ impl TimeModel {
         let searched = secs.min(clips) * SEARCH_ENCODES;
         self.secs_per_frame(pixels) * m.fps * (secs + searched) * self.factor
     }
+}
+
+/// What the time model is fitted on, as (x, y, weight), from (record, x, ln seconds per frame).
+/// Enough lines of this build are used alone: older ones timed something else, and 20 new
+/// lines among 60 old ones only moved the estimate 1.18 times where the truth was near 2.
+/// Otherwise every line counts, the newer the more, and the ones from before the check of the
+/// whole video are raised by what it adds.
+fn time_points(timed: &[(&Record, f64, f64)]) -> Vec<(f64, f64, f64)> {
+    let current = |r: &Record| r.timing_version == Some(TIMING_VERSION);
+    if timed.iter().filter(|(r, ..)| current(r)).count() >= ENOUGH_CURRENT {
+        return timed.iter().filter(|(r, ..)| current(r)).map(|(_, x, y)| (*x, *y, 1.0)).collect();
+    }
+    // Newest first; lines of the same second count as written, the later one newer.
+    let mut newest: Vec<usize> = (0..timed.len()).collect();
+    newest.sort_by_key(|&i| (std::cmp::Reverse(timed[i].0.time), std::cmp::Reverse(i)));
+    newest
+        .iter()
+        .enumerate()
+        .map(|(newer, &i)| {
+            let (r, x, y) = timed[i];
+            let raised = if r.timing_version.is_none() { CHECK_AND_REPAIR.ln() } else { 0.0 };
+            (x, y + raised, 0.5_f64.powf(newer as f64 / HALF_WEIGHT_AFTER))
+        })
+        .collect()
 }
 
 fn dot(a: &[f64; 3], b: &[f64; 3]) -> f64 {
@@ -407,8 +445,12 @@ mod tests {
             time: 0, codec: "h264".into(), width: w, height: h, fps: 30.0, duration_s: 60.0,
             source_bitrate: src_bpp * px, output_bitrate: out_bpp * px, target_vmaf: 93.0, preset: 6,
             mode: "whole".into(), crf: None, svt_params: None, search_secs: None, encode_secs: None, scenes: None,
+            version: None, timing_version: None, check_secs: None,
         }
     }
+
+    /// The first guess of seconds per 1080p frame at preset 6.
+    const GUESS_1080P: f64 = SPF_1080P * CHECK_AND_REPAIR;
 
     #[test]
     fn no_history_gives_prior() {
@@ -518,8 +560,13 @@ mod tests {
     fn timed(w: u32, h: u32, preset: u8, per_frame: f64) -> Record {
         let mut r = rec(0.1, 0.03, w, h);
         r.duration_s = 600.0;
-        (r.preset, r.encode_secs) = (preset, Some(per_frame * r.fps * r.duration_s));
+        (r.preset, r.encode_secs, r.timing_version) = (preset, Some(per_frame * r.fps * r.duration_s), Some(TIMING_VERSION));
         r
+    }
+
+    /// The same, as a line from before timings had a version.
+    fn timed_long_ago(w: u32, h: u32, preset: u8, per_frame: f64) -> Record {
+        Record { timing_version: None, ..timed(w, h, preset, per_frame) }
     }
 
     #[test]
@@ -527,22 +574,22 @@ mod tests {
         let info = |w: u32, h: u32, secs: f64| MediaInfo { width: w, height: h, fps: 30.0, duration_s: secs, ..Default::default() };
         let guess = TimeModel::fit(&[], 6);
         assert_eq!(guess.samples, 0);
-        assert!((guess.secs_per_frame(PIXELS_1080P) - SPF_1080P).abs() < 1e-12);
+        assert!((guess.secs_per_frame(PIXELS_1080P) - GUESS_1080P).abs() < 1e-12);
         // Bigger frames and slower presets take longer; an hour of 1080p is hours, not minutes.
-        assert!(guess.secs_per_frame(3840.0 * 2160.0) > 2.5 * SPF_1080P);
-        assert!(TimeModel::fit(&[], 4).secs_per_frame(PIXELS_1080P) > 1.5 * SPF_1080P);
-        assert!(TimeModel::fit(&[], 8).secs_per_frame(PIXELS_1080P) < 0.7 * SPF_1080P);
+        assert!(guess.secs_per_frame(3840.0 * 2160.0) > 2.5 * GUESS_1080P);
+        assert!(TimeModel::fit(&[], 4).secs_per_frame(PIXELS_1080P) > 1.5 * GUESS_1080P);
+        assert!(TimeModel::fit(&[], 8).secs_per_frame(PIXELS_1080P) < 0.7 * GUESS_1080P);
         let hour = guess.secs(&info(1920, 1080, 3600.0));
         // 64 sample clips of a second, encoded about twice.
-        assert!((hour / (SPF_1080P * 30.0 * 3600.0) - 1.0 - 128.0 / 3600.0).abs() < 1e-9, "{hour}");
+        assert!((hour / (GUESS_1080P * 30.0 * 3600.0) - 1.0 - 128.0 / 3600.0).abs() < 1e-9, "{hour}");
         // A short video is searched on most of it: the search outweighs the encode.
         let short = guess.secs(&info(1920, 1080, 10.0));
-        assert!((short / (SPF_1080P * 300.0) - 2.6).abs() < 1e-9, "{short}");
+        assert!((short / (GUESS_1080P * 300.0) - 2.6).abs() < 1e-9, "{short}");
         assert_eq!(guess.secs(&info(0, 0, 60.0)), 0.0);
         assert_eq!(guess.secs(&info(1920, 1080, 0.0)), 0.0);
 
         // A machine three times faster, seen through encodes at two presets and four sizes.
-        let truth = |px: f64| SPF_1080P / 3.0 * (px / PIXELS_1080P).powf(0.7);
+        let truth = |px: f64| GUESS_1080P / 3.0 * (px / PIXELS_1080P).powf(0.7);
         let sizes = [(1280, 720), (1920, 1080), (3840, 2160), (854, 480)];
         let recs: Vec<Record> = (0..40)
             .map(|i| {
@@ -568,8 +615,54 @@ mod tests {
         let mut blink = timed(1920, 1080, 6, 0.2);
         (blink.duration_s, blink.encode_secs) = (1.0, Some(6.0));
         assert_eq!(TimeModel::fit(&[blink], 6).samples, 0);
-        let one = TimeModel::fit(&[timed(1920, 1080, 6, SPF_1080P / 4.0)], 6).secs_per_frame(PIXELS_1080P);
-        assert!(one < SPF_1080P && one > SPF_1080P / 2.0, "{one}");
+        let one = TimeModel::fit(&[timed(1920, 1080, 6, GUESS_1080P / 4.0)], 6).secs_per_frame(PIXELS_1080P);
+        assert!(one < GUESS_1080P && one > GUESS_1080P / 2.0, "{one}");
+    }
+
+    #[test]
+    fn lines_of_this_build_are_gone_by_alone_once_there_are_three() {
+        let at = |recs: &[Record]| TimeModel::fit(recs, 6).secs_per_frame(PIXELS_1080P);
+        // Sixty old lines say 20 ms a frame, three new ones 40 ms.
+        let mut recs = vec![timed_long_ago(1920, 1080, 6, 0.02); 60];
+        recs.extend(vec![timed(1920, 1080, 6, 0.04); 3]);
+        let m = TimeModel::fit(&recs, 6);
+        assert_eq!(m.samples, 3);
+        // Pulled toward the first guess as usual, and far from what the old lines say.
+        let alone = at(&vec![timed(1920, 1080, 6, 0.04); 3]);
+        assert!(near(m.secs_per_frame(PIXELS_1080P), alone), "{}", m.secs_per_frame(PIXELS_1080P));
+        // A line of another timing version is not of this build.
+        let other = Record { timing_version: Some(TIMING_VERSION + 1), ..timed(1920, 1080, 6, 0.04) };
+        recs.truncate(60);
+        recs.extend(vec![other; 3]);
+        assert_eq!(TimeModel::fit(&recs, 6).samples, 63);
+    }
+
+    #[test]
+    fn with_few_lines_of_this_build_old_ones_count_raised_and_less_the_older_they_are() {
+        // Old lines alone: what they say, times what the check and repairs add. Their weights
+        // add up to about eight lines, so the first guess still has a say.
+        let many = vec![timed_long_ago(1920, 1080, 6, 0.02); 200];
+        let m = TimeModel::fit(&many, 6);
+        assert!((m.secs_per_frame(PIXELS_1080P) / (0.02 * CHECK_AND_REPAIR) - 1.0).abs() < 0.05, "{}", m.secs_per_frame(PIXELS_1080P));
+        // The newest lines weigh most: the same lines in the other order give another answer,
+        // and the time written in them decides what is new, not the place in the file.
+        let dated = |time, per_frame| Record { time, ..timed_long_ago(1920, 1080, 6, per_frame) };
+        let (slow_last, slow_first): (Vec<Record>, Vec<Record>) =
+            ((0..20).map(|i| dated(i, if i < 10 { 0.01 } else { 0.04 })).collect(), (0..20).map(|i| dated(i, if i < 10 { 0.04 } else { 0.01 })).collect());
+        let at = |recs: &[Record]| TimeModel::fit(recs, 6).secs_per_frame(PIXELS_1080P);
+        assert!(at(&slow_last) > 1.5 * at(&slow_first), "{} {}", at(&slow_last), at(&slow_first));
+        let mut shuffled = slow_last.clone();
+        shuffled.reverse();
+        assert!(near(at(&shuffled), at(&slow_last)));
+        // Weights halve every five lines, newest first.
+        let lines: Vec<Record> = (0..6).map(|i| dated(i, 0.02)).collect();
+        let timed_lines: Vec<(&Record, f64, f64)> = lines.iter().map(|r| (r, 0.0, 0.0)).collect();
+        let weights: Vec<f64> = time_points(&timed_lines).iter().map(|p| p.2).collect();
+        assert!(near(weights[0], 1.0) && near(weights[5], 0.5), "{weights:?}");
+        // Two lines of this build are too few, and are not raised.
+        let two = vec![timed(1920, 1080, 6, 0.02); 2];
+        let points: Vec<(&Record, f64, f64)> = two.iter().map(|r| (r, 0.0, 0.0)).collect();
+        assert!(time_points(&points).iter().all(|p| p.1 == 0.0));
     }
 
     #[test]
@@ -586,7 +679,7 @@ mod tests {
             r
         };
         let few = TimeModel::fit(&[took(6)], 6);
-        assert!(few.scenes < SCENES_FACTOR && few.scenes > 2.5, "{}", few.scenes);
+        assert!(few.scenes > SCENES_FACTOR && few.scenes < 2.0, "{}", few.scenes);
         let many: Vec<Record> = (0..60).map(|i| took(if i % 2 == 0 { 6 } else { 8 })).collect();
         let learned = TimeModel::fit(&many, 6);
         assert_eq!(learned.scene_samples, 60);
@@ -599,10 +692,10 @@ mod tests {
     #[test]
     fn auto_costs_what_its_share_of_per_scene_encodes_costs() {
         let info = MediaInfo { width: 1920, height: 1080, fps: 30.0, duration_s: 900.0, ..Default::default() };
-        // A third per scene at three times one pass, before anything is known.
+        // A third per scene at their multiple of one pass, before anything is known.
         let guess = TimeModel::fit(&[], 6);
         assert_eq!(guess.auto_samples, 0);
-        assert!((guess.auto_factor() - (1.0 + 2.0 / 3.0)).abs() < 1e-9);
+        assert!((guess.auto_factor() - (1.0 + (SCENES_FACTOR - 1.0) / 3.0)).abs() < 1e-9);
         assert!((guess.auto().secs(&info) / guess.secs(&info) - guess.auto_factor()).abs() < 1e-9);
         // 60 encodes made with "auto", every tenth per scene; others don't count, whatever their mode.
         let made = |setting: &str, mode: &str| Record { scenes: Some(setting.into()), mode: mode.into(), search_secs: None, encode_secs: None, ..rec(0.1, 0.03, 1920, 1080) };
@@ -831,7 +924,7 @@ mod tests {
         assert_eq!(m.secs(&MediaInfo { height: 0, ..info.clone() }), 0.0);
         // Shorter than its sample clips: searched on all of it, twice.
         let tiny = m.secs(&MediaInfo { duration_s: 4.0, ..info });
-        assert!(near(tiny, SPF_1080P * 30.0 * 12.0), "{tiny}");
+        assert!(near(tiny, GUESS_1080P * 30.0 * 12.0), "{tiny}");
     }
 
     #[test]
@@ -850,7 +943,7 @@ mod tests {
         assert!(near(all.auto_share, 998.0 / 1000.0), "{}", all.auto_share);
         let none = TimeModel::fit(&vec![made("whole"); 997], 6);
         assert!(near(none.auto_share, 1.0 / 1000.0), "{}", none.auto_share);
-        assert!(near(none.auto_factor(), 1.0 + 2.0 / 1000.0));
+        assert!(near(none.auto_factor(), 1.0 + (none.scenes - 1.0) / 1000.0));
     }
 
     #[test]

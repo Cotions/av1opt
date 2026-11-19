@@ -957,7 +957,7 @@ function encodeDialog(inputs, roots = [], watch = false, files = null) {
               tuning.map((x) => `${x.label}: ${configLabel(x.choice)}`).join("; ") + ". Other sizes use the preset and parameters above") : null,
             setting("Container", container, null),
             setting("Per-scene CRF", h("span", { class: "unit" }, scenes, workers, "at once"),
-              "Splits at scene changes and picks a CRF for each: even quality, about three times the time. “Where quality is uneven” does it only for videos whose samples score far apart at one CRF"),
+              "Splits at scene changes and picks a CRF for each: even quality, nearly twice the time of one CRF checked along the whole video. “Where quality is uneven” does it only for videos whose samples score far apart at one CRF"),
             setting("Skip if saving under", h("span", { class: "unit" }, minSav, "%"), "Files that wouldn't shrink this much are left alone")),
           h("div", { class: "checks-col" },
             h("label", { class: "check", title: "AAC, Opus and MP3 sound is normally copied untouched. With this, a track far above what Opus needs (stereo above 144 kbps) is re-encoded to Opus (stereo at 96 kbps): smaller, but lossy a second time" }, shrinkAudio, "Shrink heavy sound tracks to Opus (stereo above 144 kbps becomes 96 kbps)"),

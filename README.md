@@ -776,6 +776,9 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
   without a usable trash gives an error instead of a copy to another disk.
 - **Encode dialog**: target VMAF, preset, container, encoder parameters, metadata, sections
   to remove, and **Shrink heavy sound tracks to Opus** (`--audio shrink`, off by default).
+  It opens with the settings of the last encode queued from that browser (or that desktop
+  window), and the scan's times go by its preset: a preset chosen once stays, and a new default
+  shows only where nothing was queued yet.
 - **Queue**: encodes run one at a time with live progress: CRF search trials, chosen CRF,
   the estimated time left per job and for the whole queue (files no scan has seen are
   estimated once they are probed),
@@ -867,8 +870,8 @@ anyone's (a browser sends the cookie to every port of the host, so the cookie al
 keep them out). The system's own programs (root) pass while their connection is open, and where
 the system's list of connections can't be read the cookie alone decides. Past 64 connections
 open at once, the server closes the extra ones: another user's first, then the ones that have
-not sent a whole request, oldest first, and the page's own event stream, videos and pictures
-only when nothing else is left. It raises its open-file limit to the most the system allows,
+not sent a whole request, oldest first, then idle ones that have, quietest first, and the
+page's own event stream, videos and pictures only when nothing else is left. It raises its open-file limit to the most the system allows,
 and when a connection cannot be taken (no file left, say) it takes new ones again a moment
 later instead of stopping. Media are only
 served for the video files the page already lists: those you picked, scanned, found as
@@ -929,7 +932,9 @@ npm run dist:appimage     # an AppImage instead, if wanted
 ```
 
 The app uses, in order: `$AV1OPT_BIN`, the binary packed into the package,
-`../target/release/av1opt`, then `av1opt` on PATH. Extra arguments go in `AV1OPT_UI_ARGS`
+`../target/release/av1opt`, then `av1opt` on PATH. An installed app therefore goes on running
+the av1opt packed into it, whatever has been built since, until a new package is made and
+installed. Extra arguments go in `AV1OPT_UI_ARGS`
 (for example `AV1OPT_UI_ARGS="--memory-limit 12G"`). A desktop launcher has no shell
 environment, so set the ffmpeg path once in Settings.
 

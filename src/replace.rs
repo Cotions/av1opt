@@ -392,6 +392,12 @@ impl OpenFile {
         if meta.len() != bytes {
             bail!("{} is not the size it should be", path.display());
         }
+        // A file with a second name is reached through that name too: giving it the original's
+        // permissions, or moving it into the original's place, would act on a file somebody may
+        // have linked there from anywhere on the drive.
+        if meta.nlink() != 1 {
+            bail!("{} has other names on the drive too (hard links), so av1opt does not move it or change it; copy it to a file of its own to go on", path.display());
+        }
         Ok(OpenFile { stamp: Stamp::of(&meta), file })
     }
 
@@ -1360,6 +1366,23 @@ mod tests {
         trash::rename_new(&f.out("b.mkv"), &from).unwrap();
         assert!(land(&from, &to, &opened).is_err());
         assert!(!to.exists() && from.exists());
+    }
+
+    #[test]
+    fn an_output_with_a_second_name_is_neither_moved_nor_changed() {
+        let f = Fix::new("hard-link");
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        // A file of somebody's, reached through the output's name.
+        let elsewhere = f.dir.join("elsewhere.bin");
+        std::fs::rename(f.out("a.mkv"), &elsewhere).unwrap();
+        std::fs::set_permissions(&elsewhere, std::os::unix::fs::PermissionsExt::from_mode(0o604)).unwrap();
+        std::fs::hard_link(&elsewhere, f.out("a.mkv")).unwrap();
+        std::fs::set_permissions(f.lib("a.mp4"), std::os::unix::fs::PermissionsExt::from_mode(0o640)).unwrap();
+        let err = f.apply(&report).unwrap_err();
+        assert!(err.to_string().contains("other names on the drive too"), "{err}");
+        assert_eq!(mode(&elsewhere), 0o604);
+        assert!(f.lib("a.mp4").exists() && f.out("a.mkv").exists() && !f.lib("a.mkv").exists());
+        assert!(!f.dir.join("Trash/files/a.mp4").exists());
     }
 
     #[test]

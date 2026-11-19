@@ -106,7 +106,7 @@ fn cache_file() -> Result<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
         .context("no HOME or XDG_CACHE_HOME")?;
     let dir = base.join("av1opt");
-    std::fs::create_dir_all(&dir)?;
+    crate::files::private_folder(&dir)?;
     // Bump the version when the frame times or the hash change, so old entries are redone.
     Ok(dir.join("dups-cache-v1.json"))
 }

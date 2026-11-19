@@ -383,6 +383,7 @@ pub fn run(cfg: Config) -> Result<()> {
     // SAFETY: the environment is changed before any other thread is started.
     unsafe { std::env::remove_var("AV1OPT_UI_TOKEN") };
     // Before anything is read, wiped or restored.
+    library::close_private_folders();
     let only_server = one_server_per_user()?;
     let server = tiny_http::Server::http(("127.0.0.1", cfg.port)).map_err(|e| anyhow::anyhow!("cannot listen on 127.0.0.1:{}: {e}", cfg.port))?;
     let port = server.server_addr().to_ip().context("not an IP listener")?.port();

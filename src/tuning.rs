@@ -112,11 +112,9 @@ impl Tuning {
     pub fn save(&self) -> Result<PathBuf> {
         let p = path().context("no HOME for the tuning file")?;
         if let Some(dir) = p.parent() {
-            std::fs::create_dir_all(dir)?;
+            crate::files::private_folder(dir)?;
         }
-        let tmp = p.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&Tuning { format: FORMAT, classes: self.classes.clone() })?)?;
-        std::fs::rename(&tmp, &p)?;
+        crate::files::replace_with(&p, &serde_json::to_vec_pretty(&Tuning { format: FORMAT, classes: self.classes.clone() })?)?;
         Ok(p)
     }
 

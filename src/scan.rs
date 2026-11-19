@@ -324,7 +324,7 @@ fn cache_file() -> Result<PathBuf> {
 }
 
 fn cache_file_in(dir: &Path) -> Result<PathBuf> {
-    std::fs::create_dir_all(dir)?;
+    crate::files::private_folder(dir)?;
     // Bump the version when MediaInfo gains fields that change verdicts or what is read into
     // them, so old entries are re-probed. Version 3 holds Matroska lengths taken from what the
     // file calls its duration, wrong for files that do not start at zero.

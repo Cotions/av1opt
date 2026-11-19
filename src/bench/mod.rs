@@ -196,7 +196,7 @@ pub fn cache_dir() -> Result<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
         .context("no HOME or XDG_CACHE_HOME")?;
     let dir = base.join("av1opt");
-    std::fs::create_dir_all(&dir)?;
+    crate::files::private_folder(&dir)?;
     Ok(dir)
 }
 

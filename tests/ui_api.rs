@@ -1185,6 +1185,52 @@ fn requests_from_other_pages_are_refused_and_every_answer_is_hardened() {
     check("events", &String::from_utf8_lossy(&head));
 }
 
+#[test]
+fn what_the_server_keeps_is_closed_to_other_users() {
+    use std::os::unix::fs::PermissionsExt;
+    let open = |p: &Path, mode: u32| std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+    let mode = |p: &Path| std::fs::metadata(p).unwrap_or_else(|e| panic!("{}: {e}", p.display())).permissions().mode() & 0o777;
+    let (ffmpeg, ffprobe) = stand_in_tools_running("private", A_VIDEO, HANGS_ON_ONE_FILE);
+    // As an earlier version left things under a usual umask.
+    let s = Server::launch("private", &ffmpeg, &ffprobe, |d| {
+        let thumbs = d.join("cache/av1opt/thumbs");
+        std::fs::create_dir_all(&thumbs).unwrap();
+        std::fs::write(thumbs.join("old.jpg"), b"x").unwrap();
+        std::fs::write(d.join("data/av1opt/ui.json"), b"{}").unwrap();
+        std::fs::write(d.join("data/av1opt/history.jsonl"), b"").unwrap();
+        std::fs::write(d.join("videos/clip.mp4"), b"xx").unwrap();
+        open(&thumbs.join("old.jpg"), 0o644);
+        open(&thumbs, 0o755);
+        for file in ["ui.json", "history.jsonl"] {
+            open(&d.join("data/av1opt").join(file), 0o644);
+        }
+        open(&d.join("data/av1opt"), 0o755);
+        open(&d.join("cache/av1opt"), 0o755);
+    });
+    s.wait_for_restored_jobs();
+    let (data, cache) = (s.dir.join("data/av1opt"), s.dir.join("cache/av1opt"));
+    for folder in [&data, &cache, &cache.join("thumbs"), &cache.join("previews"), &cache.join(format!("previews/{}", s.child.id()))] {
+        assert_eq!(mode(folder), 0o700, "{}", folder.display());
+    }
+    for file in [data.join("ui.json"), data.join("history.jsonl"), data.join("ui.lock"), cache.join("thumbs/old.jpg")] {
+        assert_eq!(mode(&file), 0o600, "{}", file.display());
+    }
+
+    // What is written from now on: settings, the queue, a preview and a thumbnail.
+    let clip = s.dir.join("videos/clip.mp4");
+    assert_eq!(s.post("/api/source", &json!({ "path": clip })).status, 200);
+    let r = s.post("/api/queue/pause", &json!({ "paused": true }));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let r = s.post("/api/preview", &json!({ "path": clip, "kind": "remux" }));
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(s.get(&format!("/thumb?path={}&t=1", clip.display())).status, 200);
+    let made: Vec<PathBuf> = [cache.join(format!("previews/{}", s.child.id())), cache.join("thumbs")].iter().flat_map(|d| std::fs::read_dir(d).unwrap().flatten().map(|e| e.path())).collect();
+    assert!(made.len() >= 3, "{made:?}");
+    for file in made.iter().chain([&data.join("ui.json")]) {
+        assert_eq!(mode(file), 0o600, "{}", file.display());
+    }
+}
+
 /// A stand-in ffmpeg that writes its output, except for a file with `hang` in its name: there
 /// it notes its process number beside itself and never ends.
 const HANGS_ON_ONE_FILE: &str = "case \"$*\" in\n*hang*) echo $$ > \"$(dirname \"$0\")/hung\"; exec sleep 600;;\nesac\nfor last; do :; done\nprintf x > \"$last\"";

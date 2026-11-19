@@ -88,7 +88,8 @@ fn path() -> Option<PathBuf> {
 pub fn append(r: &Record) -> Result<()> {
     let p = path().context("no HOME for the encode history")?;
     if let Some(dir) = p.parent() {
-        std::fs::create_dir_all(dir)?;
+        // A file named by the user may be anywhere; the usual place is av1opt's own.
+        if std::env::var_os("AV1OPT_HISTORY").is_some() { std::fs::create_dir_all(dir)? } else { crate::files::private_folder(dir)? }
     }
     Ok(crate::files::append_line(&p, &serde_json::to_string(r)?, true)?)
 }

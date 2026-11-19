@@ -20,7 +20,46 @@ pub fn create_new(path: &Path) -> std::io::Result<std::fs::File> {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
         _ => {}
     }
-    std::fs::OpenOptions::new().write(true).create_new(true).custom_flags(libc::O_NOFOLLOW).open(path)
+    std::fs::OpenOptions::new().write(true).create_new(true).custom_flags(libc::O_NOFOLLOW).mode(new_file_mode(path)).open(path)
+}
+
+/// The mode for a file about to be made at `path`. In a folder only this user can enter it is
+/// for this user alone too; elsewhere, as beside an output, the umask decides as usual.
+fn new_file_mode(path: &Path) -> u32 {
+    if std::fs::metadata(folder_of(path)).is_ok_and(|m| m.mode() & 0o077 == 0) { 0o600 } else { 0o666 }
+}
+
+/// Makes `path` and what is missing above it, and leaves `path` open to this user alone
+/// whatever it was before. For the folders that hold what someone keeps, watches and encodes.
+pub fn private_folder(path: &Path) -> std::io::Result<()> {
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path)?;
+    if std::fs::metadata(path)?.mode() & 0o077 != 0 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Takes away what others may do with the file at `path`, one another program has made.
+pub fn make_private(path: &Path) -> std::io::Result<()> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+/// Takes away what others may do with everything below `folder`, for what versions before
+/// this one left there. Links are not followed. What cannot be changed stays as it is.
+pub fn tighten_below(folder: &Path) {
+    for entry in std::fs::read_dir(folder).into_iter().flatten().flatten() {
+        let path = entry.path();
+        let Ok(found) = std::fs::symlink_metadata(&path) else { continue };
+        if found.file_type().is_symlink() {
+            continue;
+        }
+        if found.mode() & 0o077 != 0 {
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(found.mode() & 0o700));
+        }
+        if found.is_dir() {
+            tighten_below(&path);
+        }
+    }
 }
 
 /// `count` random bytes as text, for names nobody can work out ahead of time.
@@ -216,7 +255,7 @@ pub fn save_name(path: &Path) -> PathBuf {
 pub fn append_line(path: &Path, line: &str, follow: bool) -> std::io::Result<()> {
     let open = |read: bool| {
         let mut o = std::fs::OpenOptions::new();
-        o.read(read).create(true).append(true);
+        o.read(read).create(true).append(true).mode(new_file_mode(path));
         if !follow {
             o.custom_flags(libc::O_NOFOLLOW);
         }
@@ -426,6 +465,49 @@ mod tests {
         let pid = child.id();
         child.wait().unwrap();
         pid
+    }
+
+    #[test]
+    fn what_is_kept_for_this_user_is_for_this_user_alone() {
+        use std::os::unix::fs::symlink;
+        let dir = room("private");
+        let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().mode() & 0o777;
+        // A new folder and one left open by an earlier version both end up closed.
+        let (new, old) = (dir.join("a/new"), dir.join("old"));
+        private_folder(&new).unwrap();
+        std::fs::create_dir(&old).unwrap();
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o755)).unwrap();
+        private_folder(&old).unwrap();
+        assert_eq!((mode(&new), mode(&old)), (0o700, 0o700));
+
+        // Files made in a closed folder are closed, however they are made.
+        write_new(&old.join("written"), b"x").unwrap();
+        replace_with(&old.join("replaced"), b"x").unwrap();
+        append_line(&old.join("added"), "x", true).unwrap();
+        for name in ["written", "replaced", "added"] {
+            assert_eq!(mode(&old.join(name)), 0o600, "{name}");
+        }
+        // Elsewhere the umask decides: a report beside an output stays readable as before.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_new(&dir.join("beside"), b"x").unwrap();
+        assert_ne!(mode(&dir.join("beside")) & 0o600, 0);
+        assert_eq!(new_file_mode(&dir.join("beside")), 0o666);
+
+        // What is there already is closed too, and a link leads nothing astray.
+        let outside = dir.join("outside");
+        std::fs::write(&outside, b"x").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(&outside, old.join("link")).unwrap();
+        let (inner, file) = (old.join("inner"), old.join("inner/file"));
+        std::fs::create_dir(&inner).unwrap();
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o664)).unwrap();
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o775)).unwrap();
+        tighten_below(&old);
+        assert_eq!((mode(&inner), mode(&file), mode(&outside)), (0o700, 0o600, 0o644));
+        make_private(&outside).unwrap();
+        assert_eq!(mode(&outside), 0o600);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

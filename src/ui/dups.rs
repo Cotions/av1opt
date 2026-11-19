@@ -284,7 +284,7 @@ pub fn pair(app: &App, body: &Value) -> Result<Value> {
 
 fn thumb_dir() -> Option<PathBuf> {
     let d = library::cache_dir()?.join("thumbs");
-    std::fs::create_dir_all(&d).ok()?;
+    crate::files::private_folder(&d).ok()?;
     Some(d)
 }
 
@@ -341,6 +341,7 @@ pub fn thumb(app: &App, path: &Path, t: f64) -> Result<Vec<u8>> {
             let _ = std::fs::remove_file(&part);
             bail!("no frame at {t:.1} s");
         }
+        crate::files::make_private(&part)?;
         std::fs::rename(&part, &out)?;
     }
     Ok(std::fs::read(&out)?)

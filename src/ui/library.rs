@@ -26,8 +26,21 @@ pub fn settings_path() -> Option<PathBuf> {
 
 pub fn cache_dir() -> Option<PathBuf> {
     let d = base_dir("XDG_CACHE_HOME", ".cache")?.join("av1opt");
-    std::fs::create_dir_all(&d).ok()?;
+    crate::files::private_folder(&d).ok()?;
     Some(d)
+}
+
+/// Closes av1opt's data and cache folders to other users, with what is in them: folder lists,
+/// the queue and previews of someone's videos are nobody else's business. Versions before this
+/// one left all of that as open as the umask made it.
+pub fn close_private_folders() {
+    let data = settings_path().and_then(|p| p.parent().map(Path::to_path_buf));
+    for folder in data.into_iter().chain(cache_dir()) {
+        if let Err(e) = crate::files::private_folder(&folder) {
+            eprintln!("warning: cannot close {} to other users: {e}", folder.display());
+        }
+        crate::files::tighten_below(&folder);
+    }
 }
 
 /// Short playback previews live in the user's cache, never next to the source, in a folder
@@ -35,10 +48,10 @@ pub fn cache_dir() -> Option<PathBuf> {
 /// their lock, and may share the cache. What servers that are gone left there is removed.
 pub fn preview_dir() -> Result<PathBuf> {
     let all = cache_dir().context("no HOME for the preview folder")?.join("previews");
-    std::fs::create_dir_all(&all)?;
+    crate::files::private_folder(&all)?;
     let own = all.join(std::process::id().to_string());
     remove_left_previews(&all, &own);
-    std::fs::create_dir_all(&own)?;
+    crate::files::private_folder(&own)?;
     crate::fsguard::ensure_writable_location(&own, false)?;
     Ok(std::fs::canonicalize(&own)?)
 }
@@ -779,6 +792,7 @@ pub fn preview(app: &App, body: &Value) -> Result<Value> {
         let _ = std::fs::remove_file(&part);
         return Err(e.context("preview encode failed"));
     }
+    crate::files::make_private(&part)?;
     std::fs::rename(&part, &out)?;
     Ok(json!({ "url": url(&out), "start": start, "secs": secs, "kind": r.kind }))
 }

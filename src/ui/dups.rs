@@ -191,11 +191,17 @@ fn check_trash(report: &Report, gone: &HashSet<PathBuf>, paths: &[PathBuf], pres
     for g in &report.groups {
         let members: Vec<&File> = g.members.iter().filter_map(|&i| report.files.get(i)).collect();
         let Some(one) = members.iter().find(|f| marked.contains(f.path.as_path())) else { continue };
+        // A copy in a trash goes when the trash is emptied: the one thing it cannot be is what
+        // stays of the video. Walks keep out of trash folders, so this takes a file moved there
+        // after the search, or a result made some other way.
+        if let Some(keeper) = members.first().filter(|keeper| crate::trash::in_a_trash(&keeper.path)) {
+            bail!("the copy to keep of {} ({}) lies in a trash folder, so nothing would stay of that video; search again", one.path.display(), keeper.path.display());
+        }
         let left: Vec<&&File> = members.iter().filter(|f| !marked.contains(f.path.as_path()) && !gone.contains(&f.path)).collect();
         if left.is_empty() {
             bail!("every copy of {} is marked: nothing would be left of that video. Untick one", one.path.display());
         }
-        if !left.iter().any(|f| present(f)) {
+        if !left.iter().any(|f| !crate::trash::in_a_trash(&f.path) && present(f)) {
             bail!("the copy to keep of {} ({}) is gone or has changed since the search; search again", one.path.display(), left[0].path.display());
         }
     }
@@ -354,6 +360,26 @@ mod tests {
 
     fn file(name: &str) -> File {
         File { path: PathBuf::from(name), root: PathBuf::from("/"), size: 10, codec: "h264".into(), width: 1280, height: 720, fps: 30.0, duration_s: 60.0, video_mbps: 2.0, identical: None }
+    }
+
+    #[test]
+    fn a_copy_in_a_trash_is_nothing_to_keep() {
+        crate::trash::TEST_HOME_TRASH.with(|h| *h.borrow_mut() = Some(PathBuf::from("/data/Trash")));
+        let report = |names: &[&str]| Report {
+            files: names.iter().map(|n| file(n)).collect(),
+            groups: vec![Group { kind: Kind::Same, score: 1.0, members: (0..names.len()).collect(), reason: String::new() }],
+            ..Default::default()
+        };
+        let live = PathBuf::from("/lib/only.mkv");
+        for keeper in ["/data/Trash/files/a.mkv", "/drive/.Trash-1000/files/a.mkv", "/drive/.Trash/1000/files/a.mkv"] {
+            let e = check_trash(&report(&[keeper, "/lib/only.mkv"]), &HashSet::new(), std::slice::from_ref(&live), &|_| true).unwrap_err().to_string();
+            assert!(e.contains("lies in a trash folder") && e.contains(keeper), "{e}");
+        }
+        // Another copy in a trash does not count as what stays either.
+        let e = check_trash(&report(&["/lib/only.mkv", "/lib/b.mkv", "/data/Trash/files/a.mkv"]), &HashSet::new(), &[live.clone(), "/lib/b.mkv".into()], &|_| true).unwrap_err().to_string();
+        assert!(e.contains("copy to keep"), "{e}");
+        assert!(check_trash(&report(&["/lib/b.mkv", "/lib/only.mkv", "/data/Trash/files/a.mkv"]), &HashSet::new(), &[live], &|_| true).is_ok());
+        crate::trash::TEST_HOME_TRASH.with(|h| *h.borrow_mut() = None);
     }
 
     #[test]

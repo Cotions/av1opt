@@ -18,11 +18,20 @@ pub const VIDEO_EXTS: &[&str] = &[
 ];
 const SKIP_DIRS: &[&str] = &["System Volume Information", "$RECYCLE.BIN", "lost+found"];
 
-/// Whether a walk stays out of this: a drive's trash and the system's folders hold no videos
-/// of the library, and what `replace` sent to a trash must not come back as work.
+/// Whether a walk stays out of this: the trash folders and the system's folders hold no videos
+/// of the library. What `replace` sent to a trash must not come back as work, and a copy in a
+/// trash must not pass for the one to keep while the last real one is thrown away. That goes
+/// for a walk that starts inside a trash too, and for the user's own trash, which a search of
+/// the home folder comes across and which has no telling name.
 pub fn not_for_videos(entry: &walkdir::DirEntry) -> bool {
-    let name = entry.file_name().to_string_lossy();
-    entry.file_type().is_dir() && (SKIP_DIRS.contains(&name.as_ref()) || name.starts_with(".Trash"))
+    if !entry.file_type().is_dir() {
+        return false;
+    }
+    let name = entry.file_name();
+    SKIP_DIRS.iter().any(|skipped| name == *skipped)
+        || crate::trash::is_trash_name(name)
+        || (name == "Trash" && crate::trash::is_home_trash(entry.path()))
+        || (entry.depth() == 0 && crate::trash::in_a_trash(entry.path()))
 }
 
 /// Probe results are cached by path, size and mtime so rescans of big libraries are fast.
@@ -368,6 +377,34 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
         assert!(scan.err().is_some_and(|e| e.to_string().contains("cannot run ffprobe")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_walk_finds_what_lies_in_a_trash() {
+        let dir = std::fs::canonicalize(std::env::temp_dir()).unwrap().join(format!("av1opt-scan-trash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("share/Trash");
+        crate::trash::TEST_HOME_TRASH.with(|h| *h.borrow_mut() = Some(home.clone()));
+        for file in ["share/Trash/files/home.mkv", "lib/.Trash-1000/files/own.mkv", "lib/.Trash/1000/files/shared.mkv", "lib/kept.mkv", "lib/Trash/named-so.mkv", "share/kept-too.mkv"] {
+            std::fs::create_dir_all(dir.join(file).parent().unwrap()).unwrap();
+            std::fs::write(dir.join(file), b"x").unwrap();
+        }
+        let ffprobe = dir.join("ffprobe");
+        crate::files::write_script(&ffprobe, "for last; do :; done\necho \"$last: Invalid data found when processing input\" >&2\nexit 1\n");
+        let found = |roots: &[PathBuf]| {
+            let (results, _) = collect_with_cache(&dir.join("cache.json"), roots, ffprobe.to_str().unwrap(), 1, 0.15, &estimate::Model::fit(&[], 93.0), &|_, _| {}).unwrap();
+            let mut names: Vec<String> = results.iter().map(|r| r.path.file_name().unwrap().to_string_lossy().into_owned()).collect();
+            names.sort();
+            names
+        };
+        // A folder that is merely called Trash is the person's own business.
+        assert_eq!(found(std::slice::from_ref(&dir)), ["kept-too.mkv", "kept.mkv", "named-so.mkv"]);
+        // Given as the place to look, a trash stays as empty as when it is come across.
+        assert!(found(&[home.join("files")]).is_empty());
+        assert!(found(&[dir.join("lib/.Trash-1000/files")]).is_empty());
+        assert!(found(&[dir.join("lib/.Trash/1000")]).is_empty());
+        crate::trash::TEST_HOME_TRASH.with(|h| *h.borrow_mut() = None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -31,6 +31,31 @@ fn home_trash() -> Option<PathBuf> {
 /// The most an info file may hold: a path as long as any can be, every byte of it encoded.
 const INFO_LIMIT: u64 = 1 << 16;
 
+/// Whether a folder of this name is a drive's trash, or what holds one: `.Trash-<uid>` and
+/// `.Trash`, which has a folder per user.
+pub fn is_trash_name(name: &std::ffi::OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    name.as_bytes().starts_with(b".Trash")
+}
+
+/// Whether the folder `dir` is the user's own trash, by whatever path it is reached.
+pub fn is_home_trash(dir: &Path) -> bool {
+    home_trash().is_some_and(|home| dir == home || std::fs::canonicalize(dir).is_ok_and(|real| std::fs::canonicalize(home).is_ok_and(|h| real == h)))
+}
+
+/// Whether `path` lies in a trash folder, of a drive or the user's own, seen through any links
+/// on the way. What is there is on its way out, and no copy to rely on. A file that is gone
+/// is judged by the nearest folder above it that still exists.
+pub fn in_a_trash(path: &Path) -> bool {
+    let named = |p: &Path| p.components().any(|c| is_trash_name(c.as_os_str()));
+    let home = home_trash();
+    if named(path) || home.as_ref().is_some_and(|h| path.starts_with(h)) {
+        return true;
+    }
+    let Some(real) = path.ancestors().find_map(|p| std::fs::canonicalize(p).ok()) else { return false };
+    named(&real) || home.and_then(|h| std::fs::canonicalize(h).ok()).is_some_and(|h| real.starts_with(h))
+}
+
 /// Moves `path` to the trash of the filesystem it is on. Returns where it is now.
 pub fn trash(path: &Path) -> Result<PathBuf> {
     // SAFETY: getuid has no failure mode and touches no memory.
@@ -545,6 +570,27 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), b"keep me");
         assert!(std::fs::symlink_metadata(&link).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trash_folders_are_known_by_name_and_by_where_the_users_own_is() {
+        let dir = std::fs::canonicalize(scratch("where")).unwrap();
+        let home = dir.join("data/Trash");
+        TEST_HOME_TRASH.with(|h| *h.borrow_mut() = Some(home.clone()));
+        make_private(&home.join("files")).unwrap();
+        std::os::unix::fs::symlink(dir.join("data"), dir.join("link")).unwrap();
+        std::os::unix::fs::symlink(dir.join("drive/.Trash-1000"), dir.join("to-bin")).unwrap();
+        std::fs::create_dir_all(dir.join("drive/.Trash-1000/files")).unwrap();
+        std::fs::create_dir_all(dir.join("lib/Trash")).unwrap();
+        for inside in ["data/Trash", "data/Trash/files/a.mkv", "link/Trash/files/a.mkv", "drive/.Trash-1000/files/a.mkv", "drive/.Trash/1000/files/a.mkv", "to-bin/files/a.mkv"] {
+            assert!(in_a_trash(&dir.join(inside)), "{inside}");
+        }
+        for outside in ["lib/a.mkv", "lib/Trash/a.mkv", "data/a.mkv", "gone/a.mkv"] {
+            assert!(!in_a_trash(&dir.join(outside)), "{outside}");
+        }
+        assert!(is_home_trash(&home) && is_home_trash(&dir.join("link/Trash")));
+        assert!(!is_home_trash(&dir.join("lib/Trash")));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn set_mode(path: &Path, mode: u32) {

@@ -2240,6 +2240,10 @@ fn verify(
 /// join is taken for broken: frames a step apart read ten or more lower.
 const JOIN_SLACK: f64 = 3.0;
 
+/// Puts a bare video stream (the first path) together with the source's other streams in
+/// the second: the ffmpeg arguments and what the result holds, with notes of what it cannot keep.
+type Remux<'a> = dyn Fn(&Path, &Path, &mut Vec<String>) -> Result<(Vec<String>, Streams)> + 'a;
+
 /// Verification of a one-pass encode along its whole length: every frame is scored against
 /// the source's, and stretches below the floor are encoded again and put in place (see
 /// [`repair`]). The scores returned are those of the usual spot-check places. `None` where
@@ -2260,7 +2264,7 @@ fn verify_whole(
     min_crf: u8,
     threads: usize,
     tmp: &Path,
-    remux: &dyn Fn(&Path, &Path, &mut Vec<String>) -> Result<(Vec<String>, Streams)>,
+    remux: &Remux,
     notes: &mut Vec<String>,
 ) -> Result<Option<(Vec<f64>, MediaInfo, repair::Summary)>> {
     let took = tools.stopwatch();

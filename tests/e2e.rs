@@ -537,7 +537,7 @@ fn channel_energy(path: &Path, track: usize, channels: usize) -> Vec<Vec<f64>> {
         .output()
         .expect("run ffmpeg");
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    let samples: Vec<f32> = o.stdout.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+    let samples: Vec<f32> = o.stdout.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
     samples.chunks(48000 * channels).map(|second| (0..channels).map(|ch| second.iter().skip(ch).step_by(channels).map(|x| f64::from(*x).powi(2)).sum()).collect()).collect()
 }
 

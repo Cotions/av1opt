@@ -22,6 +22,7 @@ mod scan;
 mod scenes;
 mod search;
 mod sections;
+mod sequence_header;
 mod signals;
 mod source;
 mod tools;

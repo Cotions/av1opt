@@ -904,7 +904,8 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
             ));
         }
         tools.emit(Event::Phase { phase: "muxing".into(), detail: format!("joining {} chunks", chunks.len()) });
-        let joined = scenes::concat(work.inside(), chunks.len())?;
+        let (joined, differences) = scenes::concat(work.inside(), chunks.len())?;
+        notes.extend(crate::sequence_header::note(&differences, "some scenes", "the first"));
         let video = match plan.timed {
             Some(_) => {
                 let stamped = scenes::stamp(tools, work.inside(), &joined, &info)?;
@@ -2492,6 +2493,11 @@ fn verify_whole(
         let _ = std::fs::remove_file(video);
         std::fs::rename(&joined, out)?;
         out_info = check_layout(tools, info, out, &joined_streams, Some(frames), None)?;
+        if let Some(n) = crate::sequence_header::note(&outcome.differences, "the stretches encoded again", "the rest") {
+            eprintln!("note: {n}");
+            tools.emit(Event::Note { text: n.clone() });
+            notes.push(n);
+        }
         // The one pass said the rest already; what is new is what the second mux lost.
         for n in said {
             if !notes.contains(&n) {

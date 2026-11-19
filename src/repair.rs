@@ -18,6 +18,7 @@ use crate::events::Event;
 use crate::probe::MediaInfo;
 use crate::scenes::{self, Bounds, Times};
 use crate::search::{self, EncodeSettings, VMAF_STRIDE};
+use crate::sequence_header;
 use crate::tools::{Tools, WENT_WRONG_INSIDE, hms, path_arg};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -506,6 +507,9 @@ pub struct Outcome {
     /// the first; one more entry than frames).
     scores: Vec<(usize, f64)>,
     secs: Vec<f64>,
+    /// What the stretches encoded again say otherwise than the video in their sequence
+    /// headers, of what they may (see [`sequence_header::joinable`]).
+    pub differences: Vec<sequence_header::Difference>,
 }
 
 impl Outcome {
@@ -846,7 +850,7 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
     );
     if low_count == 0 && mean_before >= c.target {
         let summary = Summary { mean_vmaf: mean_before, lowest_vmaf: lowest_before, lowest_before, floor: c.floor, stretches: Vec::new(), near: 0, left: Vec::new(), mean_before, top_up: None, secs: 0.0 };
-        return Ok(Outcome { summary, video: None, scores, secs });
+        return Ok(Outcome { summary, video: None, scores, secs, differences: Vec::new() });
     }
 
     let room = room_to_repair(std::fs::metadata(output).context("the encode is gone")?.len());
@@ -981,12 +985,12 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
     if fixed.is_empty() {
         let _ = std::fs::remove_file(&plain);
         let summary = Summary { mean_vmaf: mean(&scores), lowest_vmaf: lowest_before, lowest_before, floor: c.floor, stretches: Vec::new(), near: 0, left, mean_before, top_up: None, secs: 0.0 };
-        return Ok(Outcome { summary, video: None, scores, secs });
+        return Ok(Outcome { summary, video: None, scores, secs, differences: Vec::new() });
     }
 
     let still = short_of_floor(&after);
     let video = c.dir.join("repaired.ivf");
-    splice(&plain, &head, &index, &fixed, &video)?;
+    let differences = splice(&plain, &head, &index, &fixed, &video)?;
     let _ = std::fs::remove_file(&plain);
     let stretches: Vec<Stretch> = fixed
         .iter()
@@ -1017,7 +1021,7 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
         }
     });
     let summary = Summary { mean_vmaf: mean(&scores), lowest_vmaf: lowest_of(&after), lowest_before, floor: c.floor, stretches, near: still.len(), left, mean_before, top_up, secs: 0.0 };
-    Ok(Outcome { summary, video: Some(video), scores, secs })
+    Ok(Outcome { summary, video: Some(video), scores, secs, differences })
 }
 
 /// Encodes the frames of `run` again, at the highest CRF found that meets `goal`: the lowest
@@ -1148,11 +1152,42 @@ fn ivf_index(path: &Path) -> Result<([u8; 32], Vec<IvfFrame>)> {
 }
 
 /// Writes the video with the frames of each fixed run taken from its new encode. Every frame
-/// keeps the timestamp the one-pass encode gave it, counted from the first.
-fn splice(source: &Path, head: &[u8; 32], index: &[IvfFrame], fixed: &[Fixed], out: &Path) -> Result<()> {
+/// keeps the timestamp the one-pass encode gave it, counted from the first. Each new encode
+/// has to say in its sequence header what the video's says, but for what changes nothing in
+/// how a frame is decoded (see [`sequence_header::joinable`]): those differences are returned.
+fn splice(source: &Path, head: &[u8; 32], index: &[IvfFrame], fixed: &[Fixed], out: &Path) -> Result<Vec<sequence_header::Difference>> {
     use std::io::Write;
     use std::os::unix::fs::FileExt;
     let src = std::fs::File::open(source)?;
+    let read = |from: &std::fs::File, f: &IvfFrame| -> Result<Vec<u8>> {
+        let mut buf = vec![0; f.size as usize];
+        from.read_exact_at(&mut buf, f.offset)?;
+        Ok(buf)
+    };
+    // Before anything is written: a piece that cannot go in leaves the encode as it was.
+    let first = index.first().map(|f| read(&src, f)).transpose()?.unwrap_or_default();
+    let Some(header) = sequence_header::first_in(&first).map(<[u8]>::to_vec) else {
+        bail!("the encode's first frame holds no sequence header; {WENT_WRONG_INSIDE}");
+    };
+    let mut differences: Vec<sequence_header::Difference> = Vec::new();
+    let mut pieces = Vec::new();
+    for f in fixed {
+        let (_, new) = ivf_index(&f.file)?;
+        let file = std::fs::File::open(&f.file)?;
+        let start = new.first().map(|x| read(&file, x)).transpose()?.unwrap_or_default();
+        let joined = sequence_header::first_in(&start).ok_or_else(|| "it starts without a sequence header".to_string()).and_then(|h| sequence_header::joinable(&header, h));
+        match joined {
+            Ok(found) => {
+                for d in found {
+                    if !differences.iter().any(|e| e.what == d.what) {
+                        differences.push(d);
+                    }
+                }
+            }
+            Err(why) => bail!("the stretch encoded again from frame {} cannot be put into the video: {why}", f.run.start),
+        }
+        pieces.push((file, new));
+    }
     let mut w = std::io::BufWriter::new(crate::files::create_new(out)?);
     w.write_all(head)?;
     let first = index[0].pts;
@@ -1166,17 +1201,15 @@ fn splice(source: &Path, head: &[u8; 32], index: &[IvfFrame], fixed: &[Fixed], o
         Ok(())
     };
     let mut i = 0;
-    let mut next = fixed.iter().peekable();
+    let mut next = fixed.iter().zip(&pieces).peekable();
     while i < index.len() {
         match next.peek() {
-            Some(f) if f.run.start == i => {
-                let (_, new) = ivf_index(&f.file)?;
+            Some((f, (file, new))) if f.run.start == i => {
                 if new.len() != f.run.end - f.run.start {
                     bail!("a stretch encoded again came back with {} frames where {} were to be replaced; {WENT_WRONG_INSIDE}", new.len(), f.run.end - f.run.start);
                 }
-                let file = std::fs::File::open(&f.file)?;
                 for (k, frame) in new.iter().enumerate() {
-                    copy(&mut w, &file, frame, index[i + k].pts)?;
+                    copy(&mut w, file, frame, index[i + k].pts)?;
                 }
                 i = f.run.end;
                 next.next();
@@ -1191,7 +1224,7 @@ fn splice(source: &Path, head: &[u8; 32], index: &[IvfFrame], fixed: &[Fixed], o
         bail!("a stretch encoded again does not begin at a frame of the video; {WENT_WRONG_INSIDE}");
     }
     w.flush()?;
-    Ok(())
+    Ok(differences)
 }
 
 #[cfg(test)]
@@ -1446,6 +1479,20 @@ mod tests {
         std::fs::write(path, b).unwrap();
     }
 
+    use sequence_header::sample::{header as header_with, starting as starting_with};
+
+    fn starting(header: &[u8], rest: Vec<u8>) -> Vec<u8> {
+        starting_with(header, &rest)
+    }
+
+    /// `rest` after the start of a key frame of the full-range video these tests splice into.
+    fn key(rest: Vec<u8>) -> Vec<u8> {
+        starting(&header_with("color_range", 1), rest)
+    }
+
+    /// How many bytes [`key`] puts in front.
+    const KEY: u32 = 4 + 15;
+
     fn fixed(run: Run, file: PathBuf) -> Fixed {
         Fixed { run, crf: 30.0, file, scores: Vec::new(), before: 80.0, bytes: 0, out_of_reach: false, for_mean: false }
     }
@@ -1455,21 +1502,22 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("av1opt-splice-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // Six frames from timestamp 100 on, uneven steps; frames 2-3 and 5 are replaced.
-        let src: Vec<(u64, Vec<u8>)> = [100u64, 110, 125, 130, 150, 151].iter().enumerate().map(|(i, &p)| (p, vec![i as u8; i + 1])).collect();
+        let mut src: Vec<(u64, Vec<u8>)> = [100u64, 110, 125, 130, 150, 151].iter().enumerate().map(|(i, &p)| (p, vec![i as u8; i + 1])).collect();
+        src[0].1 = key(src[0].1.clone());
         write_ivf(&dir.join("src.ivf"), &src);
-        write_ivf(&dir.join("a.ivf"), &[(0, vec![0xaa; 7]), (1, vec![0xab; 2])]);
-        write_ivf(&dir.join("b.ivf"), &[(0, vec![0xbb; 3])]);
+        write_ivf(&dir.join("a.ivf"), &[(0, key(vec![0xaa; 7])), (1, vec![0xab; 2])]);
+        write_ivf(&dir.join("b.ivf"), &[(0, key(vec![0xbb; 3]))]);
         let (head, index) = ivf_index(&dir.join("src.ivf")).unwrap();
         assert_eq!(index.len(), 6);
         let fx = vec![fixed(Run { start: 2, end: 4 }, dir.join("a.ivf")), fixed(Run { start: 5, end: 6 }, dir.join("b.ivf"))];
-        splice(&dir.join("src.ivf"), &head, &index, &fx, &dir.join("out.ivf")).unwrap();
+        assert_eq!(splice(&dir.join("src.ivf"), &head, &index, &fx, &dir.join("out.ivf")).unwrap(), []);
         let (head2, out) = ivf_index(&dir.join("out.ivf")).unwrap();
         assert_eq!(head, head2);
         assert_eq!(out.iter().map(|f| f.pts).collect::<Vec<_>>(), vec![0, 10, 25, 30, 50, 51]);
-        assert_eq!(out.iter().map(|f| f.size).collect::<Vec<_>>(), vec![1, 2, 7, 2, 5, 3]);
+        assert_eq!(out.iter().map(|f| f.size).collect::<Vec<_>>(), vec![KEY + 1, 2, KEY + 7, 2, 5, KEY + 3]);
         let bytes = std::fs::read(dir.join("out.ivf")).unwrap();
-        assert_eq!(&bytes[out[2].offset as usize..][..7], &[0xaa; 7]);
-        assert_eq!(&bytes[out[5].offset as usize..][..3], &[0xbb; 3]);
+        assert_eq!(&bytes[(out[2].offset + KEY as u64) as usize..][..7], &[0xaa; 7]);
+        assert_eq!(&bytes[(out[5].offset + KEY as u64) as usize..][..3], &[0xbb; 3]);
         assert_eq!(&bytes[out[4].offset as usize..][..5], &[4; 5]);
 
         // A new encode with the wrong number of frames is refused.
@@ -1671,6 +1719,7 @@ mod tests {
             video: None,
             scores: scored(900, |i| if i < 300 { 90.0 } else { 96.0 }),
             secs: secs(900),
+            differences: Vec::new(),
         };
         assert_eq!(o.at(0.0, 5.0), Some(90.0));
         assert_eq!(o.at(10.0, 5.0), Some(96.0));
@@ -1881,6 +1930,7 @@ mod tests {
             video: None,
             scores: scored(frames, |_| 90.0),
             secs: secs(frames),
+            differences: Vec::new(),
         }
     }
 
@@ -1945,34 +1995,34 @@ mod tests {
     #[test]
     fn with_nothing_to_replace_only_the_times_move_to_zero() {
         let dir = ivf_dir("copy");
-        let frames: Vec<(u64, Vec<u8>)> = vec![(50, vec![1; 3]), (60, vec![2; 4]), (75, vec![3])];
+        let frames: Vec<(u64, Vec<u8>)> = vec![(50, key(vec![1; 3])), (60, vec![2; 4]), (75, vec![3])];
         write_ivf(&dir.join("src.ivf"), &frames);
         let (head, index) = ivf_index(&dir.join("src.ivf")).unwrap();
         splice(&dir.join("src.ivf"), &head, &index, &[], &dir.join("out.ivf")).unwrap();
         let (_, out) = ivf_index(&dir.join("out.ivf")).unwrap();
-        assert_eq!(out.iter().map(|f| (f.pts, f.size)).collect::<Vec<_>>(), vec![(0, 3), (10, 4), (25, 1)]);
+        assert_eq!(out.iter().map(|f| (f.pts, f.size)).collect::<Vec<_>>(), vec![(0, KEY + 3), (10, 4), (25, 1)]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn the_first_and_last_frames_can_be_replaced_too() {
         let dir = ivf_dir("ends");
-        write_ivf(&dir.join("src.ivf"), &[(0, vec![1]), (1, vec![2]), (2, vec![3])]);
-        write_ivf(&dir.join("a.ivf"), &[(9, vec![0xa; 5])]);
-        write_ivf(&dir.join("b.ivf"), &[(9, vec![0xb; 6])]);
+        write_ivf(&dir.join("src.ivf"), &[(0, key(vec![1])), (1, vec![2]), (2, vec![3])]);
+        write_ivf(&dir.join("a.ivf"), &[(9, key(vec![0xa; 5]))]);
+        write_ivf(&dir.join("b.ivf"), &[(9, key(vec![0xb; 6]))]);
         let (head, index) = ivf_index(&dir.join("src.ivf")).unwrap();
         let fx = [fixed(Run { start: 0, end: 1 }, dir.join("a.ivf")), fixed(Run { start: 2, end: 3 }, dir.join("b.ivf"))];
         splice(&dir.join("src.ivf"), &head, &index, &fx, &dir.join("out.ivf")).unwrap();
         let (_, out) = ivf_index(&dir.join("out.ivf")).unwrap();
-        assert_eq!(out.iter().map(|f| (f.pts, f.size)).collect::<Vec<_>>(), vec![(0, 5), (1, 1), (2, 6)]);
+        assert_eq!(out.iter().map(|f| (f.pts, f.size)).collect::<Vec<_>>(), vec![(0, KEY + 5), (1, 1), (2, KEY + 6)]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn a_stretch_that_lies_outside_the_frames_left_is_refused() {
         let dir = ivf_dir("outside");
-        write_ivf(&dir.join("src.ivf"), &[(0, vec![1]), (1, vec![2]), (2, vec![3])]);
-        write_ivf(&dir.join("a.ivf"), &[(0, vec![9]), (1, vec![9])]);
+        write_ivf(&dir.join("src.ivf"), &[(0, key(vec![1])), (1, vec![2]), (2, vec![3])]);
+        write_ivf(&dir.join("a.ivf"), &[(0, key(vec![9])), (1, vec![9])]);
         let (head, index) = ivf_index(&dir.join("src.ivf")).unwrap();
         for fx in [
             vec![fixed(Run { start: 7, end: 8 }, dir.join("a.ivf"))],
@@ -1982,6 +2032,40 @@ mod tests {
             let e = splice(&dir.join("src.ivf"), &head, &index, &fx, &dir.join("out.ivf")).unwrap_err().to_string();
             assert!(e.contains("does not begin at a frame"), "{e}");
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_stretch_whose_sequence_header_says_other_frames_is_refused_and_one_of_another_level_goes_in() {
+        let dir = ivf_dir("headers");
+        write_ivf(&dir.join("src.ivf"), &[(0, key(vec![1])), (1, vec![2]), (2, vec![3])]);
+        let (head, index) = ivf_index(&dir.join("src.ivf")).unwrap();
+        let piece = |name: &str, first: Vec<u8>| {
+            write_ivf(&dir.join(name), &[(0, first)]);
+            vec![fixed(Run { start: 2, end: 3 }, dir.join(name))]
+        };
+        // Limited range in a full-range video, as the cuts made it before; and no header.
+        for (name, first, why) in [
+            ("limited.ivf", starting(&header_with("color_range", 0), vec![7]), "its range differs (color_range limited, where the stream it goes into says full)"),
+            ("eight-bit.ivf", starting(&header_with("high_bitdepth", 0), vec![7]), "its bit depth differs"),
+            ("bare.ivf", vec![0x12, 0x00, 0x32, 0x01, 7], "it starts without a sequence header"),
+        ] {
+            let out = dir.join(format!("{name}.out"));
+            let e = splice(&dir.join("src.ivf"), &head, &index, &piece(name, first), &out).unwrap_err().to_string();
+            assert!(e.starts_with("the stretch encoded again from frame 2 cannot be put into the video: ") && e.contains(why), "{name}: {e}");
+            // Refused before anything is written.
+            assert!(!out.exists(), "{name}");
+        }
+        // Another level goes in, and is said.
+        let fx = piece("level.ivf", starting(&header_with("seq_level_idx[0]", 4), vec![7]));
+        let d = splice(&dir.join("src.ivf"), &head, &index, &fx, &dir.join("out.ivf")).unwrap();
+        assert_eq!(d, [sequence_header::Difference { what: "level", stream: "2.1".into(), piece: "3.0".into() }]);
+        assert_eq!(ivf_index(&dir.join("out.ivf")).unwrap().1.len(), 3);
+        // A video whose own first frame holds none is not spliced into.
+        write_ivf(&dir.join("plain.ivf"), &[(0, vec![1]), (1, vec![2]), (2, vec![3])]);
+        let (head, index) = ivf_index(&dir.join("plain.ivf")).unwrap();
+        let e = splice(&dir.join("plain.ivf"), &head, &index, &[], &dir.join("plain.out")).unwrap_err().to_string();
+        assert!(e.contains("first frame holds no sequence header"), "{e}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

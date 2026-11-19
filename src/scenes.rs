@@ -13,6 +13,7 @@
 use crate::events::Event;
 use crate::probe::MediaInfo;
 use crate::search::{self, EncodeSettings, Trial};
+use crate::sequence_header;
 use crate::tools::{FAILED_INSIDE, Tools, hms, path_arg};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -754,15 +755,44 @@ pub fn encode_all(c: &Ctx, plan: &Plan) -> Result<Vec<ChunkResult>> {
 }
 
 /// Joins the chunk encodes. Each chunk is a self-contained AV1 low-overhead bitstream starting
-/// with a sequence header and key frame, so plain concatenation is a valid stream.
-pub fn concat(work: &Path, n: usize) -> Result<PathBuf> {
+/// with a sequence header and key frame, so plain concatenation is a valid stream, where every
+/// chunk's header says what the first one's does, but for what changes nothing in how a frame
+/// is decoded (see [`sequence_header::joinable`]): those differences are returned. A chunk
+/// that cannot be joined fails the join before anything is written, and the chunks stay.
+pub fn concat(work: &Path, n: usize) -> Result<(PathBuf, Vec<sequence_header::Difference>)> {
+    use std::io::Read;
+    // A chunk's sequence header comes before its first frame, so the first 64 KiB hold it
+    // whatever that frame's size.
+    let header_of = |i: usize| -> Result<Option<Vec<u8>>> {
+        let mut start = Vec::new();
+        let chunk = std::fs::File::open(chunk_path(work, i, "obu")).with_context(|| format!("chunk {} missing", i + 1))?;
+        chunk.take(1 << 16).read_to_end(&mut start)?;
+        Ok(sequence_header::first_in(&start).map(<[u8]>::to_vec))
+    };
+    let mut differences: Vec<sequence_header::Difference> = Vec::new();
+    if n > 0 {
+        let Some(first) = header_of(0)? else { bail!("chunk 1 starts without a sequence header; the finished chunks are kept; {FAILED_INSIDE}") };
+        for i in 1..n {
+            let joined = header_of(i)?.ok_or_else(|| "it starts without a sequence header".to_string()).and_then(|h| sequence_header::joinable(&first, &h));
+            match joined {
+                Ok(found) => {
+                    for d in found {
+                        if !differences.iter().any(|e| e.what == d.what) {
+                            differences.push(d);
+                        }
+                    }
+                }
+                Err(why) => bail!("chunk {} of {n} cannot be joined to the first: {}; the finished chunks are kept; {FAILED_INSIDE}", i + 1, why),
+            }
+        }
+    }
     let out = work.join("video.obu");
     let mut f = crate::files::create_new(&out)?;
     for i in 0..n {
         let mut chunk = std::fs::File::open(chunk_path(work, i, "obu")).with_context(|| format!("chunk {} missing", i + 1))?;
         std::io::copy(&mut chunk, &mut f)?;
     }
-    Ok(out)
+    Ok((out, differences))
 }
 
 /// Gives every frame of the joined stream the time its source frame has. The stream is
@@ -836,6 +866,44 @@ pub fn fnv1a(s: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunks_whose_sequence_headers_say_other_frames_are_not_joined_and_are_kept() {
+        use crate::sequence_header::sample::{header, starting};
+        let work = std::env::temp_dir().join(format!("av1opt-scenes-join-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).unwrap();
+        let full = header("color_range", 1);
+        let write = |chunks: &[Vec<u8>]| {
+            let _ = std::fs::remove_file(work.join("video.obu"));
+            for (i, c) in chunks.iter().enumerate() {
+                std::fs::write(chunk_path(&work, i, "obu"), c).unwrap();
+            }
+        };
+        let (a, b) = (starting(&full, &[1, 2, 3]), starting(&full, &[4, 5]));
+        // Alike: joined end to end, nothing to say.
+        write(&[a.clone(), b.clone()]);
+        let (out, differences) = concat(&work, 2).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), [a.clone(), b.clone()].concat());
+        assert!(differences.is_empty());
+        // A chunk in another range, or with no header, is refused before anything is written,
+        // and the chunks stay.
+        for (third, why) in [
+            (starting(&header("color_range", 0), &[6]), "chunk 3 of 3 cannot be joined to the first: its range differs (color_range limited, where the stream it goes into says full)"),
+            (vec![0x12, 0x00, 0x32, 0x01, 6], "chunk 3 of 3 cannot be joined to the first: it starts without a sequence header"),
+        ] {
+            write(&[a.clone(), b.clone(), third]);
+            let e = concat(&work, 3).unwrap_err().to_string();
+            assert!(e.starts_with(why) && e.contains("the finished chunks are kept"), "{e}");
+            assert!(!work.join("video.obu").exists());
+            assert!((0..3).all(|i| chunk_path(&work, i, "obu").exists()));
+        }
+        // Another superblock size goes in, and is said.
+        write(&[a.clone(), starting(&header("use_128x128_superblock", 1), &[4, 5])]);
+        let (_, differences) = concat(&work, 2).unwrap();
+        assert_eq!(crate::sequence_header::note(&differences, "some scenes", "the first").unwrap(), "some scenes say another superblock size in their sequence headers (superblock size 128x128 where the first says 64x64): this only tells a decoder what to be ready for, not how to decode, and is left as it is");
+        std::fs::remove_dir_all(&work).unwrap();
+    }
 
     #[test]
     fn a_chunk_is_taken_over_only_when_it_is_the_encode_its_record_measured() {

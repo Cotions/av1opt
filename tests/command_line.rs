@@ -345,3 +345,19 @@ fn the_exit_status_tells_failed_files_from_errors_and_wrong_usage() {
     c.run(&["encode", "videos", "-o", "afile"]).ended(1).has("afile");
     assert_eq!(text(&c.path("afile")), "someone's");
 }
+
+#[test]
+fn a_file_at_the_outputs_name_without_a_good_report_is_not_counted_as_done() {
+    let c = Case::with_ffmpeg("unverified", "exit 1");
+    c.video("a.mkv");
+    std::fs::create_dir(c.path("out")).unwrap();
+    std::fs::write(c.path("out/a.mp4"), "").unwrap();
+    c.run(&["encode", "videos", "-o", "out"])
+        .ended(3)
+        .has("out/a.mp4 exists, not made by this run: not verified, left alone (it has no report)")
+        .has("already done 0, not verified 1")
+        .lacks("already done:");
+    std::fs::write(c.path("out/a.av1opt.json"), "{ cut off").unwrap();
+    c.run(&["encode", "videos", "-o", "out"]).ended(3).has("its report cannot be read").has("not verified 1");
+    assert_eq!(text(&c.path("out/a.mp4")), "", "it is left as it was");
+}

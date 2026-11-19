@@ -1042,7 +1042,8 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
             Err(e) => eprintln!("warning: the report of an earlier encode, which says where its original is, could not be kept: {e}"),
         }
     }
-    crate::files::write_new(&report_at, &serde_json::to_vec_pretty(&report)?)?;
+    // Whole or not at all: a report cut off by a crash would leave its output unverified.
+    crate::files::replace_with(&report_at, &serde_json::to_vec_pretty(&report)?)?;
     let recorded = crate::ledger::note_encoded(&crate::ledger::Encode {
         output: &abs_output,
         report: &abs_output.with_extension("av1opt.json"),

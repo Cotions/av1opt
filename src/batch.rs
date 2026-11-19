@@ -474,6 +474,8 @@ enum Before {
     Done,
     /// Nothing to do and nothing wrong: the input is itself the result of an earlier run.
     Leave(String),
+    /// A file stands at the output's name and nothing says what it is.
+    Unverified(String),
     Refuse(String),
 }
 
@@ -507,10 +509,11 @@ fn before_encoding(output: &Path, clash: Option<&Clash>, input: &Path, o: &Optio
     // Only a report says what an output was made from: the same file name can come from two
     // input folders, or be a file that has nothing to do with this run.
     let Some(made) = made else {
-        // No report beside it: reports get tidied away, and a run that died between the file
-        // and its report left one such. It is nobody's input (see above), so it is left alone
-        // and counted as done, as it always was.
-        return Before::Done;
+        // Reports get tidied away and a run can die between the file and its report, but the
+        // file can as well be empty, cut off or something else altogether: nothing here says
+        // this input has been encoded. It is nobody's input (see above), so it stays as it is.
+        let why = if output.with_extension("av1opt.json").exists() { "its report cannot be read" } else { "it has no report" };
+        return Before::Unverified(format!("{} exists, not made by this run: not verified, left alone ({why}); move or delete it to encode this file", output.display()));
     };
     if !same_sections(&o.remove, &made.removed) {
         return Before::Refuse(format!("{} exists but has other sections removed; move or delete it to encode again", output.display()));
@@ -539,6 +542,8 @@ pub struct Summary {
     pub skipped: usize,
     pub failed: usize,
     pub already_done: usize,
+    /// Files whose output's name is taken by something without a report to say what it is.
+    pub unverified: usize,
     pub bytes_in: u64,
     pub bytes_out: u64,
     /// The user stopped the run; remaining files were not started.
@@ -633,6 +638,13 @@ pub fn run_placed(tools: &Tools, jobs: &[Job], out_dir: &Path, place: Option<&Ou
                 eprintln!("skipped: {why}");
                 end("skip", &why, 0);
                 sum.skipped += 1;
+                continue;
+            }
+            Before::Unverified(msg) => {
+                eprintln!("{msg}");
+                end("skip", &msg, 0);
+                sum.unverified += 1;
+                record("unverified", &abs, size, &msg);
                 continue;
             }
             Before::Refuse(msg) => {
@@ -879,13 +891,23 @@ mod tests {
         assert!(ends["a.mkv"].1.starts_with("its output would take the place of another input"), "{:?}", ends["a.mkv"]);
         assert!(ends["a.mp4"].1.contains("the output would be written over this same video"), "{:?}", ends["a.mp4"]);
 
-        // A file of that name in another folder is nobody's input: whoever tidied its report
-        // away does not get it encoded again, or an error for every file of a run.
+        // A file of that name in another folder is nobody's input. It may be anything, so it
+        // does not count as this one's encode; it is not encoded over either.
         let source = Folder::new("noreport-in", &["c.mkv"]);
         let out = Folder::new("noreport-out", &["c.mp4"]);
         let (sum, ends) = source.walk(&out.0, &options());
-        assert_eq!((sum.already_done, sum.failed), (1, 0));
-        assert_eq!(ends["c.mkv"].0, "done_before");
+        assert_eq!((sum.already_done, sum.unverified, sum.failed), (0, 1, 0));
+        assert_eq!(ends["c.mkv"].0, "skip");
+        assert!(ends["c.mkv"].1.contains("exists, not made by this run: not verified, left alone (it has no report)"), "{:?}", ends["c.mkv"]);
+        assert_eq!(std::fs::read(out.0.join("c.mp4")).unwrap(), b"video");
+        // The log does not take it for a skip.
+        assert!(read_skips(&out.0.join(LOG_NAME), &settings_key(&options())).is_empty());
+
+        // A report that cannot be understood says nothing either.
+        std::fs::write(out.0.join("c.av1opt.json"), b"{ cut off").unwrap();
+        let (sum, ends) = source.walk(&out.0, &options());
+        assert_eq!((sum.already_done, sum.unverified), (0, 1));
+        assert!(ends["c.mkv"].1.contains("its report cannot be read"), "{:?}", ends["c.mkv"]);
     }
 
     #[test]

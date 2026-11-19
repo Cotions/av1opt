@@ -244,7 +244,7 @@ enum Cmd {
     },
     /// Re-encode videos to AV1 at a target quality. Inputs are never modified; results go to --out-dir.
     /// Folders are processed recursively and their layout is mirrored. Re-running resumes.
-    #[command(after_help = "Exit status: 0 when no file failed, 1 on an error that stopped the run, 2 on wrong usage, 3 when some files failed and the others were dealt with, 130 or 143 when stopped by Ctrl-C or SIGTERM.")]
+    #[command(after_help = "Exit status: 0 when no file failed, 1 on an error that stopped the run, 2 on wrong usage, 3 when some files failed or an output already there could not be verified and the others were dealt with, 130 or 143 when stopped by Ctrl-C or SIGTERM.")]
     Encode {
         /// Video files and/or folders.
         #[arg(required = true)]
@@ -739,15 +739,16 @@ fn run_command(command: Cmd) -> Result<()> {
             }
             let s = batch::run(&tools, &jobs, &out_dir, &opts, retry_skipped)?;
             let saved = s.bytes_in.saturating_sub(s.bytes_out) as f64 / 1e9;
+            let unverified = if s.unverified > 0 { format!(", not verified {}", s.unverified) } else { String::new() };
             eprintln!(
-                "\nencoded {}, skipped {}, failed {}, already done {} | {:.2} GB -> {:.2} GB ({saved:.2} GB saved)",
+                "\nencoded {}, skipped {}, failed {}, already done {}{unverified} | {:.2} GB -> {:.2} GB ({saved:.2} GB saved)",
                 s.ok, s.skipped, s.failed, s.already_done, s.bytes_in as f64 / 1e9, s.bytes_out as f64 / 1e9
             );
             eprintln!("log: {}", out_dir.join(batch::LOG_NAME).display());
             for folder in &s.kept {
                 eprintln!("kept for the next run: {}", folder.display());
             }
-            if s.failed > 0 && !s.cancelled {
+            if (s.failed > 0 || s.unverified > 0) && !s.cancelled {
                 std::process::exit(SOME_FILES_FAILED);
             }
             Ok(())

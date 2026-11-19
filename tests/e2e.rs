@@ -1867,7 +1867,7 @@ fn two_inputs_with_one_output_name_leave_the_output_to_the_first_under_overwrite
 
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
-fn an_output_whose_report_was_deleted_counts_as_done() {
+fn an_output_whose_report_was_deleted_is_left_alone_as_not_verified() {
     let c = Case::new("noreport");
     let src = c.clip("a.mp4", "320x180", 4);
     c.encode(&[&src], &[]).ok().has("encoded 1, skipped 0, failed 0, already done 0");
@@ -1875,7 +1875,9 @@ fn an_output_whose_report_was_deleted_counts_as_done() {
     let (bytes, made) = (std::fs::read(&out).unwrap(), mtime(&out));
     std::fs::remove_file(c.out().join("a.av1opt.json")).unwrap();
 
-    c.encode(&[&src], &[]).ok().has("encoded 0, skipped 0, failed 0, already done 1").has(&format!("already done: {}", out.display()));
+    let r = c.encode(&[&src], &[]);
+    assert_eq!(r.code, Some(3), "{}", r.err);
+    r.has("encoded 0, skipped 0, failed 0, already done 0, not verified 1").has(&format!("{} exists, not made by this run: not verified, left alone", out.display()));
     assert!(std::fs::read(&out).unwrap() == bytes && mtime(&out) == made, "the output was written again");
     assert_eq!(c.outputs(), ["a.mp4", "av1opt-log.tsv"]);
     // One encode in the history: the second run did not make another.

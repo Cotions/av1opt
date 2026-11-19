@@ -368,7 +368,9 @@ over. At the same size and another modification time the fingerprint in the repo
 (see Verify above): a source only touched, or copied without its dates, counts as done, and
 one rewritten is reported. So is one whose report holds the time but no fingerprint, which
 cannot tell the two apart. Deleting the output encodes the source again. A report too old to
-hold the time goes by the size alone, and a file there with no report at all counts as done.
+hold the time goes by the size alone. A file there with no report, or with one that cannot
+be read, says nothing about what it is: it is listed as not verified and left alone, the run
+ends with status 3, and moving or deleting it has the source encoded.
 An output is never written where its own source or another
 input of the run is, whatever name leads there (`--overwrite` included): with `-o` the folder
 being walked, `a.mkv` is refused when `a.mp4` is there too, and the rest of the run goes on;
@@ -389,8 +391,9 @@ from two input folders), the second is reported as a name collision instead of b
 ### Exit status
 
 `encode` ends with 0 when no file failed (files skipped or already done are no failure), 1 on
-an error that stopped the run, 2 on wrong usage, 3 when some files failed and the others were
-dealt with, and 130 or 143 when Ctrl-C or SIGTERM stopped it.
+an error that stopped the run, 2 on wrong usage, 3 when some files failed or an output already
+there could not be verified and the others were dealt with, and 130 or 143 when Ctrl-C or
+SIGTERM stopped it.
 
 ### File names
 

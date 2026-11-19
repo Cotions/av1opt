@@ -270,20 +270,55 @@ fn settings_key(o: &Options) -> String {
     k
 }
 
-/// Previous skip decisions, keyed by absolute input path and size (a changed file is retried).
-/// Lines from older versions carry no settings and count for any settings. Read as bytes and
-/// line by line: one damaged line costs that line, not what the rest of the log remembers.
-fn read_skips(log: &Path, settings: &str) -> HashMap<(PathBuf, u64), String> {
+/// A file's modification time as the log holds it, to the nanosecond the system gives.
+fn modified_stamp(meta: &std::fs::Metadata) -> Option<u128> {
+    Some(meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_nanos())
+}
+
+/// A skip decision an earlier run wrote down.
+struct PastSkip {
+    reason: String,
+    /// When the line was written, in seconds.
+    logged: Option<u64>,
+    /// The file's modification time then (see [`modified_stamp`]); older lines lack it.
+    modified: Option<u128>,
+}
+
+impl PastSkip {
+    /// Whether it still speaks for a file last changed at `now`. A line that does not hold the
+    /// time still shows a file changed after the line was written.
+    fn holds_at(&self, now: Option<u128>) -> bool {
+        let Some(now) = now else { return true };
+        match (self.modified, self.logged) {
+            (Some(then), _) => then == now,
+            (None, Some(logged)) => now / 1_000_000_000 <= u128::from(logged),
+            (None, None) => true,
+        }
+    }
+}
+
+/// Whether a run aims where the defaults do. Lines of older versions do not say what their
+/// skip was decided under, and those defaults are the likeliest answer.
+fn at_default_aims(o: &Options) -> bool {
+    o.target_vmaf == 93.0 && o.preset == crate::search::DEFAULT_PRESET && o.min_savings == crate::estimate::MIN_SAVINGS
+}
+
+/// Previous skip decisions, keyed by absolute input path and size. A line counts for the
+/// settings it was decided under; `unlabelled` says whether lines that name none count. Read
+/// as bytes and line by line: one damaged line costs that line, not what the rest of the log
+/// remembers.
+fn read_skips(log: &Path, settings: &str, unlabelled: bool) -> HashMap<(PathBuf, u64), PastSkip> {
     let Ok(bytes) = std::fs::read(log) else { return HashMap::new() };
     bytes
         .split(|b| *b == b'\n')
         .filter_map(|l| {
             let l = std::str::from_utf8(l).ok()?;
             let f: Vec<&str> = l.trim_end_matches('\r').split('\t').collect();
-            if f.len() < 5 || f[1] != "skip" || f.get(5).is_some_and(|s| *s != settings) {
+            if f.len() < 5 || f[1] != "skip" || !f.get(5).map_or(unlabelled, |s| *s == settings) {
                 return None;
             }
-            Some(((PathBuf::from(unescape_name(f[2])), f[3].parse().ok()?), f[4].to_string()))
+            let skip = PastSkip { reason: f[4].to_string(), logged: f[0].parse().ok(), modified: f.get(6).and_then(|m| m.parse().ok()) };
+            Some(((PathBuf::from(unescape_name(f[2])), f[3].parse().ok()?), skip))
         })
         .collect()
 }
@@ -316,10 +351,11 @@ fn unescape_name(field: &str) -> String {
     name
 }
 
-fn log_line(log: &Path, status: &str, input: &Path, size: u64, detail: &str, settings: &str) -> Result<()> {
+fn log_line(log: &Path, status: &str, input: &Path, (size, modified): (u64, Option<u128>), detail: &str, settings: &str) -> Result<()> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let clean = detail.replace(['\t', '\n'], " ");
-    let line = format!("{now}\t{status}\t{}\t{size}\t{clean}\t{settings}", escape_name(&input.display().to_string()));
+    let modified = modified.map_or(String::new(), |m| m.to_string());
+    let line = format!("{now}\t{status}\t{}\t{size}\t{clean}\t{settings}\t{modified}", escape_name(&input.display().to_string()));
     Ok(crate::files::append_line(log, &line, false)?)
 }
 
@@ -585,12 +621,13 @@ pub fn run_placed(tools: &Tools, jobs: &[Job], out_dir: &Path, place: Option<&Ou
     let may_write = || folder_problem().map_or(Ok(()), Err);
     let log = out_dir.join(LOG_NAME);
     let settings = settings_key(o);
-    let skips = if retry_skipped { HashMap::new() } else { read_skips(&log, &settings) };
+    // --force asks for an encode whatever was decided before.
+    let skips = if retry_skipped || o.force { HashMap::new() } else { read_skips(&log, &settings, at_default_aims(o)) };
     let clashes = clashes(jobs, o);
     // The log serves the next run; a log that cannot be written is no reason to stop this one.
     let log_warned = Cell::new(false);
-    let record = |status: &str, input: &Path, size: u64, detail: &str| {
-        if let Err(e) = log_line(&log, status, input, size, detail, &settings)
+    let record = |status: &str, input: &Path, file: (u64, Option<u128>), detail: &str| {
+        if let Err(e) = log_line(&log, status, input, file, detail, &settings)
             && !log_warned.replace(true)
         {
             eprintln!("warning: cannot write to {}: {e}; going on without it", log.display());
@@ -599,7 +636,10 @@ pub fn run_placed(tools: &Tools, jobs: &[Job], out_dir: &Path, place: Option<&Ou
     let mut sum = Summary::default();
     for (i, job) in jobs.iter().enumerate() {
         let abs = std::fs::canonicalize(&job.input).or_else(|_| std::path::absolute(&job.input))?;
-        let size = std::fs::metadata(&job.input).map_or(0, |m| m.len());
+        let meta = std::fs::metadata(&job.input).ok();
+        let size = meta.as_ref().map_or(0, |m| m.len());
+        let modified = meta.as_ref().and_then(modified_stamp);
+        let file = (size, modified);
         let output = output_of(job, o);
         eprintln!("\n[{}/{}] {}", i + 1, jobs.len(), job.input.display());
         if tools.check_cancel().is_err() {
@@ -644,14 +684,14 @@ pub fn run_placed(tools: &Tools, jobs: &[Job], out_dir: &Path, place: Option<&Ou
                 eprintln!("{msg}");
                 end("skip", &msg, 0);
                 sum.unverified += 1;
-                record("unverified", &abs, size, &msg);
+                record("unverified", &abs, file, &msg);
                 continue;
             }
             Before::Refuse(msg) => {
                 eprintln!("FAILED: {msg}");
                 end("error", &msg, 0);
                 sum.failed += 1;
-                record("error", &abs, size, &msg);
+                record("error", &abs, file, &msg);
                 continue;
             }
         }
@@ -661,7 +701,7 @@ pub fn run_placed(tools: &Tools, jobs: &[Job], out_dir: &Path, place: Option<&Ou
             sum.already_done += 1;
             continue;
         }
-        if let Some(reason) = skips.get(&(abs.clone(), size)) {
+        if let Some(PastSkip { reason, .. }) = skips.get(&(abs.clone(), size)).filter(|s| s.holds_at(modified)) {
             eprintln!("skipped earlier: {reason} (use --retry-skipped to try again)");
             end("skip", &format!("skipped earlier: {reason}"), 0);
             sum.skipped += 1;
@@ -676,7 +716,7 @@ pub fn run_placed(tools: &Tools, jobs: &[Job], out_dir: &Path, place: Option<&Ou
                 sum.bytes_in += size;
                 sum.bytes_out += out_size;
                 end("ok", &out.display().to_string(), out_size);
-                record("ok", &abs, size, &out.display().to_string());
+                record("ok", &abs, file, &out.display().to_string());
             }
             // Whatever else went wrong once the run was stopped comes of the stopping: Ctrl-C
             // reaches an ffprobe under way directly, and it fails like a damaged file.
@@ -698,7 +738,7 @@ pub fn run_placed(tools: &Tools, jobs: &[Job], out_dir: &Path, place: Option<&Ou
                 eprintln!("skipped: {e}");
                 end("skip", &e.to_string(), 0);
                 sum.skipped += 1;
-                record("skip", &abs, size, &e.to_string());
+                record("skip", &abs, file, &e.to_string());
             }
             Err(e) => {
                 let detail = format!("{e:#}");
@@ -711,7 +751,7 @@ pub fn run_placed(tools: &Tools, jobs: &[Job], out_dir: &Path, place: Option<&Ou
                     Some(problem) => {
                         sum.out_dir_lost.get_or_insert(problem);
                     }
-                    None => record("error", &abs, size, &detail),
+                    None => record("error", &abs, file, &detail),
                 }
             }
         }
@@ -901,7 +941,7 @@ mod tests {
         assert!(ends["c.mkv"].1.contains("exists, not made by this run: not verified, left alone (it has no report)"), "{:?}", ends["c.mkv"]);
         assert_eq!(std::fs::read(out.0.join("c.mp4")).unwrap(), b"video");
         // The log does not take it for a skip.
-        assert!(read_skips(&out.0.join(LOG_NAME), &settings_key(&options())).is_empty());
+        assert!(read_skips(&out.0.join(LOG_NAME), &settings_key(&options()), true).is_empty());
 
         // A report that cannot be understood says nothing either.
         std::fs::write(out.0.join("c.av1opt.json"), b"{ cut off").unwrap();
@@ -1318,10 +1358,10 @@ mod tests {
         let log = dir.join(LOG_NAME);
         let names = ["/v/a\tb.mkv", "/v/c\nd.mkv", "/v/e\rf.mkv", "/v/back\\slash.mkv", "/v/lit\\tab.mkv"];
         for n in names {
-            log_line(&log, "skip", Path::new(n), 10, "lean", "s").unwrap();
+            log_line(&log, "skip", Path::new(n), (10, None), "lean", "s").unwrap();
         }
         assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), names.len());
-        let skips = read_skips(&log, "s");
+        let skips = read_skips(&log, "s", true);
         for n in names {
             assert!(skips.contains_key(&(PathBuf::from(n), 10)), "{n:?}");
         }
@@ -1366,24 +1406,78 @@ mod tests {
     #[test]
     fn skips_only_count_for_the_same_settings() {
         let dir = std::env::temp_dir().join(format!("av1opt-skiptest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let log = dir.join(LOG_NAME);
         let p = Path::new("/videos/a.mp4");
-        log_line(&log, "skip", p, 10, "too lean", "vmaf=93 preset=10").unwrap();
+        log_line(&log, "skip", p, (10, None), "too lean", "vmaf=93 preset=10").unwrap();
         // Older format without settings.
         std::fs::OpenOptions::new().append(true).open(&log).map(|mut f| writeln!(f, "1\tskip\t/videos/b.mp4\t20\told")).unwrap().unwrap();
-        let same = read_skips(&log, "vmaf=93 preset=10");
-        let other = read_skips(&log, "vmaf=93 preset=6");
+        let same = read_skips(&log, "vmaf=93 preset=10", false);
+        let other = read_skips(&log, "vmaf=93 preset=6", true);
         assert!(same.contains_key(&(p.to_path_buf(), 10)));
         assert!(!other.contains_key(&(p.to_path_buf(), 10)));
         assert!(other.contains_key(&(PathBuf::from("/videos/b.mp4"), 20)));
+        // A line that names no settings counts only for a run at the default aims.
+        assert!(!same.contains_key(&(PathBuf::from("/videos/b.mp4"), 20)));
+        assert!(at_default_aims(&options()));
+        for changed in [Options { target_vmaf: 50.0, ..options() }, Options { preset: 8, ..options() }, Options { min_savings: 0.3, ..options() }] {
+            assert!(!at_default_aims(&changed));
+        }
 
         // A byte that is not text costs its own line and no other.
         std::fs::OpenOptions::new().append(true).open(&log).map(|mut f| f.write_all(b"1\tskip\t/videos/\xff.mp4\t30\told\n")).unwrap().unwrap();
-        log_line(&log, "skip", Path::new("/videos/c.mp4"), 40, "too lean", "s").unwrap();
-        let after = read_skips(&log, "s");
+        log_line(&log, "skip", Path::new("/videos/c.mp4"), (40, None), "too lean", "s").unwrap();
+        let after = read_skips(&log, "s", true);
         assert!(after.contains_key(&(PathBuf::from("/videos/b.mp4"), 20)) && after.contains_key(&(PathBuf::from("/videos/c.mp4"), 40)));
         assert_eq!(after.len(), 2);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_skip_is_for_the_file_as_it_was() {
+        let skip = |logged, modified| PastSkip { reason: String::new(), logged, modified };
+        let second = 1_000_000_000_u128;
+        assert!(skip(Some(100), Some(50 * second)).holds_at(Some(50 * second)));
+        // Rewritten at the same size, earlier or later: the time is another.
+        assert!(!skip(Some(100), Some(50 * second)).holds_at(Some(60 * second)));
+        assert!(!skip(Some(100), Some(50 * second)).holds_at(Some(50 * second + 1)));
+        // A line that lacks the time still shows a file changed after it was written.
+        assert!(skip(Some(100), None).holds_at(Some(100 * second)));
+        assert!(!skip(Some(100), None).holds_at(Some(101 * second)));
+        // Where nothing can be told it stands, as it always did.
+        assert!(skip(None, None).holds_at(Some(second)));
+        assert!(skip(Some(100), Some(second)).holds_at(None));
+    }
+
+    /// A batch of one file over a log that says it was skipped: whether the skip held.
+    fn skipped_earlier(line: impl Fn(&Path, u64, u128) -> String, o: &Options) -> bool {
+        let source = Folder::new("skipline-in", &["c.mkv"]);
+        let out = Folder::new("skipline-out", &[]);
+        let input = std::fs::canonicalize(source.0.join("c.mkv")).unwrap();
+        let meta = std::fs::metadata(&input).unwrap();
+        std::fs::write(out.0.join(LOG_NAME), line(&input, meta.len(), modified_stamp(&meta).unwrap())).unwrap();
+        let (_, ends) = source.walk(&out.0, o);
+        ends["c.mkv"].1.starts_with("skipped earlier")
+    }
+
+    #[test]
+    fn a_skip_line_gives_way_to_force_and_to_other_aims() {
+        let current = |input: &Path, size: u64, modified: u128| format!("1\tskip\t{}\t{size}\ttoo lean\t{}\t{modified}\n", input.display(), settings_key(&options()));
+        assert!(skipped_earlier(current, &options()));
+        // The settings of this very line, asked for with --force.
+        assert!(!skipped_earlier(current, &Options { force: true, ..options() }));
+        assert!(!skipped_earlier(current, &Options { target_vmaf: 50.0, ..options() }));
+        assert!(!skipped_earlier(|i, s, m| current(i, s, m + 1), &options()), "the file changed");
+
+        // A line of the oldest kind: five fields, written long after the file last changed.
+        let old = |input: &Path, size: u64, _: u128| format!("99999999999\tskip\t{}\t{size}\ttoo lean\n", input.display());
+        assert!(skipped_earlier(old, &options()));
+        assert!(!skipped_earlier(old, &Options { force: true, ..options() }));
+        assert!(!skipped_earlier(old, &Options { target_vmaf: 50.0, ..options() }));
+        assert!(!skipped_earlier(old, &Options { preset: 8, ..options() }));
+        assert!(!skipped_earlier(old, &Options { min_savings: 0.3, ..options() }));
+        // The same line written before the file last changed.
+        assert!(!skipped_earlier(|i, s, _| format!("1\tskip\t{}\t{s}\ttoo lean\n", i.display()), &options()));
     }
 }

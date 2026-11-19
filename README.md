@@ -360,9 +360,10 @@ contents directly below it, several folders each below a folder of their own nam
 appended to `av1opt-log.tsv` there; re-running the same command resumes: a finished file is
 skipped, whatever settings made it (`--overwrite` makes it again, over an earlier encode of the same file, and leaves anything else at that name alone), and files
 skipped for a reason (low savings, ...) are not searched again with the same settings (target,
-preset, CRF range, `--min-savings`, `--force`, and `--scenes`, `--audio`, `--svt-params`,
-`--tuned`, `--remove` and the samples where set) unless
-`--retry-skipped` is given. A finished file counts only for the source it was made from, as the
+preset, CRF range, `--min-savings`, and `--scenes`, `--audio`, `--svt-params`,
+`--tuned`, `--remove` and the samples where set) while their size and modification time stay
+the same, unless `--retry-skipped` or `--force` is given. Lines from versions that did not note
+the settings count only for a run at the default target, preset and `--min-savings`. A finished file counts only for the source it was made from, as the
 report beside it says. A source of the same name with another size is reported, not passed
 over. At the same size and another modification time the fingerprint in the report decides
 (see Verify above): a source only touched, or copied without its dates, counts as done, and

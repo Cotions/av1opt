@@ -361,3 +361,18 @@ fn a_file_at_the_outputs_name_without_a_good_report_is_not_counted_as_done() {
     c.run(&["encode", "videos", "-o", "out"]).ended(3).has("its report cannot be read").has("not verified 1");
     assert_eq!(text(&c.path("out/a.mp4")), "", "it is left as it was");
 }
+
+#[test]
+fn an_old_skip_does_not_stand_against_force_or_another_target() {
+    // ffmpeg fails whatever it is asked to do, which shows that the file was gone on with.
+    let c = Case::with_ffmpeg("old-skip", "echo 'stand-in ffmpeg: no' >&2; exit 1");
+    let video = c.video("a.mkv");
+    let size = std::fs::metadata(&video).unwrap().len();
+    std::fs::create_dir(c.path("out")).unwrap();
+    let line = format!("99999999999\tskip\t{}\t{size}\ttoo lean\n", std::fs::canonicalize(&video).unwrap().display());
+    std::fs::write(c.path("out/av1opt-log.tsv"), line).unwrap();
+    let encode = |extra: &[&str]| c.run(&[&["encode", "videos", "-o", "out", "--memory-limit", "none"], extra].concat());
+    encode(&[]).ended(0).has("skipped earlier: too lean");
+    encode(&["--force"]).ended(3).lacks("skipped earlier");
+    encode(&["--target-vmaf", "50"]).ended(3).lacks("skipped earlier");
+}

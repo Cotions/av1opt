@@ -502,6 +502,13 @@ pub fn clean_stale_temp(out_dir: &Path) {
     crate::files::remove_abandoned_folders(out_dir, TEMP_PREFIX);
 }
 
+/// Whether `landed`, what is at the output's name once the encode was moved there, is the
+/// file `made` that av1opt wrote and hashed, and not another put at that name since.
+fn is_the_one_made(landed: &std::fs::Metadata, made: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    landed.is_file() && (landed.dev(), landed.ino()) == (made.dev(), made.ino())
+}
+
 /// Whether the output's report can have its name, tried in `tmp`, which is on the same
 /// filesystem. It is the longest name a run gives anything, and the last thing written: found
 /// out then, the encode would be done and stand there without a report.
@@ -1130,13 +1137,12 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     // What has the output's name now has to be the file that was made and hashed: in a folder
     // others can write to, the name can be taken over the moment the encode lands there, and
     // the record would then speak for their file.
-    use std::os::unix::fs::MetadataExt;
     let ours = made_file.metadata()?;
     let landed = std::fs::symlink_metadata(&output).with_context(|| format!("the encode was put at {} and is gone", output.display()))?;
-    if !landed.is_file() || (landed.dev(), landed.ino()) != (ours.dev(), ours.ino()) {
+    if !is_the_one_made(&landed, &ours) {
         bail!(
-            "{} was replaced by something else as soon as the encode was put there, so nothing was recorded; someone else can write to {}: choose a folder only you can write to, or run `chmod +t` on it",
-            output.display(), out_dir.display()
+            "{} was replaced by something else as soon as the encode was put there, so nothing was recorded: what is at that name now ({}) is not av1opt's encode, and should be looked at and removed; someone else can write to {}: choose a folder only you can write to, or run `chmod +t` on it",
+            output.display(), crate::files::kind_of(&landed), out_dir.display()
         );
     }
     let output_bytes = ours.len();
@@ -2665,6 +2671,22 @@ mod tests {
         let taken = claim_output(&dir, "clip").map(|claim| claim.is_some()).map_err(|e| e.to_string());
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(taken, Ok(false));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn only_the_file_made_counts_as_landed_at_the_outputs_name() {
+        let dir = folder_for_test("landed");
+        let (made, other) = (dir.join("clip.mp4"), dir.join("theirs.mp4"));
+        std::fs::write(&made, b"video").unwrap();
+        std::fs::write(&other, b"video").unwrap();
+        let ours = std::fs::File::open(&made).unwrap().metadata().unwrap();
+        assert!(is_the_one_made(&std::fs::symlink_metadata(&made).unwrap(), &ours));
+        // Another file with the same contents, put at the name, is not it, nor is a link to it.
+        assert!(!is_the_one_made(&std::fs::symlink_metadata(&other).unwrap(), &ours));
+        let link = dir.join("link.mp4");
+        std::os::unix::fs::symlink(&made, &link).unwrap();
+        assert!(!is_the_one_made(&std::fs::symlink_metadata(&link).unwrap(), &ours));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

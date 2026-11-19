@@ -2164,7 +2164,10 @@ fn each_saved_job_outside_the_queue_can_be_tried_or_forgotten_by_itself() {
 #[test]
 fn a_job_cancelled_just_before_the_server_stops_does_not_come_back() {
     // A probe that holds the job for longer than a stop waits for it.
-    let (ffmpeg, ffprobe) = stand_in_tools("cancel-stop", "sleep 30\nexit 1");
+    // It says when it has begun: a stop that comes before the probe ends the job at once, and
+    // then there is no stopping server left to cancel anything on.
+    let (ffmpeg, ffprobe) = stand_in_tools("cancel-stop", "touch \"$(dirname \"$0\")/probing\"\nsleep 30\nexit 1");
+    let probing = Path::new(&ffprobe).with_file_name("probing");
     let launch_with = |name: &str, ffprobe: &str| {
         Server::start_with_tools(name, &ffmpeg, ffprobe, |d| {
             for video in ["a.mkv", "c.mkv"] {
@@ -2193,8 +2196,10 @@ fn a_job_cancelled_just_before_the_server_stops_does_not_come_back() {
 
     // Cancelled while the server is stopping: the stop waits a few seconds for a running job,
     // and the page can still be used meanwhile.
+    let _ = std::fs::remove_file(&probing);
     let mut s = launch("cancel-while-stopping");
     soon("the job runs", || heads(&s).first().is_some_and(|j| j["status"] == "running"));
+    soon("the probe holds the job", || probing.exists());
     let id = heads(&s)[0]["id"].as_u64().unwrap();
     unsafe { libc::kill(s.child.id() as i32, libc::SIGTERM) };
     assert_eq!(s.post(&format!("/api/jobs/{id}/cancel"), &json!({})).status, 200);

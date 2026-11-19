@@ -902,6 +902,8 @@ pub fn run_placed(tools: &Tools, jobs: &[Job], out_dir: &Path, place: Option<&Ou
                 end("skip", &msg, 0);
                 sum.unverified += 1;
                 record("unverified", &abs, file, &msg);
+                continue;
+            }
             Before::NeedsConfirming(why) => {
                 eprintln!("needs confirming: {why}");
                 end("needs_confirming", &why, 0);

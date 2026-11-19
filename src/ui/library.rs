@@ -513,7 +513,7 @@ fn replace_state(ledger: &Ledger, report: &Path, on_record: bool) -> Value {
         },
         // What only the person can settle is offered to them, with what cannot be checked.
         Check::No(why) => match replace::check_for_list_accepting_changed_date(report) {
-            Check::Ready(p) if ledger.check_ready(&p, false).is_ok() => json!({ "state": "needs_confirming", "why": why, "dest": p.dest, "copy": p.copy, "zfs": p.zfs, "removed": p.removed }),
+            Check::Ready(p) if ledger.check_ready(&p, None).is_ok() => json!({ "state": "needs_confirming", "why": why, "dest": p.dest, "copy": p.copy, "zfs": p.zfs, "removed": p.removed }),
             _ => no(why),
         },
         Check::Replaced(d) => match ledger.check_replaced(&d) {

@@ -1904,7 +1904,7 @@ fn a_memory_cap_reaches_ffmpeg_as_written_and_a_bad_one_is_refused() {
     for bad in ["garbage", "0", "12X"] {
         let r = c.encode(&[&src], &["--ffmpeg", ffmpeg, "--memory-limit", bad]);
         assert_eq!(r.code, Some(2), "{bad}: {}", r.err);
-        r.has("a memory cap is auto, none, or an amount such as 12G, 1.5G, 800M or 40%");
+        r.has("a memory cap is auto, none, infinity, or an amount such as 12G, 1.5G, 800M or 40%");
         assert!(!seen.exists(), "{bad} got as far as ffmpeg");
     }
     assert!(c.outputs().is_empty(), "{:?}", c.outputs());

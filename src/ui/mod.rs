@@ -10,6 +10,7 @@
 //! it made (see `ledger`) and previews. A report found in a folder adds nothing to these.
 
 mod bench;
+mod connections;
 mod dups;
 mod fields;
 mod hold;
@@ -456,6 +457,7 @@ pub fn run(cfg: Config) -> Result<()> {
     if open {
         open_browser(&url);
     }
+    connections::start(port);
     for req in server.incoming_requests() {
         let app = app.clone();
         std::thread::spawn(move || http::handle(&app, req));

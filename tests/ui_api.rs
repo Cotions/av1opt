@@ -1231,6 +1231,48 @@ fn what_the_server_keeps_is_closed_to_other_users() {
     }
 }
 
+#[test]
+fn connections_held_open_are_cut_to_the_limit_and_the_server_goes_on() {
+    use std::io::{ErrorKind, Read};
+    let s = Server::start("connections", |_| {});
+    const OPENED: usize = 104;
+    let mut idle: Vec<std::net::TcpStream> = (0..OPENED).map(|_| std::net::TcpStream::connect(("127.0.0.1", s.port)).unwrap()).collect();
+    for c in &idle {
+        c.set_read_timeout(Some(Duration::from_millis(1))).unwrap();
+    }
+    let started = Instant::now();
+    let mut refusals = 0;
+    while idle.len() > 64 {
+        assert!(started.elapsed() < Duration::from_secs(20), "{} connections are still open", idle.len());
+        idle.retain_mut(|c| {
+            let mut said = [0u8; 200];
+            match c.read(&mut said) {
+                Ok(0) => false,
+                Ok(n) => {
+                    assert!(said[..n].starts_with(b"HTTP/1.1 503"), "{}", String::from_utf8_lossy(&said[..n]));
+                    refusals += 1;
+                    false
+                }
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => true,
+                Err(e) => panic!("{e}"),
+            }
+        });
+    }
+    assert_eq!(refusals, OPENED - 64);
+    // Those within the limit are left alone, and new requests are answered beside them.
+    assert_eq!(s.get("/api/state").status, 200);
+    std::thread::sleep(Duration::from_millis(1200));
+    let still_open = idle
+        .iter()
+        .filter(|c| {
+            let mut reader: &std::net::TcpStream = c;
+            matches!(reader.read(&mut [0u8; 1]), Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut))
+        })
+        .count();
+    assert_eq!(still_open, 64);
+    assert_eq!(s.get("/api/state").status, 200);
+}
+
 /// A stand-in ffmpeg that writes its output, except for a file with `hang` in its name: there
 /// it notes its process number beside itself and never ends.
 const HANGS_ON_ONE_FILE: &str = "case \"$*\" in\n*hang*) echo $$ > \"$(dirname \"$0\")/hung\"; exec sleep 600;;\nesac\nfor last; do :; done\nprintf x > \"$last\"";

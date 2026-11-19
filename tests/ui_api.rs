@@ -1512,7 +1512,7 @@ fn what_a_command_was_asked_to_write_is_written_though_nobody_reads_its_output()
         drop(reader);
         writer
     };
-    let run = |what: &str, name: &str, args: &[&str], files: &[&str]| {
+    let command = |what: &str, name: &str, args: &[&str]| {
         let c = scan_command(name);
         let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("ui-{name}"));
         std::fs::write(dir.join("videos/a.mkv"), b"xx").unwrap();
@@ -1523,25 +1523,36 @@ fn what_a_command_was_asked_to_write_is_written_though_nobody_reads_its_output()
         if what != "scan" {
             command.args(["--ffmpeg", &ffmpeg]);
         }
-        for a in args {
-            command.arg(a);
-        }
+        command.args(args).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
+        (command, dir)
+    };
+    let run = |what: &str, name: &str, args: &[&str], files: &[&str]| {
+        let (mut command, dir) = command(what, name, args);
         for f in files {
             command.arg(dir.join(f));
         }
-        let out = command.stdin(std::process::Stdio::null()).stdout(closed()).stderr(std::process::Stdio::piped()).output().unwrap();
+        let out = command.stdout(closed()).output().unwrap();
         assert_eq!(out.status.signal(), Some(libc::SIGPIPE), "{what}: {out:?}");
         for f in files {
             assert!(dir.join(f).is_file(), "{what}: {f} was not written: {}", String::from_utf8_lossy(&out.stderr));
         }
     };
     run("scan", "unread-scan", &["--csv"], &["list.csv"]);
+    run("scan", "unread-scan-list", &["--hours", "1", "--list"], &["picked.txt"]);
     let dups = |name, flag, file| run("dups", name, &[flag], &[file]);
     dups("unread-dups-csv", "--csv", "groups.csv");
     dups("unread-dups-json", "--json", "groups.json");
-    let bench = |name, flag, file| run("bench", name, &["--presets", "8", "--params", "tune=0", flag], &[file]);
+    const ONE_SETTING: [&str; 4] = ["--presets", "8", "--params", "tune=0"];
+    let bench = |name, flag, file| run("bench", name, &[&ONE_SETTING[..], &[flag]].concat(), &[file]);
     bench("unread-bench-csv", "--csv", "results.csv");
     bench("unread-bench-json", "--json", "results.json");
+
+    // Nothing the stand-in tools do can be measured, so nothing is saved, and a run asked to
+    // save goes as far as the others with its output closed.
+    let (mut saving, dir) = command("bench", "unread-bench-save", &[&ONE_SETTING[..], &["--save"]].concat());
+    let out = saving.stdout(closed()).output().unwrap();
+    assert_eq!(out.status.signal(), Some(libc::SIGPIPE), "{out:?}");
+    assert!(!dir.join("data/av1opt/tuning.json").exists());
 }
 
 /// Sets a file's modification time `secs` in the past.

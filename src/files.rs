@@ -144,6 +144,49 @@ pub fn read_regular(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// The right to one piece of work, held by a lock on the file at its path. The system lets go of
+/// the lock when the holder ends in any way, so a run that was killed stands in nobody's way;
+/// the file it leaves means nothing.
+pub struct Claim {
+    file: std::fs::File,
+    path: PathBuf,
+}
+
+impl Claim {
+    /// `None` when another run, or another thread of this one, holds it.
+    pub fn take(path: &Path) -> std::io::Result<Option<Claim>> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        loop {
+            // Not through a link: this is a folder others may be able to write to.
+            let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).custom_flags(libc::O_NOFOLLOW).open(path)?;
+            // SAFETY: flock on a descriptor we own; no memory is involved.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                let e = std::io::Error::last_os_error();
+                return if e.kind() == std::io::ErrorKind::WouldBlock { Ok(None) } else { Err(e) };
+            }
+            // The holder before us removes the name as it lets go. If that happened after we
+            // opened the file, we hold a lock on a file nobody else will find.
+            let held = file.metadata()?;
+            if std::fs::symlink_metadata(path).is_ok_and(|now| (now.dev(), now.ino()) == (held.dev(), held.ino())) {
+                return Ok(Some(Claim { file, path: path.to_path_buf() }));
+            }
+        }
+    }
+}
+
+impl Drop for Claim {
+    /// The name goes first, while the lock still keeps others from believing they hold it. The
+    /// lock is let go by hand: a program another thread is starting at this moment holds a copy
+    /// of the descriptor until it has started, and closing alone would leave the lock with it.
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        let _ = std::fs::remove_file(&self.path);
+        // SAFETY: flock on a descriptor we own; no memory is involved.
+        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 /// A hash (FNV-1a, the same in every build) of a file's size and of `chunk` bytes at its start,
 /// its middle and its end: enough to tell files of one size apart without reading gigabytes
 /// from a slow drive.
@@ -384,6 +427,51 @@ mod tests {
         assert!(digest(size + 1).is_err());
         let stopped = whole_digest(&file, size, &AtomicU64::new(0), &AtomicBool::new(true)).unwrap_err();
         assert_eq!(stopped.kind(), std::io::ErrorKind::Interrupted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_claim_has_one_holder_and_leaves_nothing_behind() {
+        let dir = std::env::temp_dir().join(format!("av1opt-files-claim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lock");
+        let first = Claim::take(&path).unwrap().unwrap();
+        assert!(Claim::take(&path).unwrap().is_none(), "held, even within one process");
+        drop(first);
+        assert!(!path.exists(), "the holder takes its file along");
+
+        // What a killed run leaves is no claim.
+        std::fs::write(&path, b"").unwrap();
+        drop(Claim::take(&path).unwrap().unwrap());
+
+        // Taken and given back as fast as threads can: never two holders at a time, also
+        // when a holder removes the file that the next one has just opened.
+        let holders = std::sync::atomic::AtomicU32::new(0);
+        let held = std::sync::atomic::AtomicU32::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    for _ in 0..2000 {
+                        if let Some(claim) = Claim::take(&path).unwrap() {
+                            assert_eq!(holders.fetch_add(1, Ordering::SeqCst), 0, "two holders");
+                            held.fetch_add(1, Ordering::SeqCst);
+                            holders.fetch_sub(1, Ordering::SeqCst);
+                            drop(claim);
+                        }
+                    }
+                });
+            }
+        });
+        assert!(held.load(Ordering::SeqCst) > 0);
+        assert!(!path.exists());
+
+        // A link at that name is not followed to whatever it points at.
+        let target = dir.join("target");
+        std::fs::write(&target, b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(Claim::take(&path).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

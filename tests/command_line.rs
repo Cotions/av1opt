@@ -3,7 +3,7 @@
 //! folders below the target folder.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 /// What the stand-in ffprobe says of any file: a minute of plain H.264.
@@ -110,6 +110,16 @@ impl Case {
     }
 }
 
+/// A run under way, which does not outlive its test.
+struct Started(Child);
+
+impl Drop for Started {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 fn soon(what: &str, done: impl Fn() -> bool) {
     let start = Instant::now();
     while !done() {
@@ -194,4 +204,32 @@ fn a_scenes_value_written_with_a_space_is_not_taken_for_a_video() {
     // A video that really has that name is one.
     std::fs::write(c.path("auto"), "a video without an extension").unwrap();
     c.run(&["encode", "auto", "-o", "out"]).lacks("--scenes=auto").has("[1/1] auto");
+}
+
+#[test]
+fn a_second_run_leaves_a_file_being_encoded_and_goes_on_to_the_next() {
+    // Work on a.mkv goes on until the test says otherwise; work on any other file fails at once.
+    let c = Case::with_ffmpeg(
+        "lock",
+        "here=\"$(dirname \"$0\")/..\"\ncase \"$*\" in *a.mkv*) if [ ! -e \"$here/free\" ]; then touch \"$here/began\"; exec sleep 60; fi;; esac\nexit 1",
+    );
+    c.video("a.mkv");
+    c.video("b.mkv");
+    let first = c.command(&["encode", "videos/a.mkv", "-o", "out"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let mut first = Started(first);
+    soon("the first run to be encoding", || c.path("began").exists());
+
+    let second = c.run(&["encode", "videos", "-o", "out"]);
+    second.has("skipped: another av1opt is encoding this now").has("[2/2]");
+    // It is not noted as a file to skip from now on.
+    let log = text(&c.path("out").join("av1opt-log.tsv"));
+    assert!(!log.contains("a.mkv"), "{log}");
+
+    // A run that was killed holds nothing, though its lock file is still there.
+    first.0.kill().unwrap();
+    first.0.wait().unwrap();
+    std::fs::write(c.path("free"), "").unwrap();
+    c.run(&["encode", "videos/a.mkv", "-o", "out"]).lacks("another av1opt");
+    let left: Vec<_> = std::fs::read_dir(c.path("out")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert!(!left.iter().any(|n| n.starts_with(".av1opt-lock")), "{left:?}");
 }

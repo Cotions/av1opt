@@ -306,6 +306,35 @@ impl std::fmt::Display for Skip {
 
 impl std::error::Error for Skip {}
 
+/// Another run has this output. Not a decision about the file, so it is not remembered: the next
+/// run looks at the file again.
+#[derive(Debug)]
+pub struct InUse(pub &'static str);
+
+impl std::fmt::Display for InUse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for InUse {}
+
+/// Keeps other runs, from the command line or the page, off this output while it is made: they
+/// would do the same hours of work, and per-scene runs share their chunk files. It goes by the
+/// name without its extension, since `x.mp4` and `x.mkv` share one report.
+fn claim_output(out_dir: &Path, stem: &str) -> Result<Option<crate::files::Claim>> {
+    let path = out_dir.join(format!(".av1opt-lock-{:016x}", scenes::fnv1a(stem)));
+    match crate::files::Claim::take(&path) {
+        Ok(Some(claim)) => Ok(Some(claim)),
+        Ok(None) => Err(InUse("another av1opt is encoding this now").into()),
+        Err(e) => {
+            // A filesystem without locks: carry on as a single run would.
+            eprintln!("warning: cannot lock {}: {e}; a second run on this folder would not be noticed", path.display());
+            Ok(None)
+        }
+    }
+}
+
 /// Whether two paths lead to one file, however they are spelled: through a link, through
 /// `..`, in other letter case on a drive that does not tell case apart, or as two names of
 /// one file. Two strings that differ say nothing about that; the file's own number does.
@@ -499,6 +528,10 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     }
     may_write()?;
     std::fs::create_dir_all(out_dir)?;
+    let _only_this_run = claim_output(out_dir, &stem)?;
+    if output.exists() && !o.overwrite {
+        return Err(InUse("another av1opt finished this a moment ago").into());
+    }
     let tmp = TempDir { path: out_dir.join(format!(".av1opt-tmp-{}", std::process::id())), keep: o.keep_temp };
     std::fs::create_dir_all(&tmp.path)?;
     fits_beside_output(&output, &tmp.path)?;

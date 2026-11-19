@@ -650,6 +650,12 @@ pub fn run_placed(tools: &Tools, jobs: &[Job], out_dir: &Path, place: Option<&Ou
                 sum.cancelled = true;
                 break;
             }
+            Err(e) if e.downcast_ref::<encode::InUse>().is_some() => {
+                // Not logged: the file is still to be looked at by a later run.
+                eprintln!("skipped: {e}");
+                end("skip", &e.to_string(), 0);
+                sum.skipped += 1;
+            }
             Err(e) if e.downcast_ref::<Skip>().is_some() => {
                 eprintln!("skipped: {e}");
                 end("skip", &e.to_string(), 0);

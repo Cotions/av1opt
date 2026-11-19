@@ -161,8 +161,28 @@ function isOwn(url) {
   }
 }
 
+// What counts as the person acting on the window, and how long ago that may have been. The page
+// has no say in these: they are seen here before they reach it.
+const GESTURES = new Set(["mouseDown", "mouseUp", "rawKeyDown", "keyDown", "touchStart", "touchEnd", "gestureTap"]);
+const GESTURE_LASTS_MS = 5000;
+let lastGesture = 0;
+
+// Each click or key press opens one link at most, so a page gone wrong cannot send the browser
+// anywhere on its own, or to many places at once.
 function openExternal(url) {
-  if (/^https?:\/\//.test(url) && !isOwn(url)) shell.openExternal(url);
+  let target;
+  try {
+    target = new URL(url);
+  } catch {
+    return;
+  }
+  if (!["http:", "https:"].includes(target.protocol) || isOwn(url)) return;
+  if (Date.now() - lastGesture > GESTURE_LASTS_MS) {
+    writeLog(`refused to open ${target.origin}: nothing was clicked or pressed just before`);
+    return;
+  }
+  lastGesture = 0;
+  shell.openExternal(target.href).catch((e) => writeLog(`could not open ${target.origin}: ${e.message}`));
 }
 
 function createWindow() {
@@ -172,6 +192,12 @@ function createWindow() {
   const allowed = new Set(["clipboard-sanitized-write", "fullscreen"]);
   ses.setPermissionRequestHandler((_wc, perm, cb, details) => cb(allowed.has(perm) && isOwn(details.requestingUrl)));
   ses.setPermissionCheckHandler((_wc, perm, requestingOrigin) => allowed.has(perm) && isOwn(requestingOrigin));
+  // The one thing the page saves is the list it makes itself (Save list on the duplicates page).
+  ses.on("will-download", (e, item) => {
+    if (item.getURL().startsWith(`blob:${origin}/`)) return;
+    e.preventDefault();
+    writeLog("refused a download that did not come from the page itself");
+  });
 
   const win = new BrowserWindow({
     width: 1400,
@@ -208,6 +234,14 @@ function createWindow() {
   });
   win.webContents.on("will-redirect", (e, url) => {
     if (!isOwn(url)) e.preventDefault();
+  });
+  // The window's own navigation is handled above. This is for frames inside it, which the page
+  // does not use, so that none can be taken to another site.
+  win.webContents.on("will-frame-navigate", (details) => {
+    if (!details.isMainFrame && !isOwn(details.url)) details.preventDefault();
+  });
+  win.webContents.on("input-event", (_e, input) => {
+    if (GESTURES.has(input.type)) lastGesture = Date.now();
   });
   win.webContents.on("render-process-gone", (_e, d) => {
     if (!quitting && d.reason !== "clean-exit") win.reload();

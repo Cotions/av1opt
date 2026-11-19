@@ -423,10 +423,9 @@ accepts, so now and then a finished encode would have been thrown away), while o
 stretches sat at 97. Encoded per scene, the worst five seconds of those two came out at 89.6
 and 89.8 instead of 84.6 and 87.5 and the best at 96 instead of 97.5, for 15% and 7% more
 bytes: the one-CRF encode of the first was 0.9 VMAF short of the target over the whole
-video, which its four samples had not shown. Without `--scenes`, the report of such a video
-says that quality differs along it where the search used clips of 4 seconds (HDR, removed
-sections, your own `--samples` or `--sample-secs`). In the usual case the clips are too short
-to tell, and the check of the whole video finds the weak stretches instead.
+video, which its four samples had not shown. Without `--scenes`, such a video gets the note
+described under Search; in the usual case the check of the whole video finds the weak
+stretches instead.
 
 Finished chunks are kept in `.av1opt-work-*` in the output folder, so an interrupted run resumes
 where it stopped (including the search). A chunk is taken over only if its encode has the

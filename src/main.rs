@@ -836,7 +836,10 @@ fn run_command(command: Cmd) -> Result<()> {
             let tools = signals::stopping_on_signals(tools::Tools::new(ffmpeg, ffprobe, memory_cap(&memory_limit, 1)));
             let run = || -> Result<()> {
                 let size = std::fs::metadata(&input)?.len();
-                let info = probe::probe(&tools.ffprobe, &input, size)?;
+                let mut info = probe::probe(&tools.ffprobe, &input, size)?;
+                // Cut in the range the encode would take, as `encode` cuts.
+                let marks = probe::frame_marks(&tools.ffprobe, &input, info.video_index);
+                probe::take_decoded_range(&mut info, &marks);
                 let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
                 let vmaf_threads = if info.width.max(info.height) >= 3200 { threads.min(4) } else { threads };
                 let enc = search::EncodeSettings::for_source(&info, preset, &svt_params);

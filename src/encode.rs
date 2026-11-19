@@ -598,6 +598,13 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
         bail!("{why}; {NOT_WRITTEN}");
     }
 
+    // The first frames' marks, read once a file is not skipped; the range their decoder gives
+    // them is the one cut, encoded and scored (see `probe::take_decoded_range`).
+    let marks = probe::frame_marks(&tools.ffprobe, input, info.video_index);
+    let mut info = info;
+    probe::take_decoded_range(&mut info, &marks);
+    let info = info;
+
     let stem = input.file_stem().context("input has no file name")?.to_string_lossy();
     let output = out_dir.join(format!("{stem}.{}", o.container.ext()));
     if output.exists() && !o.overwrite {
@@ -648,7 +655,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     } else if svt_params != search::DEFAULT_PARAMS {
         notes.push(format!("SVT-AV1 parameters: {svt_params}"));
     }
-    notes.extend(picture_notes(&info, probe::frame_marks(&tools.ffprobe, input, info.video_index)));
+    notes.extend(picture_notes(&info, marks));
     let meta = metadata::resolve(&o.meta, input, &info.tags);
     if !meta.tags.is_empty() {
         let from = meta.info_json.as_ref().and_then(|p| p.file_name()).map(|n| format!(" (from {})", n.to_string_lossy())).unwrap_or_default();

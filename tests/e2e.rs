@@ -2679,6 +2679,38 @@ fn assert_one_range(out: &Path, src: &Path, full: bool) {
 
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_range_the_container_names_against_the_video_itself_gives_way_to_the_video() {
+    let c = Case::new("range-conflict");
+    c.scenes_clip("hard.mp4");
+    // The clip of the test above in full range and in limited range, each copied into
+    // Matroska with the other range named on the stream. Named colours make x264 write the
+    // range into the stream itself (without them it writes none, and the container's word is
+    // the only one). ffmpeg's decoder, the one pass and a browser go by what the H.264 stream
+    // says; the cuts went by the container, so
+    // every stretch encoded again said the other range and was refused, and the weak
+    // stretches stayed (lowest 5 s 86.5 against a floor of 89).
+    for (range, flag) in [("pc", "scale=out_range=pc"), ("tv", "null")] {
+        c.ffmpeg(&[
+            "-i", "hard.mp4", "-f", "lavfi", "-i", "testsrc=s=640x360:r=24:d=12", "-f", "lavfi", "-i", "sine=f=440:d=12",
+            "-filter_complex", &format!("[0:v][0:a][1:v][2:a]concat=n=2:v=1:a=1[v][a];[v]{flag}[w]"), "-map", "[w]", "-map", "[a]",
+            "-color_range", range, "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "16", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "64k", &format!("{range}.mp4"),
+        ]);
+    }
+    c.ffmpeg(&["-i", "pc.mp4", "-c", "copy", "-color_range", "tv", "full-says-limited.mkv"]);
+    c.ffmpeg(&["-i", "tv.mp4", "-c", "copy", "-color_range", "pc", "limited-says-full.mkv"]);
+    for (name, full) in [("full-says-limited", true), ("limited-says-full", false)] {
+        let src = c.videos().join(format!("{name}.mkv"));
+        assert_eq!(video(&src)["color_range"], if full { "tv" } else { "pc" }, "{name}");
+        let decoded = ffprobe(&["-select_streams", "v:0", "-read_intervals", "%+#1", "-show_entries", "frame=color_range", "-of", "csv=p=0"], &src);
+        assert_eq!(decoded.trim().trim_end_matches(','), if full { "pc" } else { "tv" }, "{name}");
+        c.encode(&[&src], &[]).ok().has("encoding again:").has("encoded again at CRF").lacks("could not be encoded again");
+        assert_one_range(&c.out().join(format!("{name}.mp4")), &src, full);
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn a_video_whose_frames_come_slower_than_it_says_has_key_frames_ten_seconds_apart() {
     let c = Case::new("uneven-keys");
     // The scenes of `scenes_clip` and an easy 12 s, drawn at 48 fps and thinned to 24 on

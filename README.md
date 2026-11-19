@@ -295,7 +295,13 @@ For each file:
    (up to three tries, going by what the stretch itself gains per step) and put in the place
    of the ones they replace. Every frame keeps its timestamp and the other streams are not
    touched; the joined file's frames are counted, and its first and last new stretch are
-   scored once more where they now sit. No stretch goes more than 16 CRF below the video's.
+   scored once more where they now sit. A new stretch goes in only where its sequence header
+   says what the stream's does, apart from the superblock size and the level; one that says
+   another range, say, is refused, and the video gets spot checks. A source is cut, encoded
+   and scored in the range its first frame is decoded with: the video's own word where it
+   has one, which ffmpeg and Chrome go by whatever range a remux wrote on the container
+   (`-c copy -color_range pc` over a limited stream had every stretch refused before).
+   No stretch goes more than 16 CRF below the video's.
    One that more bits don't lift (noise the metric reads as damage, mostly) keeps the
    smallest encode within half a point of the best it got, which can be the one it had
    already. The report lists each

@@ -566,6 +566,9 @@ pub struct FrameMarks {
     /// closed_captions field: measured on an H.264 file with captions in every frame, the
     /// stream showed nothing and its frames showed "ATSC A53 Part 4 Closed Captions".
     pub closed_captions: bool,
+    /// The first frame's range as the decoder gives it: Some(true) for full ("pc"),
+    /// Some(false) for limited ("tv"), None where it does not say. See [`take_decoded_range`].
+    pub full_range: Option<bool>,
 }
 
 impl FrameMarks {
@@ -577,6 +580,29 @@ impl FrameMarks {
         FrameMarks {
             hdr10_plus: kinds.iter().any(|t| t.contains("2094-40")),
             closed_captions: kinds.iter().any(|t| t.contains("A53") && t.contains("Closed Captions")),
+            full_range: match frames[0]["color_range"].as_str() {
+                Some("pc") => Some(true),
+                Some("tv") => Some(false),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// Sets `info`'s range to the one its first frame is decoded with, where the two differ. The
+/// stream's range is the container's tag where there is one, which a remux can set to
+/// anything (`-c copy -color_range pc`); the decoder goes by the video's own bitstream where
+/// that says a range, and by the container only where it does not. The decoded frame's is the
+/// one to go by: ffmpeg hands frames with it to the encoder in the one pass, so the cuts and
+/// the scores have to take the same, or every stretch encoded again says another range than
+/// the stream it goes into and is refused. It is also what is seen: Chrome showed a flat
+/// picture of luma 40 as 28 (limited) from an H.264 file whose bitstream says limited, and as
+/// 40 (full) from one that says full, whatever range the MP4 or Matroska around it named.
+pub fn take_decoded_range(info: &mut MediaInfo, marks: &FrameMarks) {
+    if let Some(full) = marks.full_range {
+        let range = if full { "pc" } else { "tv" };
+        if info.color_range != range {
+            info.color_range = range.to_string();
         }
     }
 }
@@ -584,7 +610,7 @@ impl FrameMarks {
 /// What the first frames of stream `stream` carry; nothing where it cannot tell.
 pub fn frame_marks(ffprobe: &str, path: &Path, stream: usize) -> FrameMarks {
     let mut command = crate::tools::probe_command(ffprobe);
-    command.args(["-v", "error", "-select_streams", &stream.to_string(), "-read_intervals", "%+#3", "-show_entries", "frame_side_data=side_data_type", "-of", "json"]).arg(crate::tools::probe_arg(path));
+    command.args(["-v", "error", "-select_streams", &stream.to_string(), "-read_intervals", "%+#3", "-show_entries", "frame=color_range:frame_side_data=side_data_type", "-of", "json"]).arg(crate::tools::probe_arg(path));
     let Ok(out) = run_ffprobe(command, Reads::Little) else { return FrameMarks::default() };
     let j: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
     FrameMarks::from_frames(&j["frames"])
@@ -1016,10 +1042,13 @@ mod tests {
             {"side_data_list": [{"side_data_type": "ATSC A53 Part 4 Closed Captions"}, {"side_data_type": "H.26[45] User Data Unregistered SEI message"}]},
             {"side_data_list": [{"side_data_type": "ATSC A53 Part 4 Closed Captions"}]},
         ]);
-        assert_eq!(FrameMarks::from_frames(&frames), FrameMarks { hdr10_plus: false, closed_captions: true });
+        assert_eq!(FrameMarks::from_frames(&frames), FrameMarks { hdr10_plus: false, closed_captions: true, full_range: None });
         let frames = serde_json::json!([{"side_data_list": [{"side_data_type": "Mastering display metadata"}, {"side_data_type": "HDR Dynamic Metadata SMPTE2094-40 (HDR10+)"}]}]);
-        assert_eq!(FrameMarks::from_frames(&frames), FrameMarks { hdr10_plus: true, closed_captions: false });
+        assert_eq!(FrameMarks::from_frames(&frames), FrameMarks { hdr10_plus: true, closed_captions: false, full_range: None });
         assert_eq!(FrameMarks::from_frames(&serde_json::json!([{}])), FrameMarks::default());
+        // The range is the first frame's.
+        let ranged = |r: &str| FrameMarks::from_frames(&serde_json::json!([{"color_range": r}, {"color_range": "pc"}])).full_range;
+        assert_eq!((ranged("pc"), ranged("tv"), ranged("unknown")), (Some(true), Some(false), None));
         assert_eq!(FrameMarks::from_frames(&Value::Null), FrameMarks::default());
     }
 
@@ -1213,6 +1242,26 @@ mod tests {
         let title = make("title.mkv", 24, 21, "setpts='if(lt(N\\,20)\\,N/2\\,10+(N-20)/24)/TB'");
         assert!(!title.vfr && title.fps == 24.0, "{title:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_range_a_video_is_decoded_with_outweighs_the_containers() {
+        let tagged = |range: &str, pix_fmt: &str| MediaInfo { color_range: range.into(), pix_fmt: pix_fmt.into(), ..Default::default() };
+        let decoded = |full| FrameMarks { full_range: full, ..Default::default() };
+        // `-c copy -color_range pc` over a limited stream, and the other way round.
+        let mut info = tagged("pc", "yuv420p");
+        take_decoded_range(&mut info, &decoded(Some(false)));
+        assert!(!crate::search::full_range(&info), "{info:?}");
+        let mut info = tagged("tv", "yuvj420p");
+        take_decoded_range(&mut info, &decoded(Some(true)));
+        assert!(crate::search::full_range(&info), "{info:?}");
+        // Where the frames say nothing, the stream's word stands.
+        let mut info = tagged("pc", "yuv420p");
+        take_decoded_range(&mut info, &decoded(None));
+        assert_eq!(info.color_range, "pc");
+        let mut info = tagged("", "yuvj420p");
+        take_decoded_range(&mut info, &decoded(None));
+        assert!(crate::search::full_range(&info));
     }
 
     #[test]

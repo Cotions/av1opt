@@ -172,8 +172,10 @@ pub fn reference_pix_fmt(info: &MediaInfo) -> &'static str {
 }
 
 /// Whether the source's picture uses every value (0 to 255 in 8 bits) rather than broadcast
-/// video's 16 to 235, by its tag. ffmpeg also takes the old `yuvj` formats as full range when
-/// a file has no tag. A picture stored as RGB is made limited range by [`source_filters`].
+/// video's 16 to 235, by its tag: the range its first frame is decoded with where an encode
+/// has read that (see `probe::take_decoded_range`), the stream's otherwise. ffmpeg also takes
+/// the old `yuvj` formats as full range when a file has no tag. A picture stored as RGB is
+/// made limited range by [`source_filters`].
 pub fn full_range(info: &MediaInfo) -> bool {
     let untagged = matches!(info.color_range.as_str(), "" | "unknown");
     !is_rgb(info) && (info.color_range == "pc" || (untagged && info.pix_fmt.starts_with("yuvj")))

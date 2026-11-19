@@ -248,9 +248,13 @@ pub fn source_filters(info: &MediaInfo) -> Vec<String> {
     // it is not told one, and the encode then said none: a browser takes untagged HD as
     // BT.709 and showed it a little off. Named here, the matrix is what the encode is tagged
     // with, and the clips VMAF compares are made with the same one.
+    // Rounded with care: without it, a gray picture (a PNG, tagged RGB) made 8-bit for a cut
+    // had every value cut down instead of rounded, 2 lower in 10-bit luma than the same frames
+    // made 10-bit for the one pass, and a stretch encoded again from such a cut sat 1.8 darker
+    // than the GOPs around it. The 10-bit picture is the same byte for byte either way.
     if is_rgb(info) {
         let matrix = if info.color_primaries == "bt2020" { "bt2020" } else { "bt709" };
-        f.push(format!("scale=out_color_matrix={matrix}:out_range=tv"));
+        f.push(format!("scale=out_color_matrix={matrix}:out_range=tv:flags=accurate_rnd"));
     }
     // A full-range picture made 10-bit is spread over the range one way when it comes as
     // 4:2:0 and another when it comes as 4:2:2 or 4:4:4 (ffmpeg multiplies the second by 4,
@@ -1846,11 +1850,49 @@ mod tests {
             color_primaries: color_primaries.into(),
             ..info_with_fps(25.0)
         };
-        assert_eq!(source_filters(&rgb("gbrp", "gbr", "")), ["scale=out_color_matrix=bt709:out_range=tv"]);
-        assert_eq!(source_filters(&rgb("rgb24", "", "")), ["scale=out_color_matrix=bt709:out_range=tv"]);
-        assert_eq!(source_filters(&rgb("gbrp10le", "gbr", "bt2020")), ["scale=out_color_matrix=bt2020:out_range=tv"]);
+        assert_eq!(source_filters(&rgb("gbrp", "gbr", "")), ["scale=out_color_matrix=bt709:out_range=tv:flags=accurate_rnd"]);
+        assert_eq!(source_filters(&rgb("rgb24", "", "")), ["scale=out_color_matrix=bt709:out_range=tv:flags=accurate_rnd"]);
+        assert_eq!(source_filters(&rgb("gbrp10le", "gbr", "bt2020")), ["scale=out_color_matrix=bt2020:out_range=tv:flags=accurate_rnd"]);
         assert!(source_filters(&rgb("yuv444p", "bt709", "bt709")).is_empty());
         assert!(source_filters(&rgb("gray", "", "")).is_empty());
+    }
+
+    #[test]
+    fn a_gray_picture_is_cut_with_the_brightness_the_one_pass_gives_it() {
+        let Some(tools) = crate::tools::real_tools("a_gray_picture_is_cut_with_the_brightness_the_one_pass_gives_it") else { return };
+        let dir = std::env::temp_dir().join(format!("av1opt-gray-cut-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("gray.mkv");
+        let made = std::process::Command::new(&tools.ffmpeg)
+            // Every value from black to white, each in a column of its own.
+            .args(["-v", "error", "-f", "lavfi", "-i", "color=black:s=256x240,format=gray,geq=lum=X", "-frames:v", "1", "-c:v", "png"])
+            .arg(&src)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let info = crate::probe::probe(&tools.ffprobe, &src, std::fs::metadata(&src).unwrap().len()).unwrap();
+        assert!(is_rgb(&info), "{} {}", info.pix_fmt, info.color_space);
+        let luma = |format: &[&str]| -> f64 {
+            let out = std::process::Command::new(&tools.ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(&src)
+                .args(["-vf", &source_filters(&info).join(",")])
+                .args(format)
+                .args(["-f", "rawvideo", "-"])
+                .output()
+                .unwrap();
+            let pixels = 256 * 240;
+            if format.contains(&"yuv420p10le") {
+                out.stdout[..2 * pixels].chunks(2).map(|v| f64::from(u16::from_le_bytes([v[0], v[1]]))).sum::<f64>() / pixels as f64
+            } else {
+                out.stdout[..pixels].iter().map(|&v| 4.0 * f64::from(v)).sum::<f64>() / pixels as f64
+            }
+        };
+        let one_pass = luma(&["-pix_fmt", "yuv420p10le"]);
+        let cut = luma(&reference_format(&info));
+        assert!((one_pass - cut).abs() < 0.5, "10-bit luma {one_pass:.2} in the one pass, {cut:.2} in the cut");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1885,7 +1927,7 @@ mod tests {
         // RGB is made limited range by its own filter, whatever its tag.
         let rgb = MediaInfo { color_space: "gbr".into(), ..source("gbrp", "pc") };
         assert!(!full_range(&rgb));
-        assert_eq!(source_filters(&rgb), ["scale=out_color_matrix=bt709:out_range=tv"]);
+        assert_eq!(source_filters(&rgb), ["scale=out_color_matrix=bt709:out_range=tv:flags=accurate_rnd"]);
     }
 
     #[test]

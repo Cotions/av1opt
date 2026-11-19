@@ -405,6 +405,11 @@ fn probe_within(ffprobe: &str, path: &Path, file_size: u64, limit: Duration) -> 
         if NOT_THE_FILES_FAULT.iter().any(|text| why.contains(text)) {
             return Err(NotJudged(format!("ffprobe: {why}")).into());
         }
+        // ffprobe names what it dislikes in a file. Failing without a word points at the
+        // program, so the file is not to be remembered as unreadable.
+        if one_line(&String::from_utf8_lossy(&out.stderr)).is_empty() {
+            return Err(NotJudged(format!("ffprobe failed without saying why ({})", out.status)).into());
+        }
         bail!("ffprobe: {why}");
     }
     // It said it succeeded, so an answer that does not parse is one that did not all arrive.
@@ -854,6 +859,13 @@ mod tests {
         crate::files::write_script(&ffprobe, &format!("echo '{{\"streams\":[],\"note\":\"{long}\"}}'\n"));
         let e = probe_within(ffprobe.to_str().unwrap(), &dir.join("a.mkv"), 1, Duration::from_secs(20)).unwrap_err();
         assert!(!left_unjudged(&e) && e.to_string().contains("no video stream"), "{e}");
+        // Failing in silence says nothing of the file; naming a fault in it does.
+        crate::files::write_script(&ffprobe, "exit 1\n");
+        let e = probe_within(ffprobe.to_str().unwrap(), &dir.join("a.mkv"), 1, Duration::from_secs(20)).unwrap_err();
+        assert!(left_unjudged(&e) && e.to_string().contains("without saying why"), "{e}");
+        crate::files::write_script(&ffprobe, "echo 'Invalid data found when processing input' >&2\nexit 1\n");
+        let e = probe_within(ffprobe.to_str().unwrap(), &dir.join("a.mkv"), 1, Duration::from_secs(20)).unwrap_err();
+        assert!(!left_unjudged(&e), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

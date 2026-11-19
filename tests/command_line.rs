@@ -376,3 +376,16 @@ fn an_old_skip_does_not_stand_against_force_or_another_target() {
     encode(&["--force"]).ended(3).lacks("skipped earlier");
     encode(&["--target-vmaf", "50"]).ended(3).lacks("skipped earlier");
 }
+
+#[test]
+fn a_file_is_not_remembered_as_unreadable_because_ffprobe_failed_in_silence() {
+    let c = Case::new("silent-ffprobe");
+    c.video("a.mkv");
+    let working = text(&c.path("bin/ffprobe"));
+    c.tool("ffprobe", "if [ \"$2\" = -version ]; then exit 0; fi\nexit 1\n");
+    c.run(&["scan", "videos"]).ended(0).has("unreadable");
+    assert!(!text(&c.path("cache/av1opt/probe-cache-v4.json")).contains("a.mkv"));
+    // With ffprobe working again the same file is read, not answered from the cache.
+    c.tool("ffprobe", working.trim_start_matches("#!/bin/sh\n[ \"$1\" = --ready ] && exit 0\n"));
+    c.run(&["scan", "videos"]).ended(0).has("h264").lacks("unreadable");
+}

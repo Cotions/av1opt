@@ -186,7 +186,8 @@ fn collect_with_cache(
         files
             .par_iter()
             .map(|(path, root, size, mtime)| {
-                let cached = cache.lock().unwrap().get(path).filter(|c| c.size == *size && c.mtime == *mtime).cloned();
+                // The silent failure was kept by earlier versions and says nothing of the file.
+                let cached = cache.lock().unwrap().get(path).filter(|c| c.size == *size && c.mtime == *mtime && c.error.as_deref() != Some(SILENT_FAILURE)).cloned();
                 let (entry, unjudged) = cached.map_or_else(
                     || {
                         let (info, error, unjudged) = match probe::probe(ffprobe, path, *size) {
@@ -219,6 +220,9 @@ fn collect_with_cache(
     let fresh = fresh.load(Ordering::Relaxed);
     Ok((results, Stats { fresh, cached: total - fresh, dropped, unreadable }))
 }
+
+/// The error earlier versions noted for an ffprobe that failed without saying why.
+const SILENT_FAILURE: &str = "ffprobe: could not read the file";
 
 /// What earlier scans learned, read once for looking up many files without running ffprobe.
 #[cfg(feature = "ui")]
@@ -428,6 +432,13 @@ mod tests {
         assert!(!unjudged(&results, "broken.mkv") && unjudged(&results, "killed.mkv") && unjudged(&results, "stale.mkv"));
         let kept: HashMap<PathBuf, CacheEntry> = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
         assert_eq!(kept.keys().map(|p| p.file_name().unwrap().to_str().unwrap()).collect::<Vec<_>>(), ["broken.mkv"]);
+
+        // An entry an earlier version kept for an ffprobe that failed without a word is read again.
+        let mut kept = kept;
+        kept.values_mut().for_each(|e| e.error = Some(SILENT_FAILURE.into()));
+        std::fs::write(&cache, serde_json::to_vec(&kept).unwrap()).unwrap();
+        let again = scan();
+        assert!(again.iter().find(|r| r.path.ends_with("broken.mkv")).unwrap().error.as_deref().is_some_and(|e| e.contains("Invalid data")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

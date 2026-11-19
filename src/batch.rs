@@ -334,7 +334,8 @@ struct Made {
 }
 
 fn report_input(output: &Path) -> Option<Made> {
-    let r: serde_json::Value = serde_json::from_slice(&std::fs::read(output.with_extension("av1opt.json")).ok()?).ok()?;
+    // Beside the output, where anybody who can write to the folder can leave a pipe.
+    let r: serde_json::Value = serde_json::from_slice(&crate::files::read_regular(&output.with_extension("av1opt.json"), crate::replace::REPORT_LIMIT).ok()?).ok()?;
     let p = PathBuf::from(r["input"].as_str()?);
     let removed = serde_json::from_value(r["removed"].clone()).unwrap_or_default();
     Some(Made {
@@ -723,6 +724,23 @@ pub(crate) fn guarded<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn a_pipe_under_the_name_of_a_report_is_no_report_and_no_wait() {
+        let dir = std::env::temp_dir().join(format!("av1opt-batch-pipe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pipe = std::ffi::CString::new(dir.join("a.av1opt.json").to_str().unwrap()).unwrap();
+        // SAFETY: `pipe` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(pipe.as_ptr(), 0o644) }, 0);
+        let (tell, told) = std::sync::mpsc::channel();
+        let output = dir.join("a.mkv");
+        std::thread::spawn(move || {
+            let _ = tell.send(report_input(&output).is_none());
+        });
+        assert_eq!(told.recv_timeout(std::time::Duration::from_secs(1)), Ok(true));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn a_bug_fails_one_file_not_the_run() {

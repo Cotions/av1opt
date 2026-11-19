@@ -28,6 +28,9 @@ fn home_trash() -> Option<PathBuf> {
     Some(base.join("Trash"))
 }
 
+/// The most an info file may hold: a path as long as any can be, every byte of it encoded.
+const INFO_LIMIT: u64 = 1 << 16;
+
 /// Moves `path` to the trash of the filesystem it is on. Returns where it is now.
 pub fn trash(path: &Path) -> Result<PathBuf> {
     // SAFETY: getuid has no failure mode and touches no memory.
@@ -266,7 +269,8 @@ fn holds_with(trashed: &Path, original: &Path, is_top: &dyn Fn(&Path) -> bool) -
         let bin = files.parent()?;
         let mut info_name = trashed.file_name()?.to_os_string();
         info_name.push(".trashinfo");
-        let info = std::fs::read_to_string(bin.join("info").join(info_name)).ok()?;
+        // A pipe under this name would never finish opening.
+        let info = String::from_utf8(crate::files::read_regular(&bin.join("info").join(info_name), INFO_LIMIT).ok()?).ok()?;
         let recorded = decode_path(info.lines().find_map(|l| l.strip_prefix("Path="))?)?;
         if recorded.is_absolute() {
             let home = std::fs::canonicalize(home_trash()?).ok()?;
@@ -357,6 +361,27 @@ mod tests {
         std::fs::remove_file(&dest).unwrap();
         std::os::unix::fs::symlink(&elsewhere, &dest).unwrap();
         assert!(!holds(&dest, &a, &known));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_pipe_under_the_name_of_an_info_file_is_no_answer_and_no_wait() {
+        let dir = scratch("info-pipe");
+        let home = dir.join("data/Trash");
+        std::fs::create_dir_all(home.join("files")).unwrap();
+        std::fs::create_dir_all(home.join("info")).unwrap();
+        let trashed = home.join("files/a.mkv");
+        std::fs::write(&trashed, b"x").unwrap();
+        let pipe = std::ffi::CString::new(home.join("info/a.mkv.trashinfo").to_str().unwrap()).unwrap();
+        // SAFETY: `pipe` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(pipe.as_ptr(), 0o644) }, 0);
+        let (tell, told) = std::sync::mpsc::channel();
+        let original = dir.join("lib/a.mkv");
+        std::thread::spawn(move || {
+            TEST_HOME_TRASH.with(|h| *h.borrow_mut() = Some(home));
+            let _ = tell.send(says_came_from(&trashed, &original));
+        });
+        assert_eq!(told.recv_timeout(std::time::Duration::from_secs(1)), Ok(false));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

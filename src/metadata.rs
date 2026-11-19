@@ -166,11 +166,9 @@ pub fn with_preset(preset_id: Option<&str>, extra: &[(String, String)]) -> anyho
 pub fn sidecar(input: &Path) -> Option<(PathBuf, Value)> {
     let stem = input.file_stem()?.to_string_lossy();
     let path = input.with_file_name(format!("{stem}.info.json"));
-    let meta = std::fs::metadata(&path).ok()?;
-    if !meta.is_file() || meta.len() > MAX_INFO_JSON {
-        return None;
-    }
-    let v: Value = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+    // Whoever can write beside the video can leave anything under this name: what is taken for
+    // the info file is a plain file of a sensible size, and not a link to some other file.
+    let v: Value = serde_json::from_slice(&crate::files::read_regular(&path, MAX_INFO_JSON).ok()?).ok()?;
     v.is_object().then_some((path, v))
 }
 
@@ -354,6 +352,27 @@ mod tests {
         assert_eq!(resolve(&strip, &video, &src).tags.iter().find(|(t, _)| t == "album").map(|(_, v)| v.as_str()), Some("Old album"));
         let off = MetaOptions { info_json: false, ..o };
         assert_eq!(resolve(&off, &video, &src).tags.iter().find(|(t, _)| t == "title"), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn only_a_plain_file_is_taken_for_the_info_file() {
+        let dir = std::env::temp_dir().join(format!("av1opt-meta-planted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pipe = std::ffi::CString::new(dir.join("piped.info.json").to_str().unwrap()).unwrap();
+        // SAFETY: `pipe` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(pipe.as_ptr(), 0o644) }, 0);
+        let (tell, told) = std::sync::mpsc::channel();
+        let video = dir.join("piped.mp4");
+        std::thread::spawn(move || {
+            let _ = tell.send(sidecar(&video).is_none());
+        });
+        assert_eq!(told.recv_timeout(std::time::Duration::from_secs(1)), Ok(true));
+        // Nor is what some other file holds taken in through a link to it.
+        std::fs::write(dir.join("private.json"), r#"{"title":"Private"}"#).unwrap();
+        std::os::unix::fs::symlink(dir.join("private.json"), dir.join("linked.info.json")).unwrap();
+        assert!(sidecar(&dir.join("linked.mp4")).is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

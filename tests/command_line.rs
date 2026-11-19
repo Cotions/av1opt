@@ -182,3 +182,16 @@ fn tools_named_by_a_relative_path_are_found_from_every_folder() {
     let from_env = c.command(&["encode", "videos/a.mkv", "-o", "out2"]).env("AV1OPT_FFMPEG", "bin/ffmpeg").env("AV1OPT_FFPROBE", "bin/ffprobe").output().unwrap();
     assert_eq!(text(&started).lines().next(), c.path("bin/ffmpeg").to_str(), "{}", Run::of(from_env).said);
 }
+
+#[test]
+fn a_scenes_value_written_with_a_space_is_not_taken_for_a_video() {
+    let c = Case::new("scenes-space");
+    c.video("a.mkv");
+    for word in ["auto", "off", "always"] {
+        c.run(&["encode", "--scenes", word, "videos/a.mkv", "-o", "out"]).ended(2).has(&format!("--scenes={word}"));
+        assert!(!c.path("out").exists(), "nothing was begun");
+    }
+    // A video that really has that name is one.
+    std::fs::write(c.path("auto"), "a video without an extension").unwrap();
+    c.run(&["encode", "auto", "-o", "out"]).lacks("--scenes=auto").has("[1/1] auto");
+}

@@ -30,7 +30,7 @@ mod tuning;
 mod ui;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use report_file::Kind;
 use scan::is_video;
 use std::path::{Path, PathBuf};
@@ -630,6 +630,9 @@ fn main() -> Result<()> {
             min_savings, force, overwrite, retry_skipped, keep_temp, allow_zfs, ffmpeg, ffprobe, scenes, workers, memory_limit, nice,
             strip_metadata, keep_dates, meta_preset, meta, no_info_json, remove, audio, fresh_search, order,
         } => {
+            if let Some(why) = scenes_value_taken_for_input(&inputs) {
+                Cli::command().error(clap::error::ErrorKind::ValueValidation, why).exit();
+            }
             let meta = metadata::MetaOptions {
                 keep: !strip_metadata,
                 keep_dates,
@@ -737,6 +740,14 @@ fn main() -> Result<()> {
             ui::run(ui::Config { port, open: !no_open, ffmpeg, ffprobe, memory_limit, jobs })
         }
     }
+}
+
+/// `--scenes` takes its value only after `=`, so in `--scenes auto` the word becomes an input and
+/// scenes `always`, about three times the encode time. An input of that name that is no file is
+/// that mistake.
+fn scenes_value_taken_for_input(inputs: &[PathBuf]) -> Option<String> {
+    let word = inputs.iter().filter_map(|p| p.to_str()).find(|p| matches!(*p, "auto" | "off" | "always") && !Path::new(p).exists())?;
+    Some(format!("there is no file or folder called `{word}`; to choose when scenes are used, write --scenes={word}, with the equals sign"))
 }
 
 /// Per-ffmpeg memory cap: the configured total, split between parallel workers. Units are

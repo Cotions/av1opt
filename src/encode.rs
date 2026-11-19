@@ -634,9 +634,19 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     // a few long ones (see `search::MEAN_SAMPLE_SECS`). Clips asked for by number or length
     // are laid out as they always were.
     let mean_only = o.scenes == Scenes::Off && cut.is_none() && !info.hdr && o.samples.is_none() && o.sample_secs.is_none();
+    // Such an encode is scored along its whole length and repaired only where the source's
+    // frames are shown about as long as each other; spot checks judge it otherwise. Only where
+    // repairs will follow does the search count on them: it counts the weak samples as
+    // repaired, and aims low and rounds to the nearest step because the mean is made up after.
+    // (A 15-minute source with 3% of its frames shown twice as long was encoded 0.2 low and
+    // never repaired before this was looked at.)
+    let repaired_after = mean_only && repair::steady_source(tools, input, &info);
+    if mean_only && !repaired_after {
+        eprintln!("the source's frames are shown for unequal times: the encode will get spot checks, and the search aims at the target itself");
+    }
     // How far below the target such a search aims (see `search::AIM_LOW`): the scores it hands
     // on are that much below what the video is expected to end at.
-    let aimed_low = if mean_only { search::AIM_LOW } else { 0.0 };
+    let aimed_low = if repaired_after { search::AIM_LOW } else { 0.0 };
     let t0 = tools.stopwatch();
     let (best, mut trials, mut lab, params, positions) = match &saved {
         Some(p) => {
@@ -652,8 +662,8 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
             let learned = if guess.samples == 0 { String::new() } else { format!(", going by {} past encode{}", guess.samples, if guess.samples == 1 { "" } else { "s" }) };
             // The stretches below the floor are encoded again after a one-pass encode, which
             // lifts its mean: the search aims at the mean there will be then.
-            let lift_to = mean_only.then_some(o.target_vmaf - VERIFY_SLACK + search::LIFT_ABOVE_FLOOR);
-            let counted = if mean_only { format!(" once stretches below {} are encoded again", o.target_vmaf - VERIFY_SLACK) } else { String::new() };
+            let lift_to = repaired_after.then_some(o.target_vmaf - VERIFY_SLACK + search::LIFT_ABOVE_FLOOR);
+            let counted = if repaired_after { format!(" once stretches below {} are encoded again", o.target_vmaf - VERIFY_SLACK) } else { String::new() };
             eprintln!("searching CRF for VMAF >= {}{counted} ({model}, preset {preset}), from CRF {start_crf}{learned}", o.target_vmaf);
             let count = |secs: f64| o.samples.unwrap_or_else(|| search::sample_count(secs));
             let secs = search::clip_secs(&info, o.sample_secs.unwrap_or(search::SAMPLE_SECS));
@@ -672,7 +682,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
             let params = SearchParams { target_vmaf: o.target_vmaf, min_crf: o.min_crf, max_crf: o.max_crf, start_crf, max_size_ratio, worst_sample: None, landing: search::Landing::SafeSide };
             // Where the mean is measured and brought to the target afterwards, the answer need
             // not lean toward quality, and can start a little short of what it will end at.
-            let first = if mean_only { SearchParams { target_vmaf: o.target_vmaf - search::AIM_LOW, landing: search::Landing::Nearest, ..params } } else { params };
+            let first = if repaired_after { SearchParams { target_vmaf: o.target_vmaf - search::AIM_LOW, landing: search::Landing::Nearest, ..params } } else { params };
             tools.emit(Event::Phase { phase: "searching".into(), detail: format!("VMAF >= {} ({model}, preset {preset}), from CRF {start_crf}", o.target_vmaf) });
             let (best, trials) = search::search(&mut lab, &enc, &first)?;
             (best, trials, Some(lab), Some(params), Some(again))
@@ -876,10 +886,10 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
         }
     }
 
-    let mut lifted_crf = mean_only.then_some(best.crf);
+    let mut lifted_crf = repaired_after.then_some(best.crf);
     // (A search aimed low and rounded to the nearest step says little about what the video can
     // reach: its target stands.)
-    let goal_for = |best: &search::Trial| if mean_only { o.target_vmaf } else { o.target_vmaf.min(best.mean_vmaf) };
+    let goal_for = |best: &search::Trial| if repaired_after { o.target_vmaf } else { o.target_vmaf.min(best.mean_vmaf) };
     let floor_for = |best: &search::Trial| goal_for(best) - VERIFY_SLACK;
     // What the mean loses per CRF step, as the search measured it. A further encode is allowed
     // only in answer to the first check.

@@ -150,6 +150,24 @@ pub fn survey(tools: &Tools, input: &Path, info: &MediaInfo, output: &Path, thre
     Ok(Some(Survey { scores, times, gops }))
 }
 
+/// Whether the source's frames are shown about as long as each other (see [`Times::steady`]),
+/// read off its packets without decoding. Only then can a one-pass encode be scored along its
+/// whole length and repaired, which the search counts on where it can. A source whose packets
+/// can't be read so counts as steady: the survey decides then.
+pub fn steady_source(tools: &Tools, input: &Path, info: &MediaInfo) -> bool {
+    let mut command = std::process::Command::new(&tools.ffprobe);
+    command.args(["-v", "error", "-select_streams", &info.video_index.to_string(), "-show_entries", "packet=pts", "-of", "csv=p=0"]).arg(crate::tools::probe_arg(input));
+    let Ok(out) = crate::probe::run_ffprobe(command, crate::probe::Reads::all_of(input)) else { return true };
+    if !out.status.success() {
+        return true;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut pts: Vec<i64> = text.lines().filter_map(|l| l.trim().trim_end_matches(',').parse().ok()).collect();
+    // Packets are stored in decoding order; a frame is shown in the order of its timestamp.
+    pts.sort_unstable();
+    pts.len() < 2 || Times { pts, tb: info.time_base }.steady()
+}
+
 /// Seconds from the first frame at which each frame is shown, then the end of the last one.
 fn timeline(times: &Times) -> Vec<f64> {
     let first = times.pts[0];

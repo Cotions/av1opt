@@ -874,7 +874,13 @@ fn variable_frame_rate_keeps_every_frame_at_its_time() {
     assert_eq!(want.len(), 96);
     for (extra, dir) in [(&[][..], "out"), (&["--scenes"][..], "out-scenes"), (&["--container", "mkv"][..], "out-mkv")] {
         let out_dir = c.dir.join(dir);
-        c.encode_into(&out_dir, &[&src], extra).ok().has("encoded 1,");
+        let run = c.encode_into(&out_dir, &[&src], extra);
+        run.ok().has("encoded 1,");
+        // Its frames can't be scored along the whole length, so nothing could make up a mean
+        // aimed below the target: the search aims at the target itself.
+        if dir == "out" {
+            run.has("the source's frames are shown for unequal times");
+        }
         let out = out_dir.join(if dir == "out-mkv" { "screen.mkv" } else { "screen.mp4" });
         let got = frame_times(&out);
         assert_eq!(got.len(), want.len(), "{dir}");

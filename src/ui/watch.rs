@@ -36,6 +36,9 @@ const PROBE_TRIES: u32 = 3;
 const LONGEST_WAIT: u64 = 86400;
 /// How many of those videos the page is told of by name.
 const UNREAD_LISTED: usize = 20;
+/// How many of those videos one look tries again. Each try can take as long as a probe may, and
+/// one watcher looks at every folder: thousands of them would hold it for hours.
+const RETRIES_PER_LOOK: usize = 20;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Watch {
@@ -113,6 +116,17 @@ struct Folder {
     /// How long the last walk through the folder took.
     #[serde(default)]
     walk_secs: f64,
+    /// When the folder was last walked through to its end.
+    #[serde(default)]
+    found_at: Option<u64>,
+}
+
+impl Folder {
+    /// The videos waiting to be read. Only those the latest look found: what is known of the
+    /// others is kept for a drive that comes back, but nothing of theirs is being waited for.
+    fn unread(&self) -> impl Iterator<Item = (&PathBuf, &Seen)> {
+        self.files.iter().filter(|(_, s)| s.unread() && self.found_at.is_none_or(|at| s.seen >= at))
+    }
 }
 
 #[derive(Default)]
@@ -158,6 +172,23 @@ fn settle(files: &mut BTreeMap<PathBuf, Seen>, found: Vec<(PathBuf, u64, u64)>, 
         files.retain(|_, s| now.saturating_sub(s.seen) < FORGET_AFTER);
     }
     (ready, changed || files.len() != before)
+}
+
+/// Keeps of `ready` all that have never been tried, and of those whose probe did not get through
+/// the [`RETRIES_PER_LOOK`] that have waited longest. The others keep their place and their
+/// waits, and come up at a later look. Asked for by hand (`by_hand`), videos still within their
+/// wait count as ready too, so that "Look now" is of use without trying thousands of them.
+fn with_few_retries(files: &BTreeMap<PathBuf, Seen>, ready: Vec<PathBuf>, now: u64, by_hand: bool) -> Vec<PathBuf> {
+    let (mut retries, mut chosen): (Vec<_>, Vec<_>) = ready.into_iter().partition(|p| files.get(p).is_some_and(Seen::unread));
+    if by_hand {
+        retries.extend(files.iter().filter(|(_, s)| s.unread() && s.seen == now && s.next_try > now).map(|(p, _)| p.clone()));
+    }
+    // When a video's wait began is when it was last tried.
+    let last_tried = |p: &PathBuf| files.get(p).map_or(0, |s| s.next_try.saturating_sub(wait_after(s.tries)));
+    retries.sort_by_cached_key(last_tried);
+    retries.truncate(RETRIES_PER_LOOK);
+    chosen.append(&mut retries);
+    chosen
 }
 
 /// How long a video waits after its probe failed `tries` times: nothing for the first looks,
@@ -358,7 +389,7 @@ fn judge(app: &App, w: &Watch, ready: Vec<PathBuf>) -> Result<Judged> {
 }
 
 /// Looks at one folder now: notes what is new, and queues what has settled and is worth it.
-/// Asked for `by_hand`, videos waiting for their next try get it now.
+/// Asked for `by_hand`, those that have waited longest for their next try get it now.
 fn look(app: &App, id: u64, by_hand: bool) -> Result<()> {
     let _one = app.watch.looking.lock().unwrap();
     let mut w = find(app, id)?;
@@ -378,11 +409,9 @@ fn look(app: &App, id: u64, by_hand: bool) -> Result<()> {
             Ok(found) => {
                 let first = if std::mem::take(&mut f.skip_existing) { Mark::Before } else { Mark::Fresh };
                 let had_error = f.error.take().is_some();
-                if by_hand {
-                    f.files.values_mut().for_each(|s| s.next_try = 0);
-                }
                 let (ready, changed) = settle(&mut f.files, found, at, first);
-                (ready, changed || had_error)
+                f.found_at = Some(at);
+                (with_few_retries(&f.files, ready, at, by_hand), changed || had_error)
             }
             Err(e) => {
                 f.error = Some(format!("{e:#}"));
@@ -465,7 +494,8 @@ pub fn list(app: &App) -> Value {
             let count = |m: Mark| f.map_or(0, |f| f.files.values().filter(|s| s.mark == m).count());
             let every = f.map_or(LOOK_EVERY, |f| LOOK_EVERY.max((f.walk_secs * 10.0) as u64));
             let next_look = f.and_then(|f| f.looked).map_or(at, |t| t + every);
-            let unread = || f.into_iter().flat_map(|f| f.files.iter()).filter(|(_, s)| s.unread());
+            let unread = || f.into_iter().flat_map(Folder::unread);
+            let fresh = f.map_or(0, |f| f.files.values().filter(|s| s.mark == Mark::Fresh && !s.unread()).count());
             // A try happens at the first look after its wait is over.
             let unread_files: Vec<Value> = unread()
                 .take(UNREAD_LISTED)
@@ -477,7 +507,7 @@ pub fn list(app: &App) -> Value {
                 "next_secs": f.and_then(|f| f.looked).map(|t| (t + every).saturating_sub(at)),
                 "error": f.and_then(|f| f.error.clone()),
                 "videos": f.map_or(0, |f| f.files.len()),
-                "fresh": count(Mark::Fresh) - unread().count(), "unread": unread().count(), "unread_files": unread_files,
+                "fresh": fresh, "unread": unread().count(), "unread_files": unread_files,
                 "queued": count(Mark::Queued), "left": count(Mark::Left), "before": count(Mark::Before),
             })
         })
@@ -707,6 +737,50 @@ mod tests {
             output_problem(&root, &fine).unwrap();
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn failed_at(tries: u32, last_tried: u64, seen: u64) -> Seen {
+        Seen { tries, why: Some("no".into()), next_try: last_tried + wait_after(tries), ..Seen::new(1, 1, Mark::Fresh, seen) }
+    }
+
+    #[test]
+    fn videos_gone_from_a_folder_are_not_shown_as_waiting_to_be_read() {
+        let files = BTreeMap::from([(PathBuf::from("/w/here.mkv"), failed_at(1, 90, 100)), (PathBuf::from("/w/gone.mkv"), failed_at(1, 50, 90))]);
+        let mut f = Folder { files, found_at: Some(100), ..Default::default() };
+        assert_eq!(f.unread().map(|(p, _)| p.to_str().unwrap()).collect::<Vec<_>>(), ["/w/here.mkv"]);
+        // Nothing found at all, as with a drive that is away: what is known stays, unlisted.
+        f.found_at = Some(200);
+        assert_eq!(f.unread().count(), 0);
+        assert_eq!(f.files.len(), 2);
+        // A state file of an earlier version does not say. The next look will.
+        f.found_at = None;
+        assert_eq!(f.unread().count(), 2);
+    }
+
+    #[test]
+    fn a_look_tries_again_only_the_videos_that_waited_longest() {
+        let now = 1_000_000;
+        let name = |i: usize| PathBuf::from(format!("/w/{i:04}.mkv"));
+        // Due again, the lowest numbers tried longest ago.
+        let mut files: BTreeMap<PathBuf, Seen> = (0..1000).map(|i| (name(i), failed_at(1, now - 5000 + i as u64, now))).collect();
+        let first_time = PathBuf::from("/w/new.mkv");
+        files.insert(first_time.clone(), Seen::new(1, 1, Mark::Fresh, now));
+        let before = files.clone();
+        let ready: Vec<PathBuf> = files.keys().cloned().collect();
+        let chosen = with_few_retries(&files, ready, now, false);
+        assert_eq!(chosen.len(), RETRIES_PER_LOOK + 1);
+        // A video never tried is not held back by those that failed.
+        assert_eq!(chosen[0], first_time);
+        assert_eq!(chosen[1..], (0..RETRIES_PER_LOOK).map(name).collect::<Vec<_>>());
+        assert_eq!(files, before, "the waits of the others are left alone");
+
+        // Those whose wait is not over come up only when asked for, and then in the same number.
+        let waiting: BTreeMap<PathBuf, Seen> = (0..100).map(|i| (name(i), failed_at(9, now - 10 + i as u64, now))).collect();
+        assert!(with_few_retries(&waiting, Vec::new(), now, false).is_empty());
+        assert_eq!(with_few_retries(&waiting, Vec::new(), now, true), (0..RETRIES_PER_LOOK).map(name).collect::<Vec<_>>());
+        // A video the look did not find is not tried.
+        let gone = BTreeMap::from([(name(0), failed_at(9, now - 10, now - 300))]);
+        assert!(with_few_retries(&gone, Vec::new(), now, true).is_empty());
     }
 
     #[test]

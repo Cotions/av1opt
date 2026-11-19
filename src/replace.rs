@@ -425,9 +425,25 @@ impl OpenFile {
 /// not, it goes back where it came from, or under a hidden name beside that if the name has been
 /// taken again: it must not stay in a place it was never checked for.
 fn land(from: &Path, to: &Path, file: &OpenFile) -> std::io::Result<()> {
+    land_watched(from, to, file, &|| {})
+}
+
+/// [`land`], with `after_rename` called between the rename and the look at what arrived.
+fn land_watched(from: &Path, to: &Path, file: &OpenFile, after_rename: &dyn Fn()) -> std::io::Result<()> {
+    // What the rename is about to move, which is not `file` if the name was taken over: only
+    // that is taken away again, and not a file somebody put at `to` once it had arrived.
+    let moving = std::fs::symlink_metadata(from)?;
     trash::rename_new(from, to)?;
+    after_rename();
     if file.is_at(to) {
         return Ok(());
+    }
+    if !std::fs::symlink_metadata(to).is_ok_and(|m| (m.dev(), m.ino()) == (moving.dev(), moving.ino())) {
+        return Err(std::io::Error::other(format!(
+            "{} was replaced by another file while it was being moved, and {} holds a file this move did not put there by now, so that file was left where it is",
+            from.display(),
+            to.display()
+        )));
     }
     let taken_back = trash::rename_new(to, from).or_else(|_| trash::rename_new(to, &staging_name(from)));
     Err(std::io::Error::other(match taken_back {
@@ -1383,6 +1399,26 @@ mod tests {
         assert_eq!(mode(&elsewhere), 0o604);
         assert!(f.lib("a.mp4").exists() && f.out("a.mkv").exists() && !f.lib("a.mkv").exists());
         assert!(!f.dir.join("Trash/files/a.mp4").exists());
+    }
+
+    #[test]
+    fn landing_takes_back_only_what_it_moved() {
+        let f = Fix::new("land-planted");
+        let (from, to) = (f.out("a.mkv"), f.lib("a.mkv"));
+        std::fs::write(&from, vec![b'o'; 400]).unwrap();
+        let opened = OpenFile::open(&from, 400).unwrap();
+        swap_for_another_file(&from);
+        // Once the swapped file has arrived, somebody takes it on and puts a file of theirs there.
+        let planted = f.dir.join("planted");
+        let err = land_watched(&from, &to, &opened, &|| {
+            std::fs::rename(&to, &planted).unwrap();
+            std::fs::write(&to, b"theirs").unwrap();
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("did not put there"), "{err}");
+        assert_eq!(std::fs::read(&to).unwrap(), b"theirs");
+        assert!(!from.exists(), "a file the move did not put there was moved");
+        assert_eq!(std::fs::read(&planted).unwrap(), vec![b'e'; 400]);
     }
 
     #[test]

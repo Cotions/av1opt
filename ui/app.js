@@ -2031,7 +2031,7 @@ function renderBench(out, data, ui) {
 
 const PHASES = { probing: "Probing", sampling: "Cutting samples", searching: "Searching CRF", scenes: "Finding scenes", chunks: "Encoding chunks", encoding: "Encoding", muxing: "Muxing", verifying: "Verifying", repairing: "Encoding weak stretches again" };
 const STATUS = {
-  pending: ["Waiting", ""], running: ["Running", "run"], ok: ["Done", "ok"], skip: ["Skipped", "warn"], error: ["Failed", "bad"],
+  pending: ["Waiting", ""], running: ["Running", "run"], ok: ["Done", "ok"], skip: ["Skipped", "warn"], needs_confirming: ["Needs confirming", "warn"], error: ["Failed", "bad"],
   done_before: ["Done earlier", "ok"], cancelled: ["Cancelled", ""], queued: ["Queued", ""], done: ["Finished", "ok"], failed: ["Failed", "bad"],
 };
 function statusPill(st) { const [l, c] = STATUS[st] || [st, ""]; return h("span", { class: "pill " + c }, l); }
@@ -2375,7 +2375,7 @@ views.queue = (root) => {
       right.append(h("a", { class: "btn", href: "#/compare?report=" + encodeURIComponent(f.report) }, "Compare"));
     }
     const el = h("div", { class: "file" }, h("div", { class: "line1" }, j.paused && f.status === "running" ? pausedPill(j) : statusPill(f.status), name, right));
-    if (f.detail && (f.status === "skip" || f.status === "error")) el.append(h("div", { class: f.status === "error" ? "bad mono" : "warn" }, f.detail));
+    if (f.detail && (f.status === "skip" || f.status === "error" || f.status === "needs_confirming")) el.append(h("div", { class: f.status === "error" ? "bad mono" : "warn" }, f.detail));
     if (f.status === "running") {
       const live = drawLive(j, f);
       el.append(live.el);
@@ -2637,7 +2637,8 @@ views.history = (root) => {
         stateOf(x) === "replaced" ? h("span", { class: "pill ok", title: `The AV1 file is where the original was: ${x.output}\n${x.input_exists ? "The original is in the trash" : "The original is no longer in the trash"}` }, "replaced")
           : x.input_exists === false ? h("span", { class: "pill warn", title: "source no longer at this path" }, "source gone") : null,
         x.output_exists === false ? h("span", { class: "pill bad" }, "output gone") : null,
-        stateOf(x) === "not_recorded" ? h("span", { class: "pill", title: x.replace.why }, "not made here") : null),
+        stateOf(x) === "not_recorded" ? h("span", { class: "pill", title: x.replace.why }, "not made here") : null,
+        stateOf(x) === "needs_confirming" ? h("span", { class: "pill warn", title: x.replace.why }, "date changed") : null),
       h("td", {}, x.mode === "scenes" ? `scenes (${x.chunks})` : "whole"),
       h("td", { class: "num" }, x.crf),
       h("td", { class: "num" }, x.target_vmaf),
@@ -3041,6 +3042,26 @@ function comparePlayer(root, r) {
         await act("/api/replace/undo", { report: r.report_path, allow_zfs: !!rp.zfs }, "Original back in its place");
         btn.disabled = false;
       } }, "Put original back")) : null]
+    : rp.state === "needs_confirming" ? [
+      h("p", { class: "dim" }, `The original's date is not what it was: ${rp.why}.`),
+      h("div", { class: "row" }, h("button", { class: "danger", onclick: async (e) => {
+        const btn = e.currentTarget;
+        const ok = await confirmDialog({
+          title: "Replace an original that cannot be checked?",
+          action: "Only its date changed: replace",
+          body: [
+            h("div", { class: "mono trash-list" }, r.input),
+            h("p", { class: "warn" }, `${rp.why}.`),
+            h("p", {}, "Go on only if you know that nothing but its date changed. If its contents changed after the encode, they are not in the AV1 file."),
+            h("p", { class: "dim" }, "The original moves to the trash of its drive, and this page can put it back until you empty the trash. The AV1 file becomes:"),
+            h("div", { class: "mono trash-list" }, rp.dest),
+            rp.zfs ? h("p", { class: "warn" }, "The original is on ZFS, which av1opt writes to only when asked. Replacing it here is asking.") : null],
+        });
+        if (!ok) return;
+        btn.disabled = true;
+        try { await act("/api/replace", { report: r.report_path, allow_zfs: !!rp.zfs, accept_changed_date: true }, "Original replaced; it is in the trash"); }
+        finally { btn.disabled = false; }
+      } }, "Replace original…"))]
     : rp.state === "not_recorded" ? h("p", { class: "dim" }, `${rp.why}.`)
     : h("p", { class: "dim" }, `The AV1 file can't take the original's place: ${rp.why}.`));
 

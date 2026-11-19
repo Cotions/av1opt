@@ -794,9 +794,10 @@ fn run_command(command: Cmd) -> Result<()> {
             let s = batch::run(&tools, &jobs, &out_dir, &opts, retry_skipped)?;
             let saved = s.bytes_in.saturating_sub(s.bytes_out) as f64 / 1e9;
             let unverified = if s.unverified > 0 { format!(", not verified {}", s.unverified) } else { String::new() };
+            let to_confirm = if s.needs_confirming > 0 { format!(", needs confirming {}", s.needs_confirming) } else { String::new() };
             let unread = if unread_folders.is_empty() { String::new() } else { format!(", folders not read {}", unread_folders.len()) };
             eprintln!(
-                "\nencoded {}, skipped {}, failed {}, already done {}{unverified}{unread} | {:.2} GB -> {:.2} GB ({saved:.2} GB saved)",
+                "\nencoded {}, skipped {}, failed {}, already done {}{unverified}{to_confirm}{unread} | {:.2} GB -> {:.2} GB ({saved:.2} GB saved)",
                 s.ok, s.skipped, s.failed, s.already_done, s.bytes_in as f64 / 1e9, s.bytes_out as f64 / 1e9
             );
             eprintln!("log: {}", out_dir.join(batch::LOG_NAME).display());

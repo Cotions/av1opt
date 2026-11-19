@@ -559,6 +559,20 @@ pub fn apply_if(report: &Path, allow_zfs: bool, accept: AcceptOutput) -> Result<
     apply_judging(report, allow_zfs, Judging::default(), &trash::trash, accept)
 }
 
+/// [`check_for_list`] on behalf of someone who says that only the original's date changed, as
+/// `--accept-changed-date` does: what the report cannot tell about counts as the same.
+#[cfg(feature = "ui")]
+pub fn check_for_list_accepting_changed_date(report: &Path) -> Check {
+    check_judging(report, Judging { for_list: true, accept_changed_date: true, ..Judging::default() })
+}
+
+/// [`apply_if`] on behalf of someone who says that only the original's date changed. An original
+/// known to differ is still refused.
+#[cfg(feature = "ui")]
+pub fn apply_if_date_accepted(report: &Path, allow_zfs: bool, accept: AcceptOutput) -> Result<Done> {
+    apply_judging(report, allow_zfs, Judging { accept_changed_date: true, ..Judging::default() }, &trash::trash, accept)
+}
+
 #[cfg(test)]
 fn apply_with(report: &Path, allow_zfs: bool, to_trash: &dyn Fn(&Path) -> Result<PathBuf>) -> Result<Done> {
     apply_judging(report, allow_zfs, Judging::default(), to_trash, &|_, _| Ok(()))

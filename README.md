@@ -410,8 +410,9 @@ the settings count only for a run at the default target, preset and `--min-savin
 report beside it says. A source of the same name with another size is reported, not passed
 over. At the same size and another modification time the fingerprint in the report decides
 (see Verify above): a source only touched, or copied without its dates, counts as done, and
-one rewritten is reported. So is one whose report holds the time but no fingerprint, which
-cannot tell the two apart. Deleting the output encodes the source again. A report too old to
+one rewritten is reported. One whose report holds the time but no fingerprint cannot tell the
+two apart: it is counted apart as needing confirmation, not as failed. Deleting the output
+encodes the source again. A report too old to
 hold the time goes by the size alone. A file there with no report, or with one that cannot
 be read, says nothing about what it is: it is listed as not verified and left alone, the run
 ends with status 3, and moving or deleting it has the source encoded.
@@ -434,7 +435,7 @@ from two input folders), the second is reported as a name collision instead of b
 
 ### Exit status
 
-`encode` ends with 0 when no file failed (files skipped or already done are no failure), 1 on
+`encode` ends with 0 when no file failed (files skipped, already done or needing confirmation are no failure), 1 on
 an error that stopped the run, 2 on wrong usage, 3 when some files failed or an output already
 there could not be verified and the others were dealt with, and 130 or 143 when Ctrl-C or
 SIGTERM stopped it. `dups` ends with 3 when more than half of the videos could not be read: it
@@ -617,7 +618,9 @@ single output files.
   output must be there with the sizes the encode recorded, and the output must be the smaller
   one. An original with another modification time is judged as when `encode` resumes: one only
   touched or copied is replaced, while one rewritten, one that cannot be read and one whose
-  report has no fingerprint to tell by are refused. Originals that are links, reports without
+  report has no fingerprint to tell by are refused, unless you say that only the date changed
+  (`--accept-changed-date`, or **Replace original…** on the Compare page, which first says what
+  cannot be checked). Originals that are links, reports without
   full paths (very old ones) and a new name that is already taken in the original's folder are
   refused too.
 - An output with sections removed takes its original's place like any other, and the list

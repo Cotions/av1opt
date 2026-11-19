@@ -657,6 +657,59 @@ fn originals_are_replaced_and_put_back_through_reports_in_history() {
     assert_eq!(sizes(), [Some(6), Some(1000), None]);
 }
 
+#[test]
+fn an_original_with_only_its_date_changed_is_replaced_once_someone_says_so() {
+    // Reports with nothing but a time to go by, for an original touched since.
+    let extra = |name: &str| if name == "edited" { json!({ "source_fingerprint": "0000000000000000" }) } else { json!({}) };
+    let s = Server::start("touched", |d| {
+        std::fs::create_dir_all(d.join("out")).unwrap();
+        let mut lines = Vec::new();
+        for name in ["film", "edited"] {
+            let (source, output) = (d.join(format!("videos/{name}.mp4")), d.join(format!("out/{name}.mkv")));
+            std::fs::write(&source, vec![b's'; 3000]).unwrap();
+            std::fs::write(&output, vec![b'o'; 1000]).unwrap();
+            let mut report = json!({
+                "format": 1, "input": source, "output": output, "source_bytes": 3000, "output_bytes": 1000, "source_mtime": 1000,
+                "savings": 0.667, "mode": "whole", "crf": 30.0, "preset": 6, "target_vmaf": 93.0,
+            });
+            let mut line = encoded_line(&source, &output);
+            line["source_mtime"] = json!(1000);
+            for (k, v) in extra(name).as_object().unwrap() {
+                report[k] = v.clone();
+                line[k] = v.clone();
+            }
+            std::fs::write(d.join(format!("out/{name}.av1opt.json")), report.to_string()).unwrap();
+            lines.push(line);
+        }
+        write_record(d, &lines);
+    });
+    assert_eq!(s.post("/api/history/dirs", &json!({ "path": s.dir.join("out") })).status, 200);
+    let state = |name: &str| {
+        let list = s.get("/api/history").json();
+        list["reports"].as_array().unwrap().iter().find(|r| r["input"].as_str().unwrap().ends_with(&format!("{name}.mp4"))).unwrap()["replace"].clone()
+    };
+    let report = s.dir.join("out/film.av1opt.json");
+    let st = state("film");
+    assert_eq!(st["state"], "needs_confirming", "{st}");
+    assert!(st["why"].as_str().unwrap().contains("cannot tell whether it is still the file that was encoded"), "{st}");
+    assert_eq!(st["dest"], json!(s.dir.join("videos/film.mkv")), "{st}");
+
+    // Not without being told, and then only what the report cannot tell about.
+    let r = s.post("/api/replace", &json!({ "report": report }));
+    assert!(r.status == 400 && r.body.contains("cannot tell"), "{}", r.body);
+    assert!(s.dir.join("videos/film.mp4").exists());
+    assert_eq!(state("edited")["state"], "no", "samples that differ show a change");
+    let r = s.post("/api/replace", &json!({ "report": s.dir.join("out/edited.av1opt.json"), "accept_changed_date": true }));
+    assert!(r.status == 400 && r.body.contains("changed since the encode"), "{}", r.body);
+    assert!(s.dir.join("videos/edited.mp4").exists());
+
+    let r = s.post("/api/replace", &json!({ "report": report, "accept_changed_date": true }));
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(!s.dir.join("videos/film.mp4").exists());
+    assert_eq!(std::fs::metadata(s.dir.join("videos/film.mkv")).unwrap().len(), 1000);
+    assert_eq!(std::fs::metadata(s.dir.join("data/Trash/files/film.mp4")).unwrap().len(), 3000);
+}
+
 /// Puts lines in av1opt's own record, private as av1opt keeps it.
 fn write_record(d: &Path, lines: &[Value]) {
     use std::os::unix::fs::PermissionsExt;

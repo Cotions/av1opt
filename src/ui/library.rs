@@ -511,11 +511,15 @@ fn replace_state(ledger: &Ledger, report: &Path, on_record: bool) -> Value {
             Ok(()) => json!({ "state": "ready", "dest": p.dest, "copy": p.copy, "zfs": p.zfs, "removed": p.removed }),
             Err(why) => no(why),
         },
+        // What only the person can settle is offered to them, with what cannot be checked.
+        Check::No(why) => match replace::check_for_list_accepting_changed_date(report) {
+            Check::Ready(p) if ledger.check_ready(&p, false).is_ok() => json!({ "state": "needs_confirming", "why": why, "dest": p.dest, "copy": p.copy, "zfs": p.zfs, "removed": p.removed }),
+            _ => no(why),
+        },
         Check::Replaced(d) => match ledger.check_replaced(&d) {
             Ok(()) => json!({ "state": "replaced", "trash": d.trash, "from": d.from, "can_undo": d.can_undo, "zfs": d.zfs }),
             Err(why) => no(why),
         },
-        Check::No(why) => no(why),
     }
 }
 
@@ -643,6 +647,10 @@ struct ReplaceRequest {
     /// Also replace an original stored on ZFS (asked for in the dialog, per run).
     #[serde(default)]
     allow_zfs: bool,
+    /// The person has been told what cannot be checked about this original, and says that only
+    /// its date changed.
+    #[serde(default)]
+    accept_changed_date: bool,
 }
 
 /// Moves the original of one report to the trash and its output into its place. One file
@@ -651,14 +659,16 @@ pub fn replace_original(app: &App, body: &Value) -> Result<Value> {
     let r: ReplaceRequest = serde_json::from_value(body.clone())?;
     let report = known_report(app, &r.report)?;
     refuse_unless_on_record(&app.ledger.current(), &report)?;
-    if let Check::Ready(p) = replace::check_for_list(&report)
+    let listed = if r.accept_changed_date { replace::check_for_list_accepting_changed_date(&report) } else { replace::check_for_list(&report) };
+    if let Check::Ready(p) = listed
         && crate::ui::jobs::waiting_on(app, &p.source)
     {
         bail!("the original is in the encode queue");
     }
     // The record is what says this output and this original belong together, and the output is
     // read here through the very descriptor that makes sure it is the file that gets moved.
-    let done = replace::apply_if(&report, r.allow_zfs, &|p, output| app.ledger.current().check_ready(p, Some(output)))?;
+    let on_record = |p: &replace::Plan, output: &replace::OpenFile| app.ledger.current().check_ready(p, Some(output));
+    let done = if r.accept_changed_date { replace::apply_if_date_accepted(&report, r.allow_zfs, &on_record) } else { replace::apply_if(&report, r.allow_zfs, &on_record) }?;
     Ok(json!({ "dest": done.dest, "trash": done.trash, "source_bytes": done.source_bytes, "warnings": done.warnings }))
 }
 

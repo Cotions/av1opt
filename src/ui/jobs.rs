@@ -151,7 +151,7 @@ pub struct FileState {
     input: PathBuf,
     output: PathBuf,
     report: PathBuf,
-    /// pending, running, ok, skip, error, done_before, cancelled
+    /// pending, running, ok, skip, needs_confirming, error, done_before, cancelled
     status: String,
     detail: String,
     source: Option<Value>,

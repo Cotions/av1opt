@@ -724,6 +724,8 @@ enum Before {
     Leave(String),
     /// A file stands at the output's name and nothing says what it is.
     Unverified(String),
+    /// Whether the output is this input's encode is for a person to say.
+    NeedsConfirming(String),
     Refuse(String),
 }
 
@@ -777,8 +779,8 @@ fn before_encoding(output: &Path, clash: Option<&Clash>, input: &Path, o: &Optio
         Verdict::Same => Before::Done,
         Verdict::OtherSize { then, now } => Before::Refuse(format!("{shown} was made from this file when it was another size ({then} bytes, now {now}); move or delete it to encode again")),
         Verdict::Changed => Before::Refuse(format!("{shown} was made from this file before it changed: it is the same size but holds something else now; move or delete {shown} to encode it again")),
-        Verdict::CannotTell => Before::Refuse(format!(
-            "{shown} was made from this file when it was last changed at another time, and {why}, so av1opt cannot tell whether only the date differs; this file counts as failed until then: if the file did change, or to be sure, delete {shown} to encode it again"
+        Verdict::CannotTell => Before::NeedsConfirming(format!(
+            "{shown} was made from this file when it was last changed at another time, and {why}, so av1opt cannot tell whether only the date differs. Nothing was done: if the file did change, or to be sure, delete {shown} to encode it again; if you know only its date changed, you can leave it, and replace the original from the History page or with replace --accept-changed-date"
         )),
         Verdict::Unreadable(e) => Before::Refuse(format!("cannot tell whether {shown} is the encode of this file as it is now, because the file cannot be read: {e}")),
     }
@@ -792,6 +794,9 @@ pub struct Summary {
     pub already_done: usize,
     /// Files whose output's name is taken by something without a report to say what it is.
     pub unverified: usize,
+    /// Files with an output that only a person can say is theirs. Nothing failed: nothing can
+    /// come of running again until someone has decided.
+    pub needs_confirming: usize,
     pub bytes_in: u64,
     pub bytes_out: u64,
     /// The user stopped the run; remaining files were not started.
@@ -897,6 +902,11 @@ pub fn run_placed(tools: &Tools, jobs: &[Job], out_dir: &Path, place: Option<&Ou
                 end("skip", &msg, 0);
                 sum.unverified += 1;
                 record("unverified", &abs, file, &msg);
+            Before::NeedsConfirming(why) => {
+                eprintln!("needs confirming: {why}");
+                end("needs_confirming", &why, 0);
+                sum.needs_confirming += 1;
+                record("needs_confirming", &abs, file, &why);
                 continue;
             }
             Before::Refuse(msg) => {
@@ -1133,6 +1143,22 @@ mod tests {
         std::fs::rename(g.0.join("d.mp4"), g.0.join("c.mp4")).unwrap();
         let own = [Job { input: g.0.join("c.mkv"), out_dir: g.0.clone(), also_at: None }];
         assert_eq!(clashes(&own, &options()), [Some(Clash::Own)]);
+    }
+
+    #[test]
+    fn an_output_of_a_touched_source_with_nothing_to_tell_by_waits_for_a_person() {
+        let source = Folder::new("touched-in", &["c.mkv"]);
+        let out = Folder::new("touched-out", &["c.mp4"]);
+        let size = std::fs::metadata(source.0.join("c.mkv")).unwrap().len();
+        let report = serde_json::json!({ "input": source.0.join("c.mkv"), "output": out.0.join("c.mp4"), "source_bytes": size, "source_mtime": 1000 });
+        std::fs::write(out.0.join("c.av1opt.json"), report.to_string()).unwrap();
+        let (sum, ends) = source.walk(&out.0, &options());
+        assert_eq!((sum.needs_confirming, sum.failed, sum.already_done, sum.ok), (1, 0, 0, 0));
+        let (status, detail) = &ends["c.mkv"];
+        assert_eq!(status, "needs_confirming");
+        assert!(detail.contains("cannot tell whether only the date differs") && detail.contains("delete"), "{detail}");
+        let log = std::fs::read_to_string(out.0.join(LOG_NAME)).unwrap();
+        assert!(log.contains("\tneeds_confirming\t"), "{log}");
     }
 
     #[test]
@@ -1474,7 +1500,7 @@ mod tests {
         ] {
             report(fields);
             let (status, detail) = source.walk(&out.0, &options()).1["c.mkv"].clone();
-            assert_eq!(status, "error");
+            assert_eq!(status, "needs_confirming");
             assert!(detail.contains("when it was last changed at another time") && detail.contains(why) && detail.contains(&format!("delete {}", out.0.join("c.mp4").display())), "{detail}");
         }
         // A report from before the time was kept judges by the size alone.

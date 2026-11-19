@@ -3366,6 +3366,22 @@ fn the_output_folder_of_the_last_encode_is_kept_through_a_kill() {
     assert_eq!(s2.get("/api/state").json()["default_out_dir"], json!(out));
 }
 
+/// A job brought back from the saved queue goes where it was sent in its own session; the
+/// folder offered for the next encode stays the one chosen last.
+#[test]
+fn a_job_brought_back_does_not_change_the_folder_offered_next() {
+    let (ffmpeg, ffprobe) = stand_in_tools("out-dir-restored", A_VIDEO);
+    let s = Server::start_with_tools("out-dir-restored", &ffmpeg, &ffprobe, |d| {
+        std::fs::write(d.join("videos/a.mp4"), b"xx").unwrap();
+        folder_in_use(&d.join("older"));
+        std::fs::write(d.join("data/av1opt/ui.json"), json!({ "format": 1, "out_dir": d.join("last"), "queue_paused": true }).to_string()).unwrap();
+        write_saved_queue(d, json!([{ "inputs": [d.join("videos/a.mp4")], "roots": [], "out_dir": d.join("older"), "options": {}, "out_dir_made": true }]));
+    });
+    soon("the saved queue is read", || s.get("/api/jobs").json()["restoring"] == 0);
+    assert_eq!(heads(&s).len(), 1, "{}", s.get("/api/jobs").json());
+    assert_eq!(s.get("/api/state").json()["default_out_dir"], json!(s.dir.join("last")));
+}
+
 /// Sections that leave nothing, or less than a second, are refused when they are asked for,
 /// not when the job comes to run.
 #[test]

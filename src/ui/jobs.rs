@@ -492,7 +492,7 @@ fn add_checked(app: &App, body: &Value, origin: Origin) -> Result<Value> {
     if let Some(o) = body.get("options").filter(|o| !o.is_null()) {
         check_options(app, &serde_json::from_value::<JobOptions>(o.clone())?)?;
     }
-    let id_and_files = enqueue(app, prepare(app, body, origin, &Known::load())?);
+    let id_and_files = enqueue(app, prepare(app, body, origin, &Known::load())?, origin == Origin::Asked);
     app.save_settings();
     persist(app);
     app.jobs.wake.notify_all();
@@ -679,14 +679,16 @@ fn prepare(app: &App, body: &Value, origin: Origin, known: &Known) -> Result<Job
 
 /// Puts a job in the queue. Saving and telling the page are left to the caller, who may be
 /// adding many.
-fn enqueue(app: &App, mut job: Job) -> Value {
+/// `asked_now` is false for a job brought back from the saved queue: its folder was chosen in
+/// an earlier session and must not displace the one chosen last.
+fn enqueue(app: &App, mut job: Job, asked_now: bool) -> Value {
     job.id = {
         let mut n = app.jobs.next_id.lock().unwrap();
         *n += 1;
         *n
     };
     let (id, count) = (job.id, job.files.len());
-    let (out_dir, by_hand) = (job.out_dir.clone(), job.watch.is_none());
+    let (out_dir, by_hand) = (job.out_dir.clone(), asked_now && job.watch.is_none());
     app.jobs.jobs.lock().unwrap().push(job);
     let mut s = app.settings.lock().unwrap();
     // The folder offered for the next encode is the one last chosen, not a watch's.
@@ -898,7 +900,7 @@ fn bring_back(app: &App, by_person: bool) -> (usize, bool) {
                     }
                     // Not `add`: with broken tools the jobs wait in the queue rather than get dropped.
                     eprintln!("re-queued {} file(s) from the last session", job.files.len());
-                    enqueue(app, job);
+                    enqueue(app, job, false);
                     added += 1;
                 }
                 Err(e) => {

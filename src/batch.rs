@@ -5,7 +5,8 @@ use crate::encode::{self, Options, Skip};
 use crate::events::{self, Event};
 use crate::source::Verdict;
 use crate::tools::Tools;
-use anyhow::Result;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt;
@@ -25,6 +26,89 @@ impl std::fmt::Display for OutDirMissing {
 }
 
 impl std::error::Error for OutDirMissing {}
+
+/// A job's output folder is there, but not on the drive it was on: what stands at that path
+/// now is most likely the empty mount point of a drive that is away.
+#[derive(Debug)]
+pub struct OutDirElsewhere(pub PathBuf);
+
+impl std::fmt::Display for OutDirElsewhere {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "the output folder {} is now on another drive than when it was queued; its drive may be unmounted, or mounted elsewhere", self.0.display())
+    }
+}
+
+impl std::error::Error for OutDirElsewhere {}
+
+/// Where a job's output folder was when it was made or first seen. Saved with the job.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OutDirPlace {
+    /// The device id of the file system holding it.
+    pub device: u64,
+    /// The top folder of that file system.
+    pub mount: PathBuf,
+}
+
+impl OutDirPlace {
+    /// None for a folder that cannot be looked at.
+    pub fn of(dir: &Path) -> Option<OutDirPlace> {
+        let dir = std::fs::canonicalize(dir).ok()?;
+        let device = std::fs::metadata(&dir).ok()?.dev();
+        let mut mount = dir.as_path();
+        while let Some(parent) = mount.parent().filter(|p| std::fs::metadata(p).is_ok_and(|m| m.dev() == device)) {
+            mount = parent;
+        }
+        Some(OutDirPlace { device, mount: mount.to_path_buf() })
+    }
+
+    /// Whether a folder found at `now` is still on this drive. The device id alone would not
+    /// do: many file systems get a new one at each mount, and a drive back after a restart
+    /// would count as another. So a file system at or below the same top folder counts too.
+    fn holds(&self, now: &OutDirPlace) -> bool {
+        now.device == self.device || now.mount.starts_with(&self.mount)
+    }
+}
+
+/// What stops a job from writing to its output folder now, if anything.
+pub fn out_dir_problem(out_dir: &Path, place: Option<&OutDirPlace>) -> Option<anyhow::Error> {
+    if !out_dir.is_dir() {
+        return Some(OutDirMissing(out_dir.to_path_buf()).into());
+    }
+    let now = OutDirPlace::of(out_dir)?;
+    place.filter(|then| !then.holds(&now)).map(|_| OutDirElsewhere(out_dir.to_path_buf()).into())
+}
+
+/// Whether `error` says the output folder is away, which ends once the drive is back.
+pub fn is_out_dir_problem(error: &anyhow::Error) -> bool {
+    error.chain().any(|e| e.is::<OutDirMissing>() || e.is::<OutDirElsewhere>())
+}
+
+/// Makes the output folder of a job or watch saved by a version that did not make it when it
+/// was queued. Nothing says yet whether its absence means a drive that is away, so only the
+/// last part of the path is made: with its parent missing the drive is taken to be away, and
+/// the same with a parent that is empty and on the same drive as the folder above it, which is
+/// what the mount point of an unmounted drive looks like.
+pub fn make_out_dir_once(out_dir: &Path) -> Result<()> {
+    if out_dir.is_dir() {
+        return Ok(());
+    }
+    let away = || anyhow::Error::from(OutDirMissing(out_dir.to_path_buf()));
+    let parent = out_dir.parent().ok_or_else(away)?;
+    if could_be_empty_mount_point(parent) {
+        return Err(away());
+    }
+    match std::fs::create_dir(out_dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(away()),
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => Err(e).with_context(|| format!("cannot create {}", out_dir.display())),
+        _ => Ok(()),
+    }
+}
+
+fn could_be_empty_mount_point(dir: &Path) -> bool {
+    let device = |p: &Path| std::fs::metadata(p).ok().map(|m| m.dev());
+    let empty = std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_none());
+    empty && dir.parent().is_some_and(|above| device(above).is_some() && device(above) == device(dir))
+}
 
 /// One input file and the folder its output goes to.
 pub struct Job {
@@ -396,9 +480,19 @@ pub struct Summary {
     pub bytes_out: u64,
     /// The user stopped the run; remaining files were not started.
     pub cancelled: bool,
+    /// Files failed because the output folder was away. Whatever it is doing by the end of the
+    /// run, those files are still to be done.
+    pub out_dir_lost: Option<anyhow::Error>,
 }
 
 pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipped: bool) -> Result<Summary> {
+    run_placed(tools, jobs, out_dir, None, o, retry_skipped)
+}
+
+/// [`run`] for an output folder known to have been at `place`.
+pub fn run_placed(tools: &Tools, jobs: &[Job], out_dir: &Path, place: Option<&OutDirPlace>, o: &Options, retry_skipped: bool) -> Result<Summary> {
+    let folder_problem = || if o.out_dir_must_exist { out_dir_problem(out_dir, place) } else { None };
+    let may_write = || folder_problem().map_or(Ok(()), Err);
     let log = out_dir.join(LOG_NAME);
     let settings = settings_key(o);
     let skips = if retry_skipped { HashMap::new() } else { read_skips(&log, &settings) };
@@ -429,11 +523,12 @@ pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipp
 
         // A drive lost during the job: encoding on would fill the disk under its mount point.
         // Not logged, since the log lives in the folder that is gone.
-        if o.out_dir_must_exist && !out_dir.is_dir() {
-            let msg = OutDirMissing(out_dir.to_path_buf()).to_string();
+        if let Some(problem) = folder_problem() {
+            let msg = problem.to_string();
             eprintln!("FAILED: {msg}");
             end("error", &msg, 0);
             sum.failed += 1;
+            sum.out_dir_lost.get_or_insert(problem);
             continue;
         }
 
@@ -471,7 +566,7 @@ pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipp
         }
 
         encode::clean_stale_temp(&job.out_dir);
-        match guarded(|| encode::optimize(tools, &job.input, &job.out_dir, o)) {
+        match guarded(|| encode::optimize(tools, &job.input, &job.out_dir, &may_write, o)) {
             Ok(out) => {
                 let out_size = std::fs::metadata(&out).map_or(0, |m| m.len());
                 sum.ok += 1;
@@ -494,10 +589,18 @@ pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipp
                 record("skip", &abs, size, &e.to_string());
             }
             Err(e) => {
-                eprintln!("FAILED: {e:#}");
-                end("error", &format!("{e:#}"), 0);
+                let detail = format!("{e:#}");
+                eprintln!("FAILED: {detail}");
+                end("error", &detail, 0);
                 sum.failed += 1;
-                record("error", &abs, size, &format!("{e:#}"));
+                // A file whose drive went away during its encode failed for that, whatever
+                // the error was, and it may be back before the next file looks.
+                match if is_out_dir_problem(&e) { Some(e) } else { folder_problem() } {
+                    Some(problem) => {
+                        sum.out_dir_lost.get_or_insert(problem);
+                    }
+                    None => record("error", &abs, size, &detail),
+                }
             }
         }
     }
@@ -699,6 +802,76 @@ mod tests {
             assert_eq!(*detail, OutDirMissing(out.0.clone()).to_string());
         }
         assert!(!out.0.exists());
+    }
+
+    #[test]
+    fn an_output_folder_on_another_drive_than_it_was_stops_the_job() {
+        let source = Folder::new("place-in", &["c.mkv"]);
+        let out = Folder::new("place-out", &[]);
+        let here = OutDirPlace::of(&out.0).unwrap();
+        assert!(out_dir_problem(&out.0, Some(&here)).is_none());
+        assert!(out.0.starts_with(&here.mount), "{here:?}");
+
+        // Its drive has gone and something else stands at the path.
+        let away = OutDirPlace { device: here.device + 1, mount: out.0.join("gone") };
+        let e = out_dir_problem(&out.0, Some(&away)).unwrap();
+        assert!(e.is::<OutDirElsewhere>() && is_out_dir_problem(&e), "{e}");
+        assert!(e.to_string().contains("on another drive than when it was queued"), "{e}");
+        // Back after a restart with a new device id, at the same place: the same drive.
+        assert!(out_dir_problem(&out.0, Some(&OutDirPlace { device: here.device + 1, mount: here.mount.clone() })).is_none());
+        assert!(is_out_dir_problem(&out_dir_problem(&out.0.join("nowhere"), None).unwrap()));
+
+        // Every file fails without anything being written, and the run says why.
+        let mut o = options();
+        o.out_dir_must_exist = true;
+        let jobs = vec![Job { input: source.0.join("c.mkv"), out_dir: out.0.clone() }];
+        let tools = Tools::new("false".into(), "false".into(), None);
+        let sum = run_placed(&tools, &jobs, &out.0, Some(&away), &o, false).unwrap();
+        assert_eq!(sum.failed, 1);
+        assert!(sum.out_dir_lost.is_some_and(|e| e.is::<OutDirElsewhere>()));
+        assert_eq!(std::fs::read_dir(&out.0).unwrap().count(), 0, "nothing is written there, not even the log");
+    }
+
+    #[test]
+    fn files_failed_for_a_folder_that_was_away_are_remembered_when_it_is_back() {
+        let source = Folder::new("back-in", &["a.mkv", "b.mkv"]);
+        let out = Folder::new("back-out", &[]);
+        let gone = out.0.join("drive");
+        let mut o = options();
+        o.out_dir_must_exist = true;
+        let jobs: Vec<Job> = ["a.mkv", "b.mkv"].iter().map(|n| Job { input: source.0.join(n), out_dir: gone.clone() }).collect();
+        // The drive is back as soon as the first file has failed for its absence.
+        let mut tools = Tools::new("false".into(), "false".into(), None);
+        let back = gone.clone();
+        tools.hooks = Some(std::sync::Arc::new(events::Hooks::new(move |e| {
+            if matches!(e, Event::FileEnd { .. }) {
+                let _ = std::fs::create_dir(&back);
+            }
+        })));
+        let sum = run_placed(&tools, &jobs, &gone, None, &o, false).unwrap();
+        assert!(gone.is_dir());
+        assert_eq!(sum.failed, 2);
+        assert!(sum.out_dir_lost.is_some_and(|e| e.is::<OutDirMissing>()), "the first file is still to be done");
+    }
+
+    #[test]
+    fn a_folder_nothing_has_made_yet_is_made_only_where_its_drive_can_be_there() {
+        let root = Folder::new("once", &[]);
+        // Everything saved before folders were made has no mark. With the drive away at the
+        // first start after the upgrade, nothing may appear under its mount point.
+        let gone = root.0.join("gone/drive/out");
+        assert!(make_out_dir_once(&gone).unwrap_err().is::<OutDirMissing>());
+        assert!(!root.0.join("gone").exists());
+        let mount_point = root.0.join("mount");
+        std::fs::create_dir(&mount_point).unwrap();
+        assert!(make_out_dir_once(&mount_point.join("out")).unwrap_err().is::<OutDirMissing>());
+        assert_eq!(std::fs::read_dir(&mount_point).unwrap().count(), 0);
+        // With something in the parent, the drive is there.
+        std::fs::write(mount_point.join("a file"), b"").unwrap();
+        make_out_dir_once(&mount_point.join("out")).unwrap();
+        assert!(mount_point.join("out").is_dir());
+        // One that exists is left as it is.
+        make_out_dir_once(&mount_point.join("out")).unwrap();
     }
 
     #[test]

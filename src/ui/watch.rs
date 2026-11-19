@@ -49,6 +49,9 @@ pub struct Watch {
     /// that is away. Watches saved before folders were made when added lack this.
     #[serde(default)]
     pub out_dir_made: bool,
+    /// Where the output folder was when it was made or first seen: see `batch::OutDirPlace`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out_dir_place: Option<crate::batch::OutDirPlace>,
 }
 
 fn yes() -> bool {
@@ -300,16 +303,27 @@ struct Judged {
     unjudged: Vec<(PathBuf, String)>,
 }
 
-/// Makes the output folder of a watch saved before folders were made when a watch was added.
-/// Once: from then on a missing folder means a drive that is away.
-fn make_output_once(app: &App, w: &Watch) -> Result<()> {
-    if w.out_dir_made {
+/// Makes the output folder of a watch saved before folders were made when a watch was added,
+/// and notes where it is. Once: from then on a folder missing or elsewhere means a drive that is
+/// away.
+fn make_output_once(app: &App, w: &mut Watch) -> Result<()> {
+    if w.out_dir_made && w.out_dir_place.is_some() {
         return Ok(());
     }
-    crate::fsguard::ensure_writable_location(&w.out_dir, false)?;
-    std::fs::create_dir_all(&w.out_dir).with_context(|| format!("cannot create {}", w.out_dir.display()))?;
+    let made_now = !w.out_dir_made;
+    if made_now {
+        crate::fsguard::ensure_writable_location(&w.out_dir, false)?;
+        crate::batch::make_out_dir_once(&w.out_dir)?;
+        w.out_dir_made = true;
+    }
+    w.out_dir_place = crate::batch::OutDirPlace::of(&w.out_dir);
+    // A folder that was made once and is away now is seen when it is back.
+    if !made_now && w.out_dir_place.is_none() {
+        return Ok(());
+    }
     if let Some(saved) = app.settings.lock().unwrap().watches.iter_mut().find(|s| s.id == w.id) {
-        saved.out_dir_made = true;
+        saved.out_dir_made = w.out_dir_made;
+        saved.out_dir_place.clone_from(&w.out_dir_place);
     }
     app.save_settings();
     Ok(())
@@ -322,8 +336,8 @@ fn judge(app: &App, w: &Watch, ready: Vec<PathBuf>) -> Result<Judged> {
         bail!("{p} (see Settings)");
     }
     // A job queued now could only fail. The videos wait until the folder is back.
-    if !w.out_dir.is_dir() {
-        bail!("{}", crate::batch::OutDirMissing(w.out_dir.clone()));
+    if let Some(problem) = crate::batch::out_dir_problem(&w.out_dir, w.out_dir_place.as_ref()) {
+        return Err(problem);
     }
     let model = Model::fit(&crate::history::load(), w.options.target_vmaf);
     let (results, _) = crate::scan::collect(&ready, &app.ffprobe(), app.cfg.jobs, w.options.min_savings, &model, &|_, _| {})?;
@@ -347,10 +361,10 @@ fn judge(app: &App, w: &Watch, ready: Vec<PathBuf>) -> Result<Judged> {
 /// Asked for `by_hand`, videos waiting for their next try get it now.
 fn look(app: &App, id: u64, by_hand: bool) -> Result<()> {
     let _one = app.watch.looking.lock().unwrap();
-    let w = find(app, id)?;
+    let mut w = find(app, id)?;
     let started = std::time::Instant::now();
     // Also for a watch saved before this was refused: it stays listed and says what is wrong.
-    let found = output_problem(&w.path, &w.out_dir).and_then(|()| make_output_once(app, &w)).and_then(|()| videos(&w.path, &w.out_dir));
+    let found = output_problem(&w.path, &w.out_dir).and_then(|()| make_output_once(app, &mut w)).and_then(|()| videos(&w.path, &w.out_dir));
     let walk_secs = started.elapsed().as_secs_f64();
     let at = now();
     let (ready, mut changed) = {
@@ -381,7 +395,7 @@ fn look(app: &App, id: u64, by_hand: bool) -> Result<()> {
         let (waiting, ready): (Vec<_>, Vec<_>) = ready.into_iter().partition(|p| jobs::waiting_on(app, p));
         let judged = judge(app, &w, ready).and_then(|judged| {
             if !judged.worth.is_empty() {
-                jobs::add(app, &json!({ "inputs": judged.worth, "out_dir": w.out_dir, "roots": [w.path], "options": w.options, "watch": w.path }))?;
+                jobs::add(app, &json!({ "inputs": judged.worth, "out_dir": w.out_dir, "roots": [w.path], "options": w.options, "watch": w.path, "out_dir_place": w.out_dir_place }))?;
             }
             Ok(judged)
         });
@@ -504,13 +518,14 @@ pub fn add(app: &App, body: &Value) -> Result<Value> {
     // Made now, while someone is here to choose it. From here on a missing folder means a
     // drive that is away, and the jobs of this watch will not make one in its place.
     std::fs::create_dir_all(&r.out_dir).with_context(|| format!("cannot create {}", r.out_dir.display()))?;
+    let out_dir_place = crate::batch::OutDirPlace::of(&r.out_dir);
     let id = {
         let mut s = app.settings.lock().unwrap();
         if s.watches.iter().any(|w| w.path == path) {
             bail!("{} is watched already", path.display());
         }
         let id = s.watches.iter().map(|w| w.id).max().unwrap_or(0) + 1;
-        s.watches.push(Watch { id, path, out_dir: r.out_dir, options, enabled: true, out_dir_made: true });
+        s.watches.push(Watch { id, path, out_dir: r.out_dir, options, enabled: true, out_dir_made: true, out_dir_place });
         id
     };
     app.watch.folders.lock().unwrap().insert(id, Folder { skip_existing: !r.existing, ..Default::default() });

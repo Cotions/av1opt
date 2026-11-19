@@ -2,7 +2,7 @@
 //! Progress events update a per-file state (for page reloads) and go out on the event stream.
 
 use super::{App, hold, now};
-use crate::batch::{self, OutDirMissing};
+use crate::batch::{self, OutDirPlace};
 use crate::encode::{Container, Options};
 use crate::events::{Event, Hooks};
 use crate::metadata::MetaOptions;
@@ -199,10 +199,11 @@ pub struct Job {
     /// rejoin the job if they are back at the next start.
     #[serde(skip)]
     dropped: Vec<PathBuf>,
-    /// Queued by a watch or brought back from the saved queue: nobody is there to have chosen
-    /// the output folder just now, so a missing one means a drive that is not mounted.
+    /// Where the output folder was when it was made or first seen. Before each file it is
+    /// looked for there: a folder that is missing or on another drive means a drive that is
+    /// away, and nothing is written under its mount point.
     #[serde(skip)]
-    out_dir_must_exist: bool,
+    out_dir_place: Option<OutDirPlace>,
     /// It failed for that reason, and stays in the saved queue for when the drive is back.
     #[serde(skip)]
     out_dir_missing: bool,
@@ -435,6 +436,9 @@ struct AddRequest {
     /// In a saved job: its output folder was made once. See `Job::out_dir_made`.
     #[serde(default)]
     out_dir_made: bool,
+    /// In a saved job, or one a watch queues: where its output folder was.
+    #[serde(default)]
+    out_dir_place: Option<OutDirPlace>,
 }
 
 /// ffmpeg carries on without parameters SVT-AV1 doesn't know; better said when the settings
@@ -551,22 +555,23 @@ fn prepare(app: &App, body: &Value, origin: Origin, known: &Known) -> Result<Job
         crate::fsguard::ensure_writable_location(&j.out_dir, false)?;
     }
     // A folder asked for now is made now, and a name that cannot be used is said at once. After
-    // this a missing folder means a drive that is away: see `out_dir_must_exist`.
-    let out_dir_must_exist = origin == Origin::Saved || r.watch.is_some();
-    let out_dir_made = if !out_dir_must_exist {
+    // this a missing folder means a drive that is away: see `out_dir_place`.
+    let asked_now = origin == Origin::Asked && r.watch.is_none();
+    let out_dir_made = if asked_now {
         std::fs::create_dir_all(&r.out_dir).with_context(|| format!("cannot create {}", r.out_dir.display()))?;
         true
     } else if origin == Origin::Saved && !r.out_dir_made {
         // Saved by a version that did not make the folder when a job was queued: nothing has
         // made it yet, so its absence says nothing about a drive. This happens once.
-        let made = std::fs::create_dir_all(&r.out_dir);
+        let made = batch::make_out_dir_once(&r.out_dir);
         if let Err(e) = &made {
-            eprintln!("warning: cannot create {}: {e}", r.out_dir.display());
+            eprintln!("warning: {e:#}");
         }
         made.is_ok()
     } else {
         true
     };
+    let out_dir_place = r.out_dir_place.filter(|_| !asked_now).or_else(|| OutDirPlace::of(&r.out_dir));
     // Time estimates for files a scan has seen; the others get theirs when they are probed.
     let time = crate::estimate::TimeModel::fit(&known.history, opts.preset);
     // Estimates are for the way the files will be encoded. "Where uneven" is not known
@@ -613,7 +618,7 @@ fn prepare(app: &App, body: &Value, origin: Origin, known: &Known) -> Result<Job
         hooks: None,
         cancel_requested: false,
         dropped,
-        out_dir_must_exist,
+        out_dir_place,
         out_dir_missing: false,
         out_dir_made,
         folders_queued,
@@ -655,7 +660,7 @@ fn queue_path() -> Option<PathBuf> {
 fn saved_form(j: &Job) -> Value {
     json!({
         "inputs": j.inputs, "dropped": j.dropped, "roots": j.roots, "out_dir": j.out_dir, "options": j.options, "watch": j.watch,
-        "folders_queued": j.folders_queued, "out_dir_made": j.out_dir_made,
+        "folders_queued": j.folders_queued, "out_dir_made": j.out_dir_made, "out_dir_place": j.out_dir_place,
     })
 }
 
@@ -1008,7 +1013,7 @@ fn apply(job: &mut Job, e: &Event) -> Option<usize> {
 pub fn start_worker(app: Arc<App>) {
     std::thread::spawn(move || {
         loop {
-            let (id, opts, retry, out_dir, must_exist, workers) = loop {
+            let (id, opts, retry, out_dir, place, workers) = loop {
                 // Checked before taking the lock: probing runs ffmpeg. With unusable tools,
                 // queued jobs wait (the page shows why) instead of failing.
                 let tools_ok = app.encode_problem().is_none();
@@ -1024,14 +1029,14 @@ pub fn start_worker(app: Arc<App>) {
                     && let Some(j) = jobs.iter_mut().find(|j| j.status == "queued")
                 {
                     j.status = "running".into();
-                    break (j.id, j.options.to_options(), j.options.retry_skipped, j.out_dir.clone(), j.out_dir_must_exist, j.options.workers);
+                    break (j.id, j.options.to_options(), j.options.retry_skipped, j.out_dir.clone(), j.out_dir_place.clone(), j.options.workers);
                 }
                 // Woken by new jobs and tool changes; the timeout is only a safety net.
                 drop(app.jobs.wake.wait_timeout(jobs, std::time::Duration::from_secs(30)).unwrap());
             };
             app.broadcast(json!({ "kind": "jobs" }));
             // A bug anywhere under a job fails that job; the queue goes on.
-            let result = batch::guarded(|| run_job(&app, id, opts, retry, &out_dir, must_exist, workers));
+            let result = batch::guarded(|| run_job(&app, id, opts, retry, &out_dir, place, workers));
             let mut jobs = app.jobs.jobs.lock().unwrap();
             let mut done = None;
             if let Some(j) = jobs.iter_mut().find(|j| j.id == id) {
@@ -1051,7 +1056,7 @@ pub fn start_worker(app: Arc<App>) {
                     Err(e) => {
                         j.status = "failed".into();
                         j.error = Some(format!("{e:#}"));
-                        j.out_dir_missing = e.downcast_ref::<OutDirMissing>().is_some();
+                        j.out_dir_missing = batch::is_out_dir_problem(&e);
                         // A job that waits for its folder comes back whole.
                         if !j.out_dir_missing {
                             keep_left_out(&app.jobs, j);
@@ -1073,15 +1078,16 @@ pub fn start_worker(app: Arc<App>) {
     });
 }
 
-fn run_job(app: &Arc<App>, id: u64, opts: Result<Options>, retry: bool, out_dir: &Path, must_exist: bool, workers: u8) -> Result<batch::Summary> {
+fn run_job(app: &Arc<App>, id: u64, opts: Result<Options>, retry: bool, out_dir: &Path, place: Option<OutDirPlace>, workers: u8) -> Result<batch::Summary> {
     let mut opts = opts?;
-    opts.out_dir_must_exist = must_exist;
+    // The folder was made when the job was queued, or will not be: made anew now it would land
+    // on the disk under the mount point of a drive that is away.
+    opts.out_dir_must_exist = true;
     crate::fsguard::ensure_writable_location(out_dir, false)?;
-    // Made anew it would land on the disk under the mount point of a drive that is away.
-    if must_exist && !out_dir.is_dir() {
-        return Err(OutDirMissing(out_dir.to_path_buf()).into());
+    if let Some(problem) = batch::out_dir_problem(out_dir, place.as_ref()) {
+        return Err(problem);
     }
-    std::fs::create_dir_all(out_dir)?;
+    let place = place.or_else(|| OutDirPlace::of(out_dir));
     let sink_app = app.clone();
     let hooks = Arc::new(Hooks::new(move |e: Event| {
         let file = {
@@ -1116,18 +1122,24 @@ fn run_job(app: &Arc<App>, id: u64, opts: Result<Options>, retry: bool, out_dir:
             hooks.pause();
         }
         j.hooks = Some(hooks);
+        j.out_dir_place.clone_from(&place);
         std::mem::take(&mut j.batch)
     };
-    let r = batch::run(&tools, &batch_jobs, out_dir, &opts, retry);
+    let r = batch::run_placed(&tools, &batch_jobs, out_dir, place.as_ref(), &opts, retry);
     if let Some(j) = app.jobs.jobs.lock().unwrap().iter_mut().find(|j| j.id == id) {
         j.batch = batch_jobs;
     }
-    // Lost on the way, the folder failed the files after that. The job waits for the drive
-    // like one that found it missing at the start, or those files would be forgotten.
-    if must_exist && !out_dir.is_dir() && r.as_ref().is_ok_and(|s| !s.cancelled) {
-        return Err(OutDirMissing(out_dir.to_path_buf()).into());
+    let mut summary = r?;
+    if summary.cancelled {
+        return Ok(summary);
     }
-    r
+    // Lost on the way, the folder failed the files after that, even if it is back by now. The
+    // job waits for the drive like one that found it missing at the start, or those files
+    // would be forgotten.
+    match summary.out_dir_lost.take().or_else(|| batch::out_dir_problem(out_dir, place.as_ref())) {
+        Some(problem) => Err(problem),
+        None => Ok(summary),
+    }
 }
 
 #[cfg(test)]

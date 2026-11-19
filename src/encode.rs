@@ -427,7 +427,9 @@ fn fits_beside_output(output: &Path, tmp: &Path) -> Result<()> {
 }
 
 /// Re-encodes one file into `out_dir`. Returns the output path.
-pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Result<PathBuf> {
+/// `may_write` is asked before folders are made: a job's output folder can be gone by then, and
+/// what is made in its place would land under the mount point of a drive.
+pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn() -> Result<()>, o: &Options) -> Result<PathBuf> {
     let (size, source) = Recorded::of(input).with_context(|| format!("cannot read {}", input.display()))?;
     let mut info = probe::probe(&tools.ffprobe, input, size)?;
     if o.audio == Audio::Shrink {
@@ -469,6 +471,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     if std::fs::canonicalize(input)? == std::path::absolute(&output)? || same_file(input, &output) {
         bail!("the output would be written over this same video, so nothing was written; choose another output folder");
     }
+    may_write()?;
     std::fs::create_dir_all(out_dir)?;
     let tmp = TempDir { path: out_dir.join(format!(".av1opt-tmp-{}", std::process::id())), keep: o.keep_temp };
     std::fs::create_dir_all(&tmp.path)?;
@@ -654,6 +657,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         && let Some(w) = &work
     {
         let lab = lab.as_mut().expect("a search that wasn't resumed has its lab");
+        may_write()?;
         std::fs::create_dir_all(&w.path)?;
         tools.emit(Event::Phase { phase: "scenes".into(), detail: "finding scene changes".into() });
         let found = scenes::detect(tools, input, &info, &w.path)?;

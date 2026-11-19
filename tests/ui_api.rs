@@ -1199,11 +1199,14 @@ fn an_output_folder_nothing_has_made_yet_is_made_once() {
     let mut s = Server::start_with_tools("once", &ffmpeg, &ffprobe, |d| {
         paused(d);
         std::fs::write(d.join("videos/a.mkv"), b"x").unwrap();
+        std::fs::create_dir_all(d.join("first")).unwrap();
+        std::fs::write(d.join("first/something"), b"").unwrap();
         write_saved_queue(d, json!([{ "inputs": [d.join("videos/a.mkv")], "roots": [], "out_dir": d.join("first/out"), "options": {} }]));
     });
     let out = s.dir.join("first/out");
     assert!(out.is_dir());
     soon("the job is saved with its mark", || saved_queue(&s)["jobs"][0]["out_dir_made"] == true);
+    assert!(saved_queue(&s)["jobs"][0]["out_dir_place"]["device"].is_u64(), "where the folder is is saved with it");
     // From then on its absence means a drive that is away.
     assert!(s.terminate());
     std::fs::remove_dir_all(s.dir.join("first")).unwrap();
@@ -1218,6 +1221,8 @@ fn an_output_folder_nothing_has_made_yet_is_made_once() {
         std::fs::create_dir_all(d.join("videos/in")).unwrap();
         std::fs::create_dir_all(d.join("videos/inside")).unwrap();
         std::fs::write(d.join("videos/inside/a.mkv"), b"x").unwrap();
+        std::fs::create_dir_all(d.join("second")).unwrap();
+        std::fs::write(d.join("second/something"), b"").unwrap();
         let settings = json!({ "watches": [
             { "id": 1, "path": d.join("videos/in"), "out_dir": d.join("second/out"), "options": {}, "enabled": false },
             { "id": 2, "path": d.join("videos/inside"), "out_dir": d.join("videos"), "options": {}, "enabled": false, "out_dir_made": true },
@@ -1231,12 +1236,85 @@ fn an_output_folder_nothing_has_made_yet_is_made_once() {
     assert!(out.is_dir());
     let settings: Value = serde_json::from_slice(&std::fs::read(s.data("ui.json")).unwrap()).unwrap();
     assert_eq!(settings["watches"][0]["out_dir_made"], true, "{settings}");
+    assert!(settings["watches"][0]["out_dir_place"]["device"].is_u64(), "{settings}");
     std::fs::remove_dir_all(s.dir.join("second")).unwrap();
     look(1);
     assert!(!s.dir.join("second").exists());
     let w = look(2);
     assert!(w["error"].as_str().unwrap_or_default().contains("contains the watched folder"), "{w}");
     assert_eq!(w["videos"], 0, "{w}");
+}
+
+#[test]
+fn what_was_saved_before_folders_were_made_does_not_land_under_a_mount_point() {
+    // The first start after the upgrade, with the drive away: its mount point is an empty folder,
+    // or is not there at all. Saved jobs and watches have no mark yet.
+    let (ffmpeg, ffprobe) = stand_in_tools("upgrade", "exit 1");
+    let mut s = Server::start_with_tools("upgrade", &ffmpeg, &ffprobe, |d| {
+        std::fs::write(d.join("videos/a.mkv"), b"x").unwrap();
+        std::fs::create_dir_all(d.join("videos/in")).unwrap();
+        std::fs::create_dir_all(d.join("mnt/usb")).unwrap();
+        write_saved_queue(d, json!([{ "inputs": [d.join("videos/a.mkv")], "roots": [], "out_dir": d.join("mnt/usb/out"), "options": {} }]));
+        let settings = json!({ "watches": [
+            { "id": 1, "path": d.join("videos/in"), "out_dir": d.join("mnt/usb/watched"), "options": {}, "enabled": false },
+            { "id": 2, "path": d.join("videos/in"), "out_dir": d.join("mnt/none/deep/watched"), "options": {}, "enabled": false },
+        ] });
+        std::fs::write(d.join("data/av1opt/ui.json"), settings.to_string()).unwrap();
+    });
+    let job = first_job_ended(&s);
+    assert_eq!(job["status"], "failed", "{job}");
+    assert!(job["error"].as_str().unwrap_or_default().contains("may not be mounted"), "{job}");
+    soon("the job stays saved", || saved_jobs(&s) == 1);
+    assert_eq!(saved_queue(&s)["jobs"][0]["out_dir_made"], false, "it has not been made yet");
+    let look = |id: u64| s.post(&format!("/api/watch/{id}/look"), &json!({})).json()["watches"].as_array().unwrap().iter().find(|w| w["id"] == id).unwrap().clone();
+    for id in [1, 2] {
+        let w = look(id);
+        assert!(w["error"].as_str().unwrap_or_default().contains("may not be mounted"), "{w}");
+    }
+    assert_eq!(std::fs::read_dir(s.dir.join("mnt/usb")).unwrap().count(), 0, "nothing under the mount point");
+    assert!(!s.dir.join("mnt/none").exists());
+
+    // With the drive back, what has to be made is made, once.
+    assert!(s.terminate());
+    std::fs::write(s.dir.join("mnt/usb/on the drive"), b"").unwrap();
+    let s = Server::start_in(&s.dir, &ffmpeg, &ffprobe);
+    let job = first_job_ended(&s);
+    assert_eq!(job["status"], "done", "{job}");
+    assert!(s.dir.join("mnt/usb/out").is_dir());
+    let w = s.post("/api/watch/1/look", &json!({})).json()["watches"][0].clone();
+    assert!(w["error"].is_null(), "{w}");
+    assert!(s.dir.join("mnt/usb/watched").is_dir());
+}
+
+#[test]
+fn an_output_folder_now_on_another_drive_keeps_its_job_waiting() {
+    let (ffmpeg, ffprobe) = stand_in_tools("elsewhere", "exit 1");
+    let s = Server::start_with_tools("elsewhere", &ffmpeg, &ffprobe, |d| {
+        std::fs::write(d.join("videos/a.mkv"), b"x").unwrap();
+        std::fs::create_dir_all(d.join("videos/in")).unwrap();
+        std::fs::write(d.join("videos/in/b.mkv"), b"x").unwrap();
+        age(&d.join("videos/in/b.mkv"), 1000);
+        let mtime = std::fs::metadata(d.join("videos/in/b.mkv")).unwrap().modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        std::fs::create_dir_all(d.join("mnt/usb")).unwrap();
+        // Queued while the drive was there; what stands at the path now is its mount point.
+        let place = json!({ "device": 1, "mount": d.join("mnt/usb/not mounted") });
+        write_saved_queue(d, json!([{ "inputs": [d.join("videos/a.mkv")], "roots": [], "out_dir": d.join("mnt/usb"), "options": {}, "out_dir_made": true, "out_dir_place": place }]));
+        let settings = json!({ "watches": [{ "id": 1, "path": d.join("videos/in"), "out_dir": d.join("mnt/usb"), "options": {}, "enabled": false, "out_dir_made": true, "out_dir_place": place }] });
+        std::fs::write(d.join("data/av1opt/ui.json"), settings.to_string()).unwrap();
+        let files = json!({ d.join("videos/in/b.mkv").to_str().unwrap(): { "size": 1, "mtime": mtime, "mark": "fresh", "seen": 3 } });
+        std::fs::write(d.join("data/av1opt/ui-watch.json"), json!({ "format": 1, "folders": { "1": { "files": files } } }).to_string()).unwrap();
+    });
+    let job = first_job_ended(&s);
+    assert_eq!(job["status"], "failed", "{job}");
+    assert!(job["error"].as_str().unwrap_or_default().contains("on another drive than when it was queued"), "{job}");
+    soon("the job stays saved", || saved_jobs(&s) == 1);
+    assert_eq!(s.post("/api/jobs/clear", &json!({})).status, 200);
+    assert_eq!(saved_jobs(&s), 1, "it is waiting, not over");
+    assert_eq!(std::fs::read_dir(s.dir.join("mnt/usb")).unwrap().count(), 0, "nothing is written there");
+    // The watch queues nothing that could only fail, and says why.
+    let w = s.post("/api/watch/1/look", &json!({})).json()["watches"][0].clone();
+    assert!(w["error"].as_str().unwrap_or_default().contains("on another drive"), "{w}");
+    assert_eq!(heads(&s).len(), 1, "{w}");
 }
 
 #[test]

@@ -426,6 +426,12 @@ fn fits_beside_output(output: &Path, tmp: &Path) -> Result<()> {
     Ok(std::fs::remove_file(trial)?)
 }
 
+/// The preset chunks are tried at: four steps faster, up to 12, and never slower than the
+/// encode itself (presets go to 13).
+fn probe_preset(preset: u8) -> u8 {
+    (preset + 4).min(12).max(preset)
+}
+
 /// Why an encode may not end at `output`: the report it would write is that of an output of
 /// another name. `x.mp4` and `x.mkv` in one folder share `x.av1opt.json`, and the second would
 /// take the report from the first, which could then never be replaced. A report that says where
@@ -670,7 +676,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     let covers = prepare_covers(tools, input, &info, o.container, &tmp.path, &mut notes);
     let mut t1 = tools.stopwatch();
     let mut search_secs = t0.secs(tools);
-    let probe = EncodeSettings { preset: (preset + 4).clamp(preset, 12), pix_fmt_out: enc.pix_fmt_out, params: enc.params.clone() };
+    let probe = EncodeSettings { preset: probe_preset(preset), pix_fmt_out: enc.pix_fmt_out, params: enc.params.clone() };
     let mut work = work;
     let mut plan = saved;
     if plan.is_none()
@@ -1744,6 +1750,12 @@ pub(crate) fn free_bytes(dir: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunks_are_tried_at_a_faster_preset_for_every_preset_there_is() {
+        let probes: Vec<u8> = (0..=13).map(probe_preset).collect();
+        assert_eq!(probes, [4, 5, 6, 7, 8, 9, 10, 11, 12, 12, 12, 12, 12, 13]);
+    }
 
     #[test]
     fn any_change_to_a_source_during_its_encode_fails_it_and_only_new_contents_cost_the_chunks() {

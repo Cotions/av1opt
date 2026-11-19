@@ -45,6 +45,9 @@ pub struct EncodeSettings {
     pub pix_fmt_out: &'static str,
     /// SVT-AV1 parameters as `key=value:key=value`, without the CRF.
     pub params: String,
+    /// The key frame gap in frames, for a source whose frames do not come at the rate it
+    /// declares (see [`keyint_frames`]); `None` leaves [`KEYINT`] to the encoder.
+    pub keyint_frames: Option<u32>,
 }
 
 /// Key frames at most this far apart, unless the parameters set `keyint` themselves.
@@ -54,21 +57,41 @@ pub struct EncodeSettings {
 /// no slower. Seeking lands on key frames: a player shows the frame asked for after decoding
 /// from the one before it, up to ten seconds of video instead of five.
 pub const KEYINT: &str = "10s";
+/// [`KEYINT`] in seconds.
+const KEYINT_SECS: f64 = 10.0;
 
-/// Parameters added to whatever set is in use, unless it names the key itself: the key
-/// frame gap above, and quantization matrices (coarser steps for the fine detail an eye
-/// misses first; SVT-AV1 leaves them off). With them the same VMAF took 1.1% less on eight
-/// clips, less on every one of them, with VMAF NEG and SSIMULACRA2 saying the same and XPSNR
-/// seeing no difference, for 0.5% more encoding time.
-const IMPLIED: &[(&str, &str)] = &[("keyint", KEYINT), ("enable-qm", "1")];
+/// [`KEYINT`] counted in frames of the rate the source's frames really come at, where that is
+/// not the rate it declares (`vfr`: the average is more than 0.5% off the declared rate), and
+/// `None` where it is, which leaves the encoder's arguments as they were. SVT-AV1 turns seconds
+/// into frames by the rate it is given, and the one pass gives it the declared one: a 36 s
+/// source declared at 48 fps whose frames come at 24 had its key frames at 0 and 20 s, so the
+/// weak stretch the whole-video check found took all 36 s to encode again. The cuts the other
+/// encodes are made from run at the real rate, and had theirs 10 s apart. Counted in frames
+/// of that rate, the one pass's come at 0, 10, 20 and 30 s too, and 30 s were encoded again.
+/// (SVT-AV1 makes a GOP of `10s` one frame longer than one given in frames: at 30 fps `10s`
+/// put key frames at frames 0, 301 and 602, `300` at 0, 300 and 600.)
+pub fn keyint_frames(info: &MediaInfo) -> Option<u32> {
+    (info.vfr && info.fps > 0.0).then(|| (KEYINT_SECS * info.fps).round().max(1.0) as u32)
+}
 
 impl EncodeSettings {
-    /// The parameters the encoder is given besides the CRF: the set in use and what is
-    /// added to every set (see [`IMPLIED`]).
+    /// Settings for encoding `info`'s video: its key frame gap counted as [`keyint_frames`]
+    /// says.
+    pub fn for_source(info: &MediaInfo, preset: u8, params: &str) -> Self {
+        EncodeSettings { preset, pix_fmt_out: "yuv420p10le", params: params.to_string(), keyint_frames: keyint_frames(info) }
+    }
+
+    /// The parameters the encoder is given besides the CRF: the set in use and what is added
+    /// to every set unless it names the key itself: the key frame gap (see [`KEYINT`]), and
+    /// quantization matrices (coarser steps for the fine detail an eye misses first; SVT-AV1
+    /// leaves them off). With them the same VMAF took 1.1% less on eight clips, less on every
+    /// one of them, with VMAF NEG and SSIMULACRA2 saying the same and XPSNR seeing no
+    /// difference, for 0.5% more encoding time.
     pub fn full_params(&self) -> String {
         let sets = |key: &str| self.params.split(':').any(|p| p.split_once('=').is_some_and(|(k, _)| k.trim() == key));
         let own = (!self.params.is_empty()).then(|| self.params.clone());
-        let implied = IMPLIED.iter().filter(|(k, _)| !sets(k)).map(|(k, v)| format!("{k}={v}"));
+        let keyint = self.keyint_frames.map_or(KEYINT.to_string(), |n| n.to_string());
+        let implied = [("keyint", keyint), ("enable-qm", "1".to_string())].into_iter().filter(|(k, _)| !sets(k)).map(|(k, v)| format!("{k}={v}"));
         own.into_iter().chain(implied).collect::<Vec<_>>().join(":")
     }
 
@@ -110,7 +133,7 @@ pub fn parse_params(s: &str) -> Result<String> {
 /// Tries `params` on a few generated frames: ffmpeg only warns about names SVT-AV1 doesn't
 /// know and carries on without them, which would quietly encode with other settings.
 pub fn check_params(tools: &Tools, preset: u8, params: &str) -> Result<()> {
-    let enc = EncodeSettings { preset: preset.max(8), pix_fmt_out: "yuv420p10le", params: params.to_string() };
+    let enc = EncodeSettings { preset: preset.max(8), pix_fmt_out: "yuv420p10le", params: params.to_string(), keyint_frames: None };
     let mut args: Vec<String> = ["-v", "warning", "-f", "lavfi", "-i", "testsrc2=s=256x144:r=24:d=0.5"].map(String::from).to_vec();
     args.extend(enc.video_args(35.0));
     args.extend(["-f", "null", "-"].map(String::from));
@@ -1544,7 +1567,7 @@ mod tests {
         std::fs::write(&video, b"12345").unwrap();
         let store = dir.join("trials-v2.jsonl");
         let clips = [(10.0, 8.0), (50.0, 8.0)];
-        let enc = EncodeSettings { preset: 6, pix_fmt_out: "yuv420p10le", params: "tune=0".into() };
+        let enc = EncodeSettings { preset: 6, pix_fmt_out: "yuv420p10le", params: "tune=0".into(), keyint_frames: None };
         let open = |clips: &[(f64, f64)], encoder: &str, reuse: bool| TrialCache::open_at(store.clone(), &video, 5, clips, encoder, reuse);
 
         let mut c = open(&clips, "ffmpeg 1", true);
@@ -1586,7 +1609,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let (video, store) = (dir.join("v.mkv"), dir.join("t.jsonl"));
         std::fs::write(&video, b"12345").unwrap();
-        let enc = EncodeSettings { preset: 6, pix_fmt_out: "yuv420p10le", params: "tune=0".into() };
+        let enc = EncodeSettings { preset: 6, pix_fmt_out: "yuv420p10le", params: "tune=0".into(), keyint_frames: None };
         let clips = [(1.0, 1.0)];
         let open = || TrialCache::open_at(store.clone(), &video, 5, &clips, "ffmpeg 1", true);
         let mut c = open();
@@ -1632,7 +1655,7 @@ mod tests {
         for bad in ["tune", "crf=30", "tune=0:tune=1", "a=b c", "x='1'", "=1", "preset=4", "tune=0,enable-qm=1"] {
             assert!(parse_params(bad).is_err(), "{bad}");
         }
-        let enc = |params: &str| EncodeSettings { preset: 6, pix_fmt_out: "yuv420p10le", params: params.into() };
+        let enc = |params: &str| EncodeSettings { preset: 6, pix_fmt_out: "yuv420p10le", params: params.into(), keyint_frames: None };
         assert_eq!(enc("tune=0").video_args(35.3).last().unwrap(), "crf=35.25:tune=0:keyint=10s:enable-qm=1");
         // What the user's own parameters name is left alone.
         assert_eq!(enc("tune=0:keyint=5s").video_args(35.0).last().unwrap(), "crf=35:tune=0:keyint=5s:enable-qm=1");
@@ -1640,6 +1663,25 @@ mod tests {
         assert_eq!(enc("").video_args(35.0).last().unwrap(), "crf=35:keyint=10s:enable-qm=1");
         // The CRF comes before a parameter it would otherwise set back.
         assert_eq!(enc("aq-mode=1").video_args(35.0).last().unwrap(), "crf=35:aq-mode=1:keyint=10s:enable-qm=1");
+    }
+
+    #[test]
+    fn a_source_whose_frames_come_slower_than_it_says_has_its_key_frame_gap_counted_in_frames() {
+        let steady = MediaInfo { fps: 29.97, nominal_fps: 29.97, ..MediaInfo::default() };
+        assert_eq!(keyint_frames(&steady), None);
+        let settings = EncodeSettings::for_source(&steady, 6, "tune=0");
+        assert_eq!(settings.video_args(35.0).last().unwrap(), "crf=35:tune=0:keyint=10s:enable-qm=1");
+
+        // Declared at 60, frames at 30: in seconds the encoder would count 60 to a second.
+        let uneven = MediaInfo { fps: 30.0, nominal_fps: 60.0, vfr: true, ..MediaInfo::default() };
+        assert_eq!(keyint_frames(&MediaInfo { fps: 29.97, ..uneven.clone() }), Some(300));
+        assert_eq!(keyint_frames(&MediaInfo { fps: 23.976, ..uneven.clone() }), Some(240));
+        let settings = EncodeSettings::for_source(&uneven, 6, "tune=0");
+        assert_eq!(settings.video_args(35.0).last().unwrap(), "crf=35:tune=0:keyint=300:enable-qm=1");
+        // A gap the user sets is still theirs, and the CRF still comes first.
+        let own = EncodeSettings::for_source(&uneven, 6, "keyint=5s");
+        assert_eq!(own.video_args(35.0).last().unwrap(), "crf=35:keyint=5s:enable-qm=1");
+        assert_eq!(EncodeSettings::for_source(&uneven, 6, "").video_args(35.0).last().unwrap(), "crf=35:keyint=300:enable-qm=1");
     }
 
     #[test]
@@ -1872,7 +1914,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let video = dir.join("v.mkv");
         std::fs::write(&video, b"12345").unwrap();
-        let enc = EncodeSettings { preset: 6, pix_fmt_out: "yuv420p10le", params: "tune=0".into() };
+        let enc = EncodeSettings { preset: 6, pix_fmt_out: "yuv420p10le", params: "tune=0".into(), keyint_frames: None };
         let clips = [(1.0, 1.0)];
         let mut plain = TrialCache::open_at(dir.join("t.jsonl"), &video, 5, &clips, "ffmpeg 1", true);
         plain.put(&enc, Trial { crf: 35.0, mean_vmaf: 92.0, min_vmaf: 85.0, size_ratio: 0.4 });

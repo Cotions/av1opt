@@ -617,7 +617,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     let out_of_date = saved.and_then(|c| c.out_of_date(o.target_vmaf));
     let tuned = saved.filter(|_| out_of_date.is_none());
     let (preset, svt_params) = tuned.map_or((o.preset, o.svt_params.as_str()), |c| (c.preset, c.params.as_str()));
-    let enc = EncodeSettings { preset, pix_fmt_out: "yuv420p10le", params: svt_params.to_string() };
+    let enc = EncodeSettings::for_source(&info, preset, svt_params);
     let model = search::vmaf_model(&info);
 
     eprintln!(
@@ -811,7 +811,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     let covers = prepare_covers(tools, input, &info, o.container, &tmp.path, &mut notes);
     let mut t1 = tools.stopwatch();
     let mut search_secs = t0.secs(tools);
-    let probe = EncodeSettings { preset: probe_preset(preset), pix_fmt_out: enc.pix_fmt_out, params: enc.params.clone() };
+    let probe = EncodeSettings { preset: probe_preset(preset), ..enc.clone() };
     let mut work = work;
     let mut plan = saved;
     if plan.is_none()
@@ -3227,7 +3227,7 @@ mod tests {
         let sections = Sections::new(&[(10.0, 20.0)], 60.0).unwrap();
         let cut = Cut { sections: &sections, subs: Vec::new(), chapters: None };
         let (a, _) = full_encode_args(
-            Path::new("in.mkv"), &i, &EncodeSettings { preset: 10, pix_fmt_out: "yuv420p10le", params: String::new() }, 30.0, Container::Mkv, Audio::Keep,
+            Path::new("in.mkv"), &i, &EncodeSettings { preset: 10, pix_fmt_out: "yuv420p10le", params: String::new(), keyint_frames: None }, 30.0, Container::Mkv, Audio::Keep,
             &[], &metadata::Resolved::default(), &MetaOptions::default(), Some(&cut), Path::new("out.mkv"), &mut Vec::new(),
         );
         let graph = &a[a.iter().position(|x| x == "-filter_complex").unwrap() + 1];

@@ -250,7 +250,7 @@ For each file:
 4. **Encode** – SVT-AV1, 10-bit, `--preset` 4 with `tune=0` unless `--svt-params` or `--tuned`
    say otherwise (see [bench](#bench)). Two parameters are added to whatever set is in
    use unless it names them itself: `keyint=10s` (a key frame every 10 seconds instead of
-   every 5) and `enable-qm=1` (quantization matrices). Audio already in AAC/Opus/MP3 is copied, anything else becomes
+   every 5, counted in frames where a video's frames come at another rate than it declares) and `enable-qm=1` (quantization matrices). Audio already in AAC/Opus/MP3 is copied, anything else becomes
    Opus. `--audio shrink` also re-encodes copied tracks that spend more than 1.5 times what
    Opus needs (96 kbps stereo, 56 mono, 256 for 5.1): a 320 kbps MP3 or 256 kbps AAC track
    becomes 96 kbps Opus, a 128 kbps one is left alone. It is a second lossy pass, so it is

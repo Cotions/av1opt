@@ -375,7 +375,7 @@ pub fn run(paths: &[PathBuf], tools: &Tools, o: &Options, progress: &(dyn Fn(Pro
         let mut samples: Option<Vec<Sample>> = None;
         let mut start_crf = search::START_CRF;
         for (ci, c) in o.configs.iter().enumerate() {
-            let enc = EncodeSettings { preset: c.preset, pix_fmt_out: "yuv420p10le", params: c.params.clone() };
+            let enc = EncodeSettings::for_source(&info, c.preset, &c.params);
             let mut trials: Vec<Measure> = Vec::new();
             let searched = search::find_crf(start_crf, o.min_crf, o.max_crf, o.target_vmaf, |crf| {
                 let key = (c.preset, c.params.as_str(), crf);

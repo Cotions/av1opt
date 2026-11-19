@@ -838,7 +838,7 @@ fn run_command(command: Cmd) -> Result<()> {
                 let info = probe::probe(&tools.ffprobe, &input, size)?;
                 let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
                 let vmaf_threads = if info.width.max(info.height) >= 3200 { threads.min(4) } else { threads };
-                let enc = search::EncodeSettings { preset, pix_fmt_out: "yuv420p10le", params: svt_params.clone() };
+                let enc = search::EncodeSettings::for_source(&info, preset, &svt_params);
                 let pos = search::in_file_time(&info, search::sample_positions(info.picture_secs(), samples.unwrap_or_else(|| search::sample_count(info.picture_secs())), search::clip_secs(&info, sample_secs)));
                 let clips = search::extract_samples(&tools, &input, &info, &dir, pos)?;
                 for crf in list {

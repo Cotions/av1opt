@@ -1271,7 +1271,7 @@ mod tests {
             return;
         }
         let tools = Tools::new("false".into(), "false".into(), None);
-        let (info, enc) = (MediaInfo::default(), EncodeSettings { preset: 8, pix_fmt_out: "yuv420p10le", params: String::new() });
+        let (info, enc) = (MediaInfo::default(), EncodeSettings { preset: 8, pix_fmt_out: "yuv420p10le", params: String::new(), keyint_frames: None });
         let c = Ctx { tools: &tools, input: &dir.join("in.mkv"), info: &info, enc: &enc, crf: 30.0, floor: 90.0, target: 70.0, min_crf: 20, threads: 1, dir: &dir };
         let survey = Survey { scores: scored(300, |_| 70.0), times: Times { pts: (0..300).collect(), tb: (1, 30) }, gops: vec![0] };
         let why = repair(&c, &output, &survey).err().expect("no room").to_string();

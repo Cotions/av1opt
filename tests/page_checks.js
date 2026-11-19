@@ -51,6 +51,7 @@ class Element extends Node {
   prepend(...kids) { const old = this.children; this.children = []; this.adopt(kids); this.children.push(...old); }
   replaceChildren(...kids) { for (const kid of [...this.children]) kid.remove(); this.adopt(kids); }
   remove() { if (this.parent) this.parent.children.splice(this.parent.children.indexOf(this), 1); this.parent = null; }
+  replaceWith(other) { const list = this.parent.children, at = list.indexOf(this); other.remove(); other.parent = this.parent; list[at] = other; this.parent = null; }
   contains(other) { for (let n = other; n; n = n.parent) if (n === this) return true; return false; }
   get firstChild() { return this.children[0] || null; }
   get firstElementChild() { return this.children.find((k) => k instanceof Element) || null; }
@@ -412,6 +413,137 @@ checks["remembering: full storage neither stops anything nor throws"] = async ()
   const page = openPage(() => ({}));
   await settled();
   page.run(`localStorage.setItem = () => { throw new Error("full"); }; prefs.set("x", 1)`);
+};
+
+// Answers held back until the check lets them go, so that they can arrive in any order.
+const heldAnswers = () => {
+  const waiting = [];
+  return { waiting, answer: (reply) => new Promise((done) => waiting.push(() => done(reply))) };
+};
+const tell = (page, message) => { page.context.__message = message; page.run("for (const fn of [...listeners]) fn(__message)"); };
+
+checks["scan: a running scan keeps Scan off when folders change, and a late answer does not undo the end"] = async () => {
+  const held = heldAnswers();
+  const running = { id: 1, status: "running", done: 0, total: 2 };
+  const finished = { id: 1, status: "done", rows: [], totals: {}, paths: ["/videos"] };
+  let asked = 0;
+  const page = openPage((path, body) => (body ? { id: 1 } : path === "/api/scans/1" ? held.answer(++asked === 1 ? running : finished) : {}), { scanRoots: ["/videos", "/more"] });
+  await settled();
+  const root = page.show("scan");
+  await settled();
+  const start = root.named("button", "Scan");
+  await start.click();
+  await settled();
+  root.all().find((e) => e.tag === "button" && e.textContent === "×").click();
+  assert(start.disabled, "taking a folder away made Scan available");
+  tell(page, { kind: "scan_done", id: 1 });
+  await settled();
+  const [saysRunning, saysDone] = held.waiting.splice(0);
+  saysDone();
+  await settled();
+  assert(!start.disabled, "still off after the end");
+  saysRunning();
+  await settled();
+  assert(!start.disabled, "the older answer turned it off again");
+};
+checks["watched folders: rows stay, a button stays busy, and a late list does not bring a forgotten folder back"] = async () => {
+  const held = heldAnswers();
+  const watch = (id) => ({ id, path: `/w/${id}`, out_dir: "/out", enabled: true, options: { target_vmaf: 93, preset: 5, container: "mp4" } });
+  let list = { watches: [watch(1), watch(2)], settled_secs: 60 };
+  let hold = false;
+  const page = openPage((path, body) => {
+    if (path === "/api/jobs") return { jobs: [], unrestored: [], queue: holdReply };
+    if (path === "/api/watch") return hold ? held.answer(list) : list;
+    if (path === "/api/watch/1/look") return held.answer(list);
+    if (path === "/api/watch/2/remove") { list = { ...list, watches: [watch(1)] }; return list; }
+    return {};
+  });
+  await settled();
+  const root = page.show("queue");
+  await settled();
+  const rows = root.querySelectorAll(".watch");
+  assert.strictEqual(rows.length, 2);
+  const look = rows[0].named("button", "Look now");
+  look.click();
+  await settled();
+  assert(look.disabled, "not busy");
+  tell(page, { kind: "watch" });
+  await settled();
+  assert.strictEqual(root.querySelectorAll(".watch")[0], rows[0], "the row was built again");
+  assert.strictEqual(rows[0].named("button", "Look now"), look, "the button was built again");
+  assert(look.disabled, "a new drawing forgot the request on its way");
+  held.waiting.splice(0).forEach((go) => go());
+  await settled();
+  assert(!look.disabled, "still busy after the answer");
+
+  hold = true;
+  tell(page, { kind: "watch" });
+  await settled();
+  const [late] = held.waiting.splice(0);
+  hold = false;
+  rows[1].named("button", "Forget").click();
+  await settled();
+  page.document.body.all().filter((e) => e.classList.contains("modal-bg")).pop().named("button", "Forget").click();
+  await settled();
+  assert.strictEqual(root.querySelectorAll(".watch").length, 1, "not gone after the answer");
+  late();
+  await settled();
+  assert.strictEqual(root.querySelectorAll(".watch").length, 1, "a late list brought it back");
+};
+checks["queue: an older list does not replace a newer one, and a file read meanwhile is read again"] = async () => {
+  const held = heldAnswers();
+  const file = { input: "/v/a.mp4", status: "pending", spot_checks: [], notes: [], trials: [], chunks: [] };
+  const list = (note) => ({ jobs: [{ id: 1, status: "running", total: 1, out_dir: "/out", note, options: { target_vmaf: 93, preset: 5, container: "mp4" }, counts: {}, files: [file] }], unrestored: [], queue: holdReply });
+  const notes = ["asked first", "asked second", "asked third"];
+  let holdLists = false, fileReads = 0;
+  const page = openPage((path) => {
+    if (path === "/api/jobs") return holdLists ? held.answer(list(notes.shift())) : list("first");
+    if (path === "/api/watch") return { watches: [] };
+    if (path === "/api/jobs/1/files/0") { fileReads++; return { head: {}, file: { ...file, status: "skip", detail: "too little to gain" } }; }
+    return {};
+  });
+  const wait = (ms) => new Promise((done) => setTimeout(done, ms));
+  await settled();
+  const root = page.show("queue");
+  await settled();
+  holdLists = true;
+  for (let i = 0; i < 2; i++) { tell(page, { kind: "jobs" }); await wait(170); }
+  const [older, newer] = held.waiting.splice(0);
+  newer();
+  await settled();
+  older();
+  await settled();
+  assert(root.textContent.includes("asked second") && !root.textContent.includes("asked first"), root.textContent.slice(0, 300));
+
+  tell(page, { kind: "jobs" });
+  await wait(170);
+  const [third] = held.waiting.splice(0);
+  tell(page, { kind: "job", id: 1, file: 0, event: { type: "phase" } });
+  await wait(150);
+  assert.strictEqual(fileReads, 1);
+  third();
+  await settled();
+  assert(!root.textContent.includes("too little to gain"), "the list was to show its own older state");
+  await wait(150);
+  assert.strictEqual(fileReads, 2, "the file was not read again after the list");
+  assert(root.textContent.includes("too little to gain"), root.textContent.slice(0, 200));
+};
+checks["history: a chart is made only while the view is open"] = async () => {
+  const held = heldAnswers();
+  const page = openPage((path) => (path === "/api/history" ? held.answer({ reports: [], dirs: [] }) : {}));
+  await settled();
+  page.run(`var charts = 0; savedByDay = () => [1, 2]; savedChart = () => { charts++; return { stop() {}, el: document.createElement("div") }; }`);
+  page.context.__root = page.document.createElement("div");
+  page.run("var leave = views.history(__root)");
+  await settled();
+  held.waiting.splice(0)[0]();
+  await settled();
+  assert.strictEqual(page.run("charts"), 1);
+  page.run("leave = views.history(__root); leave()");
+  await settled();
+  held.waiting.splice(0)[0]();
+  await settled();
+  assert.strictEqual(page.run("charts"), 1);
 };
 
 (async () => {

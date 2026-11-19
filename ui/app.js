@@ -320,9 +320,12 @@ async function streamRefused() {
 const EVENTS_RETRY_MS = 3000;
 
 // Queue badge: number of queued + running jobs.
+const askBadge = newestOnly();
 async function refreshBadge() {
+  const isNewest = askBadge();
   try {
     const { jobs, queue } = await api("/api/jobs/heads");
+    if (!isNewest()) return;
     const n = jobs.filter((j) => j.status === "queued" || j.status === "running").length;
     const b = document.getElementById("queue-badge");
     b.textContent = n;
@@ -417,10 +420,13 @@ function pick({ title, mode = "dir", start }) {
     };
 
     // The folder it opens on may be gone by now: home is listed instead (an empty path).
+    const askFolder = newestOnly();
     async function go(p, opening) {
+      const isNewest = askFolder();
       let r;
       try { r = await api("/api/browse?path=" + encodeURIComponent(p) + (hidden ? "&hidden=1" : "")); }
-      catch (e) { if (opening) return go(""); toast(e.message, true); return; }
+      catch (e) { if (!isNewest()) return; if (opening) return go(""); toast(e.message, true); return; }
+      if (!isNewest()) return;
       cur = r.path;
       pathEl.textContent = r.path;
       places.replaceChildren(...r.places.map((pl) => h("button", { class: "small", onclick: () => go(pl.path) }, pl.name)));
@@ -998,11 +1004,15 @@ views.scan = (root) => {
   const unreadable = h("div");
   let scanId = null;
   let scanStatus = null; // as last read; null until then
+  // A scan is being started or is running: the list of folders has no say in that.
+  let scanBusy = false;
+  const syncStart = () => { start.disabled = scanBusy || !roots.size; };
+  const askResult = newestOnly();
 
   const drawChips = () => {
     chips.replaceChildren(...[...roots].map((r) => h("span", { class: "chip" }, h("code", {}, r), h("button", { title: "Remove", onclick: () => { roots.delete(r); prefs.set("scanRoots", [...roots]); drawChips(); } }, "×"))));
     if (!roots.size) chips.append(h("span", { class: "dim" }, "No folders yet."));
-    start.disabled = !roots.size;
+    syncStart();
   };
   drawChips();
 
@@ -1010,7 +1020,9 @@ views.scan = (root) => {
     const numbers = readNumbers([[minSav, "Min savings %"], [vmaf, "Target VMAF"]]);
     if (!numbers) return;
     const [minSavings, targetVmaf] = numbers;
-    start.disabled = true;
+    scanBusy = true;
+    syncStart();
+    askResult(); // what is still on its way is about the scan before this one
     try {
       const r = await api("/api/scans", { paths: [...roots], min_savings: minSavings / 100, target_vmaf: targetVmaf, preset: Number(defaultOptions().preset) || 5 });
       // Only now: values the server refused would come back at the next visit.
@@ -1024,7 +1036,7 @@ views.scan = (root) => {
       unreadable.replaceChildren();
       // A short scan can be over before its id is known here: its last event went by unseen.
       showResult(r.id);
-    } catch (e) { toast(e.message, true); start.disabled = false; }
+    } catch (e) { toast(e.message, true); scanBusy = false; syncStart(); }
   };
 
   root.append(
@@ -1046,15 +1058,18 @@ views.scan = (root) => {
   };
 
   async function showResult(id) {
+    const isNewest = askResult();
     let r;
-    try { r = await api("/api/scans/" + id); } catch (e) { toast(e.message, true); if (id === scanId) start.disabled = !roots.size; return; }
-    if (id !== scanId) return; // another scan was started meanwhile
+    try { r = await api("/api/scans/" + id); }
+    catch (e) { if (!isNewest()) return; toast(e.message, true); scanBusy = false; syncStart(); return; }
+    // An answer can overtake an earlier one, and "running" must not follow "done".
+    if (!isNewest() || id !== scanId) return;
     scanStatus = r.status;
-    start.disabled = !roots.size;
+    scanBusy = r.status === "running";
+    syncStart();
     if (r.status === "running") {
       progText.textContent = r.total ? `probed ${r.done} / ${r.total}` : "listing files…";
       progress.firstChild.style.width = r.total ? (100 * r.done / r.total) + "%" : "0%";
-      scanId = id; start.disabled = true;
       return;
     }
     progress.firstChild.style.width = "100%";
@@ -1072,7 +1087,7 @@ views.scan = (root) => {
     // A finished scan cannot have changed, and drawing it again would lose the selection.
     else if (m.kind === "reopened" && scanId != null && (scanStatus == null || scanStatus === "running")) showResult(scanId);
   });
-  if (lastScanId) { scanId = lastScanId; showResult(lastScanId); }
+  if (lastScanId) { scanId = lastScanId; scanBusy = true; syncStart(); showResult(lastScanId); }
   return off;
 };
 
@@ -1617,10 +1632,12 @@ views.bench = (root) => {
     progText.textContent = `${now} · ${run.cells_done} / ${total} done${eta}`;
   };
 
+  const askBench = newestOnly();
   async function load() {
+    const isNewest = askBench();
     let d;
-    try { d = await api("/api/bench"); } catch (e) { toast(e.message, true); return; }
-    if (gone) return;
+    try { d = await api("/api/bench"); } catch (e) { if (isNewest()) toast(e.message, true); return; }
+    if (gone || !isNewest()) return;
     if (!defaults) {
       defaults = d.defaults;
       base = defaults.baseline;
@@ -2041,24 +2058,58 @@ views.queue = (root) => {
   // Watched folders: what turns up in them is queued without being asked for.
   const watchBox = h("div");
   const restoringBox = h("div");
-  let watched = null, watchTick = null;
+  let watched = null, watchTick = null, left = false;
+  const askWatch = newestOnly();
+  // Rows stay from one drawing to the next, so that a button keeps the focus.
+  const watchRows = new Map(); // id -> { box, draw(watch) }
+  const watchList = h("div");
+  const watchPanel = h("div", { class: "panel watched" }, h("h3", {}, "Watched folders"), watchList);
   // A path too long for its place loses its beginning, not its end: the mark keeps the
   // slashes in order where the text runs right to left for that.
   const lrm = "\u200e";
   const ago = (t) => { const d = Date.now() / 1000 - t; return d < 90 ? "a moment ago" : span(d) + " ago"; };
-  const watchAct = (path, body) => async (e) => {
-    e.target.disabled = true;
-    try { watched = await api(path, body); } catch (er) { toast(er.message, true); }
+  const watchAct = async (id, what, path, body) => {
+    const busy = `${id}:${what}`;
+    if (watchBusy.has(busy)) return;
+    watchBusy.add(busy);
     drawWatched();
+    // A list asked for before this is out of date once this is done, so it no longer counts.
+    // One asked for while this is under way may or may not show it: the list is then read anew.
+    const isNewest = askWatch();
+    try {
+      const r = await api(path, body);
+      if (isNewest()) watched = r; else loadWatched();
+    } catch (er) { toast(er.message, true); loadWatched(); }
+    watchBusy.delete(busy);
+    drawWatched();
+    // The view may have been left and opened again: that one is waiting for this as well.
+    if (left) for (const fn of [...listeners]) fn({ kind: "watch" });
   };
   async function loadWatched() {
-    try { watched = await api("/api/watch"); } catch { return; }
+    const isNewest = askWatch();
+    let r;
+    try { r = await api("/api/watch"); } catch { return; }
+    if (left || !isNewest()) return;
+    watched = r;
     drawWatched();
   }
-  function drawWatched() {
-    const ws = (watched && watched.watches) || [];
-    if (!ws.length) { watchBox.replaceChildren(); return; }
-    const row = (w) => {
+  const watchRow = (id) => {
+    let w = null;
+    const pill = h("span");
+    const from = h("code", { class: "path" }), to = h("code", { class: "path" });
+    const look = h("button", { class: "small", title: "Look at the folder now instead of waiting for the next look", onclick: () => watchAct(id, "look", `/api/watch/${id}/look`, {}) }, "Look now");
+    const onOff = h("button", { class: "small", onclick: () => watchAct(id, "enabled", `/api/watch/${id}/enabled`, { enabled: !w.enabled }) });
+    const forget = h("button", { class: "small", title: "Forget this folder. Jobs it queued stay in the queue", onclick: async () => {
+      const sure = await confirmDialog({ title: "Forget this watched folder?", action: "Forget",
+        body: [h("p", { class: "mono" }, shownPath(w.path)), h("p", { class: "dim" }, "What it queued stays in the queue, and no file is touched. Watched again later, the videos in it then count as there before.")] });
+      if (sure) watchAct(id, "remove", `/api/watch/${id}/remove`, {});
+    } }, "Forget");
+    const details = h("div");
+    const box = h("div", { class: "watch" },
+      h("div", { class: "row" }, pill, from, h("span", { class: "dim" }, "→"), to, h("span", { class: "spacer" }), look, onOff, forget),
+      details);
+    const draw = (next) => {
+      w = next;
       const counts = [
         w.queued ? `${w.queued} queued` : null,
         w.fresh ? { text: `${w.fresh} new`, title: `Seen, not queued yet: a video is left alone until it has not changed for ${span(watched.settled_secs)} and two looks` } : null,
@@ -2070,30 +2121,41 @@ views.queue = (root) => {
         `${basename(u.path)}: not read after ${u.tries} ${u.tries === 1 ? "try" : "tries"}${u.why ? ` (${u.why})` : ""}`,
         w.enabled ? `; next try ${u.next_secs < 45 ? "in a moment" : "in " + span(u.next_secs)}` : ""));
       if (w.unread > unread.length) unread.push(h("div", { class: "warn sub" }, `and ${w.unread - unread.length} more`));
-      const state = !w.enabled ? h("span", { class: "pill warn" }, "Not watching") : w.error ? h("span", { class: "pill bad" }, "Problem") : h("span", { class: "pill ok" }, "Watching");
-      return h("div", { class: "watch" },
-        h("div", { class: "row" },
-          state,
-          h("code", { class: "path", title: w.path }, lrm + w.path), h("span", { class: "dim" }, "→"), h("code", { class: "path", title: w.out_dir }, lrm + w.out_dir),
-          h("span", { class: "spacer" }),
-          h("button", { class: "small", title: "Look at the folder now instead of waiting for the next look", onclick: watchAct(`/api/watch/${w.id}/look`, {}) }, "Look now"),
-          h("button", { class: "small", onclick: watchAct(`/api/watch/${w.id}/enabled`, { enabled: !w.enabled }) }, w.enabled ? "Stop watching" : "Watch again"),
-          h("button", { class: "small", title: "Forget this folder. Jobs it queued stay in the queue", onclick: async () => {
-            const sure = await confirmDialog({ title: "Forget this watched folder?", action: "Forget",
-              body: [h("p", { class: "mono" }, w.path), h("p", { class: "dim" }, "What it queued stays in the queue, and no file is touched. Watched again later, the videos in it then count as there before.")] });
-            if (!sure) return;
-            try { watched = await api(`/api/watch/${w.id}/remove`, {}); } catch (er) { toast(er.message, true); }
-            drawWatched();
-          } }, "Forget")),
+      pill.className = "pill " + (!w.enabled ? "warn" : w.error ? "bad" : "ok");
+      pill.textContent = !w.enabled ? "Not watching" : w.error ? "Problem" : "Watching";
+      from.title = w.path;
+      from.textContent = lrm + w.path;
+      to.title = w.out_dir;
+      to.textContent = lrm + w.out_dir;
+      onOff.textContent = w.enabled ? "Stop watching" : "Watch again";
+      look.disabled = watchBusy.has(`${id}:look`);
+      onOff.disabled = watchBusy.has(`${id}:enabled`);
+      forget.disabled = watchBusy.has(`${id}:remove`);
+      details.replaceChildren(
         h("div", { class: "dim sub" },
           optionsLabel(w.options), " · ",
           w.looked ? `looked ${ago(w.looked)}` : "not looked at yet",
           w.enabled && w.next_secs != null ? `, again ${w.next_secs < 45 ? "in a moment" : "in " + span(w.next_secs)}` : "",
           counts.map((c) => [" · ", typeof c === "string" ? c : h("span", { title: c.title }, c.text)])),
-        unread,
-        w.error ? h("div", { class: "bad sub" }, w.error) : null);
+        ...unread,
+        ...(w.error ? [h("div", { class: "bad sub" }, w.error)] : []));
     };
-    watchBox.replaceChildren(h("div", { class: "panel watched" }, h("h3", {}, "Watched folders"), ws.map(row)));
+    return { box, draw };
+  };
+  function drawWatched() {
+    const ws = (watched && watched.watches) || [];
+    const ids = new Set(ws.map((w) => w.id));
+    for (const [id, row] of watchRows) if (!ids.has(id)) { row.box.remove(); watchRows.delete(id); }
+    if (!ws.length) { watchBox.replaceChildren(); return; }
+    if (watchBox.firstChild !== watchPanel) watchBox.replaceChildren(watchPanel);
+    const boxes = ws.map((w) => {
+      if (!watchRows.has(w.id)) watchRows.set(w.id, watchRow(w.id));
+      const row = watchRows.get(w.id);
+      row.draw(w);
+      return row.box;
+    });
+    // Moved only when the order differs: an element that moves loses the focus.
+    if (boxes.length !== watchList.children.length || boxes.some((b, i) => watchList.children[i] !== b)) watchList.replaceChildren(...boxes);
   }
   const watchBtn = h("button", { title: "Queue the videos that turn up in a folder, on their own", onclick: async () => {
     const p = await pick({ title: "Folder to watch", mode: "dir" });
@@ -2135,9 +2197,24 @@ views.queue = (root) => {
   let timer = null;
   const pending = new Map(); // job id -> timeout
 
+  // Answers can overtake each other. A list counts only if no later one was asked for. The
+  // answer about one file counts only if nothing later was asked about it, by itself or with
+  // the whole list; and since a list on its way can be older than that answer, a file answered
+  // meanwhile is read again once the list is in.
+  const askList = newestOnly();
+  const askFile = new Map(); // "job:file" -> its own newestOnly
+  let listsAsked = 0;
+  let readDuringList = null;
+
   async function load() {
+    const isNewest = askList();
+    const readMeanwhile = readDuringList = new Set();
+    listsAsked++;
     let r;
-    try { r = await api("/api/jobs"); } catch (e) { toast(e.message, true); return; }
+    try { r = await api("/api/jobs"); }
+    catch (e) { if (isNewest()) { readDuringList = null; toast(e.message, true); } return; }
+    if (left || !isNewest()) return;
+    readDuringList = null;
     jobs = r.jobs;
     held.hidden = !r.benchmark;
     queue = r.queue;
@@ -2145,14 +2222,21 @@ views.queue = (root) => {
     drawRestoring(r.restoring);
     drawMissing(r.unrestored);
     draw();
+    for (const key of readMeanwhile) { const [id, i] = key.split(":").map(Number); reloadFile(id, i); }
   }
   // A live event touches one file: fetch just that file and the job's header.
   async function loadFile(id, i) {
+    const key = `${id}:${i}`;
+    if (!askFile.has(key)) askFile.set(key, newestOnly());
+    const isNewest = askFile.get(key)();
+    const listsBefore = listsAsked;
     let r;
-    try { r = await api(`/api/jobs/${id}/files/${i}`); } catch { return load(); }
+    try { r = await api(`/api/jobs/${id}/files/${i}`); } catch { return isNewest() && !left ? load() : undefined; }
+    if (left || !isNewest() || listsAsked !== listsBefore) return;
     const j = jobs.find((x) => x.id === id);
     const e = jobEls.get(id);
     if (!j || !e || !e.nodes[i]) return load();
+    if (readDuringList) readDuringList.add(key);
     Object.assign(j, r.head);
     j.files[i] = r.file;
     drawLeft();
@@ -2324,7 +2408,7 @@ views.queue = (root) => {
   loadWatched();
   // "Looked 3 min ago" goes on counting between two looks.
   watchTick = setInterval(() => { if (watched && watched.watches.length) loadWatched(); }, 30000);
-  return () => { off(); clearTimeout(timer); clearInterval(watchTick); for (const t of pending.values()) clearTimeout(t); };
+  return () => { left = true; off(); clearTimeout(timer); clearInterval(watchTick); for (const t of pending.values()) clearTimeout(t); };
 };
 
 // Hours of the day encodes may run in. Resolves to the queue's new state, or null.
@@ -2487,14 +2571,18 @@ function savedChart(days) {
 
 views.history = (root) => {
   const out = h("div", { class: "empty" }, h("span", { class: "spin" }));
-  let ready = [], chart = null;
+  let ready = [], chart = null, left = false;
+  const askReports = newestOnly();
   const replaceBtn = h("button", { disabled: true, onclick: () => replaceDialog(ready, load) }, "Replace originals…");
   root.append(h("div", { class: "row" }, h("h1", { class: "grow" }, "History"), replaceBtn,
     h("button", { onclick: async () => { const p = await pick({ title: "Folder with av1opt outputs" }); if (p) { try { await api("/api/history/dirs", { path: p[0] }); load(); } catch (e) { toast(e.message, true); } } } }, "Add folder…")), out);
 
   async function load() {
+    const isNewest = askReports();
     let r;
-    try { r = await api("/api/history"); } catch (e) { toast(e.message, true); return; }
+    try { r = await api("/api/history"); } catch (e) { if (isNewest() && !left) toast(e.message, true); return; }
+    // Once the view is left nothing would stop a chart made now.
+    if (left || !isNewest()) return;
     const reps = r.reports;
     const stateOf = (x) => (x.replace || {}).state;
     ready = reps.filter((x) => stateOf(x) === "ready");
@@ -2545,7 +2633,7 @@ views.history = (root) => {
         : h("div", { class: "empty" }, "No reports found in these folders.")));
   }
   load();
-  return () => { if (chart) chart.stop(); };
+  return () => { left = true; if (chart) chart.stop(); };
 };
 
 // Outputs take the place of their originals: one request per file, so the dialog can say

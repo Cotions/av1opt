@@ -42,11 +42,25 @@ pub struct Fingerprint {
     pub tail: Vec<Frame>,
     /// `middle[i]` is the frame at the share `MIDDLE[i]` of the length.
     pub middle: Vec<Frame>,
+    /// A frame was given up on because ffmpeg took too long, which says nothing lasting about
+    /// the file: such a fingerprint is used once and not remembered.
+    #[serde(skip)]
+    pub out_of_time: bool,
 }
 
 impl Fingerprint {
+    fn frames(&self) -> impl Iterator<Item = &Frame> {
+        self.head.iter().chain(&self.tail).chain(&self.middle)
+    }
+
     pub fn usable(&self) -> usize {
-        self.head.iter().chain(&self.tail).chain(&self.middle).filter(|f| matches!(f, Frame::Picture(_))).count()
+        self.frames().filter(|f| matches!(f, Frame::Picture(_))).count()
+    }
+
+    /// Whether frames the file says it has could not be read: it is damaged, or stops before
+    /// its stated length (the frames counted from the end are the first to go).
+    pub fn damaged(&self) -> bool {
+        self.frames().any(|f| *f == Frame::Unread)
     }
 }
 
@@ -70,13 +84,19 @@ pub struct Link {
     pub score: f32,
 }
 
-/// Matching frames and frames both sides have, for one end of two videos.
+/// Matching frames and frames compared, for one part of two videos. A flat frame says nothing
+/// and is left out. A frame that could not be read counts against the match: leaving it out
+/// would let a copy that lost most of its data agree perfectly with what remains.
 fn side(x: &[Frame], y: &[Frame], max_dist: u32) -> (u32, u32) {
     let (mut matched, mut common) = (0, 0);
     for (a, b) in x.iter().zip(y) {
-        if let (Frame::Picture(a), Frame::Picture(b)) = (a, b) {
-            common += 1;
-            matched += u32::from(distance(*a, *b) <= max_dist);
+        match (a, b) {
+            (Frame::Picture(a), Frame::Picture(b)) => {
+                common += 1;
+                matched += u32::from(distance(*a, *b) <= max_dist);
+            }
+            (Frame::Unread, _) | (_, Frame::Unread) => common += 1,
+            _ => {}
         }
     }
     (matched, common)
@@ -93,11 +113,11 @@ pub fn compare(dur_a: f64, a: &Fingerprint, dur_b: f64, b: &Fingerprint, max_dis
     let (mm, mc) = side(&a.middle, &b.middle, max_dist);
     let (m, c) = (hm + tm, hc + tc);
     let close = (dur_a - dur_b).abs() <= (0.02 * dur_a.max(dur_b)).max(1.5);
-    // Whole video: three quarters of all compared frames, and most of those from the middle.
-    // Both ends can agree over a long way in two episodes with one opening and one set of
-    // credits: only what lies between them tells such videos apart.
+    // Whole video: three quarters of all compared frames, some from each end and most of the
+    // middle. Both ends can agree over a long way in two episodes with one opening and one set
+    // of credits: only what lies between them tells such videos apart.
     let (all_matched, all_compared) = (m + mm, c + mc);
-    if close && mc >= MIN_MIDDLE && mm * 5 >= mc * 4 && all_matched * 4 >= all_compared * 3 {
+    if close && hm > 0 && tm > 0 && mc >= MIN_MIDDLE && mm * 5 >= mc * 4 && all_matched * 4 >= all_compared * 3 {
         return Some((Kind::Same, all_matched as f32 / all_compared as f32));
     }
     // One end only: needs at least three frames and four in five to match, which reaches
@@ -139,6 +159,8 @@ pub struct Media {
     pub video_bitrate: f64,
     /// Files with the same number here have the same bytes (as far as sampled).
     pub identical: Option<u32>,
+    /// Frames of it could not be read: see [`Fingerprint::damaged`].
+    pub damaged: bool,
 }
 
 /// Where the user would rather keep files, and where never.
@@ -185,9 +207,9 @@ pub struct Group {
     pub reason: String,
 }
 
-/// Picks the copy to keep: never one in an avoided place if there is another, then the
-/// highest resolution, then the most bitrate for its codec, then the preferred folder.
-/// Returns its position in `members` and the reason.
+/// Picks the copy to keep: never a damaged one if there is a whole one, nor one in an avoided
+/// place if there is another, then the highest resolution, then the most bitrate for its codec,
+/// then the preferred folder. Returns its position in `members` and the reason.
 pub fn choose(members: &[usize], media: &[Media], prefs: &Prefs, kind: Kind) -> (usize, String) {
     let m = |i: usize| &media[members[i]];
     let mut cand: Vec<usize> = (0..members.len()).collect();
@@ -199,6 +221,8 @@ pub fn choose(members: &[usize], media: &[Media], prefs: &Prefs, kind: Kind) -> 
             why.push(label);
         }
     };
+    // Before anything else: a higher resolution is worth nothing in a file that breaks off.
+    narrow(&mut cand, "the others are damaged or incomplete", &|i| !m(i).damaged);
     narrow(&mut cand, "not in an avoided place", &|i| !prefs.avoided(&m(i).path));
     if kind != Kind::Same {
         // Different lengths: the longer one holds everything the shorter one does.
@@ -308,11 +332,11 @@ mod tests {
     fn fp(content: u64, duration: f64) -> Fingerprint {
         let h = |i: usize, end: u64| Frame::Picture((content * 1000 + end * 100 + i as u64).wrapping_mul(0x9E3779B97F4A7C15));
         let n = ladder(duration).len();
-        Fingerprint { head: (0..n).map(|i| h(i, 0)).collect(), tail: (0..n).map(|i| h(i, 1)).collect(), middle: (0..MIDDLE.len()).map(|i| h(i, 2)).collect() }
+        Fingerprint { head: (0..n).map(|i| h(i, 0)).collect(), tail: (0..n).map(|i| h(i, 1)).collect(), middle: (0..MIDDLE.len()).map(|i| h(i, 2)).collect(), ..Default::default() }
     }
 
     fn media(path: &str, w: u32, h: u32, codec: &str, mbps: f64, size: u64) -> Media {
-        Media { path: path.into(), size, codec: codec.into(), width: w, height: h, duration_s: 600.0, video_bitrate: mbps * 1e6, identical: None }
+        Media { path: path.into(), size, codec: codec.into(), width: w, height: h, duration_s: 600.0, video_bitrate: mbps * 1e6, identical: None, damaged: false }
     }
 
     #[test]
@@ -365,7 +389,7 @@ mod tests {
 
     #[test]
     fn flat_frames_are_not_evidence() {
-        let blank = Fingerprint { head: vec![Frame::Flat; 7], tail: vec![Frame::Flat; 7], middle: vec![Frame::Flat; 5] };
+        let blank = Fingerprint { head: vec![Frame::Flat; 7], tail: vec![Frame::Flat; 7], middle: vec![Frame::Flat; 5], ..Default::default() };
         assert_eq!(compare(600.0, &blank, 600.0, &blank, 10), None);
         assert_eq!(blank.usable(), 0);
     }
@@ -454,7 +478,7 @@ mod tests {
     }
 
     fn sides(head: &[Frame], tail: &[Frame]) -> Fingerprint {
-        Fingerprint { head: head.to_vec(), tail: tail.to_vec(), middle: shared_middle() }
+        Fingerprint { head: head.to_vec(), tail: tail.to_vec(), middle: shared_middle(), ..Default::default() }
     }
 
     /// `n` frames, of which the first `same` are the ones `base` has and the others are far off.
@@ -532,6 +556,51 @@ mod tests {
         assert_eq!(side(&[], &[], 10), (0, 0));
         assert_eq!(side(&[p], &[], 10), (0, 0));
         assert_eq!(side(&[Frame::Flat, p, p], &[p, Frame::Flat, p, p], 10), (1, 1));
+    }
+
+    #[test]
+    fn a_frame_that_could_not_be_read_counts_against_the_match() {
+        let (p, gone) = (Frame::Picture(1), Frame::Unread);
+        assert_eq!(side(&[gone, p], &[p, p], 10), (1, 2));
+        assert_eq!(side(&[p, p], &[p, gone], 10), (1, 2));
+        assert_eq!(side(&[gone], &[gone], 10), (0, 1));
+        assert_eq!(side(&[gone], &[Frame::Flat], 10), (0, 1));
+    }
+
+    #[test]
+    fn a_copy_cut_off_in_the_middle_is_not_the_same_video() {
+        // The file says it is as long as the other, and its data stops after a third.
+        let whole = fp(1, 600.0);
+        let mut cut = whole.clone();
+        cut.tail.fill(Frame::Unread);
+        cut.middle[2..].fill(Frame::Unread);
+        cut.head[6] = Frame::Unread;
+        assert!(cut.damaged() && !whole.damaged());
+        let (kind, score) = compare(600.0, &whole, 600.0, &cut, 10).unwrap();
+        assert_eq!((kind, score), (Kind::SameStart, 6.0 / 7.0));
+        // With every frame of one end gone there is nothing of that end to go by, however
+        // well the rest agrees.
+        let mut no_end = whole.clone();
+        no_end.tail.fill(Frame::Unread);
+        assert_eq!(compare(600.0, &whole, 600.0, &no_end, 10).map(|r| r.0), Some(Kind::SameStart));
+        let mut flat_end = whole.clone();
+        flat_end.tail.fill(Frame::Flat);
+        assert_eq!(compare(600.0, &whole, 600.0, &flat_end, 10).map(|r| r.0), Some(Kind::SameStart));
+    }
+
+    #[test]
+    fn a_damaged_copy_is_kept_only_if_nothing_whole_is_left() {
+        let mut m = vec![media("/a/big.mp4", 3840, 2160, "h264", 40.0, 900), media("/b/small.mp4", 640, 360, "h264", 1.0, 10)];
+        m[0].damaged = true;
+        assert_eq!(pick(&m, &Prefs::default(), Kind::Same), (1, "the others are damaged or incomplete".to_string()));
+        // It also goes before where a copy lies, and for cut copies before the length.
+        let prefs = Prefs { prefer: vec![], avoid: vec!["/b/".into()] };
+        assert_eq!(pick(&m, &prefs, Kind::Same).0, 1);
+        m[0].duration_s = 7200.0;
+        assert_eq!(pick(&m, &Prefs::default(), Kind::SameStart).0, 1);
+        // With every copy damaged the usual rules choose among them.
+        m[1].damaged = true;
+        assert_eq!(pick(&m, &Prefs::default(), Kind::Same).0, 0);
     }
 
     #[test]

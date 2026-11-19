@@ -1275,6 +1275,7 @@ function renderDups(out, run, reload) {
         g.kind === "same" && k === 0 && !g.keepGone ? h("span", { class: "pill ok", title: g.reason }, "Suggested keep") : null,
         longer ? h("span", { class: "pill ok", title: k === 0 ? g.reason : "The longest of these copies" }, "Longer") : null,
         m.identical != null ? h("span", { class: "pill", title: "Same size and the same bytes at the start, middle and end" }, "Identical bytes") : null,
+        m.damaged ? h("span", { class: "pill bad", title: "Frames of this file could not be read: it is damaged, or stops before its stated length" }, "Damaged or incomplete") : null,
         compare].filter(Boolean));
       return row;
     });

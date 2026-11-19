@@ -530,7 +530,7 @@ impl Tools {
         match status {
             Some(st) if st.success() => Ok(out),
             Some(st) => Err(self.failure(st, &stderr, 5)),
-            None => bail!("ffmpeg gave no answer within {} s", timeout.as_secs()),
+            None => bail!("{NO_ANSWER} {} s", timeout.as_secs()),
         }
     }
 
@@ -748,6 +748,9 @@ pub const FAILED_INSIDE: &str = "this went wrong inside av1opt or ffmpeg, no out
 /// The same where the encode goes on: a stretch that cannot be encoded again leaves the
 /// video to the spot checks, and the message ends up in brackets in the note that says so.
 pub const WENT_WRONG_INSIDE: &str = "this went wrong inside av1opt or ffmpeg; AV1OPT_DEBUG=1 prints the ffmpeg commands and --keep-temp keeps the files for a bug report";
+
+/// How the error of an ffmpeg run stopped for taking too long begins.
+pub const NO_ANSWER: &str = "ffmpeg gave no answer within";
 
 pub const NOT_TEXT: &str = "its path is not valid UTF-8, which av1opt cannot pass on; rename it";
 

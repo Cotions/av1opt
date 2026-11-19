@@ -55,6 +55,8 @@ pub struct File {
     pub video_mbps: f64,
     /// Files of a group with the same number here have the same bytes (sampled, not read in full).
     pub identical: Option<u32>,
+    /// Frames of it could not be read: it is damaged, or ends before its stated length.
+    pub damaged: bool,
     /// Modification time (seconds since 1970) the search saw, for [`File::unchanged`].
     #[serde(skip)]
     #[cfg_attr(not(feature = "ui"), allow(dead_code))]
@@ -137,9 +139,18 @@ fn save_cache(path: &Path, cache: &HashMap<PathBuf, CacheEntry>) -> Result<()> {
     Ok(crate::files::replace_with(path, &serde_json::to_vec(cache)?)?)
 }
 
+/// What one ffmpeg run over some frames came to.
+enum Batch {
+    Frames(Vec<Vec<u8>>),
+    /// At least one of them is not to be had.
+    Missing,
+    /// ffmpeg was stopped for taking too long, which says little about the file.
+    OutOfTime,
+}
+
 /// One ffmpeg run that seeks to each of `times` and returns the frames as square grayscale
-/// thumbnails, or None if any of them is missing.
-fn grab_batch(tools: &Tools, path: &Path, video_index: usize, times: &[f64]) -> Option<Vec<Vec<u8>>> {
+/// thumbnails.
+fn grab_batch(tools: &Tools, path: &Path, video_index: usize, times: &[f64]) -> Batch {
     let mut a: Vec<String> = vec!["-v".into(), "error".into()];
     let mut graph = String::new();
     for (i, t) in times.iter().enumerate() {
@@ -156,32 +167,46 @@ fn grab_batch(tools: &Tools, path: &Path, video_index: usize, times: &[f64]) -> 
         graph += &format!("vstack=inputs={}", times.len());
     }
     a.extend(["-filter_complex".into(), graph, "-frames:v".into(), "1".into(), "-f".into(), "rawvideo".into(), "-".into()]);
-    let out = tools.run_capture(&a, Duration::from_secs(90)).ok()?;
-    (out.len() == times.len() * THUMB * THUMB).then(|| out.chunks(THUMB * THUMB).map(<[u8]>::to_vec).collect())
+    match tools.run_capture(&a, Duration::from_secs(90)) {
+        Ok(out) if out.len() == times.len() * THUMB * THUMB => Batch::Frames(out.chunks(THUMB * THUMB).map(<[u8]>::to_vec).collect()),
+        Err(e) if e.to_string().starts_with(crate::tools::NO_ANSWER) => Batch::OutOfTime,
+        _ => Batch::Missing,
+    }
 }
 
-/// Thumbnails of the frames at `times`; None where there is no frame (past the end of the
-/// video stream, damaged data).
-fn grab(tools: &Tools, path: &Path, info: &MediaInfo, times: &[f64]) -> Result<Vec<Option<Vec<u8>>>> {
+/// Thumbnails of the frames at `times`, None where there is no frame (past the end of the
+/// video stream, damaged data), and whether any run was stopped for taking too long.
+fn grab(tools: &Tools, path: &Path, info: &MediaInfo, times: &[f64]) -> Result<(Vec<Option<Vec<u8>>>, bool)> {
     // Every seek holds a decoder open; big frames get smaller batches.
     let per_run = if info.width as u64 * info.height as u64 > 2_500_000 { 3 } else { 8 };
-    let mut out = Vec::with_capacity(times.len());
+    let (mut out, mut out_of_time) = (Vec::with_capacity(times.len()), false);
     for batch in times.chunks(per_run) {
         tools.check_cancel()?;
         match grab_batch(tools, path, info.video_index, batch) {
-            Some(frames) => out.extend(frames.into_iter().map(Some)),
+            Batch::Frames(frames) => out.extend(frames.into_iter().map(Some)),
             // One missing frame fails the whole run: ask for each on its own.
-            None if batch.len() > 1 => {
+            _ if batch.len() > 1 => {
                 for &t in batch {
                     tools.check_cancel()?;
-                    out.push(grab_batch(tools, path, info.video_index, &[t]).and_then(|mut f| f.pop()));
+                    match grab_batch(tools, path, info.video_index, &[t]) {
+                        Batch::Frames(mut frame) => out.push(frame.pop()),
+                        Batch::Missing => out.push(None),
+                        Batch::OutOfTime => {
+                            out_of_time = true;
+                            out.push(None);
+                        }
+                    }
                 }
             }
-            None => out.push(None),
+            Batch::OutOfTime => {
+                out_of_time = true;
+                out.push(None);
+            }
+            _ => out.push(None),
         }
     }
     tools.check_cancel()?;
-    Ok(out)
+    Ok((out, out_of_time))
 }
 
 /// Decodes the sampled frames of one video and hashes them. The times are those of the picture:
@@ -192,7 +217,7 @@ pub fn fingerprint(tools: &Tools, path: &Path, info: &MediaInfo) -> Result<Finge
     let from_end = lad.iter().map(|t| (length - t).max(0.0));
     let at_shares = MIDDLE.iter().map(|share| length * share);
     let times: Vec<f64> = lad.iter().copied().chain(from_end).chain(at_shares).map(|t| start + t).collect();
-    let frames = grab(tools, path, info, &times)?;
+    let (frames, out_of_time) = grab(tools, path, info, &times)?;
     let read: Vec<&[u8]> = frames.iter().flatten().map(Vec::as_slice).collect();
     if read.is_empty() {
         bail!("no frame could be read");
@@ -201,7 +226,7 @@ pub fn fingerprint(tools: &Tools, path: &Path, info: &MediaInfo) -> Result<Finge
     let hashes: Vec<Frame> = frames.iter().map(|f| f.as_ref().map_or(Frame::Unread, |f| phash::hash(f, bounds).map_or(Frame::Flat, Frame::Picture))).collect();
     let (head, rest) = hashes.split_at(lad.len());
     let (tail, middle) = rest.split_at(lad.len());
-    Ok(Fingerprint { head: head.to_vec(), tail: tail.to_vec(), middle: middle.to_vec() })
+    Ok(Fingerprint { head: head.to_vec(), tail: tail.to_vec(), middle: middle.to_vec(), out_of_time })
 }
 
 /// How much of a file's start, middle and end is compared.
@@ -299,7 +324,10 @@ pub fn find(paths: &[PathBuf], tools: &Tools, o: &Options, progress: &(dyn Fn(Pr
                         };
                         let e = CacheEntry { size: f.size, mtime: f.mtime, duration: info.duration_s, fp, error };
                         let mut c = cache.lock().unwrap();
-                        c.insert(f.path.clone(), e.clone());
+                        // A busy machine must not leave a file marked damaged for good.
+                        if !e.fp.as_ref().is_some_and(|fp| fp.out_of_time) {
+                            c.insert(f.path.clone(), e.clone());
+                        }
                         // Save now and then so a crash doesn't lose hours of decoding.
                         if fresh.fetch_add(1, Ordering::Relaxed) % 200 == 199 {
                             let _ = save_cache(&cache_path, &c);
@@ -332,6 +360,7 @@ pub fn find(paths: &[PathBuf], tools: &Tools, o: &Options, progress: &(dyn Fn(Pr
                     duration_s: info.duration_s,
                     video_bitrate: info.video_bitrate,
                     identical: None,
+                    damaged: fp.damaged(),
                 });
                 kept.push((f, info, fp));
             }
@@ -367,6 +396,7 @@ pub fn find(paths: &[PathBuf], tools: &Tools, o: &Options, progress: &(dyn Fn(Pr
                     duration_s: info.duration_s,
                     video_mbps: info.video_bitrate / 1e6,
                     identical: media[*m].identical,
+                    damaged: media[*m].damaged,
                     modified: f.mtime,
                     digest: None,
                 });
@@ -433,7 +463,11 @@ pub fn print(r: &Report, top: usize) {
                 hms(f.duration_s),
                 gb(f.size),
                 f.path.display(),
-                if f.identical.is_some() { "  [identical bytes]" } else { "" },
+                match (f.damaged, f.identical.is_some()) {
+                    (true, _) => "  [damaged or incomplete]",
+                    (false, true) => "  [identical bytes]",
+                    (false, false) => "",
+                },
             );
         }
         if g.kind == Kind::Same && !g.reason.is_empty() {
@@ -522,7 +556,7 @@ mod tests {
         assert_ne!(sample_digest(&a, size), sample_digest(&c, size));
         assert!(sample_digest(&d, 4).is_some());
 
-        let m = |p: &Path, size: u64| Media { path: p.into(), size, codec: "h264".into(), width: 1, height: 1, duration_s: 1.0, video_bitrate: 1.0, identical: None };
+        let m = |p: &Path, size: u64| Media { path: p.into(), size, codec: "h264".into(), width: 1, height: 1, duration_s: 1.0, video_bitrate: 1.0, identical: None, damaged: false };
         let mut media = vec![m(&a, size), m(&b, size), m(&c, size), m(&d, 4)];
         mark_identical(&mut media, &[0, 1, 2, 3]);
         assert_eq!(media.iter().map(|x| x.identical).collect::<Vec<_>>(), vec![Some(0), Some(0), None, None]);
@@ -541,6 +575,7 @@ mod tests {
             duration_s: d,
             video_mbps: 1.5,
             identical: (i == 0).then_some(4),
+            damaged: false,
             modified: 0,
             digest: None,
         };
@@ -612,7 +647,7 @@ mod tests {
             p
         };
         let (a, b, c, d) = (write("a", b"aaaa"), write("b", b"aaaa"), write("c", b"cccccc"), write("d", b"cccccc"));
-        let m = |p: &Path, size: u64| Media { path: p.into(), size, codec: "h264".into(), width: 1, height: 1, duration_s: 1.0, video_bitrate: 1.0, identical: None };
+        let m = |p: &Path, size: u64| Media { path: p.into(), size, codec: "h264".into(), width: 1, height: 1, duration_s: 1.0, video_bitrate: 1.0, identical: None, damaged: false };
         let mut media = vec![m(&c, 6), m(&a, 4), m(&d, 6), m(&b, 4), m(&dir.join("gone"), 4)];
         // Each set gets its own number, the smaller size first; a file that cannot be read has none.
         mark_identical(&mut media, &[0, 1, 2, 3, 4]);

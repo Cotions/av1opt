@@ -411,7 +411,7 @@ mod tests {
     use crate::dups::matching::{Group, Kind};
 
     fn file(name: &str) -> File {
-        File { path: PathBuf::from(name), root: PathBuf::from("/"), size: 10, codec: "h264".into(), width: 1280, height: 720, fps: 30.0, duration_s: 60.0, video_mbps: 2.0, identical: None, modified: 0, digest: None }
+        File { path: PathBuf::from(name), root: PathBuf::from("/"), size: 10, codec: "h264".into(), width: 1280, height: 720, fps: 30.0, duration_s: 60.0, video_mbps: 2.0, identical: None, damaged: false, modified: 0, digest: None }
     }
 
     /// A file on disk, as a search that ended now would describe it.

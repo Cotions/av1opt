@@ -30,7 +30,7 @@ mod tuning;
 #[cfg(feature = "ui")]
 mod ui;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use report_file::Kind;
 use scan::is_video;
@@ -228,6 +228,7 @@ enum Cmd {
     },
     /// Re-encode videos to AV1 at a target quality. Inputs are never modified; results go to --out-dir.
     /// Folders are processed recursively and their layout is mirrored. Re-running resumes.
+    #[command(after_help = "Exit status: 0 when no file failed, 1 on an error that stopped the run, 2 on wrong usage, 3 when some files failed and the others were dealt with, 130 or 143 when stopped by Ctrl-C or SIGTERM.")]
     Encode {
         /// Video files and/or folders.
         #[arg(required = true)]
@@ -472,6 +473,10 @@ fn parse_memory(s: &str) -> Result<String, String> {
     }
 }
 
+/// The exit status of a batch in which files failed and the rest was dealt with. An error that
+/// stops the program is 1 and wrong usage is 2, so that a script can tell the three apart.
+const SOME_FILES_FAILED: i32 = 3;
+
 fn main() -> Result<()> {
     let result = run_command(Cli::parse().cmd);
     // Stopped by a signal, whatever the work then ended with.
@@ -656,7 +661,6 @@ fn run_command(command: Cmd) -> Result<()> {
                 anyhow::bail!("{p} (--ffmpeg / AV1OPT_FFMPEG, --ffprobe / AV1OPT_FFPROBE)");
             }
             fsguard::ensure_writable_location(&out_dir, allow_zfs)?;
-            std::fs::create_dir_all(&out_dir)?;
             // SAFETY: plain syscall on our own process; children inherit the priority.
             unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) };
             let tools = signals::stopping_on_signals(tools::Tools::new(ffmpeg, ffprobe, memory_cap(&memory_limit, 1)).sharing_between_chunks(memory_cap(&memory_limit, workers)));
@@ -685,11 +689,13 @@ fn run_command(command: Cmd) -> Result<()> {
             if jobs.is_empty() {
                 anyhow::bail!("no video files found in the given inputs");
             }
-            if order != batch::Order::Given && jobs.len() > 1 {
-                order_jobs(&mut jobs, &inputs, &tools.ffprobe, &opts, order)?;
-            }
             if !opts.remove.is_empty() && jobs.len() > 1 {
                 anyhow::bail!("--remove applies to one video; {} were given", jobs.len());
+            }
+            // Only now: a run refused above leaves no empty folder behind.
+            std::fs::create_dir_all(&out_dir).with_context(|| format!("cannot make the output folder {}", out_dir.display()))?;
+            if order != batch::Order::Given && jobs.len() > 1 {
+                order_jobs(&mut jobs, &inputs, &tools.ffprobe, &opts, order)?;
             }
             let s = batch::run(&tools, &jobs, &out_dir, &opts, retry_skipped)?;
             let saved = s.bytes_in.saturating_sub(s.bytes_out) as f64 / 1e9;
@@ -701,8 +707,8 @@ fn run_command(command: Cmd) -> Result<()> {
             for folder in &s.kept {
                 eprintln!("kept for the next run: {}", folder.display());
             }
-            if s.failed > 0 {
-                std::process::exit(2);
+            if s.failed > 0 && !s.cancelled {
+                std::process::exit(SOME_FILES_FAILED);
             }
             Ok(())
         }

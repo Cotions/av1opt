@@ -324,3 +324,24 @@ fn a_second_signal_ends_the_run_at_once() {
     assert_eq!(run.0.wait().unwrap().code(), Some(130));
     soon("ffmpeg to go with it", || !Path::new(&format!("/proc/{ffmpeg}")).exists());
 }
+
+#[test]
+fn the_exit_status_tells_failed_files_from_errors_and_wrong_usage() {
+    let c = Case::with_ffmpeg("exit-codes", "[ \"$2\" = -nostdin ] && exit 1\nexit 0");
+    // Nothing to do, or nowhere to put it, stops the run.
+    c.run(&["encode", "videos", "-o", "out"]).ended(1).has("no video files");
+    assert!(!c.path("out").exists(), "a refused run leaves no folder");
+    c.run(&["encode", "videos", "-o", "out", "--tuned"]).ended(1).has("--tuned");
+    assert!(!c.path("out").exists(), "a refused run leaves no folder");
+
+    c.video("a.mkv");
+    c.video("b.mkv");
+    c.run(&["encode", "videos", "-o", "out", "--workers", "9"]).ended(2);
+    assert!(!c.path("out").exists());
+    c.run(&["encode", "videos", "-o", "out"]).ended(3).has("FAILED").has("[2/2]").has("failed 2");
+    assert!(c.path("out").is_dir());
+
+    std::fs::write(c.path("afile"), "someone's").unwrap();
+    c.run(&["encode", "videos", "-o", "afile"]).ended(1).has("afile");
+    assert_eq!(text(&c.path("afile")), "someone's");
+}

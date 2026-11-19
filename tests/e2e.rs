@@ -529,7 +529,7 @@ fn removed_sections_are_gone_to_the_frame() {
     // The same output is done; other sections for the same output are refused, not mixed up.
     c.encode(&[&src], &["--remove", "8-end", "--remove", "2-4"]).ok().has("already done 1");
     let r = c.encode(&[&src], &["--remove", "1-2"]);
-    assert_eq!(r.code, Some(2), "{}", r.err);
+    assert_eq!(r.code, Some(3), "{}", r.err);
     r.has("other sections removed");
     // And two files at once are refused before anything is encoded.
     let other = c.clip("other.mp4", "320x180", 4);
@@ -638,7 +638,7 @@ fn files_not_worth_it_are_skipped_once_and_bad_ones_fail_alone() {
     c.ffmpeg(&["-f", "lavfi", "-i", "sine=f=440:d=3", "-c:a", "aac", "sound.mp4"]);
 
     let r = c.encode(&[&c.videos()], &[]);
-    assert_eq!(r.code, Some(2), "{}", r.err);
+    assert_eq!(r.code, Some(3), "{}", r.err);
     r.has("encoded 1, skipped 2, failed 2, already done 0");
     assert_eq!(c.outputs(), ["av1opt-log.tsv", "good.av1opt.json", "good.mp4"]);
     assert_eq!(frames(&good), frames(&c.out().join("good.mp4")));
@@ -664,7 +664,7 @@ fn an_encode_never_lands_on_its_source_and_a_changed_source_is_noticed() {
     // The source under the name the output would get: a second name for the same file.
     std::fs::hard_link(&src, c.out().join("film.mp4")).unwrap();
     let r = c.encode(&[&src], &["--overwrite"]);
-    assert_eq!(r.code, Some(2), "{}", r.err);
+    assert_eq!(r.code, Some(3), "{}", r.err);
     r.has("the output would be written over this same video");
     assert_eq!(std::fs::read(&src).unwrap(), before);
     // An output folder that is the folder of the videos by another way.
@@ -672,7 +672,7 @@ fn an_encode_never_lands_on_its_source_and_a_changed_source_is_noticed() {
     std::os::unix::fs::symlink(c.videos(), &link).unwrap();
     for out in [link.clone(), c.videos().join("../videos")] {
         let r = c.encode_into(&out, &[&src], &["--overwrite"]);
-        assert_eq!(r.code, Some(2), "{}", r.err);
+        assert_eq!(r.code, Some(3), "{}", r.err);
         r.has("the output would be written over this same video");
         assert_eq!(std::fs::read(&src).unwrap(), before);
     }
@@ -684,7 +684,7 @@ fn an_encode_never_lands_on_its_source_and_a_changed_source_is_noticed() {
     c.encode(&[&src], &[]).ok().has("already done 1");
     c.clip("film.mp4", "320x180", 6);
     let r = c.encode(&[&src], &[]);
-    assert_eq!(r.code, Some(2), "{}", r.err);
+    assert_eq!(r.code, Some(3), "{}", r.err);
     r.has("was made from this file when it was another size");
     assert_eq!(std::fs::read(c.out().join("film.mp4")).unwrap(), made);
 }
@@ -710,7 +710,7 @@ fn folders_are_mirrored_and_same_names_do_not_collide_silently() {
     // Two files named alike, given one by one, would land on one output: the second says so.
     let flat = c.dir.join("out-flat");
     let r = c.encode_into(&flat, &[&c.videos().join("show/season 1/e1.mp4"), &c.videos().join("other/e1.mp4")], &[]);
-    assert_eq!(r.code, Some(2), "{}", r.err);
+    assert_eq!(r.code, Some(3), "{}", r.err);
     r.has("encoded 1, skipped 0, failed 1").has("output name collision");
 
     // The folders they sit in, given together, each keep their name: nothing collides.
@@ -1721,7 +1721,7 @@ fn a_folder_that_is_its_own_output_keeps_its_originals_and_encodes_the_rest() {
     let (b_mp4, b_report) = (dir.join("b.mp4"), dir.join("b.av1opt.json"));
     // Both of the pair are turned away in every run, and no original has changed after it.
     let pair_refused = |r: &Run| {
-        assert_eq!(r.code, Some(2), "{}", r.err);
+        assert_eq!(r.code, Some(3), "{}", r.err);
         r.has(&format!("FAILED: its output would take the place of another input, {}", a_mp4.display()));
         r.has("FAILED: the output would be written over this same video, so nothing was written; choose another output folder");
         for (path, bytes) in &originals {
@@ -1767,7 +1767,7 @@ fn two_inputs_with_one_output_name_leave_the_output_to_the_first_under_overwrite
     let before = (std::fs::read(&first).unwrap(), std::fs::read(&second).unwrap());
 
     let r = c.encode(&[&first, &second], &["--overwrite"]);
-    assert_eq!(r.code, Some(2), "{}", r.err);
+    assert_eq!(r.code, Some(3), "{}", r.err);
     r.has("encoded 1, skipped 0, failed 1, already done 0");
     r.has(&format!("FAILED: its output is also that of another input, {}; give one of them another output folder", first.display()));
     is_av1_of(&c.out().join("e.mp4"), &first);
@@ -1903,7 +1903,7 @@ fn a_long_track_that_is_not_kept_passes_the_length_check_and_a_cut_picture_does_
     let halfway = c.stand_in_ffmpeg("if [[ \"${@: -1}\" == *partial.mp4 ]]; then exec \"$real\" \"${@:1:$#-1}\" -t 3 \"${@: -1}\"; fi");
     let other = c.dir.join("out-halfway");
     let r = c.encode_into(&other, &[&src], &["--ffmpeg", halfway.to_str().unwrap()]);
-    assert_eq!(r.code, Some(2), "{}", r.err);
+    assert_eq!(r.code, Some(3), "{}", r.err);
     r.has("encoded 0, skipped 0, failed 1").has("the finished video lasts 3.0 seconds where it should last 6.0");
     assert_eq!(c.outputs_in(&other), ["av1opt-log.tsv"]);
 }

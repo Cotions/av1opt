@@ -206,7 +206,10 @@ For each file:
    search then goes by the samples as they are, whole-video check or not.
    A video whose first frame is not at zero (Matroska and MPEG-TS files can start late) is
    measured from where it starts; for a Matroska file that takes a look at its first and its
-   last packets, a fraction of a second. Clips, and the chunks of a per-scene encode, are
+   last packets, a fraction of a second. Matroska states one frame's length, and ffmpeg
+   reads that as both the declared and the average rate whatever the frames do; so the
+   rate of a Matroska file is read off its first 32 packets, and where those come slower
+   than declared, off 32 in its middle too (see the lessons below). Clips, and the chunks of a per-scene encode, are
    chosen by the source's own timestamps: where a seek lands past them (MPEG-TS, files
    without an index), the cut is redone from 30 seconds earlier and then from the start,
    which is slow on a long transport stream but takes the right frames. A file that stops
@@ -1111,6 +1114,16 @@ ignored, as the XDG specification says, and the default under the home folder is
   frames than its header says would have lost some), and the checks passed because they
   compare at the same constant rate. ffmpeg's `fps` filter counts the frames it drops and
   repeats; scene detection runs it over the whole file anyway, so that count now decides.
+  Everything else still went by the header: a file declared at 48 fps whose frames come at
+  24 had its key frames 20 s apart, and one declared at 30 with a frame every half second
+  failed as broken, because the check of a stretch put back into the video cut it on a
+  grid of 30 fps, each frame there 15 times, and VMAF reads frames that do not move lower
+  (96.1, where the same frames one each read 100). Where the two rates agree, the probe of a
+  Matroska file now reads its first 32 packets, and its middle 32 where those are slower,
+  and takes the rate they show where it is below the declared one in both places: what the
+  same frames in MP4 say (24.0 and 2.0). A frame held over four times as long as the
+  others, such as a still first frame, does not count, and a slow title before a steady
+  film keeps the declared rate.
 - **A webcam's 30 fps drifts.** The first videos from a real library were 30 fps MP4s whose
   frames come a quarter of a frame late now and then: no gap, an average of 29.99, nothing a
   header shows. On the constant-rate grid of scene mode 8 frames of 27,895 were doubled, well

@@ -645,9 +645,9 @@ fn probe_within(ffprobe: &str, path: &Path, file_size: u64, limit: Duration) -> 
     let start_time = num(&j["format"]["start_time"]).unwrap_or(0.0);
     let avg_rate = parse_rate(video["avg_frame_rate"].as_str());
     let nominal_rate = parse_rate(video["r_frame_rate"].as_str());
-    let fps = believable_rate(avg_rate, nominal_rate).unwrap_or(0.0);
+    let mut fps = believable_rate(avg_rate, nominal_rate).unwrap_or(0.0);
     let avg_rate = avg_rate.filter(|a| *a == fps);
-    let vfr = matches!((avg_rate, nominal_rate), (Some(a), Some(r)) if (a - r).abs() / r > 0.005);
+    let mut vfr = matches!((avg_rate, nominal_rate), (Some(a), Some(r)) if (a - r).abs() / r > UNEVEN_RATE);
     let mut video_start = num(&video["start_time"]).unwrap_or(start_time);
 
     // Matroska keeps a stream's length in a tag ("00:07:39.966000000"), MP4 in the stream.
@@ -672,6 +672,18 @@ fn probe_within(ffprobe: &str, path: &Path, file_size: u64, limit: Duration) -> 
         let duration_is_an_end = stated.is_some_and(|d| (d - ends.file).abs() <= (d - duration_s).abs());
         let by_tag = tagged_length.map(|t| if duration_is_an_end { t - video_start } else { t });
         video_s = ends.picture.map(|end| end - video_start).or(by_tag).filter(|s| *s > 0.0).unwrap_or(video_s);
+    }
+    // Where Matroska states a frame's length (DefaultDuration), ffmpeg gives that one rate as
+    // both the declared and the average, whatever the frames do: a file declared at 48 fps
+    // whose frames come at 24 reads 48 and 48, and the same frames in MP4 48 and 24.03. Only
+    // the packets tell, and a few of them do (see [`matroska_rate`]).
+    if !vfr
+        && fps > 0.0
+        && j["format"]["format_name"].as_str().is_some_and(|f| f.contains("matroska"))
+        && let Some(real) = matroska_rate(ffprobe, path, video["index"].as_u64().unwrap_or(0), fps, start_time, duration_s)
+    {
+        fps = real;
+        vfr = true;
     }
     let audio: Vec<&Value> = streams.iter().filter(|s| s["codec_type"] == "audio").collect();
     let total_bitrate = if duration_s > 0.0 { file_size as f64 * 8.0 / duration_s } else { 0.0 };
@@ -841,6 +853,65 @@ pub fn stream_bytes(ffprobe: &str, path: &Path, index: usize) -> Option<u64> {
     let out = run_ffprobe(command, Reads::all_of(path)).ok().filter(|o| o.status.success())?;
     let bytes: u64 = String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.trim().trim_end_matches(',').parse::<u64>().ok()).sum();
     (bytes > 0).then_some(bytes)
+}
+
+/// How far a stream's average rate may be from the rate it declares before its frames count
+/// as coming at another rate (`MediaInfo::vfr`).
+const UNEVEN_RATE: f64 = 0.005;
+
+/// How many video packets [`matroska_rate`] reads at each place it looks: a second or two of
+/// most videos, which the first look has mostly read already for the probe itself.
+const RATE_PACKETS: usize = 32;
+
+/// Of the packets read, how many of the latest by time may still be missing frames that come
+/// later in decoding order (B-frames). Those are left out of the count.
+const RATE_REORDER: usize = 8;
+
+/// The rate a Matroska file's frames come at where it is clearly below the `declared` one,
+/// from the packets at its start and then in its middle; the higher of the two. None where
+/// either place shows frames at the declared rate or faster: a file that slows down later, or
+/// a slow title before a steady film, keeps its declared rate as it always did, and frames
+/// that come faster than declared are fields, not frames. A frame held far longer than the
+/// others (a still first frame) does not count, see [`rate_of`]. The look into the middle
+/// starts at the key frame before it, a few seconds early in most videos. A steady file costs one short
+/// read of 32 packets, mostly read already by the probe itself; a slow one a second in its
+/// middle. Both go through the limits of [`matroska_ends`], and a file whose packets cannot be
+/// read keeps its declared rate.
+fn matroska_rate(ffprobe: &str, path: &Path, video: u64, declared: f64, start: f64, length: f64) -> Option<f64> {
+    let index = video.to_string();
+    let slower = |interval: String| {
+        let lines = packets(ffprobe, path, &["-select_streams", &index, "-read_intervals", &interval, "-show_entries", "packet=pts_time"])?;
+        let times: Vec<f64> = lines.lines().filter_map(|l| l.trim().trim_end_matches(',').parse().ok()).collect();
+        // Fewer than asked for: the read reached the end, and nothing is still to come.
+        let reorder = if times.len() >= RATE_PACKETS { RATE_REORDER } else { 0 };
+        rate_of(times, reorder).filter(|r| *r < declared * (1.0 - UNEVEN_RATE))
+    };
+    let first = slower(format!("%+#{RATE_PACKETS}"))?;
+    if length <= 0.0 {
+        return Some(first);
+    }
+    Some(first.max(slower(format!("{:.3}%+#{RATE_PACKETS}", start + length / 2.0))?))
+}
+
+/// Frames a second in a run of packet times (in any order), leaving out the `reorder` latest
+/// and every step more than four times longer or shorter than the middle one: a still first
+/// frame, or a jump where frames are missing. What is left is counted over the time it spans,
+/// not taken from the middle step, so that timestamps in whole milliseconds still give 29.97
+/// and not 30.3, and frames that come at mixed steps (one, two and three steps of a 48 fps
+/// grid) give their average. None for fewer than 8 steps.
+fn rate_of(mut times: Vec<f64>, reorder: usize) -> Option<f64> {
+    times.sort_by(f64::total_cmp);
+    times.dedup();
+    times.truncate(times.len().saturating_sub(reorder));
+    let steps: Vec<f64> = times.windows(2).map(|w| w[1] - w[0]).filter(|s| *s > 0.0).collect();
+    if steps.len() < 8 {
+        return None;
+    }
+    let mut sorted = steps.clone();
+    sorted.sort_by(f64::total_cmp);
+    let middle = sorted[sorted.len() / 2];
+    let kept: Vec<f64> = steps.into_iter().filter(|s| *s >= middle / 4.0 && *s <= middle * 4.0).collect();
+    Some(kept.len() as f64 / kept.iter().sum::<f64>())
 }
 
 /// Parses ffprobe rates like "30000/1001".
@@ -1061,12 +1132,13 @@ mod tests {
             (info, std::fs::read_to_string(&runs).unwrap().lines().count())
         };
 
-        // At zero: what the file says, from the one run every file costs.
+        // At zero: what the file says, from the run every file costs and the short read of
+        // its first packets every Matroska file costs (see `matroska_rate`).
         let plain = dir.join("plain.mkv");
         matroska(&ffmpeg, &plain, 0.0, None, 4);
         let (info, cost) = read(&plain);
         close(info.duration_s, 4.0, "plain");
-        assert_eq!(cost, 1);
+        assert_eq!(cost, 2);
 
         // Starting at 5 s, for 4 s, with a duration that is the end and one that is the length.
         let ends = dir.join("ends.mkv");
@@ -1098,6 +1170,73 @@ mod tests {
         close(info.picture_end(), 6.0, "where the picture ends");
         assert!(cost > 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_matroska_file_says_the_rate_its_frames_come_at() {
+        let Some(tools) = crate::tools::real_tools("a_matroska_file_says_the_rate_its_frames_come_at") else { return };
+        let ffmpeg = std::env::var("AV1OPT_FFMPEG").unwrap();
+        let dir = std::env::temp_dir().join(format!("av1opt-probe-rate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // `filter` over testsrc2 at `rate`, its frames given to Matroska as they come: the file
+        // declares that rate whatever the filter left of it. A key frame every 24 frames, as
+        // real videos have one every few seconds: a look into the middle starts at the one
+        // before it.
+        let make = |name: &str, rate: u32, secs: u32, filter: &str| {
+            let path = dir.join(name);
+            let made = Command::new(&ffmpeg)
+                .args(["-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i"])
+                .arg(format!("testsrc2=s=64x64:r={rate}:d={secs}"))
+                .args(["-vf", filter, "-fps_mode", "passthrough", "-c:v", "libx264", "-preset", "ultrafast", "-bf", "3", "-g", "24", "-pix_fmt", "yuv420p"])
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+            probe(&tools.ffprobe, &path, std::fs::metadata(&path).unwrap().len()).unwrap()
+        };
+        // Declared 48, every other frame kept: 24, as the same frames in MP4 read.
+        let half = make("half.mkv", 48, 12, "select='not(mod(n,2))'");
+        assert!(half.vfr, "{half:?}");
+        close(half.fps, 24.0, "every other frame");
+        close(half.nominal_fps, 48.0, "declared");
+        // Declared 30, a frame every half second.
+        let slow = make("slow.mkv", 30, 40, "select='not(mod(n,15))'");
+        assert!(slow.vfr && (slow.fps - 2.0).abs() < 0.01, "{slow:?}");
+        // Steady, with or without a still first frame held for 2 s.
+        for (name, filter) in [("steady.mkv", "null"), ("still.mkv", "setpts=PTS+if(gt(N\\,0)\\,2/TB\\,0)")] {
+            let steady = make(name, 25, 6, filter);
+            assert!(!steady.vfr && steady.fps == 25.0, "{name}: {steady:?}");
+        }
+        // A slow title (10 s at 2 fps) before 20 s at the declared 24: the middle is steady,
+        // and the file keeps its declared rate.
+        let title = make("title.mkv", 24, 21, "setpts='if(lt(N\\,20)\\,N/2\\,10+(N-20)/24)/TB'");
+        assert!(!title.vfr && title.fps == 24.0, "{title:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rate_is_counted_from_packet_times_that_are_all_there() {
+        let close_to = |rate: Option<f64>, expected: f64| assert!(rate.is_some_and(|r| (r - expected).abs() / expected < 0.001), "{rate:?} where {expected} was expected");
+        // 30000/1001 in whole milliseconds: steps of 33 and 34 ms, 29.97 counted over them.
+        let ntsc: Vec<f64> = (0..32).map(|i| (f64::from(i) * 1001.0 / 30.0).round() / 1000.0).collect();
+        close_to(rate_of(ntsc, 8), 30000.0 / 1001.0);
+        // One, two and three steps of a 48 fps grid, 24 on average (decoding order: B-frames
+        // after the frame they come before).
+        let grid: Vec<f64> = [0, 4, 2, 6, 8, 12, 10, 14, 15, 17, 18, 22, 20, 24, 26, 28, 30, 31, 34, 32, 36, 38, 40, 42, 45, 44, 46, 48, 50]
+            .map(|n| f64::from(n) / 48.0)
+            .to_vec();
+        close_to(rate_of(grid.clone(), 0), 28.0 / (50.0 / 48.0));
+        // A still first frame, held for 2 s, says nothing of the rate.
+        let still: Vec<f64> = std::iter::once(0.0).chain((0..31).map(|i| 2.0 + f64::from(i) / 25.0)).collect();
+        close_to(rate_of(still, 0), 25.0);
+        // In decoding order the latest frames by time can still be to come: frame 30 of 32 is.
+        let waiting: Vec<f64> = (0..33).filter(|i| *i != 30).map(|i| f64::from(i) / 25.0).collect();
+        assert!(rate_of(waiting.clone(), 0).unwrap() < 24.9, "a missing frame counted in");
+        close_to(rate_of(waiting, 8), 25.0);
+        // Too few steps to go by.
+        assert_eq!(rate_of((0..8).map(f64::from).collect(), 0), None);
+        assert_eq!(rate_of(vec![1.0; 32], 0), None);
     }
 
     #[test]

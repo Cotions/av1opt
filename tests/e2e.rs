@@ -2675,33 +2675,72 @@ fn a_video_whose_frames_come_slower_than_it_says_has_key_frames_ten_seconds_apar
     // average as a phone's camera thins them: mostly every other frame, one in seven a frame
     // early, so the file says 48 fps. Told 10 s at the declared rate, the encoder put its key
     // frames 20 s apart, and the stretch found weak took the whole 36 s to encode again.
+    // Written to MP4 and to Matroska, which states one frame's length and has ffmpeg read 48
+    // fps as both rates: only its packets say 24.
+    for name in ["uneven.mp4", "uneven-mkv.mkv"] {
+        c.ffmpeg(&[
+            "-f", "lavfi", "-i", "testsrc2=s=640x360:r=48:d=5", "-f", "lavfi", "-i", "mandelbrot=s=640x360:r=48,trim=duration=7",
+            "-f", "lavfi", "-i", "sierpinski=s=640x360:r=48:seed=1,trim=duration=7",
+            "-f", "lavfi", "-i", "life=s=640x360:r=48:mold=10:ratio=0.1:seed=1:death_color=#C83232:life_color=#00ff00,trim=duration=5",
+            "-f", "lavfi", "-i", "testsrc=s=640x360:r=48:d=12", "-f", "lavfi", "-i", "sine=f=440:d=36",
+            "-filter_complex",
+            "[0:v]format=yuv420p[a];[1:v]format=yuv420p[b];[2:v]format=yuv420p[c];[3:v]format=yuv420p[d];[4:v]format=yuv420p[e];\
+             [a][b][c][d][e]concat=n=5:v=1:a=0,select='not(mod(n\\,2))*not(eq(mod(n\\,14)\\,6))+eq(mod(n\\,14)\\,5)'[v]",
+            "-map", "[v]", "-map", "5:a", "-fps_mode", "passthrough", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "16",
+            "-c:a", "aac", "-b:a", "64k", "-bitexact", "-fflags", "+bitexact", name,
+        ]);
+    }
+    for (name, average) in [("uneven.mp4", "865/36"), ("uneven-mkv.mkv", "48/1")] {
+        let src = c.videos().join(name);
+        let v = video(&src);
+        assert_eq!((v["r_frame_rate"].as_str(), v["avg_frame_rate"].as_str()), (Some("48/1"), Some(average)), "{v}");
+        let run = c.encode(&[&src], &[]);
+        run.ok().has("encoding again:");
+        // The one pass and every stretch encoded again have their key frames 10 s apart.
+        let out = c.out().join(Path::new(name).with_extension("mp4"));
+        assert_ten_seconds_apart(&out);
+        // So what is encoded again is a whole number of those 10 s, and less than all of it.
+        let again = run.err.lines().find_map(|l| l.strip_prefix("encoding again: ")).unwrap();
+        let clock = again.split_once('(').and_then(|(_, r)| r.split_once(')')).map(|(t, _)| t).unwrap();
+        let secs = clock.split(':').fold(0, |sum, part| sum * 60 + part.parse::<u32>().unwrap());
+        assert!(secs % 10 == 0 && secs < 36, "{name}: {again}");
+    }
+}
+
+/// Key frames at 0, 10, 20 and 30 s of a 36 s video.
+fn assert_ten_seconds_apart(out: &Path) {
+    let times = frame_times(out);
+    let keys: Vec<f64> = key_frames(out).iter().map(|&k| times[k]).collect();
+    assert_eq!(keys.len(), 4, "{}: {keys:?}", out.display());
+    assert!(keys.iter().enumerate().all(|(i, t)| (t - 10.0 * i as f64).abs() < 0.05), "{}: key frames at {keys:?}", out.display());
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_matroska_video_declared_at_30_fps_with_a_frame_every_half_second_is_checked_at_its_own_rate() {
+    let c = Case::new("slow-matroska");
+    // The scenes of `scenes_clip` and an easy 12 s at 30 fps, a frame kept every half second,
+    // written to Matroska as they come: it says 30 fps for both rates. Cut on a grid of 30
+    // for the check of the joined video, each frame was there 15 times; VMAF reads frames
+    // that do not move lower, and the stretch encoded again read 96.09 there against 100.00
+    // by itself, which failed the file as broken inside av1opt.
     c.ffmpeg(&[
-        "-f", "lavfi", "-i", "testsrc2=s=640x360:r=48:d=5", "-f", "lavfi", "-i", "mandelbrot=s=640x360:r=48,trim=duration=7",
-        "-f", "lavfi", "-i", "sierpinski=s=640x360:r=48:seed=1,trim=duration=7",
-        "-f", "lavfi", "-i", "life=s=640x360:r=48:mold=10:ratio=0.1:seed=1:death_color=#C83232:life_color=#00ff00,trim=duration=5",
-        "-f", "lavfi", "-i", "testsrc=s=640x360:r=48:d=12", "-f", "lavfi", "-i", "sine=f=440:d=36",
+        "-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=5", "-f", "lavfi", "-i", "mandelbrot=s=640x360:r=30,trim=duration=7",
+        "-f", "lavfi", "-i", "sierpinski=s=640x360:r=30:seed=1,trim=duration=7",
+        "-f", "lavfi", "-i", "life=s=640x360:r=30:mold=10:ratio=0.1:seed=1:death_color=#C83232:life_color=#00ff00,trim=duration=5",
+        "-f", "lavfi", "-i", "testsrc=s=640x360:r=30:d=12",
         "-filter_complex",
         "[0:v]format=yuv420p[a];[1:v]format=yuv420p[b];[2:v]format=yuv420p[c];[3:v]format=yuv420p[d];[4:v]format=yuv420p[e];\
-         [a][b][c][d][e]concat=n=5:v=1:a=0,select='not(mod(n\\,2))*not(eq(mod(n\\,14)\\,6))+eq(mod(n\\,14)\\,5)'[v]",
-        "-map", "[v]", "-map", "5:a", "-fps_mode", "passthrough", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "16",
-        "-c:a", "aac", "-b:a", "64k", "-bitexact", "-fflags", "+bitexact", "uneven.mp4",
+         [a][b][c][d][e]concat=n=5:v=1:a=0,select='not(mod(n\\,15))'[v]",
+        "-map", "[v]", "-fps_mode", "passthrough", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "16",
+        "-bitexact", "-fflags", "+bitexact", "slow.mkv",
     ]);
-    let src = c.videos().join("uneven.mp4");
+    let src = c.videos().join("slow.mkv");
     let v = video(&src);
-    assert_eq!((v["r_frame_rate"].as_str(), v["avg_frame_rate"].as_str()), (Some("48/1"), Some("865/36")), "{v}");
+    assert_eq!((v["r_frame_rate"].as_str(), v["avg_frame_rate"].as_str()), (Some("30/1"), Some("30/1")), "{v}");
     let run = c.encode(&[&src], &[]);
-    run.ok().has("encoding again:");
-    // The one pass and every stretch encoded again have their key frames 10 s apart.
-    let out = c.out().join("uneven.mp4");
-    let times = frame_times(&out);
-    let keys: Vec<f64> = key_frames(&out).iter().map(|&k| times[k]).collect();
-    assert_eq!(keys.len(), 4, "{keys:?}");
-    assert!(keys.iter().enumerate().all(|(i, t)| (t - 10.0 * i as f64).abs() < 0.05), "key frames at {keys:?}");
-    // So what is encoded again is a whole number of those 10 s, and less than all of it.
-    let again = run.err.lines().find_map(|l| l.strip_prefix("encoding again: ")).unwrap();
-    let clock = again.split_once('(').and_then(|(_, r)| r.split_once(')')).map(|(t, _)| t).unwrap();
-    let secs = clock.split(':').fold(0, |sum, part| sum * 60 + part.parse::<u32>().unwrap());
-    assert!(secs % 10 == 0 && secs < 36, "{again}");
+    run.ok().has("2.00 fps").has("joined video at");
+    assert_ten_seconds_apart(&c.out().join("slow.mp4"));
 }
 
 /// What a player shows as a track's name: Matroska's title, MP4's name as ffmpeg reads it.

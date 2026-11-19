@@ -299,7 +299,10 @@ For each file:
    says what the stream's does, apart from the superblock size and the level; one that says
    another range, say, is refused, and the video gets spot checks. One that differs in those
    two goes in only where the frame after it carries the stream's header again, as SVT-AV1
-   writes one at every key frame; it is checked rather than trusted. A source is cut, encoded
+   writes one at every key frame; it is checked rather than trusted. A stretch at the very
+   start that says a lower level than the stream is refused as well: MP4 and Matroska tell
+   a player the level from the first sequence header, and would then say too little for
+   the rest. A source is cut, encoded
    and scored in the range its first frame is decoded with: the video's own word where it
    has one, which ffmpeg and Chrome go by whatever range a remux wrote on the container
    (`-c copy -color_range pc` over a limited stream had every stretch refused before).

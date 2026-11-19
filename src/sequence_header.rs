@@ -293,6 +293,26 @@ pub fn joinable(stream: &[u8], piece: &[u8]) -> std::result::Result<Vec<Differen
     Ok(allowed)
 }
 
+/// Where `piece` asks less of a decoder than `stream` does for some operating point (a lower
+/// level, or the main tier where it says the high one at the same level): that level, as a
+/// [`Difference`]. None where it does not, or where either header cannot be read.
+pub fn lower_level(stream: &[u8], piece: &[u8]) -> Option<Difference> {
+    let (a, b) = (parse(stream).ok()?, parse(piece).ok()?);
+    let value_in = |fields: &[Field], name: &str| fields.iter().find(|f| f.name == name).map(|f| f.value);
+    for point in 0.. {
+        let level = format!("seq_level_idx[{point}]");
+        let (Some(x), Some(y)) = (value_in(&a, &level), value_in(&b, &level)) else { return None };
+        // An unwritten tier is the main tier.
+        let tier = format!("seq_tier[{point}]");
+        let (tx, ty) = (value_in(&a, &tier).unwrap_or(0), value_in(&b, &tier).unwrap_or(0));
+        if (y, ty) < (x, tx) {
+            let said = |v: u64, t: u64| if t == 1 { format!("{} high tier", shown(&level, v)) } else { shown(&level, v) };
+            return Some(Difference { what: "level", stream: said(x, tx), piece: said(y, ty) });
+        }
+    }
+    None
+}
+
 /// The note a report gives for `pieces` joined despite `differences` to what `rest` says, or
 /// none.
 pub fn note(differences: &[Difference], pieces: &str, rest: &str) -> Option<String> {
@@ -409,6 +429,18 @@ mod tests {
         assert!(joinable(&h, &with(&both, "color_range", 0)).unwrap_err().contains("range"));
         // Bytes that are no header.
         assert!(joinable(&h, &[0xff]).is_err());
+    }
+
+    #[test]
+    fn a_lower_level_or_tier_is_told_from_a_higher_one() {
+        let h = bytes(FULL_RANGE_640);
+        assert_eq!(lower_level(&h, &h), None);
+        let lower = lower_level(&h, &with(&h, "seq_level_idx[0]", 0)).unwrap();
+        assert_eq!((lower.stream.as_str(), lower.piece.as_str()), ("2.1", "2.0"));
+        assert_eq!(lower_level(&h, &with(&h, "seq_level_idx[0]", 4)), None);
+        assert_eq!(lower_level(&with(&h, "seq_level_idx[0]", 4), &h).map(|d| d.piece), Some("2.1".into()));
+        assert_eq!(lower_level(&with(&h, "seq_level_idx[0]", 7), &with(&h, "seq_level_idx[0]", 4)).map(|d| (d.stream, d.piece)), Some(("3.3".into(), "3.0".into())));
+        assert_eq!(lower_level(&h, b"not a header"), None);
     }
 
     #[test]

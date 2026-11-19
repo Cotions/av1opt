@@ -1182,7 +1182,22 @@ fn splice(source: &Path, head: &[u8; 32], index: &[IvfFrame], fixed: &[Fixed], o
         let (_, new) = ivf_index(&f.file)?;
         let file = std::fs::File::open(&f.file)?;
         let start = new.first().map(|x| read(&file, x)).transpose()?.unwrap_or_default();
-        let joined = sequence_header::first_in(&start).ok_or_else(|| "it starts without a sequence header".to_string()).and_then(|h| sequence_header::joinable(&header, h));
+        let piece_header = sequence_header::first_in(&start);
+        let joined = piece_header.ok_or_else(|| "it starts without a sequence header".to_string()).and_then(|h| sequence_header::joinable(&header, h));
+        // MP4's av1C box and Matroska's codec data, which tell a player the level before any
+        // frame, are written from the first sequence header in the stream (seen in both with
+        // a stream whose first GOP says 2.0 and the next 4.0: the box says 2.0). A piece that
+        // begins the video and says less than the rest would leave them saying too little for
+        // the frames after it. Anywhere else, or saying more, it goes in.
+        if f.run.start == 0
+            && let Some(lower) = piece_header.and_then(|h| sequence_header::lower_level(&header, h))
+        {
+            bail!(
+                "the stretch encoded again from frame 0 cannot be put into the video: it begins the video and says a lower level ({}, where the stream it goes into says {}), which the container would then give for all of it",
+                lower.piece,
+                lower.stream
+            );
+        }
         match joined {
             // A piece that differs in what does not change how its own frames decode still
             // leaves its header in force until the next one: the GOP after it decodes right
@@ -2111,6 +2126,23 @@ mod tests {
         write_ivf(&dir.join("same.ivf"), &[(0, key(vec![7]))]);
         let same = [fixed(Run { start: 2, end: 3 }, dir.join("same.ivf"))];
         assert_eq!(splice(&dir.join("bare-after.ivf"), &head, &index, &same, &dir.join("same.out")).unwrap(), []);
+        // At the start of the video, a piece that says a lower level would be what the
+        // container says of all of it; one that says more goes in there too.
+        let gop = |name: &str, level: u64| write_ivf(&dir.join(name), &[(0, starting(&header_with("seq_level_idx[0]", level), vec![7])), (1, vec![8]), (2, vec![9])]);
+        gop("lower.ivf", 0);
+        gop("higher.ivf", 4);
+        let at_start = |name: &str| [fixed(Run { start: 0, end: 3 }, dir.join(name))];
+        let (head, index) = ivf_index(&dir.join("keyed-after.ivf")).unwrap();
+        let e = splice(&dir.join("keyed-after.ivf"), &head, &index, &at_start("lower.ivf"), &dir.join("lower.out")).unwrap_err().to_string();
+        assert_eq!(
+            e,
+            "the stretch encoded again from frame 0 cannot be put into the video: it begins the video and says a lower level (2.0, where the stream it goes into says 2.1), which the container would then give for all of it"
+        );
+        assert!(!dir.join("lower.out").exists());
+        assert_eq!(splice(&dir.join("keyed-after.ivf"), &head, &index, &at_start("higher.ivf"), &dir.join("higher.out")).unwrap().len(), 1);
+        let later = [fixed(Run { start: 3, end: 5 }, dir.join("lower.ivf"))];
+        write_ivf(&dir.join("lower.ivf"), &[(0, starting(&header_with("seq_level_idx[0]", 0), vec![7])), (1, vec![8])]);
+        assert_eq!(splice(&dir.join("keyed-after.ivf"), &head, &index, &later, &dir.join("lower-later.out")).unwrap().len(), 1);
         // A video whose own first frame holds none is not spliced into.
         write_ivf(&dir.join("plain.ivf"), &[(0, vec![1]), (1, vec![2]), (2, vec![3])]);
         let (head, index) = ivf_index(&dir.join("plain.ivf")).unwrap();

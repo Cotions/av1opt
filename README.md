@@ -394,7 +394,8 @@ from two input folders), the second is reported as a name collision instead of b
 `encode` ends with 0 when no file failed (files skipped or already done are no failure), 1 on
 an error that stopped the run, 2 on wrong usage, 3 when some files failed or an output already
 there could not be verified and the others were dealt with, and 130 or 143 when Ctrl-C or
-SIGTERM stopped it.
+SIGTERM stopped it. `dups` ends with 3 when more than half of the videos could not be read: it
+says so after the results, which then mean little.
 
 ### File names
 

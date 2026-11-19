@@ -389,3 +389,24 @@ fn a_file_is_not_remembered_as_unreadable_because_ffprobe_failed_in_silence() {
     c.tool("ffprobe", working.trim_start_matches("#!/bin/sh\n[ \"$1\" = --ready ] && exit 0\n"));
     c.run(&["scan", "videos"]).ended(0).has("h264").lacks("unreadable");
 }
+
+#[test]
+fn the_duplicate_finder_does_not_take_a_broken_ffmpeg_for_broken_videos() {
+    let c = Case::with_ffmpeg("dups-ffmpeg", "echo 'stand-in ffmpeg: cannot go on' >&2; exit 1");
+    c.video("a.mkv");
+    c.video("b.mkv");
+    let cache = c.path("cache/av1opt/dups-cache-v2.json");
+
+    // A program that is not there stops the run before any file is looked at.
+    c.run(&["dups", "videos", "--ffmpeg", "/nonexistent/ffmpeg"]).ended(1).has("cannot run ffmpeg (/nonexistent/ffmpeg)");
+    assert!(!cache.exists());
+
+    // One that starts and then fails on every video: said at the end, and nothing is remembered.
+    c.run(&["dups", "videos"]).ended(3).has("warning: 2 of 2 videos could not be read").has("stand-in ffmpeg: cannot go on");
+    assert_eq!(text(&cache), "{}");
+
+    // One that runs well and finds no frame says that of the files, and that is kept.
+    c.tool("ffmpeg", "case \"$2\" in\n-version) echo 'ffmpeg version 8.0';;\nesac\nexit 0\n");
+    c.run(&["dups", "videos"]).ended(3).has("no frame could be read");
+    assert!(text(&cache).contains("no frame could be read"));
+}

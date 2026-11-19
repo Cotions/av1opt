@@ -44,6 +44,11 @@ impl std::fmt::Display for NotJudged {
 
 impl std::error::Error for NotJudged {}
 
+/// The error of a reader of videos that ended without an opinion on the file.
+pub fn unjudged(why: String) -> anyhow::Error {
+    NotJudged(why).into()
+}
+
 /// Whether a probe's error leaves the file unjudged, to be tried again later.
 pub fn left_unjudged(e: &anyhow::Error) -> bool {
     e.downcast_ref::<NotJudged>().is_some()

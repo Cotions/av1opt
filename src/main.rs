@@ -516,6 +516,9 @@ fn run_command(command: Cmd) -> Result<()> {
             let abs = |p: &PathBuf| std::path::absolute(p).unwrap_or_else(|_| p.clone());
             let paths: Vec<PathBuf> = paths.iter().map(abs).collect();
             check_reports(&[(csv.as_deref(), dups::CSV), (json.as_deref(), Kind::Json)], &paths)?;
+            if let Some(p) = tools::Capabilities::probe(&ffmpeg, &ffprobe).cannot_read(&ffmpeg, &ffprobe) {
+                anyhow::bail!("{p} (--ffmpeg / AV1OPT_FFMPEG, --ffprobe / AV1OPT_FFPROBE)");
+            }
             // SAFETY: plain syscall on our own process; children inherit the priority.
             unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) };
             let tools = signals::stopping_on_signals(tools::Tools::new(ffmpeg, ffprobe, memory_cap(&memory_limit, jobs as u8)));
@@ -546,7 +549,12 @@ fn run_command(command: Cmd) -> Result<()> {
                 Ok(())
             })();
             dups::print(&report, top);
-            written
+            written?;
+            if let Some(warning) = report.mostly_unread() {
+                eprintln!("\nwarning: {warning}");
+                std::process::exit(SOME_FILES_FAILED);
+            }
+            Ok(())
         }
         Cmd::Replace { paths, apply, undo, allow_zfs, accept_changed_date, anywhere } => {
             let paths: Vec<PathBuf> = paths.iter().map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone())).collect();

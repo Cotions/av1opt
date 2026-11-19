@@ -126,6 +126,10 @@ struct CacheEntry {
     duration: f64,
     fp: Option<Fingerprint>,
     error: Option<String>,
+    /// Whether the outcome says something about the file. Errors kept before this was noted
+    /// may come from an ffmpeg that did not run, so they are not trusted.
+    #[serde(default)]
+    judged: bool,
 }
 
 fn cache_file() -> Result<PathBuf> {
@@ -145,6 +149,25 @@ fn save_cache(path: &Path, cache: &HashMap<PathBuf, CacheEntry>) -> Result<()> {
     Ok(crate::files::replace_with(path, &serde_json::to_vec(cache)?)?)
 }
 
+/// Why a video that was read has no place in the comparison: nothing went wrong with it.
+const TOO_FEW_FRAMES: &str = "too few frames with detail to compare";
+
+impl Report {
+    /// What to say when most videos could not be read, since the groups then mean little: a
+    /// run where every file failed would otherwise look like a library without duplicates.
+    pub fn mostly_unread(&self) -> Option<String> {
+        let failed: Vec<&Unreadable> = self.unreadable.iter().filter(|u| u.error != TOO_FEW_FRAMES).collect();
+        let first = failed.first().filter(|_| failed.len() * 2 > self.stats.videos)?;
+        Some(format!(
+            "{} of {} videos could not be read, so these results say little (for {}: {}); check that ffmpeg and ffprobe work and that the files can be read, then run again",
+            failed.len(),
+            self.stats.videos,
+            first.path.display(),
+            crate::probe::one_line(&first.error),
+        ))
+    }
+}
+
 /// What one ffmpeg run over some frames came to.
 enum Batch {
     Frames(Vec<Vec<u8>>),
@@ -152,6 +175,28 @@ enum Batch {
     Missing,
     /// ffmpeg was stopped for taking too long, which says little about the file.
     OutOfTime,
+    /// ffmpeg could not be started or ended in failure, with what it said.
+    Failed(String),
+}
+
+/// What got in the way of reading a video's frames, apart from frames that are simply not there.
+#[derive(Default)]
+struct Trouble {
+    out_of_time: bool,
+    ffmpeg_failed: Option<String>,
+}
+
+impl Trouble {
+    /// The frame of a run over a single time, noting what went wrong if there is none.
+    fn frame_of(&mut self, run: Batch) -> Option<Vec<u8>> {
+        match run {
+            Batch::Frames(mut frames) => return frames.pop(),
+            Batch::Missing => {}
+            Batch::OutOfTime => self.out_of_time = true,
+            Batch::Failed(why) => self.ffmpeg_failed = Some(why),
+        }
+        None
+    }
 }
 
 /// One ffmpeg run that seeks to each of `times` and returns the frames as square grayscale
@@ -175,17 +220,18 @@ fn grab_batch(tools: &Tools, path: &Path, video_index: usize, times: &[f64]) -> 
     a.extend(["-filter_complex".into(), graph, "-frames:v".into(), "1".into(), "-f".into(), "rawvideo".into(), "-".into()]);
     match tools.run_capture(&a, Duration::from_secs(90)) {
         Ok(out) if out.len() == times.len() * THUMB * THUMB => Batch::Frames(out.chunks(THUMB * THUMB).map(<[u8]>::to_vec).collect()),
+        Ok(_) => Batch::Missing,
         Err(e) if e.to_string().starts_with(crate::tools::NO_ANSWER) => Batch::OutOfTime,
-        _ => Batch::Missing,
+        Err(e) => Batch::Failed(format!("{e:#}")),
     }
 }
 
 /// Thumbnails of the frames at `times`, None where there is no frame (past the end of the
-/// video stream, damaged data), and whether any run was stopped for taking too long.
-fn grab(tools: &Tools, path: &Path, info: &MediaInfo, times: &[f64]) -> Result<(Vec<Option<Vec<u8>>>, bool)> {
+/// video stream, damaged data), and what went wrong on the way.
+fn grab(tools: &Tools, path: &Path, info: &MediaInfo, times: &[f64]) -> Result<(Vec<Option<Vec<u8>>>, Trouble)> {
     // Every seek holds a decoder open; big frames get smaller batches.
     let per_run = if info.width as u64 * info.height as u64 > 2_500_000 { 3 } else { 8 };
-    let (mut out, mut out_of_time) = (Vec::with_capacity(times.len()), false);
+    let (mut out, mut trouble) = (Vec::with_capacity(times.len()), Trouble::default());
     for batch in times.chunks(per_run) {
         tools.check_cancel()?;
         match grab_batch(tools, path, info.video_index, batch) {
@@ -194,25 +240,15 @@ fn grab(tools: &Tools, path: &Path, info: &MediaInfo, times: &[f64]) -> Result<(
             _ if batch.len() > 1 => {
                 for &t in batch {
                     tools.check_cancel()?;
-                    match grab_batch(tools, path, info.video_index, &[t]) {
-                        Batch::Frames(mut frame) => out.push(frame.pop()),
-                        Batch::Missing => out.push(None),
-                        Batch::OutOfTime => {
-                            out_of_time = true;
-                            out.push(None);
-                        }
-                    }
+                    let run = grab_batch(tools, path, info.video_index, &[t]);
+                    out.push(trouble.frame_of(run));
                 }
             }
-            Batch::OutOfTime => {
-                out_of_time = true;
-                out.push(None);
-            }
-            _ => out.push(None),
+            run => out.push(trouble.frame_of(run)),
         }
     }
     tools.check_cancel()?;
-    Ok((out, out_of_time))
+    Ok((out, trouble))
 }
 
 /// Decodes the sampled frames of one video and hashes them. The times are those of the picture:
@@ -223,9 +259,17 @@ pub fn fingerprint(tools: &Tools, path: &Path, info: &MediaInfo) -> Result<Finge
     let from_end = lad.iter().map(|t| (length - t).max(0.0));
     let at_shares = MIDDLE.iter().map(|share| length * share);
     let times: Vec<f64> = lad.iter().copied().chain(from_end).chain(at_shares).map(|t| start + t).collect();
-    let (frames, out_of_time) = grab(tools, path, info, &times)?;
+    let (frames, trouble) = grab(tools, path, info, &times)?;
     let read: Vec<&[u8]> = frames.iter().flatten().map(Vec::as_slice).collect();
     if read.is_empty() {
+        // Nothing read and ffmpeg in trouble may be the file or may be ffmpeg. Reading it again
+        // next time costs seconds, while remembering it wrongly would hide the video for good.
+        if let Some(why) = trouble.ffmpeg_failed {
+            return Err(crate::probe::unjudged(format!("no frame could be read: {}", crate::probe::one_line(&why))));
+        }
+        if trouble.out_of_time {
+            return Err(crate::probe::unjudged("no frame could be read: ffmpeg ran out of time".into()));
+        }
         bail!("no frame could be read");
     }
     let bounds = phash::content_bounds(&read);
@@ -235,7 +279,7 @@ pub fn fingerprint(tools: &Tools, path: &Path, info: &MediaInfo) -> Result<Finge
     let frame_s = if info.fps > 0.0 { 1.0 / info.fps } else { 0.0 };
     let share = |from: usize, to: usize| (to - from) as f32 / THUMB as f32;
     let picture = (share(bounds.x0, bounds.x1), share(bounds.y0, bounds.y1));
-    Ok(Fingerprint { head: head.to_vec(), tail: tail.to_vec(), middle: middle.to_vec(), frame_s, picture, out_of_time })
+    Ok(Fingerprint { head: head.to_vec(), tail: tail.to_vec(), middle: middle.to_vec(), frame_s, picture, out_of_time: trouble.out_of_time })
 }
 
 /// How much of a file's start, middle and end is compared.
@@ -318,23 +362,29 @@ pub fn find(paths: &[PathBuf], tools: &Tools, o: &Options, progress: &(dyn Fn(Pr
                     return None;
                 }
                 let cached = (!o.refresh)
-                    .then(|| cache.lock().unwrap().get(&f.path).filter(|c| c.size == f.size && c.mtime == f.mtime && (c.duration - info.duration_s).abs() < 0.01).cloned())
+                    .then(|| cache.lock().unwrap().get(&f.path).filter(|c| c.size == f.size && c.mtime == f.mtime && (c.duration - info.duration_s).abs() < 0.01 && (c.fp.is_some() || c.judged)).cloned())
                     .flatten();
                 let entry = match cached {
                     Some(e) => e,
                     None => {
-                        let (fp, error) = match fingerprint(tools, &f.path, info) {
-                            Ok(fp) => (Some(fp), None),
+                        let (fp, error, judged) = match fingerprint(tools, &f.path, info) {
+                            // A busy machine must not leave a file marked damaged for good.
+                            Ok(fp) => {
+                                let judged = !fp.out_of_time;
+                                (Some(fp), None, judged)
+                            }
                             Err(e) if crate::events::is_cancelled(&e) => {
                                 cancelled.store(true, Ordering::Relaxed);
                                 return None;
                             }
-                            Err(e) => (None, Some(format!("{e:#}"))),
+                            Err(e) => {
+                                let judged = !crate::probe::left_unjudged(&e);
+                                (None, Some(format!("{e:#}")), judged)
+                            }
                         };
-                        let e = CacheEntry { size: f.size, mtime: f.mtime, duration: info.duration_s, fp, error };
+                        let e = CacheEntry { size: f.size, mtime: f.mtime, duration: info.duration_s, fp, error, judged };
                         let mut c = cache.lock().unwrap();
-                        // A busy machine must not leave a file marked damaged for good.
-                        if !e.fp.as_ref().is_some_and(|fp| fp.out_of_time) {
+                        if e.judged {
                             c.insert(f.path.clone(), e.clone());
                         }
                         // Save now and then so a crash doesn't lose hours of decoding.
@@ -375,7 +425,7 @@ pub fn find(paths: &[PathBuf], tools: &Tools, o: &Options, progress: &(dyn Fn(Pr
                 });
                 kept.push((f, info, fp));
             }
-            Some(CacheEntry { fp: Some(_), .. }) => unreadable.push(Unreadable { path: f.path.clone(), error: "too few frames with detail to compare".into() }),
+            Some(CacheEntry { fp: Some(_), .. }) => unreadable.push(Unreadable { path: f.path.clone(), error: TOO_FEW_FRAMES.into() }),
             Some(e) => unreadable.push(Unreadable { path: f.path.clone(), error: e.error.unwrap_or_else(|| "no fingerprint".into()) }),
             None => {}
         }

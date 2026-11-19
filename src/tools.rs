@@ -65,6 +65,15 @@ impl Capabilities {
         Capabilities { ffmpeg_version, ffprobe_ok, svtav1, vmaf }
     }
 
+    /// Why videos cannot be read with these tools, if they cannot: all that a run needs that
+    /// encodes nothing.
+    pub fn cannot_read(&self, ffmpeg: &str, ffprobe: &str) -> Option<String> {
+        if self.ffmpeg_version.is_none() {
+            return Some(format!("cannot run ffmpeg ({ffmpeg})"));
+        }
+        (!self.ffprobe_ok).then(|| format!("cannot run ffprobe ({ffprobe})"))
+    }
+
     /// Why encoding cannot work with these tools, if it cannot.
     pub fn problem(&self, ffmpeg: &str, ffprobe: &str) -> Option<String> {
         let mut missing = Vec::new();

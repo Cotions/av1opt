@@ -711,7 +711,7 @@ mod tests {
         assert!(!folder.exists() && dest.join("in/a").exists());
         let info = std::fs::read_to_string(home.join("info/two\nlines.trashinfo")).unwrap();
         assert_eq!(info.lines().count(), 3, "{info}");
-        assert!(holds(&dest, &folder));
+        assert!(says_came_from(&dest, &folder));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

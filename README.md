@@ -3,6 +3,12 @@
 Shrink video libraries by re-encoding to AV1 at a target perceptual quality (VMAF),
 instead of one fixed setting for everything. Built on stock FFmpeg with SVT-AV1 and libvmaf.
 
+VMAF is a score from 0 to 100 of how close an encode looks to its source, made to predict
+what viewers would say. The default target, 93, is hard to tell from the source; near it, one
+point more or less costs or saves about a sixth of the file. Five seconds of an output that
+score more than 4 below the target (below 89 for the default) are encoded again where the
+whole video is scored, and otherwise lead to a lower CRF or a refusal (see [encode](#encode)).
+
 Eight commands:
 
 - `scan` — read-only survey of a library: what each file is, what re-encoding would roughly save.

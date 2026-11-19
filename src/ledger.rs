@@ -9,15 +9,12 @@
 use crate::source::Recorded;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-#[cfg(any(feature = "ui", test))]
 use std::io::Read;
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
-#[cfg(any(feature = "ui", test))]
 use crate::replace::{OpenFile, Plan, Replaced};
-#[cfg(any(feature = "ui", test))]
 use std::collections::{HashMap, HashSet};
 #[cfg(any(feature = "ui", test))]
 use std::sync::{Arc, Mutex};
@@ -28,12 +25,10 @@ const FORMAT: u32 = 1;
 const FILE_NAME: &str = "ledger.jsonl";
 
 /// What the page says of an output this record does not hold.
-#[cfg(any(feature = "ui", test))]
-pub const NOT_RECORDED: &str = "av1opt has no record of making this output here (it was made elsewhere, moved, made before this record began, or its report was put there by someone else), so the page will not move files for it; if you trust its report, `av1opt replace` in a terminal can do it";
+pub const NOT_RECORDED: &str = "av1opt has no record of making this output here (it was made elsewhere, moved, made before this record began, or its report was put there by someone else), so the page will not move files for it; if you trust its report, run `av1opt adopt` in a terminal on the output's folder, or let `av1opt replace` there do it";
 
-/// What the page says of a report that tells another story than the record.
-#[cfg(any(feature = "ui", test))]
-const DISAGREES: &str = "the report beside this output does not say what av1opt recorded when it made and moved these files, so the page will not act on it; if you trust the report, `av1opt replace` in a terminal can do it";
+/// What is said of a report that tells another story than the record.
+const DISAGREES: &str = "the report beside this output does not say what av1opt recorded when it made and moved these files, so the record does not vouch for it; if you trust the report, `av1opt replace` in a terminal can do it, given the original's folder or --anywhere";
 
 #[cfg(test)]
 thread_local! {
@@ -75,7 +70,6 @@ impl Original {
 
     /// Whether a report says the same of the original. `replace` compares the file with what the
     /// report says, so a report that says this has had the file compared with the record.
-    #[cfg(any(feature = "ui", test))]
     fn is_what(&self, said: &Recorded) -> bool {
         said.size == Some(self.source_bytes) && said.modified == self.source_mtime && said.fingerprint == self.source_fingerprint && said.whole == self.source_hash
     }
@@ -115,8 +109,34 @@ enum Event {
         /// Where it is now.
         back_to: PathBuf,
     },
+    /// An output from before this record, or from elsewhere, taken in by `av1opt adopt`: the
+    /// person named its folder, and so vouched for its report.
+    Adopted {
+        /// Where the AV1 file is now.
+        output: PathBuf,
+        report: PathBuf,
+        source: PathBuf,
+        /// The original as it was encoded.
+        #[serde(flatten)]
+        original: Original,
+        output_bytes: u64,
+        output_sha256: String,
+        /// Where the original is, if the output has taken its place already.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replaced: Option<WentToTrash>,
+    },
     /// The one look at the encode history, made the first time the page starts with this record.
     TakenOver { history_lines: usize, taken: usize },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WentToTrash {
+    trash: PathBuf,
+    /// Where the AV1 file was before.
+    from: PathBuf,
+    /// The original as it went.
+    #[serde(flatten)]
+    original: Original,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -128,7 +148,6 @@ struct Line {
 }
 
 /// What an encode left, as it was when it finished.
-#[cfg(any(feature = "ui", test))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Made {
     pub original: Original,
@@ -137,7 +156,6 @@ pub struct Made {
 }
 
 /// An original in the trash, and where its AV1 file came from.
-#[cfg(any(feature = "ui", test))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Moved {
     pub trash: PathBuf,
@@ -147,7 +165,6 @@ pub struct Moved {
 }
 
 /// An output as this record knows it, under the path it has now.
-#[cfg(any(feature = "ui", test))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
     pub source: PathBuf,
@@ -156,18 +173,26 @@ pub struct Entry {
     pub replaced: Option<Moved>,
 }
 
+/// How an output stands for being taken on record.
+#[derive(Debug, PartialEq)]
+pub enum Standing {
+    NotYet,
+    OnRecord,
+    Refused(String),
+}
+
 /// What the record says as of its last line.
-#[cfg(any(feature = "ui", test))]
 #[derive(Debug, Default)]
 pub struct Ledger {
     outputs: HashMap<PathBuf, Entry>,
+    #[cfg_attr(not(any(feature = "ui", test)), allow(dead_code))]
     files: HashSet<PathBuf>,
+    #[cfg_attr(not(any(feature = "ui", test)), allow(dead_code))]
     taken_over: bool,
     /// Why the record on disk was not used.
     problem: Option<String>,
 }
 
-#[cfg(any(feature = "ui", test))]
 impl Ledger {
     fn from_lines(bytes: &[u8]) -> Ledger {
         let mut ledger = Ledger::default();
@@ -201,18 +226,55 @@ impl Ledger {
                     self.outputs.insert(back_to, entry);
                 }
             }
+            // What av1opt saw for itself is never written over by what a report says.
+            Event::Adopted { output, report: _, source, original, output_bytes, output_sha256, replaced } => {
+                if self.known_at(&output).is_none() {
+                    let replaced = replaced.map(|m| Moved { trash: m.trash, from: m.from, original: m.original, output_bytes });
+                    self.outputs.insert(output, Entry { source, made: Some(Made { original, output_bytes, output_sha256: Some(output_sha256) }), replaced });
+                }
+            }
             Event::TakenOver { .. } => self.taken_over = true,
         }
+    }
+
+    /// What is recorded of whatever output is at `output`.
+    fn known_at(&self, output: &Path) -> Option<&Entry> {
+        self.outputs.get(output).filter(|e| e.made.is_some() || e.replaced.is_some())
     }
 
     /// What is recorded of the output at `output`, if it was made from `source` or took its
     /// place. An output put back by the command line that av1opt never saw made is not one.
     pub fn entry(&self, output: &Path, source: &Path) -> Option<&Entry> {
-        self.outputs.get(output).filter(|e| e.source == source && (e.made.is_some() || e.replaced.is_some()))
+        self.known_at(output).filter(|e| e.source == source)
+    }
+
+    /// Why the record on disk is not being used, if it is not.
+    pub fn problem(&self) -> Option<&str> {
+        self.problem.as_deref()
+    }
+
+    /// What `av1opt adopt` can do about an output that can be replaced.
+    pub fn adopting(&self, p: &Plan) -> Standing {
+        self.standing(&p.output, &p.source, || self.check_ready(p, None))
+    }
+
+    /// What `av1opt adopt` can do about an output that has replaced its original.
+    pub fn adopting_replaced(&self, d: &Replaced) -> Standing {
+        self.standing(&d.dest, &d.source, || self.check_replaced(d))
+    }
+
+    fn standing(&self, output: &Path, source: &Path, agrees: impl Fn() -> Result<(), String>) -> Standing {
+        match self.known_at(output) {
+            None => Standing::NotYet,
+            // A report must not be able to give a file on record another past.
+            Some(e) if e.source != source => Standing::Refused(format!("av1opt's record says this output came from another original, {}", e.source.display())),
+            Some(_) => agrees().map_or_else(Standing::Refused, |()| Standing::OnRecord),
+        }
     }
 
     /// Whether `file`, a path with its links resolved, is an output, a source or an original in
     /// the trash on record, and a plain file now.
+    #[cfg(any(feature = "ui", test))]
     pub fn covers(&self, file: &Path) -> bool {
         self.files.contains(file) && std::fs::symlink_metadata(file).is_ok_and(|m| m.is_file())
     }
@@ -324,7 +386,6 @@ fn file_problem(meta: &std::fs::Metadata, path: &Path) -> Option<String> {
 
 /// Reads the record. One that is missing is empty; one others could have written to is not
 /// believed, and the page then acts as if nothing were on record.
-#[cfg(any(feature = "ui", test))]
 pub fn load() -> Ledger {
     let Some(dir) = folder() else { return Ledger::default() };
     let unusable = |why: String| Ledger { problem: Some(why), ..Ledger::default() };
@@ -449,6 +510,49 @@ pub fn note_undone(source: &Path, output: &Path, back_to: &Path) -> Result<()> {
     add(Event::Undone { source: source.to_path_buf(), output: output.to_path_buf(), back_to: back_to.to_path_buf() })
 }
 
+/// Gets the record's folder ready for `av1opt adopt`, as the page does when it starts: one an
+/// earlier version left open to others is closed, and then the record in it can be used.
+pub fn make_ready() -> Result<()> {
+    private_folder().map(drop)
+}
+
+/// An output `av1opt adopt` takes on record.
+pub struct Adoption<'a> {
+    pub output: &'a Path,
+    pub report: &'a Path,
+    pub source: &'a Path,
+    pub source_bytes: u64,
+    /// The original as the report describes it, from when it was encoded.
+    pub original: &'a Recorded,
+    pub output_bytes: u64,
+    pub output_sha256: String,
+    pub replaced: Option<AdoptedReplacement<'a>>,
+}
+
+/// Where things are for an adopted output that has replaced its original.
+pub struct AdoptedReplacement<'a> {
+    pub trash: &'a Path,
+    pub from: &'a Path,
+    /// The original as it went to the trash.
+    pub known: &'a Recorded,
+}
+
+pub fn note_adopted(a: Adoption) -> Result<()> {
+    if folder().is_none() {
+        bail!("there is no folder to keep av1opt's record in (neither XDG_DATA_HOME nor HOME is set)");
+    }
+    let replaced = a.replaced.map(|m| WentToTrash { trash: m.trash.to_path_buf(), from: m.from.to_path_buf(), original: Original::new(a.source_bytes, m.known) });
+    add(Event::Adopted {
+        output: a.output.to_path_buf(),
+        report: a.report.to_path_buf(),
+        source: a.source.to_path_buf(),
+        original: Original::new(a.source_bytes, a.original),
+        output_bytes: a.output_bytes,
+        output_sha256: a.output_sha256,
+        replaced,
+    })
+}
+
 /// Gets the record ready when the page starts, and the first time looks at the encode history
 /// for encodes to take over. That history keeps numbers for the size model and no file names,
 /// so there is nothing in it to take: a report that claims to match one of its lines would be
@@ -477,7 +581,7 @@ fn start_page_with(history_lines: &dyn Fn() -> usize) -> Option<String> {
     }
     (history_lines > 0).then(|| {
         format!(
-            "av1opt now keeps a private record of the encodes it makes, and the page replaces originals only for outputs in it. Taken over from the encode history: 0 of {history_lines} past encodes, because that history holds no file names. Their outputs stay listed in History, and `av1opt replace` in a terminal can still replace them."
+            "av1opt now keeps a private record of the encodes it makes, and the page replaces originals only for outputs in it. Taken over from the encode history: 0 of {history_lines} past encodes, because that history holds no file names. Their outputs stay listed in History; `av1opt adopt` in a terminal, on their folder, takes them in, and `av1opt replace` there can still replace them."
         )
     })
 }
@@ -498,7 +602,6 @@ pub fn sha256_of_file(path: &Path) -> std::io::Result<String> {
 
 /// [`sha256_of_file`] of a file already open, which is then the file the answer is about,
 /// whatever has become of its name.
-#[cfg(any(feature = "ui", test))]
 pub fn sha256_of_open(file: &std::fs::File) -> std::io::Result<String> {
     let file = file.try_clone()?;
     crate::source::read_watched(move |got| sha256_reading(&file, got))
@@ -667,6 +770,26 @@ fn compress_by_hand(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_adopted_line_adds_what_is_missing_and_changes_nothing_known() {
+        let line = |output: &str, source: &str, event: &str, more: &str| format!(r#"{{"format":1,"time":1,"event":"{event}","output":"{output}","report":"/r","source":"{source}","source_bytes":3,"output_bytes":1,"output_sha256":"aa"{more}}}"#);
+        let trash = r#","replaced":{"trash":"/t/a.mp4","from":"/o/a.mkv","source_bytes":3,"source_mtime":9}"#;
+        let text = [
+            line("/o/known.mkv", "/v/known.mp4", "encoded", ""),
+            line("/o/known.mkv", "/v/other.mp4", "adopted", ""),
+            line("/o/new.mkv", "/v/new.mp4", "adopted", ""),
+            line("/v/a.mkv", "/v/a.mp4", "adopted", trash),
+        ]
+        .join("\n");
+        let ledger = Ledger::from_lines(text.as_bytes());
+        assert!(ledger.entry(Path::new("/o/known.mkv"), Path::new("/v/known.mp4")).is_some());
+        assert!(ledger.entry(Path::new("/o/known.mkv"), Path::new("/v/other.mp4")).is_none());
+        let new = ledger.entry(Path::new("/o/new.mkv"), Path::new("/v/new.mp4")).unwrap();
+        assert_eq!(new.made.as_ref().unwrap().output_sha256.as_deref(), Some("aa"));
+        let moved = ledger.entry(Path::new("/v/a.mkv"), Path::new("/v/a.mp4")).unwrap().replaced.as_ref().unwrap();
+        assert_eq!((moved.trash.as_path(), moved.from.as_path(), moved.original.source_mtime), (Path::new("/t/a.mp4"), Path::new("/o/a.mkv"), Some(9)));
+    }
     use std::io::Write;
 
     /// A data folder of this test's own, used by the record for as long as it lives.

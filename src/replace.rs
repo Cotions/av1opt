@@ -396,7 +396,6 @@ impl OpenFile {
     }
 
     /// The SHA-256 of what is in this file, whatever its name leads to by now.
-    #[cfg(any(feature = "ui", test))]
     pub fn sha256(&self) -> std::io::Result<String> {
         crate::ledger::sha256_of_open(&self.file)
     }
@@ -779,6 +778,11 @@ fn undo_watched(report: &Path, allow_zfs: bool, accept: Accept<Replaced>, before
 
 /// The reports under some folders (never looking into av1opt's own work folders).
 pub fn report_files(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    report_names(dirs, &|e| e.file_type().is_file())
+}
+
+/// What goes by the name of a report under `dirs`, of the kinds `wanted` lets through.
+fn report_names(dirs: &[PathBuf], wanted: &dyn Fn(&walkdir::DirEntry) -> bool) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for d in dirs {
         let walk = walkdir::WalkDir::new(d)
@@ -787,7 +791,7 @@ pub fn report_files(dirs: &[PathBuf]) -> Vec<PathBuf> {
             .filter_entry(|e| !e.file_name().to_string_lossy().starts_with(".av1opt-"))
             .flatten();
         for e in walk {
-            if e.file_type().is_file() && e.file_name().to_string_lossy().ends_with(REPORT_SUFFIX) {
+            if wanted(&e) && e.file_name().to_string_lossy().ends_with(REPORT_SUFFIX) {
                 out.push(e.into_path());
             }
         }
@@ -800,10 +804,14 @@ pub fn report_files(dirs: &[PathBuf]) -> Vec<PathBuf> {
 /// The reports meant by what was named on the command line: every report under a folder, a
 /// report itself, or the report next to an output file.
 pub fn reports_for(paths: &[PathBuf]) -> Vec<PathBuf> {
+    reports_found(paths, &report_files)
+}
+
+fn reports_found(paths: &[PathBuf], under: &dyn Fn(&[PathBuf]) -> Vec<PathBuf>) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for p in paths {
         if p.is_dir() {
-            out.extend(report_files(std::slice::from_ref(p)));
+            out.extend(under(std::slice::from_ref(p)));
         } else if p.to_string_lossy().ends_with(REPORT_SUFFIX) {
             out.push(p.clone());
         } else {
@@ -843,6 +851,10 @@ fn outside_named(source: &Path) -> String {
     format!("the original {} is outside the folders named here; name its folder too, or add --anywhere if you trust this report", source.display())
 }
 
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
 /// The `replace` command: lists what would happen, and does it with `go`. Originals outside the
 /// folders in `paths` are left alone unless `anywhere` is set.
 pub fn run(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_changed_date: bool, anywhere: bool) -> Result<()> {
@@ -865,7 +877,6 @@ pub fn run(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_chan
             Check::No(why) => stay.push((r.clone(), why)),
         }
     }
-    let plural = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
     let mut failed = 0;
 
     if back {
@@ -970,6 +981,157 @@ pub fn run(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_chan
     if failed > 0 {
         let what = if back { "put back" } else { "replaced" };
         bail!("{} not be {what}; the lines starting with FAILED above say why and where each file is now", plural(failed, "original could", "originals could"));
+    }
+    Ok(())
+}
+
+/// What a report comes to for `av1opt adopt`.
+enum Found {
+    Ready(Plan),
+    Replaced(Replaced),
+    OnRecord,
+    Refused(String),
+}
+
+/// Why an original that went to the trash could not be put back, if it could not.
+fn why_it_cannot_come_back(d: &Replaced) -> Option<String> {
+    if d.can_undo {
+        return None;
+    }
+    if file_size(&d.dest) != Some(d.output_bytes) {
+        return Some("the AV1 file is gone or has changed".into());
+    }
+    Some(match file_size(&d.trash) {
+        None => "the original is no longer in the trash".into(),
+        Some(n) if n != d.source_bytes => "the file in the trash is not the original".into(),
+        Some(_) if !trash::says_came_from(&d.trash, &d.source) => format!("the trash does not say that {} came from {}", d.trash.display(), d.source.display()),
+        Some(_) => "the file in the trash is not the original: it changed after the original went there".into(),
+    })
+}
+
+fn found_for_adoption(report: &Path, judging: Judging, ledger: &crate::ledger::Ledger) -> Found {
+    use crate::ledger::Standing;
+    match std::fs::symlink_metadata(report) {
+        Ok(m) if m.file_type().is_symlink() => return Found::Refused("the report is a link".into()),
+        Ok(m) if !m.is_file() => return Found::Refused("the report is not a plain file".into()),
+        _ => {}
+    }
+    match check_judging(report, judging) {
+        Check::No(why) => Found::Refused(why),
+        Check::Ready(p) => match ledger.adopting(&p) {
+            Standing::NotYet => Found::Ready(p),
+            Standing::OnRecord => Found::OnRecord,
+            Standing::Refused(why) => Found::Refused(why),
+        },
+        Check::Replaced(d) => match ledger.adopting_replaced(&d) {
+            Standing::NotYet => why_it_cannot_come_back(&d).map_or(Found::Replaced(d), Found::Refused),
+            Standing::OnRecord => Found::OnRecord,
+            Standing::Refused(why) => Found::Refused(why),
+        },
+    }
+}
+
+/// Reads the output once, through the descriptor it stays compared with.
+fn hash_of_output(path: &Path, bytes: u64) -> Result<String> {
+    let output = OpenFile::open(path, bytes)?;
+    let hash = output.sha256().with_context(|| format!("cannot read {}", path.display()))?;
+    if !output.is_at(path) || !output.untouched() {
+        bail!("{} changed while it was being read", path.display());
+    }
+    Ok(hash)
+}
+
+/// Looks at one report again, with nothing else acting on it, and takes it on record. False if
+/// it turned out to be there already.
+fn adopt_one(report: &Path, reads: &WholeReads) -> Result<bool> {
+    use crate::ledger::{AdoptedReplacement, Adoption, note_adopted};
+    let _lock = lock(report)?;
+    let judging = Judging { remember: Some(reads), acting: true, ..Judging::default() };
+    match found_for_adoption(report, judging, &crate::ledger::load()) {
+        Found::Refused(why) => bail!("{why}"),
+        Found::OnRecord => return Ok(false),
+        Found::Ready(p) => {
+            let output_sha256 = hash_of_output(&p.output, p.output_bytes)?;
+            let stamp = p.source_stamp.context(CHANGED_WHILE_CHECKED)?;
+            if !std::fs::symlink_metadata(&p.source).is_ok_and(|m| Stamp::of(&m) == stamp) {
+                bail!("{CHANGED_WHILE_CHECKED}");
+            }
+            note_adopted(Adoption { output: &p.output, report, source: &p.source, source_bytes: p.source_bytes, original: &p.original, output_bytes: p.output_bytes, output_sha256, replaced: None })?;
+        }
+        Found::Replaced(d) => {
+            let output_sha256 = hash_of_output(&d.dest, d.output_bytes)?;
+            // The report says how the original was when it was encoded, which is what it has to
+            // match if the replacement is undone and the output offered again.
+            let encoded = Recorded::in_report(&read_report(report).map_err(|why| anyhow!(why))?);
+            let replaced = Some(AdoptedReplacement { trash: &d.trash, from: &d.recorded_from, known: &d.original });
+            note_adopted(Adoption { output: &d.dest, report, source: &d.source, source_bytes: d.source_bytes, original: &encoded, output_bytes: d.output_bytes, output_sha256, replaced })?;
+        }
+    }
+    Ok(true)
+}
+
+/// The `adopt` command: lists which outputs under `paths` can go on av1opt's record, and with `go`
+/// writes them there. Nothing but the record is ever written.
+pub fn adopt(paths: &[PathBuf], go: bool) -> Result<()> {
+    println!("Naming a folder here says that you trust the reports in it, as `av1opt replace` on it does: what they say goes on av1opt's private record, and the page then moves these files on the strength of it.");
+    let reports = reports_found(paths, &|dirs| report_names(dirs, &|e| !e.file_type().is_dir()));
+    if reports.is_empty() {
+        bail!("no av1opt reports (*.av1opt.json) found there");
+    }
+    crate::ledger::make_ready().context("av1opt's record of its own encodes cannot be used, so nothing can be taken on it")?;
+    let ledger = crate::ledger::load();
+    if let Some(why) = ledger.problem() {
+        bail!("av1opt's record of its own encodes cannot be used ({why}), so nothing can be taken on it");
+    }
+    let reads = WholeReads::default();
+    let judging = Judging { remember: go.then_some(&reads), ..Judging::default() };
+    let (mut ready, mut replaced, mut known, mut refused) = (Vec::new(), Vec::new(), 0, Vec::new());
+    for report in &reports {
+        match found_for_adoption(report, judging, &ledger) {
+            Found::Ready(p) => ready.push(p),
+            Found::Replaced(d) => replaced.push(d),
+            Found::OnRecord => known += 1,
+            Found::Refused(why) => refused.push((report, why)),
+        }
+    }
+    println!("{} can go on record", plural(ready.len(), "output", "outputs"));
+    for p in &ready {
+        println!("  {}  (made from {})", p.output.display(), p.source.display());
+    }
+    println!("{} that already took the original's place can go on record, so that the page can put the original back", plural(replaced.len(), "output", "outputs"));
+    for d in &replaced {
+        println!("  {}  (original {}, in the trash at {})", d.dest.display(), d.source.display(), d.trash.display());
+    }
+    println!("{} on record already", plural(known, "output is", "outputs are"));
+    println!("{} refused", plural(refused.len(), "report", "reports"));
+    for (report, why) in &refused {
+        println!("  {}: {why}", report.display());
+    }
+    let wanted: Vec<&Path> = ready.iter().map(|p| p.report.as_path()).chain(replaced.iter().map(|d| d.report.as_path())).collect();
+    if !go {
+        if !wanted.is_empty() {
+            println!("\nNothing was recorded. Add --apply to record {}; each output is then read whole, and so is each original whose report holds a hash, which can take minutes on large files.", if wanted.len() == 1 { "it" } else { "them" });
+        }
+        return Ok(());
+    }
+    let (mut done, mut failed) = (0, 0);
+    for report in wanted {
+        match adopt_one(report, &reads) {
+            Ok(added) => {
+                done += usize::from(added);
+                if added {
+                    println!("recorded {}", report.display());
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                eprintln!("FAILED {}: {e:#}", report.display());
+            }
+        }
+    }
+    println!("\n{} taken on record", plural(done, "output", "outputs"));
+    if failed > 0 {
+        bail!("{} not be taken on record; the lines starting with FAILED above say why", plural(failed, "output could", "outputs could"));
     }
     Ok(())
 }

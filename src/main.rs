@@ -158,6 +158,20 @@ enum Cmd {
         #[arg(long)]
         anywhere: bool,
     },
+    /// Take outputs that are not on av1opt's private record, such as those made before it began,
+    /// onto it, so that the page can replace them and put their originals back. Reads the reports
+    /// under the folders named and lists what each would add; only --apply writes, and only to
+    /// the record. Naming a folder here says that you trust the reports in it, as naming it to
+    /// `replace` does. A report is refused unless its output and original (or, once replaced,
+    /// the original in the trash) pass the checks `replace` makes.
+    Adopt {
+        /// Output folders, reports (`.av1opt.json`) or output files.
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// Write to the record. Without this the command only lists.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Compare encoder settings on your own videos: for every preset and SVT-AV1 parameter set,
     /// find the CRF that reaches the target VMAF on sample clips, then rank the settings by
     /// file size and encode time at that equal quality. Read-only for the videos; sample
@@ -535,6 +549,10 @@ fn run_command(command: Cmd) -> Result<()> {
         Cmd::Replace { paths, apply, undo, allow_zfs, accept_changed_date, anywhere } => {
             let paths: Vec<PathBuf> = paths.iter().map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone())).collect();
             replace::run(&paths, apply, undo, allow_zfs, accept_changed_date, anywhere)
+        }
+        Cmd::Adopt { paths, apply } => {
+            let paths: Vec<PathBuf> = paths.iter().map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone())).collect();
+            replace::adopt(&paths, apply)
         }
         Cmd::Bench {
             paths, presets, param_sets, target_vmaf, max_videos, samples, sample_secs, min_crf, max_crf, refresh, work_dir, save, csv, json,

@@ -185,8 +185,16 @@ fn fingerprint(path: &Path, size: u64) -> std::io::Result<String> {
 }
 
 fn whole_hash(path: &Path, size: u64) -> std::io::Result<String> {
-    let path = path.to_path_buf();
-    read_watched(move |got| Ok(format!("{:016x}", crate::files::whole_digest(&path, size, got, &AtomicBool::new(false))?)))
+    whole_hash_stopped_by(path, size, Arc::new(AtomicBool::new(false)))
+}
+
+/// Sets `stop` when it returns: if the read was given up on, it may wake with the drive, and
+/// nobody wants what it would go on to read.
+fn whole_hash_stopped_by(path: &Path, size: u64, stop: Arc<AtomicBool>) -> std::io::Result<String> {
+    let (path, stopped) = (path.to_path_buf(), stop.clone());
+    let answer = read_watched(move |got| Ok(format!("{:016x}", crate::files::whole_digest(&path, size, got, &stopped)?)));
+    stop.store(true, Ordering::Relaxed);
+    answer
 }
 
 type Known = HashMap<(PathBuf, u64, SystemTime), String>;
@@ -413,6 +421,45 @@ mod tests {
     use super::*;
     use std::io::{Seek, SeekFrom, Write};
     use std::time::Duration;
+
+    #[test]
+    fn a_whole_hash_given_up_on_stops_reading() {
+        // A file with nothing in it takes no room, and reading it takes far longer than this test.
+        let dir = std::env::temp_dir().join(format!("av1opt-source-dropped-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.mkv");
+        let size = 1u64 << 38;
+        std::fs::File::create(&path).unwrap().set_len(size).unwrap();
+        let hash = WholeHash::start(&path, size);
+        let got = hash.got.clone();
+        let started = std::time::Instant::now();
+        while got.load(Ordering::Relaxed) == 0 {
+            assert!(started.elapsed() < Duration::from_secs(60), "the read did not begin");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(hash);
+        // What is under way ends; after that the count stands still.
+        let settled = || {
+            let before = got.load(Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(200));
+            before == got.load(Ordering::Relaxed)
+        };
+        let waited = std::time::Instant::now();
+        while !settled() {
+            assert!(waited.elapsed() < Duration::from_secs(10), "it goes on reading: {} bytes", got.load(Ordering::Relaxed));
+        }
+        assert!(got.load(Ordering::Relaxed) < size);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_read_behind_a_whole_hash_is_told_to_stop_when_the_hash_is_over() {
+        let sample = Sample::new("hash-stop", 10);
+        let stop = Arc::new(AtomicBool::new(false));
+        assert!(whole_hash_stopped_by(&sample.0, 10, stop.clone()).is_ok());
+        assert!(stop.load(Ordering::Relaxed));
+    }
 
     struct Sample(PathBuf);
 

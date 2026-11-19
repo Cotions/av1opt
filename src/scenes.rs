@@ -46,6 +46,13 @@ pub struct Plan {
     /// bounds then are. Absent: the constant-rate grid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timed: Option<(i64, i64)>,
+    /// The source's fingerprint when this was planned: see `source::Recorded`. A touched source
+    /// with the same one is still the source of the chunks here.
+    #[serde(default)]
+    pub source_fingerprint: Option<String>,
+    /// When the source was last changed then, in seconds since 1970.
+    #[serde(default)]
+    pub source_mtime: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -183,6 +183,8 @@ pub const REPORT_FORMAT: u32 = 1;
 /// their layout or meaning changes: a work folder from another format is started over
 /// instead of resumed, since mixing chunks from two versions could give a bad output.
 const PLAN_FORMAT: u32 = 1;
+/// More than the plan of any video takes.
+const PLAN_LIMIT: u64 = 64 << 20;
 
 /// Written next to the output so later tuning can learn from real results.
 #[derive(Serialize)]
@@ -193,15 +195,8 @@ struct Report<'a> {
     input: &'a Path,
     output: &'a Path,
     source_bytes: u64,
-    /// When the source was last changed, in seconds since 1970. Reports from before this was
-    /// recorded have none, which their readers take as not known.
-    source_mtime: Option<u64>,
-    /// A hash of the source's size and of samples of its contents: what tells a file only
-    /// touched from one written to. See `source`.
-    source_fingerprint: Option<&'a str>,
-    /// A hash of the whole source, which settles whether a file with a new date is still this
-    /// one. None when it could not be read to its end during the encode.
-    source_hash: Option<&'a str>,
+    #[serde(flatten)]
+    source: ReportedSource<'a>,
     output_bytes: u64,
     savings: f64,
     /// "whole" (one CRF) or "scenes" (CRF per chunk; `crf` is then the whole-file starting point).
@@ -234,6 +229,26 @@ struct Report<'a> {
     notes: &'a [String],
 }
 
+/// What a report keeps to tell later whether a file is still the source of its encode.
+#[derive(Serialize)]
+struct ReportedSource<'a> {
+    /// When the source was last changed, in seconds since 1970. Reports from before this was
+    /// recorded have none, which their readers take as not known.
+    source_mtime: Option<u64>,
+    /// A hash of the source's size and of samples of its contents: what tells a file only
+    /// touched from one written to. See `source`.
+    source_fingerprint: Option<&'a str>,
+    /// A hash of the whole source, which settles whether a file with a new date is still this
+    /// one. None when it could not be read to its end during the encode.
+    source_hash: Option<&'a str>,
+}
+
+impl<'a> ReportedSource<'a> {
+    fn of(source: &'a Recorded, whole_hash: Option<&'a str>) -> ReportedSource<'a> {
+        ReportedSource { source_mtime: source.modified, source_fingerprint: source.fingerprint.as_deref(), source_hash: whole_hash }
+    }
+}
+
 /// Whether the source is still what the encode began reading. A download that had only stalled
 /// goes on growing under the encode, and what comes out is then a copy of part of it. Here any
 /// other size or time fails the encode, to the exact value the file system gives: the file was
@@ -261,6 +276,14 @@ fn check_source_unchanged(input: &Path, before: &Recorded, work: Option<&Path>, 
         Some(true) => bail!("{changed}"),
         None => bail!("{changed}. Whether its contents differ could not be checked, so finished chunks were kept"),
     }
+}
+
+/// Waits for the hash of the source and then looks whether the source is still what was encoded.
+/// In this order: a change while the hash was being read is then seen by the check.
+fn hash_then_check<T>(hash: impl FnOnce() -> Result<T>, check: impl FnOnce() -> Result<()>) -> Result<T> {
+    let hashed = hash()?;
+    check()?;
+    Ok(hashed)
 }
 
 /// The hash of the source begun with the encode, once it is there. A source that cannot be read
@@ -530,8 +553,6 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     }
     let tmp = TempDir { path: crate::files::make_run_folder(out_dir, TEMP_PREFIX).with_context(|| format!("cannot make a temporary folder in {}", out_dir.display()))?, keep: o.keep_temp };
     fits_beside_output(&output, &tmp.path)?;
-    // Read beside the encode, which takes far longer, so that nobody waits for it.
-    let whole_hash = WholeHash::start(input, size);
 
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     // 4K VMAF with many threads was part of the memory blow-up in the first pilot.
@@ -603,8 +624,13 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     let work = (o.scenes.possible() && one_pass.is_none()).then(|| work_dir(input, out_dir, size, o, preset, svt_params, &mut notes)).transpose()?;
     let saved: Option<scenes::Plan> = work.as_ref().and_then(|w| {
         let p: scenes::Plan = serde_json::from_slice(&std::fs::read(w.path.join("plan.json")).ok()?).ok()?;
-        (p.key == w.key).then_some(p)
+        (p.key == w.key && plan_fits(&p, &source)).then_some(p)
     });
+    if saved.as_ref().is_some_and(|p| p.source_mtime.is_some() && p.source_mtime != source.modified) {
+        let n = "the source has another date than when its finished chunks were made, and the same contents where it was sampled, so the chunks are used".to_string();
+        eprintln!("note: {n}");
+        notes.push(n);
+    }
 
     // A one-pass encode that is checked along its whole length afterwards (see `whole_check`
     // below) asks only the video's mean of the search: many short clips find that better than
@@ -709,6 +735,9 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     // What encoding again weak stretches takes is looked at when it is about to start, and
     // only if there are any (see `repair::repair`).
     require_room(out_dir, free_bytes(out_dir), room_to_encode(size, best.size_ratio, scenes, o.workers))?;
+    // Read beside the encode, which takes far longer, so that nobody waits for it. Not before
+    // this point: a search that ends in a skip would have had it compete for the drive for nothing.
+    let whole_hash = WholeHash::start(input, size);
 
     // The sample clips are lossless and large; only scene mode measures on them again.
     if !scenes && let Some(lab) = lab.as_mut() {
@@ -727,6 +756,9 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
         let lab = lab.as_mut().expect("a search that wasn't resumed has its lab");
         may_write()?;
         w.start_afresh()?;
+        if !o.keep_temp {
+            w.remove_outdated_folders();
+        }
         tools.emit(Event::Phase { phase: "scenes".into(), detail: "finding scene changes".into() });
         let found = scenes::detect(tools, input, &info, &w.path)?;
         // The frames don't keep the constant rate chunks are cut at (see `Pace`). They are
@@ -777,7 +809,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
                     }
                 };
                 eprintln!("{} scene cuts, {total_frames} frames, {} chunks", found.cuts.len(), chunks.len());
-                let p = scenes::Plan { key: w.key.clone(), best, trials: trials.clone(), bias, first_pts, total_frames, chunks, timed };
+                let p = scenes::Plan { key: w.key.clone(), best, trials: trials.clone(), bias, first_pts, total_frames, chunks, timed, source_fingerprint: source.fingerprint.clone(), source_mtime: source.modified };
                 crate::files::write_new(&w.path.join("plan.json"), &serde_json::to_vec_pretty(&p)?)?;
                 plan = Some(p);
             }
@@ -950,9 +982,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
         notes.push(n);
     }
 
-    // In this order: a change while the hash was being read is then seen by the check.
-    let source_hash = finish_source_hash(tools, input, whole_hash, &mut notes)?;
-    check_source_unchanged(input, &source, work.as_ref().map(|w| w.path.as_path()), o.keep_temp)?;
+    let source_hash = hash_then_check(|| finish_source_hash(tools, input, whole_hash, &mut notes), || check_source_unchanged(input, &source, work.as_ref().map(|w| w.path.as_path()), o.keep_temp))?;
 
     // What the samples promised is the video stream at one CRF; the file is that, the
     // stretches encoded again, the other streams and the container.
@@ -1008,9 +1038,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
         input: &abs_input,
         output: &abs_output,
         source_bytes: size,
-        source_mtime: source.modified,
-        source_fingerprint: source.fingerprint.as_deref(),
-        source_hash: source_hash.as_deref(),
+        source: ReportedSource::of(&source, source_hash.as_deref()),
         output_bytes,
         savings: 1.0 - output_bytes as f64 / size as f64,
         mode: if chunks.is_some() { "scenes" } else { "whole" },
@@ -1101,12 +1129,46 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
 }
 
 /// Resumable work folder for scene mode, named after everything that affects its contents.
+#[derive(Default)]
 struct WorkDir {
     path: PathBuf,
     key: String,
+    /// What comes before and after the source's size and date in the key of this source with
+    /// these settings.
+    key_start: String,
+    key_end: String,
 }
 
 impl WorkDir {
+    /// Removes what earlier runs left for this same source and these same settings, which no
+    /// run will go on from now that a new plan is begun: chunks of the file as it was when it
+    /// had another size or, under the keys of earlier versions, another date. Only folders of
+    /// this user's that pass the checks for going on from one, and only with a key to show.
+    fn remove_outdated_folders(&self) {
+        let Some(parent) = self.path.parent() else { return };
+        for entry in std::fs::read_dir(parent).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let is_work_folder = entry.file_name().to_string_lossy().starts_with(WORK_PREFIX);
+            if !is_work_folder || path == self.path || !crate::files::check_kept_folder(&path).is_ok_and(|there| there) {
+                continue;
+            }
+            if plan_key(&path).is_some_and(|key| self.is_same_work(&key)) {
+                match std::fs::remove_dir_all(&path) {
+                    Ok(()) => eprintln!("removed {}: the chunks in it were of an earlier state of this file", path.display()),
+                    Err(e) => eprintln!("warning: could not remove the outdated work folder {}: {e}", path.display()),
+                }
+            }
+        }
+    }
+
+    /// Whether `key` is that of this source and these settings: between their two parts it holds
+    /// only a size, and in the keys of earlier versions a date as well.
+    fn is_same_work(&self, key: &str) -> bool {
+        let Some(between) = key.strip_prefix(&self.key_start).and_then(|rest| rest.strip_suffix(&self.key_end)) else { return false };
+        let numbers: Vec<&str> = between.split('|').collect();
+        numbers.len() <= 2 && numbers.iter().all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    }
+
     /// Readies the folder for a run that has nothing to go on from. What is there was checked
     /// but belongs to no plan of this encode, and chunks without one must not be taken for its
     /// own. Something turning up at the name meanwhile is left there for another name.
@@ -1143,23 +1205,49 @@ fn believed_work_path(path: PathBuf, notes: &mut Vec<String>) -> Result<PathBuf>
     beside(&path)
 }
 
+/// The key saved in a work folder, for looking at folders that may be someone else's.
+fn plan_key(folder: &Path) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Saved {
+        key: String,
+    }
+    let bytes = crate::files::read_regular(&folder.join("plan.json"), PLAN_LIMIT).ok()?;
+    serde_json::from_slice::<Saved>(&bytes).ok().map(|saved| saved.key)
+}
+
+/// Whether what a plan was made from is the source as it is now: the same samples, or where
+/// those are not known on either side the same date. A source only touched keeps its chunks,
+/// which may be days of work. A plan of a version that noted neither has the date in its key.
+fn plan_fits(plan: &scenes::Plan, now: &Recorded) -> bool {
+    match (&plan.source_fingerprint, &now.fingerprint) {
+        (Some(then), Some(now)) => then == now,
+        _ => plan.source_mtime.is_none() || plan.source_mtime == now.modified,
+    }
+}
+
 fn work_dir(input: &Path, out_dir: &Path, size: u64, o: &Options, preset: u8, svt_params: &str, notes: &mut Vec<String>) -> Result<WorkDir> {
-    let mtime = std::fs::metadata(input)?
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs());
-    let mut key = format!(
-        "v{PLAN_FORMAT}|{}|{size}|{mtime}|{}|{preset}|{}|{}|{}|{}",
-        std::path::absolute(input)?.display(), o.target_vmaf, o.min_crf, o.max_crf, o.samples.map_or("auto".to_string(), |n| n.to_string()), o.sample_secs.unwrap_or(search::SAMPLE_SECS)
-    );
+    let key_start = format!("v{PLAN_FORMAT}|{}|", std::path::absolute(input)?.display());
+    let mut key_end = format!("|{}|{preset}|{}|{}|{}|{}", o.target_vmaf, o.min_crf, o.max_crf, o.samples.map_or("auto".to_string(), |n| n.to_string()), o.sample_secs.unwrap_or(search::SAMPLE_SECS));
     // Only when they differ, so work folders from before this setting existed still resume.
     if svt_params != search::DEFAULT_PARAMS {
-        key.push_str(&format!("|{svt_params}"));
+        key_end.push_str(&format!("|{svt_params}"));
     }
+    let folder_for = |key: &str| out_dir.join(format!("{WORK_PREFIX}{:016x}", scenes::fnv1a(key)));
+    let key = format!("{key_start}{size}{key_end}");
     // Created only when chunk work starts, so skipped files leave nothing behind.
-    let path = believed_work_path(out_dir.join(format!("{WORK_PREFIX}{:016x}", scenes::fnv1a(&key))), notes)?;
-    Ok(WorkDir { path, key })
+    let path = believed_work_path(folder_for(&key), notes)?;
+    let mut work = WorkDir { path, key, key_start, key_end };
+    // A folder from when the key held the source's date goes on being used, for that same date.
+    if !work.path.exists() {
+        let mtime = std::fs::metadata(input)?.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+        let earlier_key = format!("{}{size}|{mtime}{}", work.key_start, work.key_end);
+        let earlier = folder_for(&earlier_key);
+        if crate::files::check_kept_folder(&earlier).is_ok_and(|there| there) && plan_key(&earlier).as_deref() == Some(earlier_key.as_str()) {
+            work.path = earlier;
+            work.key = earlier_key;
+        }
+    }
+    Ok(work)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1858,6 +1946,159 @@ pub(crate) fn free_bytes(dir: &Path) -> Option<u64> {
 mod tests {
     use super::*;
 
+    fn options() -> Options {
+        Options {
+            container: Container::Mp4, target_vmaf: 93.0, preset: 5, svt_params: search::DEFAULT_PARAMS.into(), tuning: None,
+            min_crf: 20, max_crf: 55, samples: None, sample_secs: None, min_savings: 0.15, force: false, overwrite: false, keep_temp: false,
+            scenes: Scenes::Off, workers: 1, meta: Default::default(), remove: Vec::new(), audio: Audio::Keep, fresh_search: false,
+            out_dir_must_exist: false,
+        }
+    }
+
+    fn folder_for_test(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("av1opt-encode-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn set_date(file: &Path, seconds: u64) {
+        std::fs::File::options().write(true).open(file).unwrap().set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds)).unwrap();
+    }
+
+    fn plan(fingerprint: Option<&str>, mtime: Option<u64>) -> scenes::Plan {
+        let best = Trial { crf: 30.0, mean_vmaf: 95.0, min_vmaf: 90.0, size_ratio: 0.5 };
+        scenes::Plan { key: String::new(), best, trials: Vec::new(), bias: 0.0, first_pts: 0, total_frames: 0, chunks: Vec::new(), timed: None, source_fingerprint: fingerprint.map(Into::into), source_mtime: mtime }
+    }
+
+    #[test]
+    fn a_touched_source_keeps_its_work_folder_and_a_rewritten_one_does_not_go_on_from_it() {
+        let dir = folder_for_test("work-key");
+        let input = dir.join("a.mkv");
+        std::fs::write(&input, b"contents").unwrap();
+        set_date(&input, 1_000_000);
+        let folder = |o: &Options| work_dir(&input, &dir, 8, o, 5, search::DEFAULT_PARAMS, &mut Vec::new()).unwrap();
+        let first = folder(&options());
+        set_date(&input, 2_000_000);
+        let touched = folder(&options());
+        assert_eq!((&first.path, &first.key), (&touched.path, &touched.key), "the date is not part of it");
+        assert!(!first.key.contains("1000000"), "{}", first.key);
+        assert_ne!(first.path, folder(&Options { target_vmaf: 95.0, ..options() }).path, "settings are");
+
+        let now = Recorded { fingerprint: Some("same".into()), modified: Some(2_000_000), ..Recorded::default() };
+        assert!(plan_fits(&plan(Some("same"), Some(1_000_000)), &now), "only touched");
+        assert!(!plan_fits(&plan(Some("other"), Some(2_000_000)), &now), "samples that differ settle it, whatever the date");
+        // With no samples on one side only the date can tell.
+        assert!(plan_fits(&plan(None, Some(2_000_000)), &now));
+        assert!(!plan_fits(&plan(None, Some(1_000_000)), &now));
+        let unread = Recorded { modified: Some(2_000_000), ..Recorded::default() };
+        assert!(plan_fits(&plan(Some("same"), Some(2_000_000)), &unread));
+        assert!(!plan_fits(&plan(Some("same"), Some(1_000_000)), &unread));
+        // A plan of an earlier version: its key held the date, and the folder was found by it.
+        assert!(plan_fits(&plan(None, None), &now));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_work_folder_from_when_the_key_held_the_date_is_gone_on_from_for_that_date() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = folder_for_test("work-earlier");
+        let input = dir.join("a.mkv");
+        std::fs::write(&input, b"contents").unwrap();
+        set_date(&input, 1_000_000);
+        let w = work_dir(&input, &dir, 8, &options(), 5, search::DEFAULT_PARAMS, &mut Vec::new()).unwrap();
+        let earlier_key = format!("{}8|1000000{}", w.key_start, w.key_end);
+        let earlier = dir.join(format!("{WORK_PREFIX}{:016x}", scenes::fnv1a(&earlier_key)));
+        std::fs::create_dir(&earlier).unwrap();
+        std::fs::set_permissions(&earlier, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(earlier.join("plan.json"), serde_json::json!({ "key": earlier_key }).to_string()).unwrap();
+        let found = work_dir(&input, &dir, 8, &options(), 5, search::DEFAULT_PARAMS, &mut Vec::new()).unwrap();
+        assert_eq!((found.path, found.key), (earlier.clone(), earlier_key));
+        // Touched since, it is another date: that folder is then one to clear away.
+        set_date(&input, 2_000_000);
+        assert_eq!(work_dir(&input, &dir, 8, &options(), 5, search::DEFAULT_PARAMS, &mut Vec::new()).unwrap().path, w.path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_work_folders_of_the_same_source_and_settings_are_cleared_away() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = folder_for_test("work-outdated");
+        let input = dir.join("a.mkv");
+        std::fs::write(&input, b"contents").unwrap();
+        let mut w = work_dir(&input, &dir, 8, &options(), 5, search::DEFAULT_PARAMS, &mut Vec::new()).unwrap();
+        let (start, end) = (w.key_start.clone(), w.key_end.clone());
+        let keeper = |name: &str, key: Option<String>| {
+            let f = dir.join(format!("{WORK_PREFIX}{name}"));
+            std::fs::create_dir(&f).unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o700)).unwrap();
+            if let Some(key) = key {
+                std::fs::write(f.join("plan.json"), serde_json::json!({ "key": key }).to_string()).unwrap();
+            }
+            f
+        };
+        let gone = [keeper("other-size", Some(format!("{start}9{end}"))), keeper("with-date", Some(format!("{start}8|1000000{end}")))];
+        let kept = [
+            keeper("other-settings", Some(format!("{start}8|95|5|20|55|auto|3"))),
+            keeper("other-source", Some(format!("v1|/elsewhere/a.mkv|8{end}"))),
+            keeper("no-plan", None),
+            keeper("more-in-between", Some(format!("{start}8|1|2{end}"))),
+            keeper("words-in-between", Some(format!("{start}eight{end}"))),
+        ];
+        // Not this user's to judge: others can write to it.
+        let open = keeper("open", Some(format!("{start}7{end}")));
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        w.start_afresh().unwrap();
+        w.remove_outdated_folders();
+        assert!(w.path.is_dir(), "its own stays");
+        for f in &gone {
+            assert!(!f.exists(), "{}", f.display());
+        }
+        for f in kept.iter().chain([&open]) {
+            assert!(f.exists(), "{}", f.display());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nothing_is_made_for_an_output_folder_that_may_not_be_written_to() {
+        let dir = folder_for_test("may-write");
+        let (input, out, ffprobe) = (dir.join("a.mkv"), dir.join("away/out"), dir.join("ffprobe"));
+        std::fs::write(&input, b"xx").unwrap();
+        let video = r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":64,"height":64,"pix_fmt":"yuv420p","r_frame_rate":"25/1","avg_frame_rate":"25/1","duration":"9"}],"format":{"format_name":"mov","duration":"9","size":"2"}}"#;
+        crate::files::write_script(&ffprobe, &format!("echo '{video}'\n"));
+        let tools = Tools::new("false".into(), ffprobe.to_str().unwrap().into(), None);
+        let e = optimize(&tools, &input, &out, &|| anyhow::bail!("the drive is away"), &options()).unwrap_err();
+        assert!(e.to_string().contains("the drive is away"), "{e:#}");
+        assert!(!dir.join("away").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_report_holds_what_tells_its_source_later() {
+        let source = Recorded { modified: Some(5), fingerprint: Some("samples".into()), ..Recorded::default() };
+        let fields = serde_json::to_value(ReportedSource::of(&source, Some("whole"))).unwrap();
+        assert_eq!(fields, serde_json::json!({ "source_mtime": 5, "source_fingerprint": "samples", "source_hash": "whole" }));
+    }
+
+    #[test]
+    fn a_change_while_the_hash_was_read_is_seen_by_the_check_after_it() {
+        let dir = folder_for_test("hash-order");
+        let input = dir.join("a.mkv");
+        std::fs::write(&input, b"contents").unwrap();
+        set_date(&input, 1_000_000);
+        let before = Recorded::of(&input).unwrap().1;
+        let finished = hash_then_check(
+            || {
+                set_date(&input, 2_000_000);
+                Ok("hash")
+            },
+            || check_source_unchanged(&input, &before, None, false),
+        );
+        assert!(finished.unwrap_err().to_string().contains("changed or went away"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn chunks_are_tried_at_a_faster_preset_for_every_preset_there_is() {
         let probes: Vec<u8> = (0..=13).map(probe_preset).collect();
@@ -1902,7 +2143,7 @@ mod tests {
             assert_eq!(used.parent(), planted.parent());
             assert!(said[0].contains(why) && said[0].contains("left alone"), "{said:?}");
             // The new one is made private, and the planted one stays as it was.
-            let mut w = WorkDir { path: used, key: String::new() };
+            let mut w = WorkDir { path: used, ..WorkDir::default() };
             w.start_afresh().unwrap();
             assert_eq!(std::fs::symlink_metadata(&w.path).unwrap().permissions().mode() & 0o777, 0o700);
             assert!(std::fs::symlink_metadata(planted).is_ok());
@@ -1910,7 +2151,7 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("elsewhere/plan.json")).unwrap(), b"precious");
 
         // A run with no plan to go on from takes nothing over from what lies in its folder.
-        let mut w = WorkDir { path: old.clone(), key: String::new() };
+        let mut w = WorkDir { path: old.clone(), ..WorkDir::default() };
         std::fs::write(old.join("chunk00000.obu"), b"from another video").unwrap();
         w.start_afresh().unwrap();
         assert_eq!(w.path, old);

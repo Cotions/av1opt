@@ -1243,9 +1243,11 @@ fn scenes_get_their_own_crf_and_a_killed_run_goes_on_where_it_stopped() {
     child.wait().unwrap();
     wait_until("ffmpeg to end with av1opt", 5, || ffmpegs_under(&c.dir).is_empty());
     assert!(!c.out().join("s.mp4").exists() && !c.out().join("s.av1opt.json").exists());
+    // Touched meanwhile: its contents are what the chunks were made from.
+    std::fs::File::options().write(true).open(&src).unwrap().set_modified(mtime(&src) + std::time::Duration::from_secs(3600)).unwrap();
 
     let r = c.av1opt(&args());
-    r.ok().has("resuming earlier run: crf").has("encoded 1, skipped 0, failed 0");
+    r.ok().has("resuming earlier run: crf").has("another date than when its finished chunks were made").has("encoded 1, skipped 0, failed 0");
     let kept: u32 = r.err.split("resuming: ").nth(1).and_then(|t| t.split_whitespace().next()?.parse().ok()).unwrap_or_else(|| panic!("no chunk kept:\n{}", r.err));
     assert!((1..4).contains(&kept), "{kept} chunks kept");
     // The search was not run again.

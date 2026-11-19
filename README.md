@@ -952,7 +952,7 @@ environment, so set the ffmpeg path once in Settings.
   over: the finished encode is kept next to it under another name, and the run says where.
 - What av1opt reads in the output folder (`av1opt-log.tsv`, the reports, a work folder's plan)
   is read only if it is a plain file of a sensible size (8 MiB for a report, 128 MiB for the
-  log); a pipe, a link or a larger file there is passed over with a warning, never waited on.
+  log, 64 MiB for a plan); a pipe, a link or a larger file there is passed over with a warning, never waited on.
 - Each output is locked while it is made (`.av1opt-lock-<number>` in the output folder). Something
   at that name that is not a plain file of yours stops that file with a message: move it away
   if no av1opt is working there. When the filesystem gives no lock for any other reason (it has

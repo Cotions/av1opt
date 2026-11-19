@@ -12,7 +12,7 @@ use crate::probe::MediaInfo;
 use crate::scan;
 use crate::tools::{Tools, hms, path_arg};
 use anyhow::{Context, Result, bail};
-use matching::{Fingerprint, Group, Kind, Media, Prefs, ladder};
+use matching::{Fingerprint, Frame, Group, Kind, MIDDLE, Media, Prefs, ladder};
 use phash::THUMB;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -128,7 +128,9 @@ fn cache_file() -> Result<PathBuf> {
     let dir = base.join("av1opt");
     crate::files::private_folder(&dir)?;
     // Bump the version when the frame times or the hash change, so old entries are redone.
-    Ok(dir.join("dups-cache-v1.json"))
+    // Version 1 has no frames from the middle of a video.
+    let _ = std::fs::remove_file(dir.join("dups-cache-v1.json"));
+    Ok(dir.join("dups-cache-v2.json"))
 }
 
 fn save_cache(path: &Path, cache: &HashMap<PathBuf, CacheEntry>) -> Result<()> {
@@ -182,18 +184,24 @@ fn grab(tools: &Tools, path: &Path, info: &MediaInfo, times: &[f64]) -> Result<V
     Ok(out)
 }
 
-/// Decodes the ladder frames of one video and hashes them.
+/// Decodes the sampled frames of one video and hashes them. The times are those of the picture:
+/// sound that starts earlier or runs on has no frames to show.
 pub fn fingerprint(tools: &Tools, path: &Path, info: &MediaInfo) -> Result<Fingerprint> {
-    let lad = ladder(info.duration_s);
-    let times: Vec<f64> = lad.iter().copied().chain(lad.iter().map(|t| (info.duration_s - t).max(0.0))).collect();
+    let (start, length) = (info.picture_start(), info.picture_secs());
+    let lad = ladder(length);
+    let from_end = lad.iter().map(|t| (length - t).max(0.0));
+    let at_shares = MIDDLE.iter().map(|share| length * share);
+    let times: Vec<f64> = lad.iter().copied().chain(from_end).chain(at_shares).map(|t| start + t).collect();
     let frames = grab(tools, path, info, &times)?;
     let read: Vec<&[u8]> = frames.iter().flatten().map(Vec::as_slice).collect();
     if read.is_empty() {
         bail!("no frame could be read");
     }
     let bounds = phash::content_bounds(&read);
-    let hashes: Vec<Option<u64>> = frames.iter().map(|f| f.as_ref().and_then(|f| phash::hash(f, bounds))).collect();
-    Ok(Fingerprint { head: hashes[..lad.len()].to_vec(), tail: hashes[lad.len()..].to_vec() })
+    let hashes: Vec<Frame> = frames.iter().map(|f| f.as_ref().map_or(Frame::Unread, |f| phash::hash(f, bounds).map_or(Frame::Flat, Frame::Picture))).collect();
+    let (head, rest) = hashes.split_at(lad.len());
+    let (tail, middle) = rest.split_at(lad.len());
+    Ok(Fingerprint { head: head.to_vec(), tail: tail.to_vec(), middle: middle.to_vec() })
 }
 
 /// How much of a file's start, middle and end is compared.
@@ -333,7 +341,7 @@ pub fn find(paths: &[PathBuf], tools: &Tools, o: &Options, progress: &(dyn Fn(Pr
         }
     }
     progress(Progress::Comparing { videos: kept.len() });
-    let items: Vec<(f64, &Fingerprint)> = kept.iter().map(|(_, info, fp)| (info.duration_s, fp)).collect();
+    let items: Vec<(f64, &Fingerprint)> = kept.iter().map(|(_, info, fp)| (info.picture_secs(), fp)).collect();
     let links = matching::links(&items, o.max_dist);
     let mut linked: Vec<usize> = links.iter().filter(|l| l.kind == Kind::Same).flat_map(|l| [l.a, l.b]).collect();
     linked.sort_unstable();

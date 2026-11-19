@@ -1245,8 +1245,9 @@ function renderDups(out, run, reload) {
   const card = (g) => {
     const members = g.members.map((i) => files[i]);
     const [label, cls] = DUP_KIND[g.kind] || [g.kind, ""];
-    // The same moment in every copy, so the thumbnails can be compared at a glance.
-    const at = Math.min(30, Math.min(...members.map((m) => m.duration_s)) * 0.4);
+    // The same moment in every copy, so the thumbnails can be compared at a glance: the middle
+    // of the shortest, because videos that share an opening look alike at its start.
+    const at = Math.min(...members.map((m) => m.duration_s)) * 0.5;
     const thumbAt = (m) => (g.kind === "same_end" ? Math.max(0, m.duration_s - at) : at);
     const spare = g.kind === "same" ? members.slice(1).reduce((a, m) => a + m.size, 0) : 0;
     const allMarked = h("span", { class: "bad", hidden: true }, "Every copy is marked: nothing would be left");

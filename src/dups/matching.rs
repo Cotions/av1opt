@@ -17,18 +17,36 @@ pub fn ladder(duration: f64) -> Vec<f64> {
     if v.is_empty() { vec![(duration / 4.0).max(0.0)] } else { v }
 }
 
-/// Frame hashes of one video; None where the frame was flat or could not be read.
+/// Where in a video, as shares of its length, the frames that stand for its middle are taken.
+/// Counted from the length and not in seconds, so that two copies of one video agree and two
+/// episodes with the same opening and credits are compared where they differ.
+pub const MIDDLE: [f64; 5] = [1.0 / 6.0, 2.0 / 6.0, 3.0 / 6.0, 4.0 / 6.0, 5.0 / 6.0];
+
+/// What became of one sampled frame.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Frame {
+    /// The hash of a picture.
+    Picture(u64),
+    /// Black, a fade, a plain colour: nothing to tell it from any other such frame.
+    Flat,
+    /// There is no such frame to be had: past the end of the data, or damaged.
+    Unread,
+}
+
+/// The sampled frames of one video.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct Fingerprint {
     /// `head[i]` is the frame `ladder[i]` seconds after the start.
-    pub head: Vec<Option<u64>>,
+    pub head: Vec<Frame>,
     /// `tail[i]` is the frame `ladder[i]` seconds before the end.
-    pub tail: Vec<Option<u64>>,
+    pub tail: Vec<Frame>,
+    /// `middle[i]` is the frame at the share `MIDDLE[i]` of the length.
+    pub middle: Vec<Frame>,
 }
 
 impl Fingerprint {
     pub fn usable(&self) -> usize {
-        self.head.iter().chain(&self.tail).filter(|h| h.is_some()).count()
+        self.head.iter().chain(&self.tail).chain(&self.middle).filter(|f| matches!(f, Frame::Picture(_))).count()
     }
 }
 
@@ -53,10 +71,10 @@ pub struct Link {
 }
 
 /// Matching frames and frames both sides have, for one end of two videos.
-fn side(x: &[Option<u64>], y: &[Option<u64>], max_dist: u32) -> (u32, u32) {
+fn side(x: &[Frame], y: &[Frame], max_dist: u32) -> (u32, u32) {
     let (mut matched, mut common) = (0, 0);
     for (a, b) in x.iter().zip(y) {
-        if let (Some(a), Some(b)) = (a, b) {
+        if let (Frame::Picture(a), Frame::Picture(b)) = (a, b) {
             common += 1;
             matched += u32::from(distance(*a, *b) <= max_dist);
         }
@@ -64,17 +82,23 @@ fn side(x: &[Option<u64>], y: &[Option<u64>], max_dist: u32) -> (u32, u32) {
     (matched, common)
 }
 
+/// The fewest frames of the middle two videos must both show to be called the same video.
+const MIN_MIDDLE: u32 = 3;
+
 /// How two videos relate, if they do. `max_dist` is the most bits two frame hashes may differ
 /// by and still count as the same picture.
 pub fn compare(dur_a: f64, a: &Fingerprint, dur_b: f64, b: &Fingerprint, max_dist: u32) -> Option<(Kind, f32)> {
     let (hm, hc) = side(&a.head, &b.head, max_dist);
     let (tm, tc) = side(&a.tail, &b.tail, max_dist);
+    let (mm, mc) = side(&a.middle, &b.middle, max_dist);
     let (m, c) = (hm + tm, hc + tc);
     let close = (dur_a - dur_b).abs() <= (0.02 * dur_a.max(dur_b)).max(1.5);
-    // Whole video: three quarters of all compared frames, from both ends together, so two
-    // episodes with the same intro don't count.
-    if close && c >= 2 && m >= 2 && m * 4 >= c * 3 {
-        return Some((Kind::Same, m as f32 / c as f32));
+    // Whole video: three quarters of all compared frames, and most of those from the middle.
+    // Both ends can agree over a long way in two episodes with one opening and one set of
+    // credits: only what lies between them tells such videos apart.
+    let (all_matched, all_compared) = (m + mm, c + mc);
+    if close && mc >= MIN_MIDDLE && mm * 5 >= mc * 4 && all_matched * 4 >= all_compared * 3 {
+        return Some((Kind::Same, all_matched as f32 / all_compared as f32));
     }
     // One end only: needs at least three frames and four in five to match, which reaches
     // past a few seconds of shared logo.
@@ -282,9 +306,9 @@ mod tests {
     /// A fake video: frame hashes are far apart for different `content`, and position `i`
     /// of the same content always hashes the same.
     fn fp(content: u64, duration: f64) -> Fingerprint {
-        let h = |i: usize, end: u64| Some((content * 1000 + end * 100 + i as u64).wrapping_mul(0x9E3779B97F4A7C15));
+        let h = |i: usize, end: u64| Frame::Picture((content * 1000 + end * 100 + i as u64).wrapping_mul(0x9E3779B97F4A7C15));
         let n = ladder(duration).len();
-        Fingerprint { head: (0..n).map(|i| h(i, 0)).collect(), tail: (0..n).map(|i| h(i, 1)).collect() }
+        Fingerprint { head: (0..n).map(|i| h(i, 0)).collect(), tail: (0..n).map(|i| h(i, 1)).collect(), middle: (0..MIDDLE.len()).map(|i| h(i, 2)).collect() }
     }
 
     fn media(path: &str, w: u32, h: u32, codec: &str, mbps: f64, size: u64) -> Media {
@@ -305,11 +329,11 @@ mod tests {
     fn same_video_matches_with_a_few_bad_frames() {
         let a = fp(1, 600.0);
         let mut b = a.clone();
-        b.head[2] = Some(!b.head[2].unwrap());
-        b.tail[0] = None;
+        b.head[2] = flipped(b.head[2]);
+        b.tail[0] = Frame::Flat;
         let (kind, score) = compare(600.0, &a, 600.4, &b, 10).unwrap();
         assert_eq!(kind, Kind::Same);
-        assert!((score - 12.0 / 13.0).abs() < 1e-6);
+        assert!((score - 17.0 / 18.0).abs() < 1e-6);
         assert_eq!(compare(600.0, &a, 600.0, &fp(2, 600.0), 10), None);
     }
 
@@ -341,7 +365,7 @@ mod tests {
 
     #[test]
     fn flat_frames_are_not_evidence() {
-        let blank = Fingerprint { head: vec![None; 7], tail: vec![None; 7] };
+        let blank = Fingerprint { head: vec![Frame::Flat; 7], tail: vec![Frame::Flat; 7], middle: vec![Frame::Flat; 5] };
         assert_eq!(compare(600.0, &blank, 600.0, &blank, 10), None);
         assert_eq!(blank.usable(), 0);
     }
@@ -416,15 +440,62 @@ mod tests {
         h ^ ((1u64 << bits) - 1)
     }
 
-    fn sides(head: &[Option<u64>], tail: &[Option<u64>]) -> Fingerprint {
-        Fingerprint { head: head.to_vec(), tail: tail.to_vec() }
+    /// The picture farthest from this frame's.
+    fn flipped(f: Frame) -> Frame {
+        match f {
+            Frame::Picture(h) => Frame::Picture(!h),
+            other => other,
+        }
+    }
+
+    /// Five pictures of a middle, the same for all videos made with [`sides`].
+    fn shared_middle() -> Vec<Frame> {
+        frames(900, MIDDLE.len(), MIDDLE.len()).0
+    }
+
+    fn sides(head: &[Frame], tail: &[Frame]) -> Fingerprint {
+        Fingerprint { head: head.to_vec(), tail: tail.to_vec(), middle: shared_middle() }
     }
 
     /// `n` frames, of which the first `same` are the ones `base` has and the others are far off.
-    fn frames(base: u64, n: usize, same: usize) -> (Vec<Option<u64>>, Vec<Option<u64>>) {
-        let a: Vec<Option<u64>> = (0..n as u64).map(|i| Some((base + i).wrapping_mul(0x9E3779B97F4A7C15))).collect();
-        let b = a.iter().enumerate().map(|(i, h)| if i < same { *h } else { h.map(|h| !h) }).collect();
+    fn frames(base: u64, n: usize, same: usize) -> (Vec<Frame>, Vec<Frame>) {
+        let a: Vec<Frame> = (0..n as u64).map(|i| Frame::Picture((base + i).wrapping_mul(0x9E3779B97F4A7C15))).collect();
+        let b = a.iter().enumerate().map(|(i, f)| if i < same { *f } else { flipped(*f) }).collect();
         (a, b)
+    }
+
+    /// A video whose start and end are those of `a`, and of whose middle only the first
+    /// `same` frames are.
+    fn same_ends_as(a: &Fingerprint, other_content: u64, same: usize) -> Fingerprint {
+        let mut b = fp(other_content, 600.0);
+        b.head.clone_from(&a.head);
+        b.tail.clone_from(&a.tail);
+        b.middle[..same].clone_from_slice(&a.middle[..same]);
+        b
+    }
+
+    #[test]
+    fn shared_ends_with_another_middle_are_not_the_same_video() {
+        let a = fp(1, 600.0);
+        // Everything at both ends agrees, and at most three of the five frames between them.
+        for same in 0..=3 {
+            assert_eq!(compare(600.0, &a, 600.0, &same_ends_as(&a, 2, same), 10).map(|r| r.0), Some(Kind::SameStart), "{same}");
+        }
+        // Four of five is what a copy with a damaged or odd frame still reaches.
+        assert_eq!(compare(600.0, &a, 600.0, &same_ends_as(&a, 2, 4), 10).map(|r| r.0), Some(Kind::Same));
+        assert_eq!(compare(600.0, &a, 600.0, &a, 10), Some((Kind::Same, 1.0)));
+    }
+
+    #[test]
+    fn without_three_frames_of_the_middle_in_common_nothing_is_the_same_video() {
+        let a = fp(1, 600.0);
+        let mut b = a.clone();
+        b.middle[..3].fill(Frame::Flat);
+        assert_eq!(compare(600.0, &a, 600.0, &b, 10).map(|r| r.0), Some(Kind::SameStart));
+        b.middle[2] = a.middle[2];
+        assert_eq!(compare(600.0, &a, 600.0, &b, 10).map(|r| r.0), Some(Kind::Same));
+        b.middle.clear();
+        assert_eq!(compare(600.0, &a, 600.0, &b, 10).map(|r| r.0), Some(Kind::SameStart));
     }
 
     #[test]
@@ -449,7 +520,7 @@ mod tests {
     #[test]
     fn frames_count_as_the_same_up_to_the_tolerance_and_no_further() {
         let h = 0x1234_5678_9ABC_DEF0_u64 >> 1;
-        let same = |bits| side(&[Some(h)], &[Some(off(h, bits))], 10);
+        let same = |bits| side(&[Frame::Picture(h)], &[Frame::Picture(off(h, bits))], 10);
         assert_eq!(same(0), (1, 1));
         assert_eq!(same(10), (1, 1));
         assert_eq!(same(11), (0, 1));
@@ -457,9 +528,10 @@ mod tests {
 
     #[test]
     fn only_frames_both_sides_have_are_compared() {
+        let p = Frame::Picture(1);
         assert_eq!(side(&[], &[], 10), (0, 0));
-        assert_eq!(side(&[Some(1)], &[], 10), (0, 0));
-        assert_eq!(side(&[None, Some(1), Some(1)], &[Some(1), None, Some(1), Some(1)], 10), (1, 1));
+        assert_eq!(side(&[p], &[], 10), (0, 0));
+        assert_eq!(side(&[Frame::Flat, p, p], &[p, Frame::Flat, p, p], 10), (1, 1));
     }
 
     #[test]
@@ -478,24 +550,23 @@ mod tests {
 
     #[test]
     fn three_quarters_of_all_frames_make_the_same_video() {
-        let whole = |n, same| {
-            let (a, b) = frames(1, n, same);
-            compare(600.0, &sides(&a, &[]), 600.0, &sides(&b, &[]), 10)
+        // Six frames at each end and the five of the middle, which all agree: 13 of 17 do it.
+        let whole = |head, tail| {
+            let (a, b) = frames(1, 6, head);
+            let (c, d) = frames(50, 6, tail);
+            compare(600.0, &sides(&a, &c), 600.0, &sides(&b, &d), 10)
         };
-        assert_eq!(whole(8, 6), Some((Kind::Same, 0.75)));
-        // One short of it: not the whole video, and too few for a shared start either.
-        assert_eq!(whole(8, 5), None);
-        // Two frames are the least that say anything.
-        assert_eq!(whole(2, 2), Some((Kind::Same, 1.0)));
-        assert_eq!(whole(1, 1), None);
+        assert_eq!(whole(4, 4), Some((Kind::Same, 13.0 / 17.0)));
+        // One short of it: not the whole video, and neither end agrees enough on its own.
+        assert_eq!(whole(4, 3), None);
     }
 
     #[test]
     fn frames_of_both_ends_are_added_up_for_the_whole_video() {
-        // Half of one end and all of the other: 6 of 8.
+        // Half of one end and all of the other, with the middle: 11 of 13.
         let (a, b) = frames(1, 4, 2);
         let (c, d) = frames(50, 4, 4);
-        assert_eq!(compare(600.0, &sides(&a, &c), 600.0, &sides(&b, &d), 10), Some((Kind::Same, 0.75)));
+        assert_eq!(compare(600.0, &sides(&a, &c), 600.0, &sides(&b, &d), 10), Some((Kind::Same, 11.0 / 13.0)));
     }
 
     #[test]

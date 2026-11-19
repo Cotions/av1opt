@@ -187,16 +187,17 @@ av1opt encode movie.mkv some/folder -o /out [--target-vmaf 93] [--preset 4] [--c
 For each file:
 
 1. **Sample** – cuts clips spread through the video into lossless, constant-frame-rate
-   references (deinterlaced and cropped to even size when needed). A plain encode in one
-   pass (no `--scenes`, HDR, removed sections, `--samples` or `--sample-secs`: the usual case)
-   is scored along its whole length afterwards (step 5), so the search only has to find the
-   video's mean, and what throws that off is where the clips lie, not how long they are: one
-   clip of 1 second for every 8 seconds of video, 8 at least and 64 at most, spread evenly
-   from the first second to the last; a video under 64 seconds is sampled whole, as clips of
-   a second side by side. Where one CRF has to carry its worst stretch
-   (`--scenes`, HDR, removed sections), clips of 4 seconds, long enough to show a stretch: 8
-   of them up to about 17 minutes, then one for every two minutes more, 32 at most.
-   `--samples` and `--sample-secs` set both by hand, and with them the 4-second scheme.
+   references (deinterlaced and cropped to even size when needed). An encode in one pass
+   without `--scenes`, HDR or removed sections (the usual case) is scored along its whole
+   length afterwards (step 5), so the search only has to find the video's mean, and what
+   throws that off is where the clips lie, not how long they are: one clip of 1 second for
+   every 8 seconds of video, 8 at least and 64 at most, spread evenly from the first second
+   to the last; a video under 64 seconds is sampled whole, as clips of a second side by side.
+   Where one CRF has to carry its worst stretch (`--scenes`, HDR, removed sections), clips
+   of 4 seconds, long enough to show a stretch: 8 of them up to about 17 minutes, then one
+   for every two minutes of video, 32 at most. `--samples` and `--sample-secs` set the
+   number and the length by hand; what they leave out follows the 4-second scheme, and the
+   search then goes by the samples as they are, whole-video check or not.
    A video whose first frame is not at zero (Matroska and MPEG-TS files can start late) is
    measured from where it starts; for a Matroska file that takes a look at its first and its
    last packets, a fraction of a second. Clips, and the chunks of a per-scene encode, are
@@ -298,8 +299,10 @@ For each file:
    short; the report says how much was encoded again for the mean, at what cost, and whether
    it stayed short. The scores foretell all this by imitating the repairs before any is
    made: if the mean could not be brought up within that quarter, or would end more than 0.5
-   above the target, the whole video is encoded once more at a CRF moved by the difference,
-   once per video. Windows left less than a point under the line after three
+   above the target while no more than a quarter of the video is to be encoded again below the
+   line, the whole video is encoded once more at a CRF moved by the difference, once per
+   video. (Half a point over the target is about 6% more file than it needs; the second encode
+   takes that off for up to twice the time on that video.) Windows left less than a point under the line after three
    rounds are kept and noted; stretches further short become
    samples of a second search (the worst sample two points above the line this time) and
    the video is encoded once more at the lower CRF it finds, which the report says; if that
@@ -398,9 +401,10 @@ pass, and the report says so):
 
 On a 60 s test clip mixing six kinds of footage, `--scenes` gave a 6% smaller file at identical
 full-length VMAF (93.07), with per-segment VMAF between 91.9 and 94.1 instead of 90.8 to 95.9.
-On a single continuous shot it gives no gain. It takes about 1.5-2x as long on short clips
+On a single continuous shot it gives no gain. It took about 1.5-2x as long on short clips
 and about 3x on real 15-minute recordings (six of them: 180 minutes where one pass was
-estimated at 58); `--workers 2` encodes two chunks at once (those two then share `--memory-limit`; every other ffmpeg run has all of it).
+estimated at 58), against a one pass that was not yet scored whole and repaired; against
+one that is, it is about 1.8 times, which is what `scan` starts from; `--workers 2` encodes two chunks at once (those two then share `--memory-limit`; every other ffmpeg run has all of it).
 
 `--scenes=auto` spends that time only where it buys something: on videos whose samples score
 far apart at one CRF (the worst one 4 VMAF or more below their mean), and one CRF for the
@@ -465,8 +469,9 @@ web UI files are queued in the order of the scan table. Trial encodes are rememb
 for the same file (path, size, date), sample clips, settings, ffmpeg build, SVT-AV1 version and way of measuring: an encode that
 was stopped or failed, or is run again with another container or `--min-savings`,
 starts from the scores it already has and often measures nothing new. Another target does so
-only with `--scenes`, HDR, removed sections or your own samples; in the usual case the scores
-are counted towards a mark that depends on the target, so they are measured again.
+only with `--scenes`, HDR, removed sections, your own samples or a source sent to spot checks;
+in the usual case the scores are counted towards a mark that depends on the target, so they
+are measured again.
 `--fresh-search`
 measures everything again. If two inputs would produce the same output name (same file name
 from two input folders), the second is reported as a name collision instead of being skipped.

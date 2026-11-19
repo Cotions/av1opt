@@ -586,8 +586,17 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
             list.len(), if list.len() == 1 { "" } else { "s" }, list.join(", "), sections::fmt_time(c.kept()), sections::fmt_time(info.duration_s)
         ));
     }
-    // Why scenes can't be encoded apart here, if they can't.
-    let one_pass = if cut.is_some() { Some("sections removed") } else { None };
+    // Why scenes can't be encoded apart here, if they can't. An encode's mastering display and
+    // light level reach the container through the encoder, and scenes are joined from bare
+    // streams, which have no place for them: the file would keep them only inside its video,
+    // where players that go by the container do not look.
+    let one_pass = if cut.is_some() {
+        Some("sections removed")
+    } else if info.hdr {
+        Some("an HDR video joined from scenes would lose its mastering data")
+    } else {
+        None
+    };
     if o.scenes == Scenes::Always && let Some(why) = one_pass {
         notes.push(format!("{why}: encoded in one pass instead of per scene"));
     }
@@ -669,7 +678,8 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     };
     if uneven {
         match (o.scenes, one_pass) {
-            (Scenes::Off, _) => notes.push(format!("{differs}; a CRF per scene (--scenes) would even it out")),
+            (Scenes::Off, None) => notes.push(format!("{differs}; a CRF per scene (--scenes) would even it out")),
+            (Scenes::Off, Some(_)) => notes.push(differs),
             (Scenes::Auto, None) => notes.push(format!("{differs}: each scene gets its own CRF")),
             (Scenes::Auto, Some(why)) => notes.push(format!("{differs}; {why}, so encoded in one pass all the same")),
             (Scenes::Always, _) => {}
@@ -1557,6 +1567,25 @@ fn check_layout(tools: &Tools, info: &MediaInfo, out: &Path, streams: &Streams, 
     Ok(out_info)
 }
 
+/// Refuses an HDR output whose container does not say what the source says of its mastering
+/// display and light level. The source can say it in its container or in its frames; players go
+/// by the output's container.
+fn check_hdr_data(tools: &Tools, input: &Path, info: &MediaInfo, out: &Path, out_info: &MediaInfo) -> Result<()> {
+    let source = match probe::hdr_data(&tools.ffprobe, input, info.video_index) {
+        Ok((container, frame)) => probe::HdrData { mastering: container.mastering.or(frame.mastering), light_level: container.light_level.or(frame.light_level) },
+        // It was read a moment ago; a hiccup here is no reason to throw the encode away.
+        Err(e) => {
+            eprintln!("warning: could not read the source's HDR data again, so the output's was not compared with it: {e:#}");
+            return Ok(());
+        }
+    };
+    let (kept, _) = probe::hdr_data(&tools.ffprobe, out, out_info.video_index)?;
+    if let Some(what) = source.not_kept_in(&kept) {
+        bail!("the finished video {what} of its source; {NOT_WRITTEN}");
+    }
+    Ok(())
+}
+
 /// How long a finished file is and how long it should be. The picture is what was encoded:
 /// the length of the container can come from a track that was not kept (image subtitles do
 /// not go into MP4) or be an estimate (TS, AVI). Where either file does not say how long its
@@ -1620,6 +1649,9 @@ fn verify(
     tmp: &Path,
 ) -> Result<(Vec<f64>, MediaInfo)> {
     let out_info = check_layout(tools, info, out, streams, expect_frames, cut)?;
+    if info.hdr {
+        check_hdr_data(tools, input, info, out, &out_info)?;
+    }
     let mut scores = Vec::new();
     let mut low = Vec::new();
     let floor = target_vmaf - VERIFY_SLACK;

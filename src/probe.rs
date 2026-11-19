@@ -303,6 +303,88 @@ pub fn run_ffprobe(command: Command, reads: Reads) -> Result<Output> {
     }
 }
 
+/// The mastering display of an HDR video, as ten numbers: the red, green, blue and white points
+/// (x and y each), then the lowest and highest brightness in nits.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MasteringDisplay([f64; 10]);
+
+/// What an HDR video says of its brightness besides its transfer function.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct HdrData {
+    pub mastering: Option<MasteringDisplay>,
+    /// Content light level: the brightest pixel and the brightest frame on average, in nits.
+    /// Zeros mean "not known", and count as nothing said.
+    pub light_level: Option<(u64, u64)>,
+}
+
+impl HdrData {
+    /// Read from a `side_data_list` of ffprobe. A mastering display given in part is left out:
+    /// MP4 has no way to store one, so it could not be asked of an output.
+    fn from_side_data(list: &Value) -> HdrData {
+        let mut data = HdrData::default();
+        for entry in list.as_array().into_iter().flatten() {
+            match entry["side_data_type"].as_str() {
+                Some("Mastering display metadata") => {
+                    let fields = ["red_x", "red_y", "green_x", "green_y", "blue_x", "blue_y", "white_point_x", "white_point_y", "min_luminance", "max_luminance"];
+                    let mut numbers = [0.0; 10];
+                    let all = fields.iter().zip(&mut numbers).all(|(field, number)| fraction(&entry[*field]).map(|n| *number = n).is_some());
+                    data.mastering = all.then_some(MasteringDisplay(numbers));
+                }
+                Some("Content light level metadata") => {
+                    let level = (entry["max_content"].as_u64().unwrap_or(0), entry["max_average"].as_u64().unwrap_or(0));
+                    data.light_level = (level != (0, 0)).then_some(level);
+                }
+                _ => {}
+            }
+        }
+        data
+    }
+
+    /// What this video says that `other` has lost or says differently, in words. The numbers are
+    /// stored differently by each format (MP4 in fixed steps, Matroska as decimals, AV1 itself
+    /// in powers of two), so they are compared to within what those steps can move them.
+    pub fn not_kept_in(&self, other: &HdrData) -> Option<&'static str> {
+        let same_display = |a: &MasteringDisplay, b: &MasteringDisplay| {
+            let colours = a.0[..8].iter().zip(&b.0[..8]).all(|(x, y)| (x - y).abs() <= 0.002);
+            let brightness = a.0[8..].iter().zip(&b.0[8..]).all(|(x, y)| (x - y).abs() <= 0.001 + x.abs() * 0.01);
+            colours && brightness
+        };
+        match (&self.mastering, &other.mastering) {
+            (Some(_), None) => return Some("lost the mastering display data"),
+            (Some(a), Some(b)) if !same_display(a, b) => return Some("has other mastering display data"),
+            _ => {}
+        }
+        match (self.light_level, other.light_level) {
+            (Some(_), None) => Some("lost the content light level"),
+            (Some(a), Some(b)) if a != b => Some("has another content light level"),
+            _ => None,
+        }
+    }
+}
+
+/// A number ffprobe writes as a fraction ("34000/50000"), or plainly.
+fn fraction(value: &Value) -> Option<f64> {
+    let text = value.as_str()?;
+    let number = match text.split_once('/') {
+        Some((top, bottom)) => top.parse::<f64>().ok()? / bottom.parse::<f64>().ok()?,
+        None => text.parse().ok()?,
+    };
+    number.is_finite().then_some(number)
+}
+
+/// The HDR data of stream `stream`: what its container says, and what its first frame says. A
+/// source can have it in either place, while a player goes by the container.
+pub fn hdr_data(ffprobe: &str, path: &Path, stream: usize) -> Result<(HdrData, HdrData)> {
+    let mut command = crate::tools::probe_command(ffprobe);
+    command.args(["-v", "error", "-select_streams", &stream.to_string(), "-read_intervals", "%+#1", "-show_streams", "-show_frames", "-of", "json"]).arg(crate::tools::probe_arg(path));
+    let out = run_ffprobe(command, Reads::Little)?;
+    if !out.status.success() {
+        bail!("ffprobe: {}", reason(&String::from_utf8_lossy(&out.stderr), path));
+    }
+    let j: Value = serde_json::from_slice(&out.stdout).context("ffprobe returned invalid JSON")?;
+    Ok((HdrData::from_side_data(&j["streams"][0]["side_data_list"]), HdrData::from_side_data(&j["frames"][0]["side_data_list"])))
+}
+
 pub fn probe(ffprobe: &str, path: &Path, file_size: u64) -> Result<MediaInfo> {
     probe_within(ffprobe, path, file_size, PROBE_LIMIT)
 }
@@ -638,6 +720,36 @@ mod tests {
 
     fn close(a: f64, b: f64, what: &str) {
         assert!((a - b).abs() < 0.05, "{what}: {a} where {b} was expected");
+    }
+
+    #[test]
+    fn hdr_data_counts_as_kept_only_when_it_is_there_and_the_same() {
+        let side = |max: &str, content: u64| {
+            serde_json::json!([
+                {"side_data_type": "Mastering display metadata", "red_x": "34000/50000", "red_y": "16000/50000", "green_x": "13250/50000", "green_y": "34500/50000",
+                 "blue_x": "7500/50000", "blue_y": "3000/50000", "white_point_x": "15635/50000", "white_point_y": "16450/50000", "min_luminance": "1/10000", "max_luminance": max},
+                {"side_data_type": "Content light level metadata", "max_content": content, "max_average": 400},
+            ])
+        };
+        let source = HdrData::from_side_data(&side("10000000/10000", 1000));
+        assert!(source.mastering.is_some());
+        assert_eq!(source.light_level, Some((1000, 400)));
+        assert_eq!(source.not_kept_in(&source), None);
+        // The same value as Matroska and AV1 write it.
+        assert_eq!(source.not_kept_in(&HdrData::from_side_data(&side("1000/1", 1000))), None);
+        assert_eq!(source.not_kept_in(&HdrData::from_side_data(&side("256000/256", 1000))), None);
+        // What a video joined from bare streams looked like: nothing in its container.
+        assert_eq!(source.not_kept_in(&HdrData::default()), Some("lost the mastering display data"));
+        assert_eq!(source.not_kept_in(&HdrData { light_level: None, ..source }), Some("lost the content light level"));
+        assert_eq!(source.not_kept_in(&HdrData::from_side_data(&side("4000/1", 1000))), Some("has other mastering display data"));
+        assert_eq!(source.not_kept_in(&HdrData::from_side_data(&side("1000/1", 4000))), Some("has another content light level"));
+        // A source with nothing to lose, or only "not known" or half a display, asks nothing.
+        assert_eq!(HdrData::default().not_kept_in(&HdrData::default()), None);
+        let empty = serde_json::json!([
+            {"side_data_type": "Content light level metadata", "max_content": 0, "max_average": 0},
+            {"side_data_type": "Mastering display metadata", "min_luminance": "1/10000", "max_luminance": "1000/1"},
+        ]);
+        assert_eq!(HdrData::from_side_data(&empty), HdrData::default());
     }
 
     #[test]

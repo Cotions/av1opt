@@ -193,7 +193,9 @@ For each file:
    smaller by less than `--min-savings`, it is kept with a note.
    HDR10 and HLG are encoded with their colour signalling
    and mastering/light-level metadata intact (VMAF is then measured on the HDR signal, which
-   tracks encoding damage but is not calibrated like SDR scores).
+   tracks encoding damage but is not calibrated like SDR scores). They are encoded in one
+   pass even with `--scenes`, with a note in the report: a video joined from scenes would
+   lose that metadata from its container.
 4. **Encode** – SVT-AV1, 10-bit, `--preset` 5 with `tune=0` unless `--svt-params` or `--tuned`
    say otherwise (see [bench](#bench)). Two parameters are added to whatever set is in
    use unless it names them itself: `keyint=10s` (a key frame every 10 seconds instead of
@@ -205,7 +207,9 @@ For each file:
    `--container mkv` to keep image subtitles too. Cover art is kept: JPEG and PNG in MP4 (as
    attached pictures), JPEG, PNG, BMP and WebP in MKV (as attachments with their original
    file names). A cover of another kind is dropped, with a note in the report.
-5. **Verify** – codec, duration, stream and cover counts, HDR transfer, and the picture.
+5. **Verify** – codec, duration, stream and cover counts, HDR transfer, mastering display
+   and light level (an output whose container lost what the source says of them is refused),
+   and the picture.
    A video encoded in one pass is scored against its source along its whole length (every
    third frame, each against the source frame of the same number), in stretches of five
    seconds a second apart. One CRF gives a video one quantizer, not one quality, so some
@@ -299,7 +303,8 @@ marked parts; Compare maps the cut output back onto the source.
 ### Per-scene CRF (`--scenes`)
 
 One CRF for a whole video spends too many bits on easy scenes and too few on hard ones. With
-`--scenes`, after the search above:
+`--scenes`, after the search above (HDR videos and videos with sections removed stay in one
+pass, and the report says so):
 
 1. Scene changes are detected (`scdet`) and the video is cut into chunks of 4-20 s (10 s for 4K)
    at scene boundaries, frame-exactly, as lossless constant-frame-rate references.

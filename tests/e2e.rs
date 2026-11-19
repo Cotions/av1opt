@@ -468,6 +468,27 @@ fn ten_bit_and_hdr_signalling_survive() {
 }
 
 #[test]
+#[ignore = "needs ffmpeg with libsvtav1, libvmaf and libx265"]
+fn an_hdr_video_keeps_its_mastering_data_when_scenes_are_asked_for() {
+    let c = Case::new("hdr-scenes");
+    c.ffmpeg(&[
+        "-f", "lavfi", "-i", "testsrc2=s=320x240:r=24:d=6", "-vf", "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc",
+        "-c:v", "libx265", "-preset", "ultrafast", "-crf", "14", "-pix_fmt", "yuv420p10le", "-tag:v", "hvc1",
+        "-x265-params", "log-level=error:hdr10=1:repeat-headers=1:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400",
+        "pq.mp4",
+    ]);
+    let src = c.videos().join("pq.mp4");
+    for container in ["mp4", "mkv"] {
+        let out = c.dir.join(format!("out-{container}"));
+        c.encode_into(&out, &[&src], &["--scenes=always", "--min-savings", "0", "--container", container]).ok().has("encoded in one pass instead of per scene");
+        let file = out.join(format!("pq.{container}"));
+        let side = serde_json::to_string(&streams(&probe(&file), "video")[0]["side_data_list"]).unwrap();
+        assert!(side.contains("Mastering display metadata") && side.contains("\"max_content\":1000") && side.contains("\"max_average\":400"), "{container}: {side}");
+        assert_eq!(c.report_in(&out, "pq")["mode"], "whole");
+    }
+}
+
+#[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn sound_tracks_are_copied_converted_or_shrunk() {
     let c = Case::new("audio");

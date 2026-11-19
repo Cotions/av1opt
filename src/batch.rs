@@ -409,6 +409,23 @@ fn clashes(jobs: &[Job], o: &Options) -> Vec<Option<Clash>> {
         .collect()
 }
 
+/// Why `--overwrite` may not replace the file at `output` with an encode of `input`, an
+/// absolute path. It is for encoding a file again: only the report beside an output says what
+/// that output is, and without one the file may be anybody's. (av1opt leaves no file of its own
+/// under an output's name without a report, except when a run dies in the moment between the
+/// two, and nothing tells that one from a stranger.)
+pub(crate) fn overwrite_refused(output: &Path, input: &Path) -> Option<String> {
+    let shown = output.display();
+    if !output.exists() {
+        return None;
+    }
+    match report_input(output) {
+        Some(made) if made.source == input => None,
+        Some(made) => Some(format!("--overwrite replaces only an encode of the same file, and {shown} was made from {}; move or delete it to encode this file there", made.source.display())),
+        None => Some(format!("--overwrite replaces only an encode of the same file, and {shown} has no report saying what it was made from; move or delete it if it may go")),
+    }
+}
+
 /// What to do with a job before any work on it.
 #[derive(Debug, PartialEq)]
 enum Before {
@@ -442,7 +459,10 @@ fn before_encoding(output: &Path, clash: Option<&Clash>, input: &Path, o: &Optio
         _ => {}
     }
     if !exists || o.overwrite {
-        return Before::Encode;
+        if let Some(why) = encode::report_of_another_output(output) {
+            return Before::Refuse(why);
+        }
+        return overwrite_refused(output, input).map_or(Before::Encode, Before::Refuse);
     }
     // Only a report says what an output was made from: the same file name can come from two
     // input folders, or be a file that has nothing to do with this run.
@@ -762,6 +782,59 @@ mod tests {
         let (sum, ends) = source.walk(&out.0, &options());
         assert_eq!((sum.already_done, sum.failed), (1, 0));
         assert_eq!(ends["c.mkv"].0, "done_before");
+    }
+
+    #[test]
+    fn overwrite_replaces_only_an_encode_of_the_same_file() {
+        let source = Folder::new("replace-in", &["c.mkv", "d.mkv"]);
+        let out = Folder::new("replace-out", &["c.mp4", "d.mp4"]);
+        let o = Options { overwrite: true, ..options() };
+        let report = |stem: &str, input: &Path| std::fs::write(out.0.join(format!("{stem}.av1opt.json")), serde_json::json!({"input": input, "output": out.0.join(format!("{stem}.mp4")), "source_bytes": 5}).to_string()).unwrap();
+        // Its own encode goes through to the encoder.
+        report("c", &source.0.join("c.mkv"));
+        report("d", Path::new("/elsewhere/d.mkv"));
+        let (sum, ends) = source.walk(&out.0, &o);
+        assert!(reached_the_encode(&ends["c.mkv"]), "{:?}", ends["c.mkv"]);
+        // The encode of another file is not this run's to replace.
+        let (status, detail) = &ends["d.mkv"];
+        assert_eq!(status, "error");
+        assert!(detail.contains("was made from /elsewhere/d.mkv") && detail.contains("d.mp4"), "{detail}");
+        assert_eq!(sum.failed, 2);
+        // Nor is a file nothing is known about.
+        std::fs::remove_file(out.0.join("d.av1opt.json")).unwrap();
+        let (_, ends) = source.walk(&out.0, &o);
+        assert!(ends["d.mkv"].1.contains("has no report"), "{:?}", ends["d.mkv"]);
+        std::fs::write(out.0.join("d.av1opt.json"), b"not json").unwrap();
+        let (_, ends) = source.walk(&out.0, &o);
+        assert!(ends["d.mkv"].1.contains("has no report"), "{:?}", ends["d.mkv"]);
+        assert_eq!(std::fs::read(out.0.join("d.mp4")).unwrap(), b"video");
+    }
+
+    #[test]
+    fn a_report_belonging_to_another_container_is_left_to_it() {
+        let source = Folder::new("container-in", &["x.mkv"]);
+        let out = Folder::new("container-out", &["x.mp4"]);
+        let report = out.0.join("x.av1opt.json");
+        let fields = serde_json::json!({"input": source.0.join("x.mkv"), "output": out.0.join("x.mp4"), "source_bytes": 5});
+        std::fs::write(&report, fields.to_string()).unwrap();
+        let mkv = || Options { container: encode::Container::Mkv, ..options() };
+        for o in [Options { overwrite: true, ..mkv() }, mkv()] {
+            let (sum, ends) = source.walk(&out.0, &o);
+            assert_eq!(sum.failed, 1);
+            let detail = &ends["x.mkv"].1;
+            assert!(detail.contains("x.av1opt.json") && detail.contains("x.mp4") && detail.contains("another output folder"), "{detail}");
+        }
+        assert_eq!(std::fs::read_to_string(&report).unwrap(), fields.to_string());
+        // Under its own name the output goes on as ever.
+        assert_eq!(source.walk(&out.0, &options()).1["x.mkv"].0, "done_before");
+        // A report whose output has gone, or that says where an original went, stands in
+        // nobody's way: the first is stale, and the second is set aside when the time comes.
+        std::fs::remove_file(out.0.join("x.mp4")).unwrap();
+        assert!(reached_the_encode(&source.walk(&out.0, &mkv()).1["x.mkv"]));
+        std::fs::write(out.0.join("x.mp4"), b"video").unwrap();
+        let replaced = serde_json::json!({"input": source.0.join("x.mkv"), "output": out.0.join("x.mp4"), "source_bytes": 5, "replaced": {"at": 1}});
+        std::fs::write(&report, replaced.to_string()).unwrap();
+        assert!(reached_the_encode(&source.walk(&out.0, &mkv()).1["x.mkv"]));
     }
 
     #[test]

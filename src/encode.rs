@@ -426,6 +426,26 @@ fn fits_beside_output(output: &Path, tmp: &Path) -> Result<()> {
     Ok(std::fs::remove_file(trial)?)
 }
 
+/// Why an encode may not end at `output`: the report it would write is that of an output of
+/// another name. `x.mp4` and `x.mkv` in one folder share `x.av1opt.json`, and the second would
+/// take the report from the first, which could then never be replaced. A report that says where
+/// an original went is exempt: it is kept under a name of its own when the new one is written.
+pub fn report_of_another_output(output: &Path) -> Option<String> {
+    let at = output.with_extension("av1opt.json");
+    let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&at).ok()?).ok()?;
+    if report.get("replaced").is_some_and(|v| !v.is_null()) {
+        return None;
+    }
+    let name = Path::new(report["output"].as_str()?).file_name()?;
+    let other = output.with_file_name(name);
+    (Some(name) != output.file_name() && other.exists()).then(|| {
+        format!(
+            "{} would need the report {}, which belongs to {}; choose another output folder, or remove {} and its report first",
+            output.display(), at.display(), other.display(), other.display()
+        )
+    })
+}
+
 /// Re-encodes one file into `out_dir`. Returns the output path.
 /// `may_write` is asked before folders are made: a job's output folder can be gone by then, and
 /// what is made in its place would land under the mount point of a drive.
@@ -913,7 +933,8 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
 
     // The place was free when the encode began, hours ago perhaps. A file that has turned up
     // there since is not this run's to write over: the encode is kept under another name.
-    if o.overwrite {
+    // Nor is one --overwrite would have refused at the start.
+    if o.overwrite && crate::batch::overwrite_refused(&output, &std::fs::canonicalize(input)?).is_none() {
         std::fs::rename(&partial, &output).or_else(|_| std::fs::copy(&partial, &output).map(|_| ()))?;
     } else if let Err(e) = crate::trash::rename_new(&partial, &output) {
         if e.kind() != std::io::ErrorKind::AlreadyExists {

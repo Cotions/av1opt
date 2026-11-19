@@ -268,6 +268,8 @@ enum Cmd {
         /// Encode even if already AV1 or below --min-savings.
         #[arg(long)]
         force: bool,
+        /// Encode again over an output already there, if its report says it was made from this
+        /// same file. Any other file of that name is refused and left as it is.
         #[arg(long)]
         overwrite: bool,
         /// Retry files an earlier run skipped (low savings, unreachable target, ...).

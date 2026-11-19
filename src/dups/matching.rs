@@ -44,6 +44,8 @@ pub struct Fingerprint {
     pub middle: Vec<Frame>,
     /// Seconds one frame lasts, 0 when unknown.
     pub frame_s: f64,
+    /// Shares of the width and of the height that are picture rather than black bars.
+    pub picture: (f32, f32),
     /// A frame was given up on because ffmpeg took too long, which says nothing lasting about
     /// the file: such a fingerprint is used once and not remembered.
     #[serde(skip)]
@@ -205,14 +207,17 @@ pub struct Media {
     pub path: PathBuf,
     pub size: u64,
     pub codec: String,
-    pub width: u32,
-    pub height: u32,
     pub duration_s: f64,
     pub video_bitrate: f64,
     /// Files with the same number here have the same bytes (as far as sampled).
     pub identical: Option<u32>,
     /// Frames of it could not be read: see [`Fingerprint::damaged`].
     pub damaged: bool,
+    pub sound_tracks: u32,
+    pub subtitle_tracks: u32,
+    /// The size of the picture inside any black bars, in pixels of the file.
+    pub picture_width: u32,
+    pub picture_height: u32,
 }
 
 /// Where the user would rather keep files, and where never.
@@ -257,11 +262,48 @@ pub struct Group {
     pub members: Vec<usize>,
     /// Why the first member is the suggested one to keep.
     pub reason: String,
+    /// What sets the other copies of one video apart from the first, in words.
+    pub differences: Vec<String>,
+    /// A person should look before any copy goes: another copy holds tracks the first lacks,
+    /// or the first is damaged itself. Such copies are not offered as spare.
+    pub look_first: bool,
 }
 
-/// Picks the copy to keep: never a damaged one if there is a whole one, nor one in an avoided
-/// place if there is another, then the highest resolution, then the most bitrate for its codec,
-/// then the preferred folder. Returns its position in `members` and the reason.
+/// What sets the others of `members` apart from the first, and whether that means a person
+/// should look before anything goes.
+fn differences(members: &[usize], media: &[Media]) -> (Vec<String>, bool) {
+    let name = |m: &Media| m.path.file_name().map_or_else(|| m.path.display().to_string(), |n| n.to_string_lossy().into_owned());
+    let keep = &media[members[0]];
+    let (mut said, mut look) = (Vec::new(), keep.damaged);
+    if keep.damaged {
+        said.push(format!("{} is damaged or incomplete, like every copy here", name(keep)));
+    }
+    for other in members[1..].iter().map(|&i| &media[i]) {
+        if other.damaged && !keep.damaged {
+            said.push(format!("{} is damaged or incomplete", name(other)));
+        }
+        for (what, theirs, ours) in [("sound tracks", other.sound_tracks, keep.sound_tracks), ("subtitle tracks", other.subtitle_tracks, keep.subtitle_tracks)] {
+            if theirs != ours {
+                said.push(format!("{} has {theirs} {what}, the suggested copy {ours}", name(other)));
+                look |= theirs > ours;
+            }
+        }
+        let pixels = |m: &Media| f64::from(m.picture_width) * f64::from(m.picture_height);
+        if pixels(other) < pixels(keep) * SAME_RESOLUTION || pixels(keep) < pixels(other) * SAME_RESOLUTION {
+            said.push(format!("{} shows {}x{} inside any black bars, the suggested copy {}x{}", name(other), other.picture_width, other.picture_height, keep.picture_width, keep.picture_height));
+        }
+    }
+    (said, look)
+}
+
+/// Pictures with at least this share of the most pixels count as equally sharp.
+const SAME_RESOLUTION: f64 = 0.9;
+
+/// Picks the copy to keep: never a damaged one if there is a whole one. Of copies of one whole
+/// video, then the one with the most sound and subtitle tracks, which cannot be got back from
+/// the others. Then not one in an avoided place if there is another, the longest of cut copies,
+/// the highest resolution inside any black bars, the most bitrate for its codec, the preferred
+/// folder. Returns its position in `members` and the reason.
 pub fn choose(members: &[usize], media: &[Media], prefs: &Prefs, kind: Kind) -> (usize, String) {
     let m = |i: usize| &media[members[i]];
     let mut cand: Vec<usize> = (0..members.len()).collect();
@@ -275,15 +317,22 @@ pub fn choose(members: &[usize], media: &[Media], prefs: &Prefs, kind: Kind) -> 
     };
     // Before anything else: a higher resolution is worth nothing in a file that breaks off.
     narrow(&mut cand, "the others are damaged or incomplete", &|i| !m(i).damaged);
+    if kind == Kind::Same {
+        let most = cand.iter().map(|&i| m(i).sound_tracks).max().unwrap_or(0);
+        narrow(&mut cand, "most sound tracks", &|i| m(i).sound_tracks == most);
+        let most = cand.iter().map(|&i| m(i).subtitle_tracks).max().unwrap_or(0);
+        narrow(&mut cand, "most subtitle tracks", &|i| m(i).subtitle_tracks == most);
+    }
     narrow(&mut cand, "not in an avoided place", &|i| !prefs.avoided(&m(i).path));
     if kind != Kind::Same {
         // Different lengths: the longer one holds everything the shorter one does.
         let longest = cand.iter().map(|&i| m(i).duration_s).fold(0.0, f64::max);
         narrow(&mut cand, "longest", &|i| m(i).duration_s >= longest - 1.0);
     }
-    let pixels = |i: usize| m(i).width as f64 * m(i).height as f64;
+    // Measured inside black bars: bars added by a re-encode make a file bigger, not sharper.
+    let pixels = |i: usize| f64::from(m(i).picture_width) * f64::from(m(i).picture_height);
     let most = cand.iter().map(|&i| pixels(i)).fold(0.0, f64::max);
-    narrow(&mut cand, "highest resolution", &|i| pixels(i) >= most * 0.9);
+    narrow(&mut cand, "highest resolution", &|i| pixels(i) >= most * SAME_RESOLUTION);
     let quality = |i: usize| m(i).video_bitrate * codec_efficiency(&m(i).codec);
     let best = cand.iter().map(|&i| quality(i)).fold(0.0, f64::max);
     narrow(&mut cand, "highest bitrate for its codec", &|i| quality(i) >= best * 0.85);
@@ -335,7 +384,9 @@ pub fn groups(links: &[Link], media: &[Media], prefs: &Prefs) -> Vec<Group> {
         let (keep, reason) = choose(&members, media, prefs, kind);
         members.swap(0, keep);
         members[1..].sort_by(|&a, &b| media[a].path.cmp(&media[b].path));
-        Group { kind, score, members, reason }
+        // Videos that only share a start or an end are not copies of each other.
+        let (differences, look_first) = if kind == Kind::Same { differences(&members, media) } else { (Vec::new(), false) };
+        Group { kind, score, members, reason, differences, look_first }
     };
     let mut out: Vec<Group> = same
         .iter()
@@ -388,7 +439,7 @@ mod tests {
     }
 
     fn media(path: &str, w: u32, h: u32, codec: &str, mbps: f64, size: u64) -> Media {
-        Media { path: path.into(), size, codec: codec.into(), width: w, height: h, duration_s: 600.0, video_bitrate: mbps * 1e6, identical: None, damaged: false }
+        Media { path: path.into(), size, codec: codec.into(), duration_s: 600.0, video_bitrate: mbps * 1e6, identical: None, damaged: false, sound_tracks: 0, subtitle_tracks: 0, picture_width: w, picture_height: h }
     }
 
     #[test]
@@ -698,6 +749,59 @@ mod tests {
         let mut flat_end = whole.clone();
         flat_end.tail.fill(Frame::Flat);
         assert_eq!(compare(600.0, &whole, 600.0, &flat_end, 10).map(|r| r.0), Some(Kind::SameStart));
+    }
+
+    #[test]
+    fn a_copy_with_more_tracks_is_kept_over_a_sharper_one_and_the_rest_is_left_to_a_person() {
+        let mut m = vec![media("/v/sharp.mkv", 1920, 1080, "h264", 8.0, 900), media("/v/full.mkv", 1280, 720, "h264", 2.0, 300)];
+        m[1].sound_tracks = 2;
+        m[0].sound_tracks = 1;
+        assert_eq!(pick(&m, &Prefs::default(), Kind::Same), (1, "most sound tracks".to_string()));
+        let g = groups(&[link(0, 1, Kind::Same, 1.0)], &m, &Prefs::default());
+        // The sharper copy lacks nothing the kept one has, so it is an ordinary spare.
+        assert_eq!((g[0].members.clone(), g[0].look_first), (vec![1, 0], false));
+        assert!(g[0].differences.iter().any(|d| d == "sharp.mkv has 1 sound tracks, the suggested copy 2"), "{:?}", g[0].differences);
+        assert!(g[0].differences.iter().any(|d| d.contains("sharp.mkv shows 1920x1080")), "{:?}", g[0].differences);
+
+        // Each holds what the other lacks: one is suggested, and neither is offered as spare.
+        m[0].subtitle_tracks = 3;
+        let g = groups(&[link(0, 1, Kind::Same, 1.0)], &m, &Prefs::default());
+        assert_eq!(g[0].members[0], 1);
+        assert!(g[0].look_first);
+        assert!(g[0].differences.iter().any(|d| d == "sharp.mkv has 3 subtitle tracks, the suggested copy 0"), "{:?}", g[0].differences);
+
+        // Tracks decide between copies of one video only: of cut copies the longer comes first.
+        m[0].duration_s = 7200.0;
+        assert_eq!(pick(&m, &Prefs::default(), Kind::SameStart).0, 0);
+        let g = groups(&[link(0, 1, Kind::SameStart, 1.0)], &m, &Prefs::default());
+        assert!(g[0].differences.is_empty() && !g[0].look_first);
+    }
+
+    #[test]
+    fn a_damaged_copy_left_as_the_only_choice_is_not_trusted_either() {
+        let mut m = numbered(&[5, 4]);
+        m[0].damaged = true;
+        m[1].damaged = true;
+        let g = groups(&[link(0, 1, Kind::Same, 1.0)], &m, &Prefs::default());
+        assert!(g[0].look_first);
+        m[1].damaged = false;
+        let g = groups(&[link(0, 1, Kind::Same, 1.0)], &m, &Prefs::default());
+        assert_eq!((g[0].members[0], g[0].look_first), (1, false));
+        assert_eq!(g[0].differences, ["0.mp4 is damaged or incomplete"]);
+    }
+
+    #[test]
+    fn black_bars_do_not_count_as_resolution() {
+        // A letterboxed re-encode of a 640x272 film in a 640x480 frame holds the same picture.
+        let mut m = vec![media("/v/boxed.mkv", 640, 480, "h264", 4.0, 900), media("/v/film.mkv", 640, 272, "h264", 4.0, 300)];
+        m[0].picture_height = 272;
+        let g = groups(&[link(0, 1, Kind::Same, 1.0)], &m, &Prefs::default());
+        assert_eq!(g[0].reason, "largest file");
+        m[0].size = 100;
+        assert_eq!(groups(&[link(0, 1, Kind::Same, 1.0)], &m, &Prefs::default())[0].members[0], 1);
+        // Inside its bars a bigger picture is still the bigger picture.
+        m[0].picture_height = 400;
+        assert_eq!(pick(&m, &Prefs::default(), Kind::Same), (0, "highest resolution".to_string()));
     }
 
     #[test]

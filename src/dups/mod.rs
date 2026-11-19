@@ -57,6 +57,11 @@ pub struct File {
     pub identical: Option<u32>,
     /// Frames of it could not be read: it is damaged, or ends before its stated length.
     pub damaged: bool,
+    pub sound_tracks: u32,
+    pub subtitle_tracks: u32,
+    /// The size of the picture inside any black bars.
+    pub picture_width: u32,
+    pub picture_height: u32,
     /// Modification time (seconds since 1970) the search saw, for [`File::unchanged`].
     #[serde(skip)]
     #[cfg_attr(not(feature = "ui"), allow(dead_code))]
@@ -95,7 +100,8 @@ pub struct Stats {
     pub fresh: usize,
     pub same_groups: usize,
     pub partial_groups: usize,
-    /// Files that are a spare copy in a whole-video group, and their total size.
+    /// Files that are a spare copy in a whole-video group, and their total size. Groups a
+    /// person should look at first are not counted.
     pub spare_files: usize,
     pub spare_bytes: u64,
     /// Videos left out because their paths are not text.
@@ -227,7 +233,9 @@ pub fn fingerprint(tools: &Tools, path: &Path, info: &MediaInfo) -> Result<Finge
     let (head, rest) = hashes.split_at(lad.len());
     let (tail, middle) = rest.split_at(lad.len());
     let frame_s = if info.fps > 0.0 { 1.0 / info.fps } else { 0.0 };
-    Ok(Fingerprint { head: head.to_vec(), tail: tail.to_vec(), middle: middle.to_vec(), frame_s, out_of_time })
+    let share = |from: usize, to: usize| (to - from) as f32 / THUMB as f32;
+    let picture = (share(bounds.x0, bounds.x1), share(bounds.y0, bounds.y1));
+    Ok(Fingerprint { head: head.to_vec(), tail: tail.to_vec(), middle: middle.to_vec(), frame_s, picture, out_of_time })
 }
 
 /// How much of a file's start, middle and end is compared.
@@ -356,12 +364,14 @@ pub fn find(paths: &[PathBuf], tools: &Tools, o: &Options, progress: &(dyn Fn(Pr
                     path: f.path.clone(),
                     size: f.size,
                     codec: info.codec.clone(),
-                    width: info.width,
-                    height: info.height,
                     duration_s: info.duration_s,
                     video_bitrate: info.video_bitrate,
                     identical: None,
                     damaged: fp.damaged(),
+                    sound_tracks: info.audio_streams,
+                    subtitle_tracks: info.subtitle_streams,
+                    picture_width: (info.width as f32 * fp.picture.0).round() as u32,
+                    picture_height: (info.height as f32 * fp.picture.1).round() as u32,
                 });
                 kept.push((f, info, fp));
             }
@@ -398,6 +408,10 @@ pub fn find(paths: &[PathBuf], tools: &Tools, o: &Options, progress: &(dyn Fn(Pr
                     video_mbps: info.video_bitrate / 1e6,
                     identical: media[*m].identical,
                     damaged: media[*m].damaged,
+                    sound_tracks: media[*m].sound_tracks,
+                    subtitle_tracks: media[*m].subtitle_tracks,
+                    picture_width: media[*m].picture_width,
+                    picture_height: media[*m].picture_height,
                     modified: f.mtime,
                     digest: None,
                 });
@@ -407,19 +421,18 @@ pub fn find(paths: &[PathBuf], tools: &Tools, o: &Options, progress: &(dyn Fn(Pr
     }
     // What the page checks again before it moves anything; only files in a group are read.
     pool.install(|| files.par_iter_mut().for_each(|f| f.digest = crate::files::sample_digest(&f.path, f.size, IDENTICAL_SAMPLE).ok()));
-    let same: Vec<&Group> = groups.iter().filter(|g| g.kind == Kind::Same).collect();
-    let stats = Stats {
-        videos: found.len(),
-        compared: kept.len(),
-        fresh: fresh.load(Ordering::Relaxed),
-        same_groups: same.len(),
-        partial_groups: groups.len() - same.len(),
-        spare_files: same.iter().map(|g| g.members.len() - 1).sum(),
-        spare_bytes: same.iter().flat_map(|g| &g.members[1..]).map(|&i| files[i].size).sum(),
-        not_text,
-    };
+    let same = groups.iter().filter(|g| g.kind == Kind::Same).count();
+    let (spare_files, spare_bytes) = spare_copies(&groups, &files);
+    let stats = Stats { videos: found.len(), compared: kept.len(), fresh: fresh.load(Ordering::Relaxed), same_groups: same, partial_groups: groups.len() - same, spare_files, spare_bytes, not_text };
     unreadable.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(Report { files, groups, unreadable, stats })
+}
+
+/// How many files can go without a second thought, and their total size: the copies other than
+/// the first in groups of one whole video, unless a person should look at the group first.
+fn spare_copies(groups: &[Group], files: &[File]) -> (usize, u64) {
+    let spares: Vec<&File> = groups.iter().filter(|g| g.kind == Kind::Same && !g.look_first).flat_map(|g| &g.members[1..]).map(|&i| &files[i]).collect();
+    (spares.len(), spares.iter().map(|f| f.size).sum())
 }
 
 pub fn kind_label(k: Kind) -> &'static str {
@@ -474,6 +487,12 @@ pub fn print(r: &Report, top: usize) {
         if g.kind == Kind::Same && !g.reason.is_empty() {
             println!("  keep because: {}", g.reason);
         }
+        for difference in &g.differences {
+            println!("  {difference}");
+        }
+        if g.look_first {
+            println!("  look before removing any of these: none is counted as spare");
+        }
     }
     if r.groups.len() > top {
         println!("\n... and {} more groups (--top N shows more; --csv / --json list all)", r.groups.len() - top);
@@ -484,11 +503,13 @@ pub fn print(r: &Report, top: usize) {
 /// What a member of a group is called in the listing and the CSV. Only copies of one whole
 /// video have one to keep and others to spare; videos that share a beginning or an ending
 /// are different videos, told apart by length, and none of them is called spare (a list
-/// acted on by its "spare" rows would delete a video that exists nowhere else).
+/// acted on by its "spare" rows would delete a video that exists nowhere else). The same goes
+/// for a copy holding tracks the suggested one lacks.
 fn role(r: &Report, g: &Group, k: usize) -> &'static str {
     let secs = |i: usize| r.files[i].duration_s;
     match g.kind {
         Kind::Same if k == 0 => "keep",
+        Kind::Same if g.look_first => "look",
         Kind::Same => "spare",
         _ if g.members.iter().all(|&i| secs(i) <= secs(g.members[k])) => "long",
         _ => "short",
@@ -510,7 +531,7 @@ pub fn write_csv(r: &Report, path: &Path, given: &[PathBuf]) -> Result<()> {
                 kind_label(g.kind).to_string(),
                 format!("{:.2}", g.score),
                 role(r, g, k).to_string(),
-                if k == 0 { g.reason.clone() } else { String::new() },
+                if k == 0 { std::iter::once(&g.reason).chain(&g.differences).filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join("; ") } else { String::new() },
                 f.path.display().to_string(),
                 f.size.to_string(),
                 f.codec.clone(),
@@ -557,7 +578,7 @@ mod tests {
         assert_ne!(sample_digest(&a, size), sample_digest(&c, size));
         assert!(sample_digest(&d, 4).is_some());
 
-        let m = |p: &Path, size: u64| Media { path: p.into(), size, codec: "h264".into(), width: 1, height: 1, duration_s: 1.0, video_bitrate: 1.0, identical: None, damaged: false };
+        let m = |p: &Path, size: u64| Media { path: p.into(), size, codec: "h264".into(), duration_s: 1.0, video_bitrate: 1.0, identical: None, damaged: false, sound_tracks: 0, subtitle_tracks: 0, picture_width: 1, picture_height: 1 };
         let mut media = vec![m(&a, size), m(&b, size), m(&c, size), m(&d, 4)];
         mark_identical(&mut media, &[0, 1, 2, 3]);
         assert_eq!(media.iter().map(|x| x.identical).collect::<Vec<_>>(), vec![Some(0), Some(0), None, None]);
@@ -577,10 +598,14 @@ mod tests {
             video_mbps: 1.5,
             identical: (i == 0).then_some(4),
             damaged: false,
+            sound_tracks: 1,
+            subtitle_tracks: 0,
+            picture_width: 640,
+            picture_height: 360,
             modified: 0,
             digest: None,
         };
-        let g = Group { kind, score: 0.875, members: (0..secs.len()).collect(), reason: "largest file".into() };
+        let g = Group { kind, score: 0.875, members: (0..secs.len()).collect(), reason: "largest file".into(), differences: Vec::new(), look_first: false };
         let r = Report { files: secs.iter().enumerate().map(|(i, &d)| file(i, d)).collect(), groups: vec![g.clone()], ..Default::default() };
         (r, g)
     }
@@ -596,6 +621,16 @@ mod tests {
             let (r, g) = report(kind, &[10.0, 10.0]);
             assert_eq!((0..2).map(|k| role(&r, &g, k)).collect::<Vec<_>>(), ["long", "long"]);
         }
+    }
+
+    #[test]
+    fn copies_a_person_should_look_at_are_not_called_spare_or_counted() {
+        let (mut r, mut g) = report(Kind::Same, &[10.0, 10.0, 10.0]);
+        assert_eq!(spare_copies(&r.groups, &r.files), (2, 2003));
+        g.look_first = true;
+        r.groups[0].look_first = true;
+        assert_eq!((0..3).map(|k| role(&r, &g, k)).collect::<Vec<_>>(), ["keep", "look", "look"]);
+        assert_eq!(spare_copies(&r.groups, &r.files), (0, 0));
     }
 
     #[test]
@@ -648,7 +683,7 @@ mod tests {
             p
         };
         let (a, b, c, d) = (write("a", b"aaaa"), write("b", b"aaaa"), write("c", b"cccccc"), write("d", b"cccccc"));
-        let m = |p: &Path, size: u64| Media { path: p.into(), size, codec: "h264".into(), width: 1, height: 1, duration_s: 1.0, video_bitrate: 1.0, identical: None, damaged: false };
+        let m = |p: &Path, size: u64| Media { path: p.into(), size, codec: "h264".into(), duration_s: 1.0, video_bitrate: 1.0, identical: None, damaged: false, sound_tracks: 0, subtitle_tracks: 0, picture_width: 1, picture_height: 1 };
         let mut media = vec![m(&c, 6), m(&a, 4), m(&d, 6), m(&b, 4), m(&dir.join("gone"), 4)];
         // Each set gets its own number, the smaller size first; a file that cannot be read has none.
         mark_identical(&mut media, &[0, 1, 2, 3, 4]);

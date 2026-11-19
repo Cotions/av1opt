@@ -411,7 +411,7 @@ mod tests {
     use crate::dups::matching::{Group, Kind};
 
     fn file(name: &str) -> File {
-        File { path: PathBuf::from(name), root: PathBuf::from("/"), size: 10, codec: "h264".into(), width: 1280, height: 720, fps: 30.0, duration_s: 60.0, video_mbps: 2.0, identical: None, damaged: false, modified: 0, digest: None }
+        File { path: PathBuf::from(name), root: PathBuf::from("/"), size: 10, codec: "h264".into(), width: 1280, height: 720, fps: 30.0, duration_s: 60.0, video_mbps: 2.0, identical: None, damaged: false, sound_tracks: 1, subtitle_tracks: 0, picture_width: 1280, picture_height: 720, modified: 0, digest: None }
     }
 
     /// A file on disk, as a search that ended now would describe it.
@@ -437,7 +437,7 @@ mod tests {
     fn pair_report(paths: &[PathBuf]) -> Report {
         Report {
             files: paths.iter().map(|p| seen(p)).collect(),
-            groups: vec![Group { kind: Kind::Same, score: 1.0, members: (0..paths.len()).collect(), reason: String::new() }],
+            groups: vec![Group { kind: Kind::Same, score: 1.0, members: (0..paths.len()).collect(), reason: String::new(), differences: Vec::new(), look_first: false }],
             ..Default::default()
         }
     }
@@ -501,7 +501,7 @@ mod tests {
     fn one_changed_file_does_not_stop_the_others() {
         let (dir, p) = library("some", &["a.mkv", "b.mkv", "c.mkv", "d.mkv"]);
         let mut report = pair_report(&p);
-        report.groups = vec![Group { kind: Kind::Same, score: 1.0, members: vec![0, 1], reason: String::new() }, Group { kind: Kind::Same, score: 1.0, members: vec![2, 3], reason: String::new() }];
+        report.groups = vec![Group { kind: Kind::Same, score: 1.0, members: vec![0, 1], reason: String::new(), differences: Vec::new(), look_first: false }, Group { kind: Kind::Same, score: 1.0, members: vec![2, 3], reason: String::new(), differences: Vec::new(), look_first: false }];
         std::fs::write(&p[1], "another file altogether").unwrap();
         let moved = move_all(&report, &[p[1].clone(), p[3].clone()]);
         assert_eq!(moved.trashed, [p[3].clone()]);
@@ -532,7 +532,7 @@ mod tests {
         // Where it cannot go back the message says where it is.
         let report = pair_report(&[spare.clone()]);
         std::fs::write(keep, "again").unwrap();
-        let report = Report { files: vec![seen(keep), report.files[0].clone()], groups: vec![Group { kind: Kind::Same, score: 1.0, members: vec![0, 1], reason: String::new() }], ..Default::default() };
+        let report = Report { files: vec![seen(keep), report.files[0].clone()], groups: vec![Group { kind: Kind::Same, score: 1.0, members: vec![0, 1], reason: String::new(), differences: Vec::new(), look_first: false }], ..Default::default() };
         let moved = move_marked(&report, &HashSet::new(), std::slice::from_ref(spare), &File::unchanged, &|path| {
             let dest = crate::trash::trash(path)?;
             std::fs::remove_file(keep).unwrap();
@@ -569,7 +569,7 @@ mod tests {
         crate::trash::TEST_HOME_TRASH.with(|h| *h.borrow_mut() = Some(PathBuf::from("/data/Trash")));
         let report = |names: &[&str]| Report {
             files: names.iter().map(|n| file(n)).collect(),
-            groups: vec![Group { kind: Kind::Same, score: 1.0, members: (0..names.len()).collect(), reason: String::new() }],
+            groups: vec![Group { kind: Kind::Same, score: 1.0, members: (0..names.len()).collect(), reason: String::new(), differences: Vec::new(), look_first: false }],
             ..Default::default()
         };
         let live = PathBuf::from("/lib/only.mkv");
@@ -589,8 +589,8 @@ mod tests {
         let report = Report {
             files: vec![file("/a/1.mkv"), file("/b/1.mp4"), file("/c/1.webm"), file("/a/2.mkv"), file("/b/2.mkv")],
             groups: vec![
-                Group { kind: Kind::Same, score: 1.0, members: vec![0, 1, 2], reason: String::new() },
-                Group { kind: Kind::SameStart, score: 1.0, members: vec![3, 4], reason: String::new() },
+                Group { kind: Kind::Same, score: 1.0, members: vec![0, 1, 2], reason: String::new(), differences: Vec::new(), look_first: false },
+                Group { kind: Kind::SameStart, score: 1.0, members: vec![3, 4], reason: String::new(), differences: Vec::new(), look_first: false },
             ],
             ..Default::default()
         };

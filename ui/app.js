@@ -1170,7 +1170,8 @@ function renderDups(out, run, reload) {
   for (const p of gone) dupMarks.delete(p);
   const groups = rep.groups.map((g) => ({ ...g, members: g.members.filter((i) => !gone.has(files[i].path)), keepGone: gone.has(files[g.members[0]].path) }))
     .filter((g) => g.members.length > 1);
-  const spares = groups.filter((g) => g.kind === "same").flatMap((g) => g.members.slice(1));
+  // A group that needs a look first has no spare copies to count or to mark in one go.
+  const spares = groups.filter((g) => g.kind === "same" && !g.look_first).flatMap((g) => g.members.slice(1));
   const s = gone.size ? {
     same_groups: groups.filter((g) => g.kind === "same").length, partial_groups: groups.filter((g) => g.kind !== "same").length,
     spare_files: spares.length, spare_bytes: spares.reduce((a, i) => a + files[i].size, 0),
@@ -1249,7 +1250,7 @@ function renderDups(out, run, reload) {
     // of the shortest, because videos that share an opening look alike at its start.
     const at = Math.min(...members.map((m) => m.duration_s)) * 0.5;
     const thumbAt = (m) => (g.kind === "same_end" ? Math.max(0, m.duration_s - at) : at);
-    const spare = g.kind === "same" ? members.slice(1).reduce((a, m) => a + m.size, 0) : 0;
+    const spare = g.kind === "same" && !g.look_first ? members.slice(1).reduce((a, m) => a + m.size, 0) : 0;
     const allMarked = h("span", { class: "bad", hidden: true }, "Every copy is marked: nothing would be left");
     const sync = () => { allMarked.hidden = !members.every((m) => dupMarks.has(m.path)); };
     const rows = members.map((m, k) => {
@@ -1271,7 +1272,7 @@ function renderDups(out, run, reload) {
       row.append(...[cb, img,
         h("div", { class: "dup-info" },
           h("div", { class: "name", title: m.path }, h("span", { class: "dim" }, dirname(m.path) + "/"), basename(m.path)),
-          h("div", { class: "dim" }, `${m.codec} · ${m.width}×${m.height} · ${num(m.video_mbps, 1)} Mbps · ${hms(m.duration_s)} · ${bytes(m.size)}`)),
+          h("div", { class: "dim" }, `${m.codec} · ${m.width}×${m.height}${m.picture_width !== m.width || m.picture_height !== m.height ? ` (picture ${m.picture_width}×${m.picture_height})` : ""} · ${num(m.video_mbps, 1)} Mbps · ${hms(m.duration_s)} · ${bytes(m.size)} · ${plural(m.sound_tracks, "sound track")}${m.subtitle_tracks ? ` · ${plural(m.subtitle_tracks, "subtitle track")}` : ""}`)),
         g.kind === "same" && k === 0 && !g.keepGone ? h("span", { class: "pill ok", title: g.reason }, "Suggested keep") : null,
         longer ? h("span", { class: "pill ok", title: k === 0 ? g.reason : "The longest of these copies" }, "Longer") : null,
         m.identical != null ? h("span", { class: "pill", title: "Same size and the same bytes at the start, middle and end" }, "Identical bytes") : null,
@@ -1284,6 +1285,8 @@ function renderDups(out, run, reload) {
       h("div", { class: "head" }, h("span", { class: "pill " + cls }, label), h("span", {}, `${pct(g.score)} of the compared frames match`),
         g.kind === "same" && g.reason && !g.keepGone ? h("span", { class: "dim" }, `keep: ${g.reason}`) : null, allMarked,
         h("span", { class: "spacer" }), spare ? h("span", { class: "ok" }, `frees ${bytes(spare)}`) : null),
+      g.look_first ? h("div", { class: "warn" }, "Look before removing any of these: they are not marked as spare copies") : null,
+      (g.differences || []).map((d) => h("div", { class: "dim" }, d)),
       rows);
   };
   const draw = () => {
@@ -1297,7 +1300,7 @@ function renderDups(out, run, reload) {
     h("option", { value: "same" }, `Same video (${s.same_groups})`), h("option", { value: "partial" }, `Same start or ending (${s.partial_groups})`), h("option", { value: "all" }, "All groups"));
   filt.value = filter;
   const markSpares = h("button", { title: "Marks every copy except the suggested one, in the groups of the same video", onclick: () => {
-    for (const g of groups) if (g.kind === "same") for (const i of g.members.slice(1)) dupMarks.add(files[i].path);
+    for (const g of groups) if (g.kind === "same" && !g.look_first) for (const i of g.members.slice(1)) dupMarks.add(files[i].path);
     draw();
   } }, "Mark all spare copies");
 

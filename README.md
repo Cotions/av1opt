@@ -464,6 +464,17 @@ single output files.
 - A report is a file like any other, so it is only followed where `encode` writes one: next
   to its output, under the output's name. Both files it names have to be videos. A report
   that turns up in some other folder and points at files elsewhere moves nothing.
+- av1opt keeps a private record of what it made and moved, `ledger.jsonl` in its data folder
+  (`~/.local/share/av1opt`, for your user only): a line for each finished encode (output, report,
+  original, what tells the original from another file, a SHA-256 of the output) and for each
+  replacement and undo. A report on record is followed wherever its original is, because the
+  record vouches for that path. Any other report is followed only to originals inside the folders
+  you name, so name the originals' folder as well or add `--anywhere`.
+- `av1opt adopt FOLDER... [--apply]` takes outputs that are not on record, such as those made
+  before it began, onto it. It lists what it would add and writes only with `--apply`, and only to
+  the record. Naming a folder says that you trust the reports in it; a report whose output or
+  original fails the checks above is refused, and an output that already replaced its original
+  is taken too if the original is still in the trash. Nothing is adopted without this command.
 - Nothing is deleted and no file is written over. The original goes to the trash of the drive
   it is on (as in the duplicates view), and the space is freed when you empty the trash. If the
   output can't be put in place after that, the original is taken back out of the trash. An
@@ -581,7 +592,9 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
   **Replace originals…** lists the outputs that can take their original's place (the rules of
   `replace` above), all ticked; it works through the ticked ones one by one and keeps the ones
   that failed on screen with the reason. Replaced encodes carry a "replaced" mark. An original
-  that is still in the encode queue is refused.
+  that is still in the encode queue is refused. The page acts only on outputs in av1opt's private
+  record (see `replace`). Others are marked "not made here" until `av1opt adopt` has been run on
+  their folder in a terminal.
 
 The server listens on 127.0.0.1 only, on a free port unless `--port` names one, and prints its
 address and a sign-in link with a random token (the browser

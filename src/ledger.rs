@@ -253,6 +253,12 @@ impl Ledger {
         self.problem.as_deref()
     }
 
+    /// Whether the record speaks for this output and this original, so that the report's word
+    /// is not needed for where the original is. All of the output is compared before it moves.
+    pub fn vouches_for(&self, p: &Plan) -> bool {
+        self.check_ready(p, None).is_ok() && self.entry(&p.output, &p.source).and_then(|e| e.made.as_ref()).is_some_and(|m| m.output_sha256.is_some())
+    }
+
     /// What `av1opt adopt` can do about an output that can be replaced.
     pub fn adopting(&self, p: &Plan) -> Standing {
         self.standing(&p.output, &p.source, || self.check_ready(p, None))

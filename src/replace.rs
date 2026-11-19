@@ -841,22 +841,22 @@ impl NamedFolders {
         let parent = source.parent().and_then(|p| std::fs::canonicalize(p).ok());
         parent.is_some_and(|p| folders.iter().any(|f| p.starts_with(f)))
     }
-
-    fn accept(&self, source: &Path) -> Result<(), String> {
-        if self.holds(source) { Ok(()) } else { Err(outside_named(source)) }
-    }
 }
 
+const THREE_WAYS: &str = "name its folder too, add --anywhere if you trust this report, or take it on record with `av1opt adopt` on the output's folder";
+
 fn outside_named(source: &Path) -> String {
-    format!("the original {} is outside the folders named here; name its folder too, or add --anywhere if you trust this report", source.display())
+    format!("the original {} is outside the folders named here and av1opt has no record of this pair; {THREE_WAYS}", source.display())
 }
 
 fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
-/// The `replace` command: lists what would happen, and does it with `go`. Originals outside the
-/// folders in `paths` are left alone unless `anywhere` is set.
+/// The `replace` command: lists what would happen, and does it with `go`. A report is followed to
+/// an original inside the folders in `paths`, or anywhere with `anywhere`, or where av1opt's own
+/// record says that this output and this original belong together: then it is the record that
+/// vouches for the original's path, and not the report.
 pub fn run(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_changed_date: bool, anywhere: bool) -> Result<()> {
     use crate::report::gb;
     // Only what is going to be replaced is worth keeping reads for.
@@ -867,10 +867,11 @@ pub fn run(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_chan
         bail!("no av1opt reports (*.av1opt.json) found there");
     }
     let named = NamedFolders::of(paths, anywhere);
+    let ledger = crate::ledger::load();
     let (mut ready, mut replaced, mut stay) = (Vec::new(), Vec::new(), Vec::new());
     for r in &reports {
         match check_judging(r, judging) {
-            Check::Ready(p) if !named.holds(&p.source) => stay.push((p.output.clone(), outside_named(&p.source))),
+            Check::Ready(p) if !named.holds(&p.source) && !ledger.vouches_for(&p) => stay.push((p.output.clone(), outside_named(&p.source))),
             Check::Ready(p) if p.zfs && !allow_zfs => stay.push((p.output.clone(), "the original is on ZFS (--allow-zfs replaces there too)".to_string())),
             Check::Ready(p) => ready.push(p),
             Check::Replaced(d) => replaced.push(d),
@@ -881,7 +882,7 @@ pub fn run(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_chan
 
     if back {
         let (can, cannot): (Vec<_>, Vec<_>) = replaced.into_iter().partition(|d| d.can_undo);
-        let (can, outside): (Vec<_>, Vec<_>) = can.into_iter().partition(|d| named.holds(&d.source));
+        let (can, outside): (Vec<_>, Vec<_>) = can.into_iter().partition(|d| named.holds(&d.source) || ledger.check_replaced(d).is_ok());
         let (can, on_zfs): (Vec<_>, Vec<_>) = can.into_iter().partition(|d| !d.zfs || allow_zfs);
         println!("{} can go back to their place", plural(can.len(), "original", "originals"));
         for d in &can {
@@ -894,7 +895,7 @@ pub fn run(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_chan
             }
         }
         if !outside.is_empty() {
-            println!("{} outside the folders named here (name their folders too, or add --anywhere if you trust these reports)", plural(outside.len(), "original is", "originals are"));
+            println!("{} outside the folders named here, with no record of them (name their folders too, add --anywhere if you trust these reports, or run `av1opt adopt` on the output folders)", plural(outside.len(), "original is", "originals are"));
             for d in &outside {
                 println!("  {}", d.source.display());
             }
@@ -913,7 +914,9 @@ pub fn run(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_chan
         }
         let mut done = 0;
         for d in &can {
-            match undo_if(&d.report, allow_zfs, &|d| named.accept(&d.source)) {
+            // Asked again here: the record may have changed since the list was made.
+            let accept = |d: &Replaced| if named.holds(&d.source) { Ok(()) } else { crate::ledger::load().check_replaced(d).map_err(|why| format!("{} ({why})", outside_named(&d.source))) };
+            match undo_if(&d.report, allow_zfs, &accept) {
                 Ok(_) => done += 1,
                 Err(e) => {
                     failed += 1;
@@ -961,7 +964,9 @@ pub fn run(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_chan
         }
         let (mut done, mut trashed) = (0, 0u64);
         for p in &ready {
-            match apply_judging(&p.report, allow_zfs, judging, &trash::trash, &|p, _| named.accept(&p.source)) {
+            // Outside the folders named, all of the output has to be what the record says.
+            let accept = |p: &Plan, output: &OpenFile| if named.holds(&p.source) { Ok(()) } else { crate::ledger::load().check_ready(p, Some(output)).map_err(|why| format!("{} ({why})", outside_named(&p.source))) };
+            match apply_judging(&p.report, allow_zfs, judging, &trash::trash, &accept) {
                 Ok(d) => {
                     done += 1;
                     trashed += d.source_bytes;

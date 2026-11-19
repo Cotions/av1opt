@@ -1028,7 +1028,7 @@ fn the_command_follows_a_report_only_into_the_folders_it_was_given() {
     // The output folder alone does not reach the original.
     let run = replace_command(&dir, &[out.as_os_str(), apply]);
     let said = String::from_utf8_lossy(&run.stdout).into_owned();
-    assert!(run.status.success() && said.contains("outside the folders named") && said.contains("--anywhere"), "{said}");
+    assert!(run.status.success() && said.contains("outside the folders named") && said.contains("name its folder too") && said.contains("--anywhere") && said.contains("av1opt adopt"), "{said}");
     assert!(original.exists() && output.exists() && !placed.exists());
     // A report named by itself does not either.
     let run = replace_command(&dir, &[dir.join("out/film.av1opt.json").as_os_str(), apply]);
@@ -1041,7 +1041,8 @@ fn the_command_follows_a_report_only_into_the_folders_it_was_given() {
     let record = std::fs::read_to_string(dir.join("data/av1opt/ledger.jsonl")).unwrap();
     assert!(record.contains("\"event\":\"replaced\""), "{record}");
 
-    // Putting back follows the same rule.
+    // Without that record, putting back follows the same rule.
+    std::fs::remove_file(dir.join("data/av1opt/ledger.jsonl")).unwrap();
     let run = replace_command(&dir, &[out.as_os_str(), undo, apply]);
     assert!(String::from_utf8_lossy(&run.stdout).contains("outside the folders named"), "{}", String::from_utf8_lossy(&run.stdout));
     assert!(placed.exists() && !original.exists());
@@ -1066,6 +1067,25 @@ fn command_folder(name: &str) -> (PathBuf, PathBuf, PathBuf) {
     std::fs::write(&output, vec![b'o'; 1000]).unwrap();
     write_report(&dir.join("out/film.av1opt.json"), json!({ "format": 1, "input": original, "output": output, "source_bytes": 3000, "output_bytes": 1000 }));
     (dir, original, output)
+}
+
+#[test]
+fn the_command_follows_a_pair_on_record_without_being_told_where_the_original_is() {
+    let (dir, original, output) = command_folder("ui-replace-on-record");
+    let placed = dir.join("videos/film.mkv");
+    write_record(&dir, &[encoded_line(&original, &output)]);
+    let (out, apply, undo) = (dir.join("out"), std::ffi::OsStr::new("--apply"), std::ffi::OsStr::new("--undo"));
+    let run = replace_command(&dir, &[out.as_os_str(), apply]);
+    assert!(run.status.success() && placed.exists() && !original.exists(), "{}", out_of(&run));
+    let run = replace_command(&dir, &[out.as_os_str(), undo, apply]);
+    assert!(run.status.success() && original.exists() && output.exists() && !placed.exists(), "{}", out_of(&run));
+
+    // The output is compared whole before it moves: the record speaks for the file it saw.
+    std::fs::write(&output, vec![b'e'; 1000]).unwrap();
+    let run = replace_command(&dir, &[out.as_os_str(), apply]);
+    let said = out_of(&run);
+    assert!(!run.status.success() && said.contains("outside the folders named") && said.contains("contents differ"), "{said}");
+    assert!(original.exists() && output.exists() && !placed.exists());
 }
 
 #[test]

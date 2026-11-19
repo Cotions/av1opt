@@ -131,8 +131,9 @@ enum Cmd {
     /// the output takes its name in its folder. Lists what would happen and changes nothing
     /// until --apply is given. Only outputs whose report (`.av1opt.json`) still matches both
     /// files are touched, and no existing file is ever written over. A report is followed only
-    /// to originals inside the folders named here: name the originals' folder as well as the
-    /// output folder, or give --anywhere.
+    /// to originals inside the folders named here (name the originals' folder as well as the
+    /// output folder, or give --anywhere), unless av1opt's own record says that this output was
+    /// made from that original.
     Replace {
         /// Output folders, the folders of the originals, reports (`.av1opt.json`) or output files.
         #[arg(required = true)]

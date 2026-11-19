@@ -586,13 +586,17 @@ pub fn encode_all(c: &Ctx, plan: &Plan) -> Result<Vec<ChunkResult>> {
     let (next, stop, frames_done) = (AtomicUsize::new(0), AtomicBool::new(false), AtomicU64::new(0));
     let failure: Mutex<Option<anyhow::Error>> = Mutex::new(None);
     let t0 = c.tools.stopwatch();
+    // The memory cap is shared only by encodes that really run at the same time.
+    let at_once = c.workers.clamp(1, todo.len().max(1));
+    let side_by_side = c.tools.for_chunks_at_once(at_once);
+    let chunks = Ctx { tools: side_by_side.as_ref().unwrap_or(c.tools), ..*c };
 
     std::thread::scope(|s| {
-        for _ in 0..c.workers.clamp(1, todo.len().max(1)) {
+        for _ in 0..at_once {
             s.spawn(|| {
                 while !stop.load(Ordering::Relaxed) {
                     let Some(&i) = todo.get(next.fetch_add(1, Ordering::Relaxed)) else { break };
-                    match encode_chunk(c, plan, i) {
+                    match encode_chunk(&chunks, plan, i) {
                         Ok(r) => {
                             let done = frames_done.fetch_add(r.frames, Ordering::Relaxed) + r.frames;
                             let frac = (done as f64 / todo_frames.max(1) as f64).min(1.0);

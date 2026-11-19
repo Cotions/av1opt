@@ -296,7 +296,7 @@ enum Cmd {
         /// `--scenes=auto` does it only for videos whose samples differ in quality at one CRF.
         #[arg(long, value_enum, value_name = "WHEN", num_args = 0..=1, require_equals = true, default_value_t, default_missing_value = "always")]
         scenes: encode::Scenes,
-        /// Chunks encoded in parallel with --scenes. Each ffmpeg gets its share of --memory-limit.
+        /// Chunks encoded in parallel with --scenes. Chunks running at once share --memory-limit.
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=8))]
         workers: u8,
         /// Memory cap for each ffmpeg run (systemd MemoryMax syntax, e.g. 12G). "auto" = 40% of RAM, "none" = no cap.
@@ -649,7 +649,7 @@ fn main() -> Result<()> {
             std::fs::create_dir_all(&out_dir)?;
             // SAFETY: plain syscall on our own process; children inherit the priority.
             unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) };
-            let tools = tools::Tools::new(ffmpeg, ffprobe, memory_cap(&memory_limit, if scenes.possible() { workers } else { 1 }));
+            let tools = tools::Tools::new(ffmpeg, ffprobe, memory_cap(&memory_limit, 1)).sharing_between_chunks(memory_cap(&memory_limit, workers));
             let tuning = if tuned {
                 let t = tuning::Tuning::load()?;
                 if t.classes.is_empty() {
@@ -750,8 +750,8 @@ fn scenes_value_taken_for_input(inputs: &[PathBuf]) -> Option<String> {
     Some(format!("there is no file or folder called `{word}`; to choose when scenes are used, write --scenes={word}, with the equals sign"))
 }
 
-/// Per-ffmpeg memory cap: the configured total, split between parallel workers. Units are
-/// in capitals, the only way systemd reads them.
+/// Per-ffmpeg memory cap: the configured total, split between the `workers` that run at the
+/// same time. Units are in capitals, the only way systemd reads them.
 fn memory_cap(setting: &str, workers: u8) -> Option<String> {
     let workers = workers.max(1) as f64;
     let as_given = || Some(setting.to_ascii_uppercase());

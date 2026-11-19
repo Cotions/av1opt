@@ -1144,7 +1144,7 @@ fn run_job(app: &Arc<App>, id: u64, opts: Result<Options>, retry: bool, out_dir:
         };
         sink_app.broadcast(json!({ "kind": "job", "id": id, "file": file, "event": e }));
     }));
-    let mut tools = app.tools(if opts.scenes.possible() { workers } else { 1 });
+    let mut tools = app.encode_tools(workers);
     tools.hooks = Some(hooks.clone());
     // A hold that arrived since the worker looked. One that arrives after this is put into
     // effect through the job's hooks, which exist from here on.

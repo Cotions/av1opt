@@ -1824,9 +1824,9 @@ fn a_memory_cap_reaches_ffmpeg_as_written_and_a_bad_one_is_refused() {
         ("1.5G", &[][..], 1536.0 * MIB),
         ("800m", &[], 800.0 * MIB),
         ("40%", &[], share(40.0)),
-        // Two workers each get half, a share of the memory too.
-        ("1.5g", scenes, 768.0 * MIB),
-        ("50.5%", scenes, share(25.25)),
+        // Workers share the cap only as chunks run side by side; this first run is alone.
+        ("1.5g", scenes, 1536.0 * MIB),
+        ("50.5%", scenes, share(50.5)),
     ] {
         let _ = std::fs::remove_file(&seen);
         let mut args = vec!["--ffmpeg", ffmpeg, "--memory-limit", cap];

@@ -124,8 +124,10 @@ impl Stopwatch {
 pub struct Tools {
     pub ffmpeg: String,
     pub ffprobe: String,
-    /// Prepended to every ffmpeg call, e.g. a systemd-run scope with a memory cap.
-    prefix: Vec<String>,
+    /// What each ffmpeg run may use, enforced by a systemd scope around it.
+    cap: Option<String>,
+    /// What each of several chunk encodes running side by side may use: their part of the cap.
+    side_by_side_cap: Option<String>,
     /// Progress listener and cancel switch (the UI); None on the command line.
     pub hooks: Option<Arc<Hooks>>,
     /// First line of `ffmpeg -version`, asked for once.
@@ -134,21 +136,48 @@ pub struct Tools {
 
 impl Tools {
     pub fn new(ffmpeg: String, ffprobe: String, memory_limit: Option<String>) -> Self {
-        let prefix = match memory_limit {
-            Some(limit) if systemd_scope_works() => [
-                // --collect: an ffmpeg killed before systemd had put it in its scope (a cancel
-                // at the wrong moment) leaves a failed unit, which would otherwise stay listed.
-                "systemd-run", "--user", "--scope", "--collect", "-q", "-p", &format!("MemoryMax={limit}"), "-p", "MemorySwapMax=0",
-            ]
-            .map(String::from)
-            .to_vec(),
-            Some(_) => {
+        let cap = memory_limit.filter(|_| {
+            let works = systemd_scope_works();
+            if !works {
                 eprintln!("warning: systemd-run --user unavailable, running ffmpeg without a memory limit");
-                Vec::new()
             }
-            None => Vec::new(),
+            works
+        });
+        Tools { ffmpeg, ffprobe, side_by_side_cap: cap.clone(), cap, hooks: None, version: std::sync::OnceLock::new() }
+    }
+
+    /// Sets what each chunk encode gets when several run at once. Every other ffmpeg run is
+    /// alone (a search, a one-pass encode, a check) and has the whole cap.
+    pub fn sharing_between_chunks(mut self, part: Option<String>) -> Self {
+        if self.cap.is_some() {
+            self.side_by_side_cap = part;
+        }
+        self
+    }
+
+    /// The tools for `at_once` chunk encodes running side by side, if that is more than one.
+    pub fn for_chunks_at_once(&self, at_once: usize) -> Option<Tools> {
+        (at_once > 1).then(|| Tools {
+            ffmpeg: self.ffmpeg.clone(),
+            ffprobe: self.ffprobe.clone(),
+            cap: self.side_by_side_cap.clone(),
+            side_by_side_cap: self.side_by_side_cap.clone(),
+            hooks: self.hooks.clone(),
+            version: self.version.clone(),
+        })
+    }
+
+    /// What to say of an ffmpeg run that failed. Killed outright under a cap, the likely reason
+    /// is the cap, and the log says nothing of it.
+    fn failure(&self, status: std::process::ExitStatus, log: &str, lines: usize) -> anyhow::Error {
+        use std::os::unix::process::ExitStatusExt;
+        let why = match &self.cap {
+            Some(cap) if status.signal() == Some(libc::SIGKILL) => {
+                format!(": it was killed, most likely for going over its memory cap of {cap}; raise --memory-limit, or lower --workers if chunks are encoded side by side")
+            }
+            _ => String::new(),
         };
-        Tools { ffmpeg, ffprobe, prefix, hooks: None, version: std::sync::OnceLock::new() }
+        anyhow::anyhow!("ffmpeg failed ({status}){why}:\n{}", tail(log, lines))
     }
 
     /// Which ffmpeg build this is (the first line of `ffmpeg -version`; empty if it won't
@@ -180,10 +209,12 @@ impl Tools {
             let quoted: Vec<String> = args.iter().map(|a| if a.contains([' ', ';', '[']) { format!("'{a}'") } else { a.clone() }).collect();
             eprintln!("+ ffmpeg {}", quoted.join(" "));
         }
-        let mut c = match self.prefix.split_first() {
-            Some((first, rest)) => {
-                let mut c = Command::new(first);
-                c.args(rest).arg(&self.ffmpeg);
+        let mut c = match &self.cap {
+            Some(cap) => {
+                let mut c = Command::new("systemd-run");
+                // --collect: an ffmpeg killed before systemd had put it in its scope (a cancel
+                // at the wrong moment) leaves a failed unit, which would otherwise stay listed.
+                c.args(["--user", "--scope", "--collect", "-q", "-p", &format!("MemoryMax={cap}"), "-p", "MemorySwapMax=0"]).arg(&self.ffmpeg);
                 c
             }
             None => Command::new(&self.ffmpeg),
@@ -258,7 +289,7 @@ impl Tools {
         let out = self.finish(child)?;
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         if !out.status.success() {
-            bail!("ffmpeg failed ({}):\n{}", out.status, tail(&stderr, 15));
+            return Err(self.failure(out.status, &stderr, 15));
         }
         Ok(stderr)
     }
@@ -300,7 +331,7 @@ impl Tools {
         self.check_cancel()?;
         match status {
             Some(st) if st.success() => Ok(out),
-            Some(st) => bail!("ffmpeg failed ({st}):\n{}", tail(&stderr, 5)),
+            Some(st) => Err(self.failure(st, &stderr, 5)),
             None => bail!("ffmpeg gave no answer within {} s", timeout.as_secs()),
         }
     }
@@ -362,7 +393,7 @@ impl Tools {
         let status = out.status;
         let stderr = err_reader.join().unwrap_or_default();
         if !status.success() {
-            bail!("ffmpeg failed ({status}):\n{}", tail(&stderr, 15));
+            return Err(self.failure(status, &stderr, 15));
         }
         Ok((frames, stderr))
     }
@@ -581,6 +612,40 @@ pub(crate) fn real_tools(test: &str) -> Option<Tools> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn capped(cap: &str, part: &str) -> Tools {
+        Tools { ffmpeg: "ffmpeg".into(), ffprobe: "ffprobe".into(), cap: Some(cap.into()), side_by_side_cap: Some(part.into()), hooks: None, version: Default::default() }
+    }
+
+    fn cap_of(tools: &Tools) -> String {
+        let c = tools.command_for(&[]);
+        assert_eq!(c.get_program(), "systemd-run");
+        c.get_args().filter_map(|a| a.to_str()?.strip_prefix("MemoryMax=")).collect()
+    }
+
+    #[test]
+    fn only_chunks_encoded_side_by_side_share_the_memory_cap() {
+        let tools = capped("12G", "6144M");
+        assert_eq!(cap_of(&tools), "12G");
+        assert!(tools.for_chunks_at_once(1).is_none(), "one at a time has all of it");
+        assert_eq!(cap_of(&tools.for_chunks_at_once(2).unwrap()), "6144M");
+        // No cap in force stays no cap, whatever part was worked out.
+        let free = Tools { cap: None, side_by_side_cap: None, ..capped("1G", "1G") }.sharing_between_chunks(Some("1M".into()));
+        assert_eq!(free.for_chunks_at_once(2).unwrap().command_for(&[]).get_program(), "ffmpeg");
+    }
+
+    #[test]
+    fn being_killed_under_a_cap_is_put_down_to_the_cap() {
+        use std::os::unix::process::ExitStatusExt;
+        let killed = std::process::ExitStatus::from_raw(libc::SIGKILL);
+        let said = capped("12G", "6G").for_chunks_at_once(2).unwrap().failure(killed, "the log", 5).to_string();
+        assert!(said.contains("--memory-limit") && said.contains("cap of 6G") && said.contains("the log"), "{said}");
+        // Without a cap, or for another ending, there is nothing to blame on one.
+        let free = Tools { cap: None, ..capped("1G", "1G") };
+        assert!(!free.failure(killed, "", 5).to_string().contains("--memory-limit"));
+        let ended = std::process::ExitStatus::from_raw(1 << 8);
+        assert!(!capped("1G", "1G").failure(ended, "", 5).to_string().contains("--memory-limit"));
+    }
 
     #[test]
     fn a_clip_without_frames_counts_none_and_a_failure_stays_a_failure() {

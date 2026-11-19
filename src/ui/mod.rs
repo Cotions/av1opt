@@ -163,6 +163,11 @@ impl App {
         Tools::new(self.ffmpeg(), self.ffprobe(), crate::memory_cap(&self.cfg.memory_limit, workers))
     }
 
+    /// The tools of an encode: `workers` is how many of its chunks may run at the same time.
+    pub fn encode_tools(&self, workers: u8) -> Tools {
+        self.tools(1).sharing_between_chunks(crate::memory_cap(&self.cfg.memory_limit, workers))
+    }
+
     pub fn ffmpeg(&self) -> String {
         self.settings.lock().unwrap().ffmpeg.clone().unwrap_or_else(|| self.cfg.ffmpeg.clone())
     }

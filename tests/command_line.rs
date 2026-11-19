@@ -233,3 +233,21 @@ fn a_second_run_leaves_a_file_being_encoded_and_goes_on_to_the_next() {
     let left: Vec<_> = std::fs::read_dir(c.path("out")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
     assert!(!left.iter().any(|n| n.starts_with(".av1opt-lock")), "{left:?}");
 }
+
+#[test]
+fn a_run_killed_under_the_memory_cap_says_so_and_had_all_of_it() {
+    let c = Case::with_ffmpeg("memory-cap", "kill -9 $$");
+    c.video("a.mkv");
+    // Stands in for systemd: notes the scope asked for and runs what is to go in it.
+    c.tool(
+        "systemd-run",
+        "echo \"$*\" >> \"$(dirname \"$0\")/../scopes\"\nwhile [ $# -gt 0 ]; do case \"$1\" in --user|--scope|--collect|-q) shift;; -p) shift 2;; *) break;; esac; done\nexec \"$@\"\n",
+    );
+    let path = format!("{}:{}", c.path("bin").display(), std::env::var("PATH").unwrap());
+    let args = ["encode", "videos/a.mkv", "-o", "out", "--memory-limit", "2G", "--scenes", "--workers", "2"];
+    let run = Run::of(c.command(&args).env("PATH", path).output().unwrap());
+    run.has("memory cap of 2G").has("--memory-limit");
+    // What runs before any chunk runs alone, so it is not held to a worker's part.
+    let scopes = text(&c.path("scopes"));
+    assert!(scopes.contains("MemoryMax=2G") && !scopes.contains("MemoryMax=1024M"), "{scopes}");
+}

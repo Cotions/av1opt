@@ -30,6 +30,18 @@ const PRIOR_SIGMA: f64 = 0.6;
 const SOURCE_BPP_REF: f64 = 0.1;
 /// z for an 80% interval.
 const Z80: f64 = 1.28;
+/// What a video unlike those in the history adds to the spread (log units). Fitted on one
+/// library and tried on 22 other videos, only 64% of them fell inside the "80%" range, with
+/// errors of x1.65 where the library's own were x1.29.
+const UNKNOWN_CONTENT_SIGMA: f64 = 0.4;
+/// Squared distance from the history (in standard deviations of its two measures) at which a
+/// video counts as wholly unlike it.
+const FAR_FROM_HISTORY: f64 = 4.0;
+/// Below this many encodes the history says too little of what is like it.
+const MIN_FOR_DISTANCE: usize = 5;
+/// The least a measure of the history is taken to vary (log units): a history of one frame
+/// size has no spread of its own, and a video of the same size is then no distance from it.
+const MIN_HISTORY_SD: f64 = 0.1;
 
 /// ln(av1 bpp) = beta[0] + beta[1]·ln(source bpp / 0.1) + beta[2]·ln(pixels / 1080p).
 #[derive(Debug, Clone, Copy)]
@@ -39,6 +51,9 @@ pub struct Model {
     pub sigma: f64,
     /// Encodes the model was fitted on.
     pub samples: usize,
+    /// Mean and standard deviation over those encodes of the two measures of a video, for
+    /// how far a video is from what the model has seen.
+    seen: [(f64, f64); 2],
 }
 
 fn features(source_bpp: f64, pixels: f64) -> [f64; 3] {
@@ -52,7 +67,7 @@ fn bpp(bitrate: f64, width: u32, height: u32, fps: f64) -> f64 {
 
 impl Model {
     pub fn prior() -> Self {
-        Model { beta: [BPP_1080P.ln(), SOURCE_EXPONENT, RES_EXPONENT], sigma: PRIOR_SIGMA, samples: 0 }
+        Model { beta: [BPP_1080P.ln(), SOURCE_EXPONENT, RES_EXPONENT], sigma: PRIOR_SIGMA, samples: 0, seen: [(0.0, 0.0); 2] }
     }
 
     /// Ridge regression toward the prior, on encodes made for a similar VMAF target.
@@ -88,13 +103,30 @@ impl Model {
         let sse: f64 = pts.iter().map(|(x, y)| (y - dot(&beta, x)).powi(2)).sum();
         let n = pts.len() as f64;
         let sigma = ((sse + PRIOR_WEIGHT * PRIOR_SIGMA.powi(2)) / (n + PRIOR_WEIGHT)).sqrt().max(0.1);
-        Model { beta, sigma, samples: pts.len() }
+        let seen = [1, 2].map(|k| {
+            let mean = pts.iter().map(|(x, _)| x[k]).sum::<f64>() / n;
+            (mean, (pts.iter().map(|(x, _)| (x[k] - mean).powi(2)).sum::<f64>() / n).sqrt())
+        });
+        Model { beta, sigma, samples: pts.len(), seen }
+    }
+
+    /// The spread to expect for a video with these features (log units): the history's own,
+    /// and more the further the video is from what the history holds.
+    fn sigma_for(&self, x: &[f64; 3]) -> f64 {
+        let unlike = if self.samples < MIN_FOR_DISTANCE {
+            1.0
+        } else {
+            let distance: f64 = [1, 2].iter().zip(self.seen).map(|(&k, (mean, sd))| ((x[k] - mean) / sd.max(MIN_HISTORY_SD)).powi(2)).sum();
+            (distance / FAR_FROM_HISTORY).min(1.0)
+        };
+        (self.sigma.powi(2) + UNKNOWN_CONTENT_SIGMA.powi(2) * unlike).sqrt()
     }
 
     /// Predicted AV1 bits per pixel: (low, likely, high), the outer two an 80% interval.
     pub fn predict_bpp(&self, source_bpp: f64, pixels: f64) -> (f64, f64, f64) {
-        let mid = dot(&self.beta, &features(source_bpp.max(1e-4), pixels));
-        let d = Z80 * self.sigma;
+        let x = features(source_bpp.max(1e-4), pixels);
+        let mid = dot(&self.beta, &x);
+        let d = Z80 * self.sigma_for(&x);
         ((mid - d).exp(), mid.exp(), (mid + d).exp())
     }
 }
@@ -726,7 +758,7 @@ mod tests {
 
     /// A model that says `bpp` whatever the source.
     fn says(bpp: f64) -> Model {
-        Model { beta: [bpp.ln(), 0.0, 0.0], sigma: 0.1, samples: 0 }
+        Model { beta: [bpp.ln(), 0.0, 0.0], sigma: 0.1, samples: 0, seen: [(0.0, 0.0); 2] }
     }
 
     fn near(a: f64, b: f64) -> bool {
@@ -810,9 +842,55 @@ mod tests {
     fn the_range_is_the_same_factor_either_side_of_the_likely_size() {
         for m in [Model::prior(), says(0.03)] {
             let (lo, mid, hi) = m.predict_bpp(0.1, PIXELS_1080P);
-            let factor = (Z80 * m.sigma).exp();
+            let factor = (Z80 * m.sigma_for(&features(0.1, PIXELS_1080P))).exp();
             assert!(near(hi / mid, factor) && near(mid / lo, factor), "{lo} {mid} {hi}");
         }
+    }
+
+    /// Encodes of sources from 0.05 to 0.2 bits per pixel, at 720p and 1080p.
+    fn varied_history(n: usize) -> Vec<Record> {
+        (0..n).map(|i| {
+            let (w, h) = if i % 2 == 0 { (1920, 1080) } else { (1280, 720) };
+            rec(0.05 * 4f64.powf((i % 7) as f64 / 6.0), 0.03, w, h)
+        }).collect()
+    }
+
+    /// How many times the likely size the top of the range is.
+    fn top_of_range(m: &Model, source_bpp: f64, pixels: f64) -> f64 {
+        let (_, mid, hi) = m.predict_bpp(source_bpp, pixels);
+        hi / mid
+    }
+
+    #[test]
+    fn the_range_widens_away_from_what_the_history_holds() {
+        let m = Model::fit(&varied_history(60), 93.0);
+        let middle = (0.1, 1600.0 * 900.0);
+        let beside = top_of_range(&m, middle.0, middle.1);
+        // At the middle of the history nothing is added.
+        let x = features(m.seen[0].0.exp() * SOURCE_BPP_REF, m.seen[1].0.exp() * PIXELS_1080P);
+        assert!(near(m.sigma_for(&x), m.sigma), "{} {}", m.sigma_for(&x), m.sigma);
+        // 4K, far from any frame size seen: the whole addition, and no more further out.
+        let far = |px: f64| m.sigma_for(&features(0.1, px));
+        let whole = (m.sigma.powi(2) + UNKNOWN_CONTENT_SIGMA.powi(2)).sqrt();
+        assert!(near(far(3840.0 * 2160.0), whole) && near(far(7680.0 * 4320.0), whole));
+        assert!(top_of_range(&m, 0.1, 3840.0 * 2160.0) > beside);
+        // So does a source of far fewer or more bits per pixel than any seen.
+        assert!(near(m.sigma_for(&features(0.001, middle.1)), whole));
+    }
+
+    #[test]
+    fn with_few_encodes_every_video_counts_as_unlike_them() {
+        let whole = |m: &Model| (m.sigma.powi(2) + UNKNOWN_CONTENT_SIGMA.powi(2)).sqrt();
+        for n in [0, 1, 4] {
+            let m = Model::fit(&varied_history(n), 93.0);
+            assert!(near(m.sigma_for(&features(0.1, PIXELS_1080P)), whole(&m)), "{n}");
+        }
+        // Five are enough to tell, and a history of one frame size and one kind of source
+        // finds the same video close and another frame size far.
+        let same = vec![rec(0.1, 0.03, 1920, 1080); 5];
+        let m = Model::fit(&same, 93.0);
+        assert!(near(m.sigma_for(&features(0.1, PIXELS_1080P)), m.sigma));
+        assert!(near(m.sigma_for(&features(0.1, 1280.0 * 720.0)), whole(&m)));
     }
 
     #[test]

@@ -492,7 +492,7 @@ fn allow_video(app: &App, p: &Path) {
 
 /// What `replace` would do with a report, for the history table and the compare view.
 fn replace_state(report: &Path) -> Value {
-    match replace::check(report) {
+    match replace::check_for_list(report) {
         Check::Ready(p) => json!({ "state": "ready", "dest": p.dest, "copy": p.copy, "zfs": p.zfs, "removed": p.removed }),
         Check::Replaced(d) => json!({ "state": "replaced", "trash": d.trash, "from": d.from, "can_undo": d.can_undo, "zfs": d.zfs }),
         Check::No(why) => json!({ "state": "no", "why": why }),
@@ -509,7 +509,7 @@ fn source_of(app: &App, report: &Path, r: &Value) -> PathBuf {
     };
     // Only a file the trash itself says came from the original: the report alone could name
     // any file of the right size.
-    if is_video(&input) && replace::original_in_trash(r).is_some_and(|known| crate::trash::holds(&trash, &input, &known)) {
+    if is_video(&input) && replace::original_in_trash(r).is_some_and(|known| crate::trash::holds_for_list(&trash, &input, &known)) {
         app.allow(&trash);
     }
     trash
@@ -613,7 +613,7 @@ struct ReplaceRequest {
 pub fn replace_original(app: &App, body: &Value) -> Result<Value> {
     let r: ReplaceRequest = serde_json::from_value(body.clone())?;
     let report = known_report(app, &r.report)?;
-    if let Check::Ready(p) = replace::check(&report)
+    if let Check::Ready(p) = replace::check_for_list(&report)
         && crate::ui::jobs::waiting_on(app, &p.source)
     {
         bail!("the original is in the encode queue");

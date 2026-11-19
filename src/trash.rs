@@ -212,9 +212,20 @@ fn decode_path(s: &str) -> Option<PathBuf> {
 }
 
 /// Whether the plain file at `path` is the one `known` describes, by the rule for sources: its
-/// size, then its time, then its fingerprint. Going into the trash changes none of them.
+/// size, then its time, then the hash of the whole file. Going into the trash changes none of
+/// them. Reports without that hash count here when their samples match: nothing is lost by
+/// putting a file back where nothing stands, and originals that were only touched went to the
+/// trash on that same evidence.
 pub fn is_file_recorded(path: &Path, known: &Recorded) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) && matches!(crate::source::compare(known, path), Verdict::Same)
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) && counts_as_recorded(crate::source::compare(known, path), known)
+}
+
+fn counts_as_recorded(verdict: Verdict, known: &Recorded) -> bool {
+    match verdict {
+        Verdict::Same => true,
+        Verdict::CannotTell => known.fingerprint.is_some(),
+        _ => false,
+    }
 }
 
 /// Whether `trashed` is the file `known` describes, in a trash that says it came from
@@ -223,6 +234,12 @@ pub fn is_file_recorded(path: &Path, known: &Recorded) -> bool {
 /// put in the original's place.
 pub fn holds(trashed: &Path, original: &Path, known: &Recorded) -> bool {
     is_file_recorded(trashed, known) && says_came_from(trashed, original)
+}
+
+/// [`holds`] for a list of many reports, which reads no whole file: see
+/// `source::compare_for_list`. Putting the file back asks [`is_file_recorded`] again.
+pub fn holds_for_list(trashed: &Path, original: &Path, known: &Recorded) -> bool {
+    std::fs::symlink_metadata(trashed).is_ok_and(|m| m.is_file()) && counts_as_recorded(crate::source::compare_for_list(known, trashed), known) && says_came_from(trashed, original)
 }
 
 /// Whether `trashed` is a file in a trash whose info file says it came from `original`.
@@ -323,10 +340,15 @@ mod tests {
         assert!(!holds(&dest, &a, &known), "same time, another size");
         assert!(!holds(&dest, &a, &by_size));
 
-        // The right contents under another time are still the original.
+        // The right contents under another time are still the original: samples are all a
+        // report of an earlier version has, and with the whole hash that hash decides.
         std::fs::write(&dest, b"first").unwrap();
         set_age(&dest, then + std::time::Duration::from_secs(120));
         assert!(holds(&dest, &a, &known));
+        assert!(holds_for_list(&dest, &a, &known));
+        let hash = crate::source::WholeHash::start(&dest, 5).finish(&|| false).unwrap();
+        assert!(holds(&dest, &a, &Recorded { whole: Some(hash), ..known.clone() }));
+        assert!(!holds(&dest, &a, &Recorded { whole: Some("0".into()), ..known.clone() }));
 
         // A link of the right kind to a file of the right kind is still no file in the trash.
         let elsewhere = dir.join("elsewhere.mkv");

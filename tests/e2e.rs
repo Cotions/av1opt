@@ -1486,6 +1486,54 @@ fn an_output_takes_its_originals_place_and_gives_it_back() {
     assert!(placed.exists() && !src.exists());
 }
 
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_source_completed_after_its_encode_is_not_replaced_and_one_only_touched_is() {
+    use std::os::unix::fs::FileExt;
+    const MEGABYTE: usize = 1 << 20;
+    let c = Case::new("hole");
+    let src = c.clip("a.mp4", "320x180", 4);
+    // A download that has allocated its file: what it has not got yet reads as zeros. Players
+    // and ffmpeg stop at the end of the video, so the encode goes through as it would for a
+    // file whose missing part they cannot tell from the rest.
+    let mut original = std::fs::read(&src).unwrap();
+    original.resize(original.len() + 8 * MEGABYTE, 0);
+    std::fs::write(&src, &original).unwrap();
+    c.encode(&[&src], &[]).ok().has("encoded 1,");
+    assert!(c.report("a")["source_hash"].is_string(), "{}", c.report("a"));
+    let encoded = std::fs::read(c.out().join("a.mp4")).unwrap();
+    let trash = c.dir.join("data/Trash/files");
+    let out_arg = c.out();
+    let replace = |extra: &[&str]| {
+        let mut a: Vec<std::ffi::OsString> = vec!["replace".into(), out_arg.clone().into()];
+        a.extend(extra.iter().map(Into::into));
+        c.av1opt(&a)
+    };
+    let later = mtime(&src) + std::time::Duration::from_secs(3600);
+
+    // The rest arrives: same size, a new date, and none of it where the samples are taken (the
+    // first and the last megabyte and the one in the middle).
+    let hole = (original.len() - 3 * MEGABYTE) as u64;
+    assert!(hole as usize > original.len() / 2 + MEGABYTE);
+    let file = std::fs::File::options().write(true).open(&src).unwrap();
+    file.write_all_at(&vec![0xab; MEGABYTE], hole).unwrap();
+    file.set_modified(later).unwrap();
+    let completed = std::fs::read(&src).unwrap();
+    for extra in [&["--apply"][..], &["--apply", "--accept-changed-date"][..]] {
+        replace(extra).ok().has("reading all of").has("the original changed since the encode");
+        assert_eq!(std::fs::read(&src).unwrap(), completed);
+        assert!(entries(&trash, "").is_empty(), "{:?}", entries(&trash, ""));
+    }
+
+    // The same bytes as were encoded under another date: only touched, or copied without its
+    // dates. It is the file that was encoded.
+    file.write_all_at(&vec![0; MEGABYTE], hole).unwrap();
+    file.set_modified(later + std::time::Duration::from_secs(60)).unwrap();
+    replace(&["--apply"]).ok().has("1 original");
+    assert_eq!(std::fs::read(&src).unwrap(), encoded, "the output took its place");
+    assert_eq!(std::fs::read(trash.join("a.mp4")).unwrap(), original);
+}
+
 /// Every file below `dir` with its size and modification time.
 fn snapshot(dir: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
     let mut all = Vec::new();

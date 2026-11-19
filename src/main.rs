@@ -141,6 +141,12 @@ enum Cmd {
         /// Also replace originals stored on ZFS.
         #[arg(long)]
         allow_zfs: bool,
+        /// Take an original whose date changed as the file that was encoded, where its report
+        /// cannot tell (reports written before the whole file was hashed). The risk is yours: if
+        /// the file was in fact completed or rewritten since, its newer contents go to the trash
+        /// in favour of an encode of the older ones. Originals seen to differ are still refused.
+        #[arg(long, conflicts_with = "undo")]
+        accept_changed_date: bool,
     },
     /// Compare encoder settings on your own videos: for every preset and SVT-AV1 parameter set,
     /// find the CRF that reaches the target VMAF on sample clips, then rank the settings by
@@ -455,9 +461,9 @@ fn main() -> Result<()> {
             dups::print(&report, top);
             written
         }
-        Cmd::Replace { paths, apply, undo, allow_zfs } => {
+        Cmd::Replace { paths, apply, undo, allow_zfs, accept_changed_date } => {
             let paths: Vec<PathBuf> = paths.iter().map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone())).collect();
-            replace::run(&paths, apply, undo, allow_zfs)
+            replace::run(&paths, apply, undo, allow_zfs, accept_changed_date)
         }
         Cmd::Bench {
             paths, presets, param_sets, target_vmaf, max_videos, samples, sample_secs, min_crf, max_crf, refresh, work_dir, save, csv, json,

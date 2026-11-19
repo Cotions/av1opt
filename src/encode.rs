@@ -7,7 +7,7 @@ use crate::repair;
 use crate::metadata::{self, MetaOptions, Resolved};
 use crate::scenes;
 use crate::sections::{self, Sections};
-use crate::source::{Recorded, Verdict};
+use crate::source::{Recorded, WholeHash};
 use crate::search::{self, EncodeSettings, SearchParams, Trial};
 use crate::tools::{FAILED_INSIDE, NOT_WRITTEN, Tools, hms, path_arg};
 use anyhow::{Context, Result, bail};
@@ -195,6 +195,9 @@ struct Report<'a> {
     /// A hash of the source's size and of samples of its contents: what tells a file only
     /// touched from one written to. See `source`.
     source_fingerprint: Option<&'a str>,
+    /// A hash of the whole source, which settles whether a file with a new date is still this
+    /// one. None when it could not be read to its end during the encode.
+    source_hash: Option<&'a str>,
     output_bytes: u64,
     savings: f64,
     /// "whole" (one CRF) or "scenes" (CRF per chunk; `crf` is then the whole-file starting point).
@@ -228,21 +231,50 @@ struct Report<'a> {
 }
 
 /// Whether the source is still what the encode began reading. A download that had only stalled
-/// goes on growing under the encode, and what comes out is then a copy of part of it. Chunks
-/// made from the earlier state are of no use to the next run and go with it, but only when the
-/// file was seen to have changed: a drive that dropped out says nothing about the file, and
-/// the chunks may be days of work.
+/// goes on growing under the encode, and what comes out is then a copy of part of it. Here any
+/// other size or time fails the encode, to the exact value the file system gives: the file was
+/// being written to or at least touched, and hours of reading it may have seen either version.
+/// Chunks made from the earlier state are of no use to the next run and go with it, but only
+/// when the file was seen to hold something else: a drive that dropped out or a file only
+/// touched says nothing against them, and they may be days of work.
 fn check_source_unchanged(input: &Path, before: &Recorded, work: Option<&Path>, keep_temp: bool) -> Result<()> {
-    match crate::source::compare(before, input) {
-        Verdict::Same => Ok(()),
-        Verdict::Unreadable(e) => {
-            bail!("{} could not be looked at after its encode ({e}), so the result was thrown away; its drive may have dropped out. Finished chunks are kept, and encoding it again goes on from them", input.display())
-        }
-        _ => {
+    let shown = input.display();
+    let meta = match std::fs::metadata(input) {
+        Ok(meta) => meta,
+        Err(e) => bail!("{shown} could not be looked at after its encode ({e}), so the result was thrown away; its drive may have dropped out. Finished chunks are kept, and encoding it again goes on from them"),
+    };
+    if before.size == Some(meta.len()) && before.modified_exactly == meta.modified().ok() {
+        return Ok(());
+    }
+    let changed = format!("{shown} changed or went away while it was being encoded, so the result was thrown away; encode it again once it is complete");
+    match crate::source::samples_match(before, input, &meta) {
+        Some(false) => {
             if let Some(work) = work.filter(|_| !keep_temp) {
                 let _ = std::fs::remove_dir_all(work);
             }
-            bail!("{} changed or went away while it was being encoded, so the result was thrown away; encode it again once it is complete", input.display())
+            bail!("{changed}")
+        }
+        Some(true) => bail!("{changed}"),
+        None => bail!("{changed}. Whether its contents differ could not be checked, so finished chunks were kept"),
+    }
+}
+
+/// The hash of the source begun with the encode, once it is there. A source that cannot be read
+/// to its end costs the report that value and not the encode.
+fn finish_source_hash(tools: &Tools, input: &Path, hash: WholeHash, notes: &mut Vec<String>) -> Result<Option<String>> {
+    if !hash.all_read() {
+        tools.emit(Event::Phase { phase: "verifying".into(), detail: "reading the rest of the source for its report".into() });
+        eprintln!("reading the rest of {} for the report", input.display());
+    }
+    match hash.finish(&|| tools.check_cancel().is_err()) {
+        Ok(hash) => Ok(Some(hash)),
+        Err(e) => {
+            tools.check_cancel()?;
+            let n = format!("the source could not be read to its end for the report ({e}): if its date changes later, av1opt will not be able to tell whether it is still this file");
+            eprintln!("note: {n}");
+            tools.emit(Event::Note { text: n.clone() });
+            notes.push(n);
+            Ok(None)
         }
     }
 }
@@ -441,6 +473,8 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
     let tmp = TempDir { path: out_dir.join(format!(".av1opt-tmp-{}", std::process::id())), keep: o.keep_temp };
     std::fs::create_dir_all(&tmp.path)?;
     fits_beside_output(&output, &tmp.path)?;
+    // Read beside the encode, which takes far longer, so that nobody waits for it.
+    let whole_hash = WholeHash::start(input, size);
 
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     // 4K VMAF with many threads was part of the memory blow-up in the first pilot.
@@ -844,6 +878,8 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         notes.push(n);
     }
 
+    // In this order: a change while the hash was being read is then seen by the check.
+    let source_hash = finish_source_hash(tools, input, whole_hash, &mut notes)?;
     check_source_unchanged(input, &source, work.as_ref().map(|w| w.path.as_path()), o.keep_temp)?;
 
     // What the samples promised is the video stream at one CRF; the file is that, the
@@ -895,6 +931,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, o: &Options) -> Res
         source_bytes: size,
         source_mtime: source.modified,
         source_fingerprint: source.fingerprint.as_deref(),
+        source_hash: source_hash.as_deref(),
         output_bytes,
         savings: 1.0 - output_bytes as f64 / size as f64,
         mode: if chunks.is_some() { "scenes" } else { "whole" },
@@ -1668,7 +1705,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_source_written_to_during_the_encode_is_noticed_and_one_only_touched_is_not() {
+    fn any_change_to_a_source_during_its_encode_fails_it_and_only_new_contents_cost_the_chunks() {
         use std::io::Write;
         use std::time::{Duration, SystemTime};
         let dir = std::env::temp_dir().join(format!("av1opt-source-stamp-{}", std::process::id()));
@@ -1686,11 +1723,17 @@ mod tests {
         check(false).unwrap();
         assert_eq!(before.modified, Some(1_700_000_000));
 
-        // A new date alone, far off or within the two seconds a filesystem may round to.
+        // A new date alone, even within the two seconds a comparison later would allow: what
+        // was read may be from before or after whatever touched it. Its chunks are not at fault.
         for off in [1, 3600] {
             std::fs::File::options().write(true).open(&input).unwrap().set_modified(then + Duration::from_secs(off)).unwrap();
-            check(false).unwrap();
+            assert!(check(false).unwrap_err().contains("changed or went away"));
+            assert!(work.is_dir());
         }
+        // Nothing to compare with: said so, and the chunks stay.
+        let no_samples = Recorded { fingerprint: None, ..before.clone() };
+        let e = check_source_unchanged(&input, &no_samples, Some(work.as_path()), false).unwrap_err().to_string();
+        assert!(e.contains("changed or went away") && e.contains("could not be checked") && e.contains("kept"), "{e}");
         assert!(work.is_dir());
 
         // Written in place at the same size, as into a file allocated ahead: the fingerprint

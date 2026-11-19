@@ -4,7 +4,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Writes `data` to a new file at `path`. What was at that name is removed first and the
 /// file is made anew: a link left there (in an output folder others can write to) is
@@ -106,19 +106,89 @@ fn needs_line_end_first(file: &std::fs::File) -> bool {
     size > 0 && file.read_exact_at(&mut last, size - 1).map_or(true, |()| last[0] != b'\n')
 }
 
+/// Reads `buffer` full from `file`, or as far as the file goes, adding what arrives to `got` as
+/// it arrives. Returns how much there was.
+fn read_counting(file: &mut std::fs::File, buffer: &mut [u8], got: &AtomicU64) -> std::io::Result<usize> {
+    let mut have = 0;
+    while have < buffer.len() {
+        match file.read(&mut buffer[have..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                have += n;
+                got.fetch_add(n as u64, Ordering::Relaxed);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(have)
+}
+
 /// A hash (FNV-1a, the same in every build) of a file's size and of `chunk` bytes at its start,
 /// its middle and its end: enough to tell files of one size apart without reading gigabytes
 /// from a slow drive.
 pub fn sample_digest(path: &Path, size: u64, chunk: u64) -> std::io::Result<u64> {
+    sample_digest_counting(path, size, chunk, &AtomicU64::new(0))
+}
+
+/// [`sample_digest`], adding the bytes read to `got` as they arrive, for whoever is watching
+/// whether the drive still answers.
+pub fn sample_digest_counting(path: &Path, size: u64, chunk: u64, got: &AtomicU64) -> std::io::Result<u64> {
     let add = |hash: u64, bytes: &[u8]| bytes.iter().fold(hash, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100000001b3));
     let mut file = std::fs::File::open(path)?;
     let mut hash = add(0xcbf29ce484222325, &size.to_le_bytes());
-    let mut buffer = Vec::with_capacity(chunk as usize);
+    let mut buffer = vec![0; (1 << 16).min(chunk as usize)];
     for start in [0, (size / 2).saturating_sub(chunk / 2), size.saturating_sub(chunk)] {
         file.seek(SeekFrom::Start(start))?;
-        buffer.clear();
-        (&file).take(chunk).read_to_end(&mut buffer)?;
-        hash = add(hash, &buffer);
+        let mut left = chunk;
+        while left > 0 {
+            let room = buffer.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+            let have = read_counting(&mut file, &mut buffer[..room], got)?;
+            hash = add(hash, &buffer[..have]);
+            if have < room {
+                break;
+            }
+            left -= have as u64;
+        }
+    }
+    Ok(hash)
+}
+
+/// One step of [`whole_digest`]. FNV-1a's step taken a 64-bit word at a time, which is what makes
+/// it fast, with a multiplier that spreads over the whole word and a turn that brings the top
+/// bits back down: multiplying alone never carries a change in them anywhere else, and two such
+/// changes would cancel out.
+fn mix_word(hash: u64, word: u64) -> u64 {
+    (hash ^ word).wrapping_mul(0x9e3779b97f4a7c15).rotate_left(23)
+}
+
+/// A hash of the first `size` bytes of the file at `path` and of `size`, for telling whether a
+/// file is still the one it was, wherever it was written to. Not one against someone who wants
+/// two files to match. Adds the bytes read to `got`; `stop` ends it early with an error.
+pub fn whole_digest(path: &Path, size: u64, got: &AtomicU64, stop: &AtomicBool) -> std::io::Result<u64> {
+    const BLOCK: usize = 1 << 20;
+    let mut file = std::fs::File::open(path)?;
+    let mut hash = mix_word(0xcbf29ce484222325, size);
+    let mut buffer = vec![0; BLOCK];
+    let mut left = size;
+    while left > 0 {
+        if stop.load(Ordering::Relaxed) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "no longer needed"));
+        }
+        let room = BLOCK.min(usize::try_from(left).unwrap_or(usize::MAX));
+        if read_counting(&mut file, &mut buffer[..room], got)? < room {
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "the file is shorter than it was"));
+        }
+        // A block is a whole number of words, so only the last one can end inside a word.
+        let words = buffer[..room].chunks_exact(8);
+        let end = words.remainder();
+        hash = words.fold(hash, |h, w| mix_word(h, u64::from_le_bytes(w.try_into().expect("eight bytes"))));
+        if !end.is_empty() {
+            let mut last = [0; 8];
+            last[..end.len()].copy_from_slice(end);
+            hash = mix_word(hash, u64::from_le_bytes(last));
+        }
+        left -= room as u64;
     }
     Ok(hash)
 }
@@ -260,6 +330,41 @@ mod tests {
         assert!(!needs_line_end_first(&readable));
         std::fs::write(&log, b"").unwrap();
         assert!(!needs_line_end_first(&std::fs::File::options().append(true).open(&log).unwrap()), "an empty file has no line to end");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_hash_of_a_whole_file_sees_every_byte_and_stays_what_reports_hold() {
+        let dir = std::env::temp_dir().join(format!("av1opt-files-whole-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.bin");
+        let digest = |size| whole_digest(&file, size, &AtomicU64::new(0), &AtomicBool::new(false));
+        // Longer than a block, and not a whole number of words.
+        let size = (1 << 20) + 13;
+        let bytes: Vec<u8> = (0..size).map(|i: u64| (i.wrapping_mul(31) >> 3) as u8).collect();
+        std::fs::write(&file, &bytes).unwrap();
+        let hash = digest(size).unwrap();
+        // Written out: reports keep this value, so another hash would call every file changed.
+        assert_eq!(format!("{hash:016x}"), "31aae172d094ef06");
+        for (at, bit) in [(0, 1), (7, 0x80), (1 << 19, 0x80), ((1 << 20) - 1, 0x80), ((1 << 20) + 12, 1)] {
+            let mut other = bytes.clone();
+            other[at] ^= bit;
+            std::fs::write(&file, &other).unwrap();
+            assert_ne!(digest(size).unwrap(), hash, "byte {at}");
+        }
+        // Top bits changed in two words do not cancel each other out.
+        let mut other = bytes.clone();
+        other[7] ^= 0x80;
+        other[15] ^= 0x80;
+        std::fs::write(&file, &other).unwrap();
+        assert_ne!(digest(size).unwrap(), hash);
+        // Nothing is read past the size asked for, and a shorter file is an error.
+        std::fs::write(&file, &bytes).unwrap();
+        assert_eq!(digest(size).unwrap(), hash);
+        assert!(digest(size + 1).is_err());
+        let stopped = whole_digest(&file, size, &AtomicU64::new(0), &AtomicBool::new(true)).unwrap_err();
+        assert_eq!(stopped.kind(), std::io::ErrorKind::Interrupted);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

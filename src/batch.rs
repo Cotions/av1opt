@@ -374,12 +374,13 @@ fn before_encoding(output: &Path, clash: Option<&Clash>, input: &Path, o: &Optio
     // The same name and another file: a download done again, an edit saved over it, or a
     // download that wrote into a file allocated ahead.
     let shown = output.display();
+    let why = made.then.why_it_cannot_tell();
     match crate::source::compare(&made.then, input) {
         Verdict::Same => Before::Done,
         Verdict::OtherSize { then, now } => Before::Refuse(format!("{shown} was made from this file when it was another size ({then} bytes, now {now}); move or delete it to encode again")),
         Verdict::Changed => Before::Refuse(format!("{shown} was made from this file before it changed: it is the same size but holds something else now; move or delete {shown} to encode it again")),
         Verdict::CannotTell => Before::Refuse(format!(
-            "{shown} was made from this file when it was last changed at another time, and its report is from a version that cannot tell whether only the date differs; if the file did change, or to be sure, delete {shown} to encode it again"
+            "{shown} was made from this file when it was last changed at another time, and {why}, so av1opt cannot tell whether only the date differs; this file counts as failed until then: if the file did change, or to be sure, delete {shown} to encode it again"
         )),
         Verdict::Unreadable(e) => Before::Refuse(format!("cannot tell whether {shown} is the encode of this file as it is now, because the file cannot be read: {e}")),
     }
@@ -707,23 +708,35 @@ mod tests {
         let input = source.0.join("c.mkv");
         let meta = std::fs::metadata(&input).unwrap();
         let now = crate::source::modified_seconds(&meta).unwrap();
-        let print = crate::source::Recorded::of(&input).unwrap().1.fingerprint.unwrap();
+        let then = crate::source::Recorded::of(&input).unwrap().1;
+        let print = then.fingerprint.unwrap();
+        let hash = crate::source::WholeHash::start(&input, 5).finish(&|| false).unwrap();
         let report = |fields: serde_json::Value| std::fs::write(out.0.join("c.av1opt.json"), fields.to_string()).unwrap();
         report(serde_json::json!({"input": input, "source_bytes": 5, "source_mtime": now}));
         assert_eq!(source.walk(&out.0, &options()).1["c.mkv"].0, "done_before");
         // Another time and the same contents: touched, or copied without its dates.
-        report(serde_json::json!({"input": input, "source_bytes": 5, "source_mtime": now - 60, "source_fingerprint": print}));
+        report(serde_json::json!({"input": input, "source_bytes": 5, "source_mtime": now - 60, "source_fingerprint": print, "source_hash": hash}));
         assert_eq!(source.walk(&out.0, &options()).1["c.mkv"].0, "done_before");
         // Another time and other contents, as for a file allocated ahead and filled in later.
-        report(serde_json::json!({"input": input, "source_bytes": 5, "source_mtime": now - 60, "source_fingerprint": "0000000000000000"}));
-        let (status, detail) = source.walk(&out.0, &options()).1["c.mkv"].clone();
-        assert_eq!(status, "error");
-        assert!(detail.contains("before it changed"), "{detail}");
-        // A report with the time and no fingerprint cannot tell, and says what can be done.
-        report(serde_json::json!({"input": input, "source_bytes": 5, "source_mtime": now - 60}));
-        let (status, detail) = source.walk(&out.0, &options()).1["c.mkv"].clone();
-        assert_eq!(status, "error");
-        assert!(detail.contains("when it was last changed at another time") && detail.contains(&format!("delete {}", out.0.join("c.mp4").display())), "{detail}");
+        for other in [serde_json::json!({"source_hash": "0000000000000000"}), serde_json::json!({"source_fingerprint": "0000000000000000"})] {
+            let mut fields = serde_json::json!({"input": input, "source_bytes": 5, "source_mtime": now - 60});
+            fields.as_object_mut().unwrap().extend(other.as_object().unwrap().clone());
+            report(fields);
+            let (status, detail) = source.walk(&out.0, &options()).1["c.mkv"].clone();
+            assert_eq!(status, "error");
+            assert!(detail.contains("before it changed"), "{detail}");
+        }
+        // A report without the whole hash cannot tell, says why, and says what can be done.
+        for (fields, why) in [
+            (serde_json::json!({"input": input, "source_bytes": 5, "source_mtime": now - 60}), "from an earlier version"),
+            (serde_json::json!({"input": input, "source_bytes": 5, "source_mtime": now - 60, "source_fingerprint": null}), "could not be read when its encode began"),
+            (serde_json::json!({"input": input, "source_bytes": 5, "source_mtime": now - 60, "source_fingerprint": print}), "only samples"),
+        ] {
+            report(fields);
+            let (status, detail) = source.walk(&out.0, &options()).1["c.mkv"].clone();
+            assert_eq!(status, "error");
+            assert!(detail.contains("when it was last changed at another time") && detail.contains(why) && detail.contains(&format!("delete {}", out.0.join("c.mp4").display())), "{detail}");
+        }
         // A report from before the time was kept judges by the size alone.
         report(serde_json::json!({"input": input, "source_bytes": 5}));
         assert_eq!(source.walk(&out.0, &options()).1["c.mkv"].0, "done_before");

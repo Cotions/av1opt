@@ -1128,6 +1128,63 @@ fn stand_in_tools_running(name: &str, on_a_file: &str, on_a_run: &str) -> (Strin
     (write("ffmpeg", &ffmpeg), write("ffprobe", &ffprobe))
 }
 
+#[test]
+fn requests_from_other_pages_are_refused_and_every_answer_is_hardened() {
+    use std::io::{Read, Write};
+    let (ffmpeg, ffprobe) = stand_in_tools("fetch-site", A_VIDEO);
+    let s = Server::start_with_tools("fetch-site", &ffmpeg, &ffprobe, |d| std::fs::write(d.join("videos/a.mp4"), b"xx").unwrap());
+    let cookie = s.cookie();
+    let from = |site: &str, path: &str| s.request("GET", path, &[("Cookie", &cookie), ("Sec-Fetch-Site", site)], None);
+    // Another port of this host counts as the same site, and the cookie goes there too.
+    for site in ["cross-site", "same-site"] {
+        for path in ["/api/state", "/", "/thumb?path=/x&t=1", "/media?path=/x", &format!("/?token={TOKEN}")] {
+            let r = from(site, path);
+            assert_eq!(r.status, 403, "{site} {path}: {}", r.body);
+            assert!(!r.headers.to_ascii_lowercase().contains("set-cookie"), "{site} {path}");
+        }
+    }
+    // The page itself, an address the person opened, and a program that says nothing.
+    for site in ["same-origin", "none"] {
+        assert_eq!(from(site, "/api/state").status, 200, "{site}");
+    }
+    assert_eq!(s.get("/api/state").status, 200);
+    let signed_in = s.request("GET", &format!("/?token={TOKEN}"), &[("Sec-Fetch-Site", "none")], None);
+    assert_eq!(signed_in.status, 303, "{}", signed_in.body);
+    assert!(signed_in.headers.contains("Set-Cookie: av1opt_"), "{}", signed_in.headers);
+
+    let check = |what: &str, headers: &str| {
+        for wanted in [
+            "Cross-Origin-Resource-Policy: same-origin",
+            "X-Content-Type-Options: nosniff",
+            "Content-Security-Policy: default-src 'self'; media-src 'self' blob:; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'",
+            "frame-ancestors 'none'",
+        ] {
+            assert!(headers.contains(wanted), "{what}: no {wanted} in {headers}");
+        }
+    };
+    check("sign-in", &signed_in.headers);
+    check("refused", &from("cross-site", "/").headers);
+    check("not signed in", &s.request("GET", "/", &[], None).headers);
+    for path in ["/", "/app.js", "/style.css", "/api/state", "/no/such/page"] {
+        check(path, &s.get(path).headers);
+    }
+    let clip = s.dir.join("videos/a.mp4");
+    assert_eq!(s.post("/api/source", &json!({ "path": clip })).status, 200);
+    let media = s.get(&format!("/media?path={}", clip.display()));
+    assert_eq!(media.status, 200, "{}", media.body);
+    check("media", &media.headers);
+    // The event stream stays open, so only its head is read.
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", s.port)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    write!(stream, "GET /api/events HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nCookie: {cookie}\r\n\r\n", s.port).unwrap();
+    let (mut head, mut byte) = (Vec::new(), [0u8; 1]);
+    while !head.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).unwrap();
+        head.push(byte[0]);
+    }
+    check("events", &String::from_utf8_lossy(&head));
+}
+
 /// A stand-in ffmpeg that writes its output, except for a file with `hang` in its name: there
 /// it notes its process number beside itself and never ends.
 const HANGS_ON_ONE_FILE: &str = "case \"$*\" in\n*hang*) echo $$ > \"$(dirname \"$0\")/hung\"; exec sleep 600;;\nesac\nfor last; do :; done\nprintf x > \"$last\"";

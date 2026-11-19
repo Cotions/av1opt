@@ -28,12 +28,23 @@ fn get_header<'a>(req: &'a Request, name: &str) -> Option<&'a str> {
     req.headers().iter().find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name)).map(|h| h.value.as_str())
 }
 
-/// Security headers sent with every response.
+/// What the page is: its own script and style files, video from this server or from memory,
+/// pictures from this server and the icon written into it. Nothing may frame it.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; media-src 'self' blob:; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
+/// Security headers sent with every response. Cross-Origin-Resource-Policy keeps a video or a
+/// picture from being taken into a page of another port, which counts as the same site.
+const SECURITY_HEADERS: [(&str, &str); 6] = [
+    ("X-Content-Type-Options", "nosniff"),
+    ("X-Frame-Options", "DENY"),
+    ("Referrer-Policy", "no-referrer"),
+    ("Cache-Control", "no-store"),
+    ("Cross-Origin-Resource-Policy", "same-origin"),
+    ("Content-Security-Policy", CONTENT_SECURITY_POLICY),
+];
+
 fn hardened<R: Read>(r: Response<R>) -> Response<R> {
-    r.with_header(header("X-Content-Type-Options", "nosniff"))
-        .with_header(header("X-Frame-Options", "DENY"))
-        .with_header(header("Referrer-Policy", "no-referrer"))
-        .with_header(header("Cache-Control", "no-store"))
+    SECURITY_HEADERS.iter().fold(r, |r, (name, value)| r.with_header(header(name, value)))
 }
 
 fn reply(req: Request, status: u16, ctype: &str, body: impl Into<Vec<u8>>) {
@@ -59,6 +70,14 @@ fn same_host(app: &App, req: &Request) -> bool {
         Some(o) => o.strip_prefix("http://").is_some_and(ok),
     };
     host_ok && origin_ok
+}
+
+/// Whether a browser, if this is one, says the request comes from this page or from the person
+/// (an address typed, a link opened from another program). Cookies do not tell ports apart and
+/// every port of 127.0.0.1 counts as the same site, so a page of any other local program would
+/// otherwise have its requests sent signed in. Other clients do not send the header.
+fn from_this_page_or_the_person(req: &Request) -> bool {
+    get_header(req, "Sec-Fetch-Site").is_none_or(|site| site == "same-origin" || site == "none")
 }
 
 fn has_session(app: &App, req: &Request) -> bool {
@@ -114,6 +133,9 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 pub fn handle(app: &Arc<App>, mut req: Request) {
     if !same_host(app, &req) {
         return reply(req, 403, "text/plain", "forbidden: av1opt only answers to http://127.0.0.1");
+    }
+    if !from_this_page_or_the_person(&req) {
+        return reply(req, 403, "text/plain", "forbidden: av1opt does not answer requests from other pages; open its address directly");
     }
     if !same_user(app, &req) {
         return reply(req, 403, "text/plain", "forbidden: this page is for the user who started av1opt");
@@ -265,7 +287,8 @@ fn events(app: &App, req: Request) {
     let (tx, rx) = mpsc::channel::<String>();
     app.subscribers.lock().unwrap().push(tx);
     let mut w = req.into_writer();
-    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n\r\n";
+    let security: String = SECURITY_HEADERS.iter().map(|(name, value)| format!("{name}: {value}\r\n")).collect();
+    let head = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n{security}\r\n");
     if w.write_all(head.as_bytes()).and_then(|_| w.write_all(b"retry: 2000\n\n")).and_then(|_| w.flush()).is_err() {
         return;
     }

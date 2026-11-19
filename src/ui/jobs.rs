@@ -1195,15 +1195,18 @@ pub fn start_worker(app: Arc<App>) {
                     }
                     Ok(_) => {
                         j.status = "done".into();
-                        keep_left_out(&app.jobs, j, false);
+                        if !stopping {
+                            keep_left_out(&app.jobs, j, false);
+                        }
                     }
                     Err(e) => {
                         j.status = "failed".into();
                         j.error = Some(format!("{e:#}"));
                         j.out_dir_missing = batch::is_out_dir_problem(&e);
                         j.out_dir_to_confirm = batch::out_dir_needs_confirming(&e);
-                        // A job that waits for its folder comes back whole.
-                        if !j.out_dir_missing {
+                        // A job that waits for its folder comes back whole, as does one that
+                        // ended as the server stopped.
+                        if !j.out_dir_missing && !stopping {
                             keep_left_out(&app.jobs, j, false);
                         }
                     }

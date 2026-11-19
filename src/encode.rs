@@ -622,10 +622,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
         notes.push(format!("{why}: encoded in one pass instead of per scene"));
     }
     let work = (o.scenes.possible() && one_pass.is_none()).then(|| work_dir(input, out_dir, size, o, preset, svt_params, &mut notes)).transpose()?;
-    let saved: Option<scenes::Plan> = work.as_ref().and_then(|w| {
-        let p: scenes::Plan = serde_json::from_slice(&std::fs::read(w.path.join("plan.json")).ok()?).ok()?;
-        (p.key == w.key && plan_fits(&p, &source)).then_some(p)
-    });
+    let saved = work.as_ref().and_then(|w| saved_plan(w, &source));
     if saved.as_ref().is_some_and(|p| p.source_mtime.is_some() && p.source_mtime != source.modified) {
         let n = "the source has another date than when its finished chunks were made, and the same contents where it was sampled, so the chunks are used".to_string();
         eprintln!("note: {n}");
@@ -1213,6 +1210,12 @@ fn plan_key(folder: &Path) -> Option<String> {
     }
     let bytes = crate::files::read_regular(&folder.join("plan.json"), PLAN_LIMIT).ok()?;
     serde_json::from_slice::<Saved>(&bytes).ok().map(|saved| saved.key)
+}
+
+/// The plan in a work folder, if it is one for these settings and for the source as it is now.
+fn saved_plan(w: &WorkDir, source: &Recorded) -> Option<scenes::Plan> {
+    let p: scenes::Plan = serde_json::from_slice(&std::fs::read(w.path.join("plan.json")).ok()?).ok()?;
+    (p.key == w.key && plan_fits(&p, source)).then_some(p)
 }
 
 /// Whether what a plan was made from is the source as it is now: the same samples, or where
@@ -1996,6 +1999,16 @@ mod tests {
         assert!(!plan_fits(&plan(Some("same"), Some(1_000_000)), &unread));
         // A plan of an earlier version: its key held the date, and the folder was found by it.
         assert!(plan_fits(&plan(None, None), &now));
+
+        // What a run goes on from is the plan that fits, in the folder of its settings.
+        std::fs::create_dir_all(&first.path).unwrap();
+        let write_plan = |p: scenes::Plan| std::fs::write(first.path.join("plan.json"), serde_json::to_vec(&scenes::Plan { key: first.key.clone(), ..p }).unwrap()).unwrap();
+        write_plan(plan(Some("same"), Some(1_000_000)));
+        assert!(saved_plan(&first, &now).is_some(), "only touched");
+        write_plan(plan(Some("other"), Some(2_000_000)));
+        assert!(saved_plan(&first, &now).is_none(), "rewritten");
+        std::fs::write(first.path.join("plan.json"), serde_json::to_vec(&scenes::Plan { key: "other settings".into(), ..plan(Some("same"), Some(2_000_000)) }).unwrap()).unwrap();
+        assert!(saved_plan(&first, &now).is_none(), "made for other settings");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

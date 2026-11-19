@@ -1030,7 +1030,7 @@ mod tests {
     fn ends_soon(process: &str) -> bool {
         let gone = || std::fs::read_to_string(format!("/proc/{process}/stat")).map_or(true, |stat| stat.rsplit(')').next().is_some_and(|rest| rest.trim_start().starts_with('Z')));
         let started = Instant::now();
-        while !gone() && started.elapsed() < Duration::from_secs(10) {
+        while !gone() && started.elapsed() < Duration::from_secs(2) {
             std::thread::sleep(Duration::from_millis(20));
         }
         gone()
@@ -1042,7 +1042,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let (ffprobe, pid_file) = (dir.join("ffprobe"), dir.join("reader"));
-        crate::files::write_script(&ffprobe, &format!("cat /dev/zero > /dev/null &\necho $! > '{}'\nwait\n", pid_file.display()));
+        // Bounded, so that a run nothing stops still ends and fails this test rather than hang it:
+        // at the rate head reads, tens of seconds.
+        crate::files::write_script(&ffprobe, &format!("head -c 50000000000 /dev/zero > /dev/null &\necho $! > '{}'\nwait\n", pid_file.display()));
         let long = Duration::from_secs(600);
         let started = Instant::now();
         let why = run_watched(Command::new(&ffprobe), ReadWatch::new(long, long, Duration::from_millis(400))).unwrap().unwrap_err();

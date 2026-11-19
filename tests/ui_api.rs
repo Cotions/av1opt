@@ -2080,6 +2080,8 @@ fn inputs_left_out_of_a_job_outlive_it() {
     let id = heads(&s)[0]["id"].as_u64().unwrap();
     assert_eq!(s.post(&format!("/api/jobs/{id}/cancel"), &json!({})).status, 200);
     std::fs::write(s.dir.join("videos/b.mkv"), b"x").unwrap();
+    // Trying the others again leaves them as they were, still the job's.
+    assert_eq!(s.post("/api/jobs/unrestored/retry", &json!({})).json()["restored"], 0);
     assert_eq!(s.post(&format!("/api/jobs/{id}/again"), &json!({})).status, 200);
     assert_eq!(heads(&s)[0]["total"], 2);
     assert!(s.get("/api/jobs").json()["unrestored"].as_array().unwrap().is_empty());
@@ -2161,9 +2163,10 @@ fn each_saved_job_outside_the_queue_can_be_tried_or_forgotten_by_itself() {
 
 #[test]
 fn a_job_cancelled_just_before_the_server_stops_does_not_come_back() {
+    // A probe that holds the job for longer than a stop waits for it.
     let (ffmpeg, ffprobe) = stand_in_tools("cancel-stop", "sleep 30\nexit 1");
-    let launch = |name: &str| {
-        Server::start_with_tools(name, &ffmpeg, &ffprobe, |d| {
+    let launch_with = |name: &str, ffprobe: &str| {
+        Server::start_with_tools(name, &ffmpeg, ffprobe, |d| {
             for video in ["a.mkv", "c.mkv"] {
                 std::fs::write(d.join("videos").join(video), b"x").unwrap();
             }
@@ -2171,6 +2174,7 @@ fn a_job_cancelled_just_before_the_server_stops_does_not_come_back() {
             write_saved_queue(d, json!([{ "inputs": [d.join("videos/a.mkv"), d.join("videos/b.mkv"), d.join("videos/c.mkv")], "roots": [], "out_dir": d.join("out"), "options": {}, "out_dir_made": true }]));
         })
     };
+    let launch = |name: &str| launch_with(name, &ffprobe);
     let mut s = launch("cancel-stop");
     soon("the job runs", || heads(&s).first().is_some_and(|j| j["status"] == "running"));
     let id = heads(&s)[0]["id"].as_u64().unwrap();
@@ -2187,8 +2191,23 @@ fn a_job_cancelled_just_before_the_server_stops_does_not_come_back() {
     assert_eq!(s.get("/api/jobs").json()["unrestored"].as_array().unwrap().len(), 1);
     drop(s);
 
-    // Interrupted by the stop and not by anyone, the same job comes back whole.
-    let mut s = launch("stop-only");
+    // Cancelled while the server is stopping: the stop waits a few seconds for a running job,
+    // and the page can still be used meanwhile.
+    let mut s = launch("cancel-while-stopping");
+    soon("the job runs", || heads(&s).first().is_some_and(|j| j["status"] == "running"));
+    let id = heads(&s)[0]["id"].as_u64().unwrap();
+    unsafe { libc::kill(s.child.id() as i32, libc::SIGTERM) };
+    assert_eq!(s.post(&format!("/api/jobs/{id}/cancel"), &json!({})).status, 200);
+    assert!(s.terminate());
+    let saved = saved_queue(&s)["jobs"].as_array().unwrap().clone();
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    assert_eq!(saved[0]["only_by_hand"], true, "{saved:?}");
+    drop(s);
+
+    // Interrupted by the stop and not by anyone, the same job comes back whole, also when its
+    // run has ended by the time the stop is over.
+    let (_, quick_ffprobe) = stand_in_tools("stop-only", "sleep 2\nexit 1");
+    let mut s = launch_with("stop-only", &quick_ffprobe);
     soon("the job runs", || heads(&s).first().is_some_and(|j| j["status"] == "running"));
     assert!(s.terminate());
     let saved = saved_queue(&s)["jobs"].as_array().unwrap().clone();

@@ -515,12 +515,25 @@ fn at_default_aims(o: &Options) -> bool {
     o.target_vmaf == 93.0 && o.preset == crate::search::DEFAULT_PRESET && o.min_savings == crate::estimate::MIN_SAVINGS
 }
 
+/// The most of the log that is read: a line is about 200 bytes, so this is over half a million
+/// files. A larger one is not believed: it is more likely a file planted under its name.
+const LOG_LIMIT: u64 = 128 << 20;
+
 /// Previous skip decisions, keyed by absolute input path and size. A line counts for the
 /// settings it was decided under; `unlabelled` says whether lines that name none count. Read
 /// as bytes and line by line: one damaged line costs that line, not what the rest of the log
-/// remembers.
+/// remembers. The log is in the output folder, where anybody who can write to it can leave a
+/// pipe, a link to `/dev/zero` or an endless file under its name: only a plain file within
+/// [`LOG_LIMIT`] is read, and otherwise the files are looked at again.
 fn read_skips(log: &Path, settings: &str, unlabelled: bool) -> HashMap<(PathBuf, u64), PastSkip> {
-    let Ok(bytes) = std::fs::read(log) else { return HashMap::new() };
+    let bytes = match crate::files::read_regular(log, LOG_LIMIT) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+        Err(e) => {
+            eprintln!("warning: {} was not read ({e}), so files it says were skipped before are looked at again; move it away if it is not av1opt's", log.display());
+            return HashMap::new();
+        }
+    };
     bytes
         .split(|b| *b == b'\n')
         .filter_map(|l| {
@@ -1015,6 +1028,29 @@ mod tests {
             let _ = tell.send(report_input(&output).is_none());
         });
         assert_eq!(told.recv_timeout(std::time::Duration::from_secs(1)), Ok(true));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_log_that_is_a_pipe_a_link_or_endless_is_passed_over_without_a_wait() {
+        let dir = std::env::temp_dir().join(format!("av1opt-batch-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (pipe, link, endless) = (dir.join("pipe.tsv"), dir.join("link.tsv"), dir.join("endless.tsv"));
+        crate::files::tests::make_pipe(&pipe);
+        std::os::unix::fs::symlink("/dev/zero", &link).unwrap();
+        std::fs::File::create(&endless).unwrap().set_len(LOG_LIMIT + 1).unwrap();
+        let (tell, told) = std::sync::mpsc::channel();
+        let paths = [pipe.clone(), link.clone(), endless];
+        std::thread::spawn(move || {
+            let read = paths.iter().all(|p| read_skips(p, "s", true).is_empty());
+            // Nor does a line go into a pipe or through a link.
+            let written = paths[..2].iter().map(|p| log_line(p, "ok", Path::new("/x.mp4"), (1, None), "", "s").unwrap_err().to_string()).collect::<Vec<_>>();
+            let _ = tell.send((read, written));
+        });
+        let (read, written) = told.recv_timeout(std::time::Duration::from_secs(2)).expect("the log was waited on");
+        assert!(read);
+        assert_eq!(written, ["not a plain file: it is a pipe", "not a plain file: it is a link"]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

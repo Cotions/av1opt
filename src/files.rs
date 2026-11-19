@@ -271,15 +271,21 @@ pub fn append_line(path: &Path, line: &str, follow: bool) -> std::io::Result<()>
         let mut o = std::fs::OpenOptions::new();
         o.read(read).create(true).append(true).mode(new_file_mode(path));
         if !follow {
-            o.custom_flags(libc::O_NOFOLLOW);
+            // Nor waited on: a pipe at that name would hold the run until someone read it.
+            o.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
         o.open(path)
     };
     // Reading is only for the last byte: a log that may only be written to still gets its line.
     let mut file = match open(true) {
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => open(false)?,
+        Err(e) if !follow && e.raw_os_error() == Some(libc::ELOOP) => return Err(std::io::Error::other("not a plain file: it is a link")),
         opened => opened?,
     };
+    let meta = file.metadata()?;
+    if !follow && !meta.is_file() {
+        return Err(std::io::Error::other(format!("not a plain file: it is {}", kind_of(&meta))));
+    }
     let start = if needs_line_end_first(&file) { "\n" } else { "" };
     file.write_all(format!("{start}{line}\n").as_bytes())
 }
@@ -311,24 +317,58 @@ fn read_counting(file: &mut std::fs::File, buffer: &mut [u8], got: &AtomicU64) -
     Ok(have)
 }
 
+/// What stands at a name, in words, for a message about something that is not a plain file.
+pub fn kind_of(meta: &std::fs::Metadata) -> &'static str {
+    use std::os::unix::fs::FileTypeExt;
+    let kind = meta.file_type();
+    if kind.is_symlink() {
+        "a link"
+    } else if kind.is_dir() {
+        "a folder"
+    } else if kind.is_fifo() {
+        "a pipe"
+    } else if kind.is_char_device() || kind.is_block_device() {
+        "a device"
+    } else if kind.is_socket() {
+        "a socket"
+    } else if kind.is_file() {
+        "a plain file"
+    } else {
+        "something other than a file"
+    }
+}
+
 /// The contents of the plain file at `path`, of at most `limit` bytes. What lies in a folder
-/// others can write to may be a pipe, which would never finish opening, or a link, or endless.
+/// others can write to may be a pipe, which would never finish opening, or a link (to
+/// `/dev/zero`, say), or endless: each is refused with a message that says what is there, and
+/// nothing is read from it. The open does not wait and does not follow a link, and the kind of
+/// file is judged on the descriptor, so what is judged is what is read.
 pub fn read_regular(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
     use std::os::unix::fs::OpenOptionsExt;
-    let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
+    let too_large = || std::io::Error::other(format!("not a plain file of a sensible size: it is larger than the {} allowed", size_words(limit)));
+    let file = match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC).open(path) {
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(std::io::Error::other("not a plain file: it is a link")),
+        opened => opened?,
+    };
     let meta = file.metadata()?;
     if !meta.is_file() {
-        return Err(std::io::Error::other("not a plain file"));
+        return Err(std::io::Error::other(format!("not a plain file: it is {}", kind_of(&meta))));
     }
     if meta.len() > limit {
-        return Err(std::io::Error::other(format!("larger than the {} MiB allowed", limit >> 20)));
+        return Err(too_large());
     }
     let mut bytes = Vec::with_capacity(meta.len() as usize);
+    // A file that grows while it is read is cut off one byte past the limit, and refused.
     file.take(limit + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > limit {
-        return Err(std::io::Error::other(format!("larger than the {} MiB allowed", limit >> 20)));
+        return Err(too_large());
     }
     Ok(bytes)
+}
+
+/// A size limit in words: whole MiB where it is one, bytes otherwise.
+fn size_words(limit: u64) -> String {
+    if limit >= 1 << 20 && limit % (1 << 20) == 0 { format!("{} MiB", limit >> 20) } else { format!("{limit} bytes") }
 }
 
 /// The right to one piece of work, held by a lock on the file at its path. The system lets go of
@@ -471,7 +511,7 @@ pub fn write_script(path: &Path, body: &str) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -838,5 +878,37 @@ mod tests {
         release.join().unwrap();
         assert_eq!(std::process::Command::new(&script).status().unwrap().code(), Some(3));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pipe at `path`, made as anyone who can write to a folder can make one.
+    pub(crate) fn make_pipe(path: &Path) {
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o644) }, 0);
+    }
+
+    #[test]
+    fn only_a_plain_file_within_its_limit_is_read_and_nothing_else_is_waited_on() {
+        let dir = room("read-regular");
+        let (report, pipe, link, long, folder) = (dir.join("r.json"), dir.join("pipe"), dir.join("link"), dir.join("long"), dir.join("folder"));
+        std::fs::write(&report, b"{}").unwrap();
+        assert_eq!(read_regular(&report, 2).unwrap(), b"{}");
+        make_pipe(&pipe);
+        std::os::unix::fs::symlink("/dev/zero", &link).unwrap();
+        std::fs::write(&long, vec![b' '; 3]).unwrap();
+        std::fs::create_dir(&folder).unwrap();
+        // Each in a thread of its own, so that a wait shows as a failed test, not a hung one.
+        let said = |path: PathBuf, limit: u64| {
+            let (tell, told) = std::sync::mpsc::channel();
+            std::thread::spawn(move || drop(tell.send(read_regular(&path, limit).map_err(|e| e.to_string()))));
+            told.recv_timeout(std::time::Duration::from_secs(2)).expect("the read waited").unwrap_err()
+        };
+        assert_eq!(said(pipe, 1 << 20), "not a plain file: it is a pipe");
+        assert_eq!(said(link, 1 << 20), "not a plain file: it is a link");
+        assert_eq!(said(PathBuf::from("/dev/zero"), 1 << 20), "not a plain file: it is a device");
+        assert_eq!(said(folder, 1 << 20), "not a plain file: it is a folder");
+        assert_eq!(said(long, 2), "not a plain file of a sensible size: it is larger than the 2 bytes allowed");
+        assert_eq!(size_words(8 << 20), "8 MiB");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -486,7 +486,8 @@ fn probe_preset(preset: u8) -> u8 {
 /// an original went is exempt: it is kept under a name of its own when the new one is written.
 pub fn report_of_another_output(output: &Path) -> Option<String> {
     let at = output.with_extension("av1opt.json");
-    let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&at).ok()?).ok()?;
+    // Beside the output, where anybody who can write to the folder can leave a pipe or a link.
+    let report: serde_json::Value = serde_json::from_slice(&crate::files::read_regular(&at, crate::replace::REPORT_LIMIT).ok()?).ok()?;
     if report.get("replaced").is_some_and(|v| !v.is_null()) {
         return None;
     }
@@ -1268,7 +1269,7 @@ fn plan_key(folder: &Path) -> Option<String> {
 
 /// The plan in a work folder, if it is one for these settings and for the source as it is now.
 fn saved_plan(w: &WorkDir, source: &Recorded) -> Option<scenes::Plan> {
-    let p: scenes::Plan = serde_json::from_slice(&std::fs::read(w.path.join("plan.json")).ok()?).ok()?;
+    let p: scenes::Plan = serde_json::from_slice(&crate::files::read_regular(&w.path.join("plan.json"), PLAN_LIMIT).ok()?).ok()?;
     (p.key == w.key && plan_fits(&p, source)).then_some(p)
 }
 
@@ -2553,6 +2554,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_pipe_or_a_link_at_the_reports_name_is_not_waited_on_nor_read_through() {
+        let dir = folder_for_test("other-report");
+        let output = dir.join("clip.mp4");
+        crate::files::tests::make_pipe(&dir.join("clip.av1opt.json"));
+        let (tell, told) = std::sync::mpsc::channel();
+        let asked = output.clone();
+        std::thread::spawn(move || drop(tell.send(report_of_another_output(&asked))));
+        assert_eq!(told.recv_timeout(std::time::Duration::from_secs(2)).expect("the report was waited on"), None);
+        // A link to the report of another output is not gone through either.
+        std::fs::remove_file(dir.join("clip.av1opt.json")).unwrap();
+        std::fs::write(dir.join("clip.mkv"), b"other").unwrap();
+        std::fs::write(dir.join("elsewhere.json"), br#"{"output":"clip.mkv"}"#).unwrap();
+        std::os::unix::fs::symlink(dir.join("elsewhere.json"), dir.join("clip.av1opt.json")).unwrap();
+        assert_eq!(report_of_another_output(&output), None);
+        std::fs::remove_file(dir.join("clip.av1opt.json")).unwrap();
+        std::fs::rename(dir.join("elsewhere.json"), dir.join("clip.av1opt.json")).unwrap();
+        assert!(report_of_another_output(&output).is_some_and(|why| why.contains("belongs to")));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn set_date(file: &Path, seconds: u64) {

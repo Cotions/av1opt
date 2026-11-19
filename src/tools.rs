@@ -128,7 +128,8 @@ pub struct Tools {
     cap: Option<String>,
     /// What each of several chunk encodes running side by side may use: their part of the cap.
     side_by_side_cap: Option<String>,
-    /// Progress listener and cancel switch (the UI); None on the command line.
+    /// Progress listener and cancel switch: the page's, or the one signals use on the command
+    /// line. None where nothing can stop the run.
     pub hooks: Option<Arc<Hooks>>,
     /// First line of `ffmpeg -version`, asked for once.
     version: std::sync::OnceLock<String>,
@@ -365,6 +366,7 @@ impl Tools {
         });
 
         let watch = self.stopwatch();
+        let listened_to = self.hooks.as_ref().is_some_and(|h| !h.is_on_terminal());
         let (mut done_secs, mut fps, mut frames) = (0.0_f64, String::new(), 0u64);
         // Read errors end the loop instead of returning, so the child is always reaped
         // (and untracked) below.
@@ -379,14 +381,14 @@ impl Tools {
                 let frac = (done_secs / total_secs).clamp(0.0, 1.0);
                 let elapsed = watch.secs(self);
                 let eta = if frac > 0.01 { elapsed / frac - elapsed } else { 0.0 };
-                if self.hooks.is_some() {
+                if listened_to {
                     self.emit(Event::Progress { label: label.to_string(), frac, fps: fps.trim().parse().unwrap_or(0.0), eta_secs: eta });
                 } else {
                     eprint!("\r{label} {:5.1}%  {fps:>6} fps  ETA {}   ", frac * 100.0, hms(eta));
                 }
             }
         }
-        if self.hooks.is_none() {
+        if !listened_to {
             eprintln!();
         }
         let out = self.finish(child)?;

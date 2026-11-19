@@ -545,6 +545,27 @@ pub struct Summary {
     /// Files failed because the output folder was away. Whatever it is doing by the end of the
     /// run, those files are still to be done.
     pub out_dir_lost: Option<anyhow::Error>,
+    /// What a stopped run left on purpose in the folder it was working in.
+    pub kept: Vec<PathBuf>,
+}
+
+/// The folders a stopped run leaves in `out_dir`: per-scene work, which the next run resumes from,
+/// and its temporary folder if it was told to keep that.
+fn kept_when_stopped(out_dir: &Path, o: &Options) -> Vec<PathBuf> {
+    let temp = format!(".av1opt-tmp-{}", std::process::id());
+    let mut kept: Vec<PathBuf> = std::fs::read_dir(out_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(encode::WORK_PREFIX) || (o.keep_temp && *name == temp)
+        })
+        .map(|e| e.path())
+        .collect();
+    kept.sort();
+    kept
 }
 
 pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipped: bool) -> Result<Summary> {
@@ -643,11 +664,14 @@ pub fn run_placed(tools: &Tools, jobs: &[Job], out_dir: &Path, place: Option<&Ou
                 end("ok", &out.display().to_string(), out_size);
                 record("ok", &abs, size, &out.display().to_string());
             }
-            Err(e) if events::is_cancelled(&e) => {
+            // Whatever else went wrong once the run was stopped comes of the stopping: Ctrl-C
+            // reaches an ffprobe under way directly, and it fails like a damaged file.
+            Err(e) if events::is_cancelled(&e) || tools.check_cancel().is_err() => {
                 // Not logged: the next run picks the file up again (scene work resumes).
                 eprintln!("cancelled");
                 end("cancelled", "", 0);
                 sum.cancelled = true;
+                sum.kept = kept_when_stopped(&job.out_dir, o);
                 break;
             }
             Err(e) if e.downcast_ref::<encode::InUse>().is_some() => {

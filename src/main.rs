@@ -22,6 +22,7 @@ mod scan;
 mod scenes;
 mod search;
 mod sections;
+mod signals;
 mod source;
 mod tools;
 mod trash;
@@ -472,7 +473,16 @@ fn parse_memory(s: &str) -> Result<String, String> {
 }
 
 fn main() -> Result<()> {
-    match Cli::parse().cmd {
+    let result = run_command(Cli::parse().cmd);
+    // Stopped by a signal, whatever the work then ended with.
+    if let Some(code) = signals::exit_code() {
+        std::process::exit(code);
+    }
+    result
+}
+
+fn run_command(command: Cmd) -> Result<()> {
+    match command {
         Cmd::Scan { paths, ffprobe, jobs, min_savings, csv, top, target_vmaf, preset, sort, hours, list } => {
             let past = history::load();
             let model = estimate::Model::fit(&past, target_vmaf);
@@ -487,7 +497,7 @@ fn main() -> Result<()> {
             check_reports(&[(csv.as_deref(), dups::CSV), (json.as_deref(), Kind::Json)], &paths)?;
             // SAFETY: plain syscall on our own process; children inherit the priority.
             unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) };
-            let tools = tools::Tools::new(ffmpeg, ffprobe, memory_cap(&memory_limit, jobs as u8));
+            let tools = signals::stopping_on_signals(tools::Tools::new(ffmpeg, ffprobe, memory_cap(&memory_limit, jobs as u8)));
             let opts = dups::Options { jobs, max_dist: tolerance, prefs: dups::matching::Prefs { prefer: prefer.iter().map(abs).collect(), avoid }, refresh };
             let start = std::time::Instant::now();
             let progress = |p: dups::Progress| match p {
@@ -531,7 +541,7 @@ fn main() -> Result<()> {
             let configs = bench::matrix(&presets, &param_sets);
             // SAFETY: plain syscall on our own process; children inherit the priority.
             unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) };
-            let tools = tools::Tools::new(ffmpeg, ffprobe, memory_cap(&memory_limit, 1));
+            let tools = signals::stopping_on_signals(tools::Tools::new(ffmpeg, ffprobe, memory_cap(&memory_limit, 1)));
             let opts = bench::Options {
                 configs: configs.clone(), target_vmaf, min_crf, max_crf, samples, sample_secs,
                 max_videos, jobs, refresh, work_dir,
@@ -649,7 +659,7 @@ fn main() -> Result<()> {
             std::fs::create_dir_all(&out_dir)?;
             // SAFETY: plain syscall on our own process; children inherit the priority.
             unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) };
-            let tools = tools::Tools::new(ffmpeg, ffprobe, memory_cap(&memory_limit, 1)).sharing_between_chunks(memory_cap(&memory_limit, workers));
+            let tools = signals::stopping_on_signals(tools::Tools::new(ffmpeg, ffprobe, memory_cap(&memory_limit, 1)).sharing_between_chunks(memory_cap(&memory_limit, workers)));
             let tuning = if tuned {
                 let t = tuning::Tuning::load()?;
                 if t.classes.is_empty() {
@@ -688,6 +698,9 @@ fn main() -> Result<()> {
                 s.ok, s.skipped, s.failed, s.already_done, s.bytes_in as f64 / 1e9, s.bytes_out as f64 / 1e9
             );
             eprintln!("log: {}", out_dir.join(batch::LOG_NAME).display());
+            for folder in &s.kept {
+                eprintln!("kept for the next run: {}", folder.display());
+            }
             if s.failed > 0 {
                 std::process::exit(2);
             }
@@ -706,7 +719,7 @@ fn main() -> Result<()> {
             std::fs::create_dir_all(&dir)?;
             // SAFETY: plain syscall on our own process; children inherit the priority.
             unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 10) };
-            let tools = tools::Tools::new(ffmpeg, ffprobe, memory_cap(&memory_limit, 1));
+            let tools = signals::stopping_on_signals(tools::Tools::new(ffmpeg, ffprobe, memory_cap(&memory_limit, 1)));
             let run = || -> Result<()> {
                 let size = std::fs::metadata(&input)?.len();
                 let info = probe::probe(&tools.ffprobe, &input, size)?;

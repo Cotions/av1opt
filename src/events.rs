@@ -1,6 +1,6 @@
-//! Progress events and cancellation for front ends other than the terminal (the `ui` web app).
-//! The command line passes no hooks and keeps printing to stderr; the encode code paths are the
-//! same either way.
+//! Progress events and cancellation. The `ui` web app listens to the events; the command line
+//! prints to stderr and uses only the cancelling, for signals. The encode code paths are the same
+//! either way.
 
 use serde::Serialize;
 use std::path::PathBuf;
@@ -41,6 +41,8 @@ pub struct Hooks {
     sink: Box<dyn Fn(Event) + Send + Sync>,
     cancelled: AtomicBool,
     running: Mutex<Running>,
+    /// Only the switches are in use: progress goes to the terminal.
+    terminal: bool,
 }
 
 /// The job's ffmpeg processes and whether they are held. One lock for both: a process started
@@ -62,7 +64,16 @@ fn signal(pid: u32, sig: libc::c_int) {
 #[cfg_attr(not(feature = "ui"), allow(dead_code))]
 impl Hooks {
     pub fn new(sink: impl Fn(Event) + Send + Sync + 'static) -> Self {
-        Hooks { sink: Box::new(sink), cancelled: AtomicBool::new(false), running: Mutex::default() }
+        Hooks { sink: Box::new(sink), cancelled: AtomicBool::new(false), running: Mutex::default(), terminal: false }
+    }
+
+    /// For a run on the command line, which nobody listens to but which can still be stopped.
+    pub fn on_terminal() -> Self {
+        Hooks { terminal: true, ..Hooks::new(|_| {}) }
+    }
+
+    pub fn is_on_terminal(&self) -> bool {
+        self.terminal
     }
 
     pub fn emit(&self, e: Event) {

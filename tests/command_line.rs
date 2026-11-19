@@ -120,6 +120,40 @@ impl Drop for Started {
     }
 }
 
+impl Case {
+    /// An `encode` of one video under way, its messages going to the file `said`, with ffmpeg
+    /// (which writes its process number to `pid` and then waits) started.
+    fn encoding(&self) -> (Started, u32) {
+        use std::os::unix::process::CommandExt;
+        self.video("a.mkv");
+        let said = std::fs::File::create(self.path("said")).unwrap();
+        let mut command = self.command(&["encode", "videos/a.mkv", "-o", "out", "--memory-limit", "none"]);
+        command.stdout(Stdio::null()).stderr(said);
+        // SAFETY: only signal(2) between fork and exec. The test may itself be running with
+        // Ctrl-C ignored, as a background job is, and the program would inherit that.
+        unsafe {
+            command.pre_exec(|| {
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                Ok(())
+            });
+        }
+        let run = Started(command.spawn().unwrap());
+        let pid = self.path("pid");
+        soon("ffmpeg to start", || std::fs::read_to_string(&pid).is_ok_and(|p| p.ends_with('\n')));
+        (run, text(&pid).trim().parse().unwrap())
+    }
+
+    fn left_in_out(&self, start: &str) -> Vec<String> {
+        let names = std::fs::read_dir(self.path("out")).unwrap().flatten();
+        names.map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with(start)).collect()
+    }
+}
+
+fn send(run: &Started, signal: i32) {
+    // SAFETY: kill(2) on a child that has not been waited for yet.
+    assert_eq!(unsafe { libc::kill(run.0.id() as i32, signal) }, 0);
+}
+
 fn soon(what: &str, done: impl Fn() -> bool) {
     let start = Instant::now();
     while !done() {
@@ -250,4 +284,43 @@ fn a_run_killed_under_the_memory_cap_says_so_and_had_all_of_it() {
     // What runs before any chunk runs alone, so it is not held to a worker's part.
     let scopes = text(&c.path("scopes"));
     assert!(scopes.contains("MemoryMax=2G") && !scopes.contains("MemoryMax=1024M"), "{scopes}");
+}
+
+/// For the runs of the encode, which start this way (asking the encoder its version does not).
+const WRITES_ITS_PID_AND_WAITS: &str = "[ \"$2\" = -nostdin ] || exit 0\necho $$ > \"$(dirname \"$0\")/../pid\"\nexec sleep 60";
+
+#[test]
+fn a_signal_stops_ffmpeg_and_clears_the_temporary_folder_but_not_the_work() {
+    for (signal, code) in [(libc::SIGTERM, 143), (libc::SIGINT, 130)] {
+        let c = Case::with_ffmpeg(&format!("signal-{signal}"), WRITES_ITS_PID_AND_WAITS);
+        std::fs::create_dir_all(c.path("out/.av1opt-work-0123")).unwrap();
+        std::fs::write(c.path("out/.av1opt-work-0123/chunk"), "hours of work").unwrap();
+        let (mut run, ffmpeg) = c.encoding();
+        assert_eq!(c.left_in_out(".av1opt-tmp-").len(), 1, "the run has its temporary folder");
+
+        send(&run, signal);
+        assert_eq!(run.0.wait().unwrap().code(), Some(code));
+        assert!(!Path::new(&format!("/proc/{ffmpeg}")).exists(), "ffmpeg was ended and waited for");
+        assert_eq!(c.left_in_out(".av1opt-tmp-"), [""; 0], "the temporary folder went");
+        assert_eq!(c.left_in_out(".av1opt-lock-"), [""; 0]);
+        assert_eq!(text(&c.path("out/.av1opt-work-0123/chunk")), "hours of work");
+        let said = text(&c.path("said"));
+        assert!(said.contains("stopping") && said.contains("kept for the next run") && said.contains(".av1opt-work-0123"), "{said}");
+        assert!(!said.contains("FAILED"), "{said}");
+        // Nothing about the file was noted: the next run takes it up again.
+        assert!(!std::fs::read_to_string(c.path("out/av1opt-log.tsv")).unwrap_or_default().contains("a.mkv"));
+    }
+}
+
+#[test]
+fn a_second_signal_ends_the_run_at_once() {
+    // This ffmpeg takes no notice of being asked to stop.
+    let c = Case::with_ffmpeg("signal-twice", &format!("trap '' TERM\n{WRITES_ITS_PID_AND_WAITS}"));
+    let (mut run, ffmpeg) = c.encoding();
+    send(&run, libc::SIGTERM);
+    soon("the first signal to be taken up", || text(&c.path("said")).contains("stopping"));
+    assert!(run.0.try_wait().unwrap().is_none(), "still waiting for ffmpeg");
+    send(&run, libc::SIGINT);
+    assert_eq!(run.0.wait().unwrap().code(), Some(130));
+    soon("ffmpeg to go with it", || !Path::new(&format!("/proc/{ffmpeg}")).exists());
 }

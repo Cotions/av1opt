@@ -40,12 +40,14 @@ pub fn private_folder(path: &Path) -> std::io::Result<()> {
 }
 
 /// Takes away what others may do with the file at `path`, one another program has made.
+#[cfg(any(feature = "ui", test))]
 pub fn make_private(path: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
 /// Takes away what others may do with everything below `folder`, for what versions before
 /// this one left there. Links are not followed. What cannot be changed stays as it is.
+#[cfg(any(feature = "ui", test))]
 pub fn tighten_below(folder: &Path) {
     for entry in std::fs::read_dir(folder).into_iter().flatten().flatten() {
         let path = entry.path();
@@ -561,7 +563,7 @@ mod tests {
         // A link with such a name, names that are not a run's, and another prefix.
         let link = dir.join(format!(".t-{gone}-2-00ff"));
         std::os::unix::fs::symlink(&keep, &link).unwrap();
-        let others = [make(&format!(".t-{gone}-1")), make(&format!(".t-{gone}-1-zz")), make(&format!(".t-x-1-00ff")), make(&format!(".u-{gone}-1-00ff"))];
+        let others = [make(&format!(".t-{gone}-1")), make(&format!(".t-{gone}-1-zz")), make(".t-x-1-00ff"), make(&format!(".u-{gone}-1-00ff"))];
 
         // Another user's look the same by name: the owner decides.
         remove_abandoned_folders_of(&dir, ".t-", me + 1);

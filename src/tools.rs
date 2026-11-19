@@ -296,6 +296,26 @@ impl Stopwatch {
     }
 }
 
+/// Waits for a child and says how it ended and how much processor time it used.
+fn wait_with_processor_time(pid: u32) -> std::io::Result<(std::process::ExitStatus, f64)> {
+    use std::os::unix::process::ExitStatusExt;
+    let mut status = 0;
+    // SAFETY: an all-zero rusage is valid, and wait4 only writes to the two places it is given.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    loop {
+        // SAFETY: as above; the pointers live across the call.
+        if unsafe { libc::wait4(pid as libc::pid_t, &mut status, 0, &mut usage) } >= 0 {
+            break;
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+    let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    Ok((std::process::ExitStatus::from_raw(status), secs(usage.ru_utime) + secs(usage.ru_stime)))
+}
+
 pub struct Tools {
     pub ffmpeg: String,
     pub ffprobe: String,
@@ -490,6 +510,38 @@ impl Tools {
             return Err(self.failure(out.status, &stderr, 15));
         }
         Ok(stderr)
+    }
+
+    /// Runs ffmpeg like [`Tools::run`] and returns the processor time it used, user and system,
+    /// in seconds. Asked of this one process, not of all children: the page's server has others
+    /// running at the same time.
+    pub fn run_timed(&self, args: &[String]) -> Result<f64> {
+        let mut cmd = self.command_for(&[], args);
+        cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+        let mut child = self.spawn(&mut cmd)?;
+        let watchdog = self.watchdog(&child, false);
+        let id = child.id();
+        // Read beside the wait: ffmpeg would stop once the pipe is full.
+        let mut pipe = child.stderr.take().context("ffmpeg's error output is not connected")?;
+        let reader = std::thread::spawn(move || {
+            let mut text = Vec::new();
+            let _ = pipe.read_to_end(&mut text);
+            text
+        });
+        let waited = wait_with_processor_time(id);
+        let stderr = reader.join().unwrap_or_default();
+        if let Some(h) = &self.hooks {
+            h.untrack(id);
+        }
+        self.check_cancel()?;
+        let (status, secs) = waited.context("cannot wait for ffmpeg")?;
+        if !status.success() {
+            if watchdog.stalled() {
+                return Err(self.stalled());
+            }
+            return Err(self.failure(status, &String::from_utf8_lossy(&stderr), 15));
+        }
+        Ok(secs)
     }
 
     /// Runs ffmpeg and returns what it wrote to stdout. A run still going after `timeout` (a
@@ -947,6 +999,24 @@ mod tests {
         }
         assert!(processor_time(std::process::id()).unwrap() > began);
         assert_eq!(processor_time(u32::MAX), None);
+    }
+
+    #[test]
+    fn a_timed_run_counts_the_processor_time_of_ffmpeg_and_not_its_waiting() {
+        let (tools, dir) = stand_in("timed", "i=0; while [ $i -lt 300000 ]; do i=$((i+1)); done\nsleep 0.5\n", 60);
+        let t = Instant::now();
+        let busy = tools.run_timed(&[]).unwrap();
+        let clock = t.elapsed().as_secs_f64();
+        assert!(busy > 0.05 && busy < clock - 0.3, "{busy} of {clock} seconds");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_timed_run_that_fails_says_what_ffmpeg_said() {
+        let (tools, dir) = stand_in("timed-fail", "echo 'it went wrong' >&2\nexit 3\n", 60);
+        let e = format!("{:#}", tools.run_timed(&[]).unwrap_err());
+        assert!(e.contains("it went wrong"), "{e}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

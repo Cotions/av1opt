@@ -571,6 +571,9 @@ fn run_command(command: Cmd) -> Result<()> {
                 configs: configs.clone(), target_vmaf, min_crf, max_crf, samples, sample_secs,
                 max_videos, jobs, refresh, work_dir,
             };
+            if bench::an_encode_is_running() {
+                eprintln!("warning: an AV1 encode is running on this machine: it slows this benchmark and disturbs its times, even in processor time; for times worth comparing, run it when the encode is done");
+            }
             let start = std::time::Instant::now();
             let plan = std::sync::Mutex::new((0usize, 0usize, 0usize));
             let progress = |p: bench::Progress| match p {
@@ -594,7 +597,7 @@ fn run_command(command: Cmd) -> Result<()> {
                     };
                     let left = start.elapsed().as_secs_f64() / done as f64 * (videos * n - done) as f64;
                     let what = match (&cell.point, &cell.error) {
-                        (Some(pt), _) => format!("crf {:.2}, {:.0} kbps, {:.2}x speed{}", pt.crf, pt.bitrate / 1000.0, 1.0 / pt.cost.max(1e-9), if pt.capped { " (above target at the highest CRF)" } else { "" }),
+                        (Some(pt), _) => format!("crf {:.2}, {:.0} kbps, {:.2}x speed{}", pt.crf, pt.bitrate / 1000.0, 1.0 / pt.clock_cost().max(1e-9), if pt.capped { " (above target at the highest CRF)" } else { "" }),
                         (None, Some(e)) => format!("failed: {}", e.lines().last().unwrap_or("")),
                         (None, None) => "target out of reach".to_string(),
                     };

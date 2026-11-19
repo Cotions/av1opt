@@ -12,9 +12,12 @@ pub struct Measure {
     pub vmaf: f64,
     pub vmaf_min: f64,
     pub bytes: u64,
-    /// Length of the clips together, and how long encoding them took.
+    /// Length of the clips together, and how long encoding them took by the clock.
     pub clip_secs: f64,
     pub encode_secs: f64,
+    /// The processor time of those encodes, user and system. 0 when it was not measured.
+    #[serde(default)]
+    pub cpu_secs: f64,
 }
 
 impl Measure {
@@ -22,8 +25,17 @@ impl Measure {
         self.bytes as f64 * 8.0 / self.clip_secs.max(1e-9)
     }
 
-    /// Encode seconds per second of video.
+    /// Processor seconds per second of video. Settings are ranked by it: with anything else
+    /// running, the same clip pair differed by 7 to 32% by the clock and by 1 to 4.6% in
+    /// processor time, and the clock read preset 4 as 5% faster than preset 6 when it is 60%
+    /// slower.
     fn cost(&self) -> f64 {
+        let secs = if self.cpu_secs > 0.0 { self.cpu_secs } else { self.encode_secs };
+        secs / self.clip_secs.max(1e-9)
+    }
+
+    /// Seconds by the clock per second of video.
+    fn wall_cost(&self) -> f64 {
         self.encode_secs / self.clip_secs.max(1e-9)
     }
 }
@@ -34,12 +46,27 @@ pub struct Point {
     pub crf: f64,
     /// Video bits per second.
     pub bitrate: f64,
-    /// Encode seconds per second of video.
+    /// Processor seconds of encoding per second of video.
     pub cost: f64,
+    /// Seconds of encoding by the clock per second of video. NaN (null in JSON) in results of
+    /// versions that did not tell the two apart.
+    #[serde(default = "not_known", deserialize_with = "nan_for_null")]
+    pub wall_cost: f64,
     pub vmaf: f64,
     /// The highest CRF allowed still beats the target, so this is that CRF's result: the file
     /// could be smaller still, and the quality is above the target.
     pub capped: bool,
+}
+
+impl Point {
+    /// Encode seconds per second of video as somebody waiting sees them.
+    pub fn clock_cost(&self) -> f64 {
+        if self.wall_cost.is_nan() { self.cost } else { self.wall_cost }
+    }
+}
+
+fn not_known() -> f64 {
+    f64::NAN
 }
 
 /// Interpolates between the last CRF that meets `target` and the first that misses it: size on
@@ -49,7 +76,7 @@ pub fn at_target(measures: &[Measure], target: f64) -> Option<Point> {
     let pass = measures.iter().filter(|m| m.vmaf >= target).max_by_key(|m| m.crf)?;
     let fail = measures.iter().filter(|m| m.vmaf < target && m.crf > pass.crf).min_by_key(|m| m.crf);
     let Some(fail) = fail else {
-        return Some(Point { crf: pass.crf as f64, bitrate: pass.bitrate(), cost: pass.cost(), vmaf: pass.vmaf, capped: true });
+        return Some(Point { crf: pass.crf as f64, bitrate: pass.bitrate(), cost: pass.cost(), wall_cost: pass.wall_cost(), vmaf: pass.vmaf, capped: true });
     };
     let frac = ((pass.vmaf - target) / (pass.vmaf - fail.vmaf)).clamp(0.0, 1.0);
     let mix = |a: f64, b: f64| a + (b - a) * frac;
@@ -57,6 +84,7 @@ pub fn at_target(measures: &[Measure], target: f64) -> Option<Point> {
         crf: mix(pass.crf as f64, fail.crf as f64),
         bitrate: mix(pass.bitrate().max(1.0).ln(), fail.bitrate().max(1.0).ln()).exp(),
         cost: mix(pass.cost(), fail.cost()),
+        wall_cost: mix(pass.wall_cost(), fail.wall_cost()),
         vmaf: target,
         capped: false,
     })
@@ -67,12 +95,16 @@ pub fn at_target(measures: &[Measure], target: f64) -> Option<Point> {
 pub struct Row {
     /// Index into the report's settings.
     pub config: usize,
-    /// Typical size and encode time relative to the baseline (geometric means; 1.0 = the same).
-    /// NaN (null in JSON) when the setting has no result on any video.
+    /// Typical size and processor time relative to the baseline (geometric means; 1.0 = the
+    /// same). NaN (null in JSON) when the setting has no result on any video.
     #[serde(deserialize_with = "nan_for_null")]
     pub size: f64,
     #[serde(deserialize_with = "nan_for_null")]
     pub time: f64,
+    /// The same for time by the clock, shown beside it and not used to choose. NaN when
+    /// unknown.
+    #[serde(default = "not_known", deserialize_with = "nan_for_null")]
+    pub wall_time: f64,
     /// The video where this setting did worst and best on size.
     #[serde(deserialize_with = "nan_for_null")]
     pub size_worst: f64,
@@ -80,7 +112,7 @@ pub struct Row {
     pub size_best: f64,
     /// Mean CRF at the target.
     pub crf: f64,
-    /// Video seconds encoded per second (all videos together).
+    /// Video seconds encoded per second by the clock (all videos together).
     pub speed: f64,
     /// Videos where this setting failed or could not reach the target although the baseline
     /// did. The numbers above then cover the other videos only, and the setting is never picked.
@@ -141,15 +173,17 @@ pub fn summarize(class: Option<Class>, points: &[&[Option<Point>]], configs: usi
             let pairs: Vec<(Point, Point)> = usable.iter().filter_map(|v| Some((v[c]?, v[baseline]?))).collect();
             let sizes: Vec<f64> = pairs.iter().map(|(p, b)| p.bitrate / b.bitrate.max(1e-9)).collect();
             let times: Vec<f64> = pairs.iter().map(|(p, b)| p.cost / b.cost.max(1e-9)).collect();
+            let wall_times: Vec<f64> = pairs.iter().map(|(p, b)| p.wall_cost / b.wall_cost.max(1e-9)).filter(|x| !x.is_nan()).collect();
             let n = pairs.len().max(1) as f64;
             Row {
                 config: c,
                 size: geomean(&sizes),
                 time: geomean(&times),
+                wall_time: geomean(&wall_times),
                 size_worst: sizes.iter().copied().fold(f64::NAN, f64::max),
                 size_best: sizes.iter().copied().fold(f64::NAN, f64::min),
                 crf: pairs.iter().map(|(p, _)| p.crf).sum::<f64>() / n,
-                speed: pairs.len() as f64 / pairs.iter().map(|(p, _)| p.cost).sum::<f64>().max(1e-9),
+                speed: pairs.len() as f64 / pairs.iter().map(|(p, _)| p.clock_cost()).sum::<f64>().max(1e-9),
                 missing: usable.len() - pairs.len(),
                 pareto: false,
             }
@@ -211,11 +245,11 @@ mod tests {
     use super::*;
 
     fn m(crf: u8, vmaf: f64, kbps: f64, cost: f64) -> Measure {
-        Measure { crf, vmaf, vmaf_min: vmaf - 1.0, bytes: (kbps * 1000.0 / 8.0 * 10.0) as u64, clip_secs: 10.0, encode_secs: cost * 10.0 }
+        Measure { crf, vmaf, vmaf_min: vmaf - 1.0, bytes: (kbps * 1000.0 / 8.0 * 10.0) as u64, clip_secs: 10.0, encode_secs: cost * 10.0, cpu_secs: cost * 10.0 }
     }
 
     fn p(bitrate: f64, cost: f64) -> Option<Point> {
-        Some(Point { crf: 35.0, bitrate, cost, vmaf: 93.0, capped: false })
+        Some(Point { crf: 35.0, bitrate, cost, wall_cost: cost, vmaf: 93.0, capped: false })
     }
 
     #[test]
@@ -340,11 +374,38 @@ mod tests {
 
     #[test]
     fn bitrate_and_cost_are_per_second_of_video() {
-        let x = Measure { crf: 30, vmaf: 93.0, vmaf_min: 90.0, bytes: 1250, clip_secs: 10.0, encode_secs: 25.0 };
+        let x = Measure { crf: 30, vmaf: 93.0, vmaf_min: 90.0, bytes: 1250, clip_secs: 10.0, encode_secs: 25.0, cpu_secs: 0.0 };
         assert_eq!((x.bitrate(), x.cost()), (1000.0, 2.5));
         // Clips of no length give large numbers, not infinite ones.
         let none = Measure { clip_secs: 0.0, ..x };
         assert!(none.bitrate().is_finite() && none.cost().is_finite());
+    }
+
+    #[test]
+    fn settings_are_ranked_by_processor_time_with_the_clock_beside_it() {
+        // By the clock the second setting looks faster, as a busy machine can make it look.
+        let timed = |cpu: f64, wall: f64| Measure { crf: 30, vmaf: 93.0, vmaf_min: 92.0, bytes: 1250, clip_secs: 10.0, encode_secs: wall, cpu_secs: cpu };
+        let at = |x: Measure| at_target(&[x], 93.0);
+        let (base, slower) = (at(timed(100.0, 20.0)), at(timed(160.0, 19.0)));
+        assert_eq!((base.unwrap().cost, base.unwrap().wall_cost), (10.0, 2.0));
+        let s = summarize(None, &[&[base, slower]], 2, 0).unwrap();
+        assert!(near(s.rows[1].time, 1.6) && near(s.rows[1].wall_time, 0.95), "{:?}", s.rows[1]);
+        // How fast it goes is what somebody waits for.
+        assert!(near(s.rows[1].speed, 10.0 / 19.0), "{}", s.rows[1].speed);
+        assert_eq!(s.picks.fastest, 0, "60% more processor time is not faster");
+    }
+
+    #[test]
+    fn results_of_a_version_without_processor_time_still_load_and_count_by_the_clock() {
+        let m: Measure = serde_json::from_str(r#"{"crf":30,"vmaf":93.0,"vmaf_min":92.0,"bytes":1250,"clip_secs":10.0,"encode_secs":25.0}"#).unwrap();
+        assert_eq!((m.cpu_secs, m.cost()), (0.0, 2.5));
+        let point: Point = serde_json::from_str(r#"{"crf":30.0,"bitrate":1000.0,"cost":2.5,"vmaf":93.0,"capped":false}"#).unwrap();
+        assert!(point.wall_cost.is_nan());
+        assert_eq!(point.clock_cost(), 2.5);
+        let row: Row = serde_json::from_str(r#"{"config":1,"size":0.9,"time":1.5,"size_worst":0.9,"size_best":0.9,"crf":33.0,"speed":1.0,"missing":0,"pareto":true}"#).unwrap();
+        assert!(row.wall_time.is_nan());
+        let s = summarize(None, &[&[Some(point), Some(point)]], 2, 0).unwrap();
+        assert!(s.rows[1].wall_time.is_nan() && near(s.rows[1].speed, 0.4));
     }
 
     #[test]
@@ -469,7 +530,7 @@ mod tests {
 
     #[test]
     fn crf_and_speed_are_over_the_videos_a_setting_has_a_result_for() {
-        let at = |crf, cost| Some(Point { crf, bitrate: 1000.0, cost, vmaf: 93.0, capped: false });
+        let at = |crf, cost| Some(Point { crf, bitrate: 1000.0, cost, wall_cost: cost, vmaf: 93.0, capped: false });
         let a = [at(30.0, 1.0), at(40.0, 1.0)];
         let b = [at(30.0, 1.0), None];
         let c = [at(30.0, 1.0), at(20.0, 3.0)];

@@ -416,7 +416,8 @@ videos.
 2. **Measure** – `--samples` (2) lossless clips of `--sample-secs` (6) seconds per video. Every
    setting (each preset with each parameter set, plus the default: preset 5 with `tune=0`) gets
    a CRF search of its own, which goes on until two neighbouring CRFs are measured (`encode`
-   stops sooner), so each ends at the target VMAF; every sample encode is timed.
+   stops sooner), so each ends at the target VMAF; every sample encode is timed, in processor time and by the
+   clock.
 3. **Compare at equal quality** – a setting's size and time at exactly the target are read
    between the last CRF that passes and the first that fails. Settings are then compared with
    the default per video and averaged as ratios (geometric mean), for all videos and per size
@@ -449,8 +450,11 @@ Read the result with these in mind:
 - **VMAF is the judge.** Settings tuned for metrics (`tune=1`, `tune=2`) tend to win on it;
   `tune=0` aims at how the picture looks to people, which VMAF only partly sees. Compare a clip
   by eye (the UI's Compare) before switching away from it on a few percent.
-- **Times are wall-clock on this machine**, including reading the lossless clip. Run it on an
-  otherwise idle machine; small differences in time are noise.
+- **Times are processor time on this machine** (user and system, including reading the lossless
+  clip), and settings are ranked by it; the *clock* column has the same by the clock. Other work
+  disturbs the clock far more, 7 to 32% between two runs of a clip against 1 to 4.6%, but it
+  disturbs processor time too: the command warns when an encode is running, and an otherwise
+  idle machine is still best.
 - **A dozen seconds per video is a sample.** More videos (`--max-videos`) say more than more
   settings; the per-video range in the table shows how much the videos disagree.
 - Parameter names SVT-AV1 doesn't know are refused up front: ffmpeg would only warn and encode

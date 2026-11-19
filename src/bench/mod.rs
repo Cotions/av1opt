@@ -237,16 +237,41 @@ impl Drop for WorkDir {
     }
 }
 
+/// Whether `cmdline` (as in /proc, arguments ended by zero bytes) is an AV1 encode at work:
+/// `av1opt encode`, or an ffmpeg using SVT-AV1 as the page's encodes do.
+fn is_an_encode(cmdline: &[u8]) -> bool {
+    let mut args = cmdline.split(|b| *b == 0).map(String::from_utf8_lossy);
+    let Some(program) = args.next() else { return false };
+    match Path::new(program.as_ref()).file_name().and_then(|n| n.to_str()) {
+        Some("av1opt") => args.next().as_deref() == Some("encode"),
+        Some("ffmpeg") => args.any(|a| a == "libsvtav1"),
+        _ => false,
+    }
+}
+
+fn an_encode_is_running_in(proc: &Path, me: u32) -> bool {
+    let Ok(entries) = std::fs::read_dir(proc) else { return false };
+    entries.flatten().any(|e| {
+        let pid = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok());
+        pid.is_some_and(|pid| pid != me) && std::fs::read(e.path().join("cmdline")).is_ok_and(|c| is_an_encode(&c))
+    })
+}
+
+/// Whether another AV1 encode is at work on this machine, which would disturb the timings.
+pub fn an_encode_is_running() -> bool {
+    an_encode_is_running_in(Path::new("/proc"), std::process::id())
+}
+
 /// Encodes every sample at `crf`, timed, and scores it against its reference.
 fn measure(tools: &Tools, info: &MediaInfo, samples: &[Sample], tmp: &Path, enc: &EncodeSettings, crf: u8, threads: usize) -> Result<Measure> {
-    let (mut scores, mut bytes, mut clip_secs, mut encode_secs) = (Vec::new(), 0u64, 0.0, 0.0);
+    let (mut scores, mut bytes, mut clip_secs, mut encode_secs, mut cpu_secs) = (Vec::new(), 0u64, 0.0, 0.0, 0.0);
     for (i, s) in samples.iter().enumerate() {
         let out = tmp.join(format!("bench{i}.mkv"));
         let mut args: Vec<String> = ["-y", "-v", "error", "-i", &path_arg(&s.reference)].map(String::from).to_vec();
         args.extend(enc.video_args(crf as f64));
         args.push(path_arg(&out));
         let t = Instant::now();
-        tools.run(&args)?;
+        cpu_secs += tools.run_timed(&args)?;
         encode_secs += t.elapsed().as_secs_f64();
         scores.push(tools.vmaf(&out, &s.reference, search::vmaf_model(info), search::reference_pix_fmt(info), threads, 0, search::VMAF_STRIDE)?);
         bytes += std::fs::metadata(&out)?.len();
@@ -263,6 +288,7 @@ fn measure(tools: &Tools, info: &MediaInfo, samples: &[Sample], tmp: &Path, enc:
         bytes,
         clip_secs,
         encode_secs,
+        cpu_secs,
     })
 }
 
@@ -514,7 +540,7 @@ pub fn print(r: &Report) {
     for s in &r.summaries {
         let title = s.class.map_or("All videos", Class::label);
         println!("\n{title}: {} video{}{}", s.videos, if s.videos == 1 { "" } else { "s" }, if s.class.is_some() && s.videos < 3 { " (few: treat with care)" } else { "" });
-        println!("  {:<width$}  {:>8}  {:>17}  {:>7}  {:>9}  {:>5}", "setting", "size", "per video", "time", "speed", "CRF");
+        println!("  {:<width$}  {:>8}  {:>17}  {:>7}  {:>7}  {:>9}  {:>5}", "setting", "size", "per video", "time", "clock", "speed", "CRF");
         let mut rows: Vec<&stats::Row> = s.rows.iter().collect();
         // Smallest first; settings without a result on every video after the others.
         rows.sort_by(|a, b| (a.missing > 0).cmp(&(b.missing > 0)).then(a.size.total_cmp(&b.size)));
@@ -531,12 +557,13 @@ pub fn print(r: &Report) {
                 marks.push("no result on some videos");
             }
             if row.size.is_nan() {
-                println!("  {:<width$}  {:>8}  {:>17}  {:>7}  {:>9}  {:>5}  no result", c.label(), "", "", "", "", "");
+                println!("  {:<width$}  {:>8}  {:>17}  {:>7}  {:>7}  {:>9}  {:>5}  no result", c.label(), "", "", "", "", "", "");
                 continue;
             }
             let range = if s.videos - row.missing > 1 && row.config != r.baseline { format!("{} to {}", percent(row.size_best), percent(row.size_worst)) } else { String::new() };
+            let clock = if row.wall_time.is_nan() { String::new() } else { format!("{:.2}x", row.wall_time) };
             println!(
-                "  {:<width$}  {:>8}  {:>17}  {:>6.2}x  {:>8.2}x  {:>5.1}  {}",
+                "  {:<width$}  {:>8}  {:>17}  {:>6.2}x  {clock:>7}  {:>8.2}x  {:>5.1}  {}",
                 c.label(), percent(row.size), range, row.time, row.speed, row.crf, marks.join(", ")
             );
         }
@@ -551,11 +578,11 @@ pub fn print(r: &Report) {
         say("smallest at about the default's time (balanced)", s.picks.balanced);
         say("fastest at about the default's size", s.picks.fastest);
     }
-    println!("\nsize and time are against the default settings at equal VMAF; speed is video seconds per encode second; \"front\": nothing else is both smaller and faster");
+    println!("\nsize and time are against the default settings at equal VMAF; time is processor time, which ranks the settings, and clock the same by the clock, which other work on the machine disturbs; speed is video seconds per second by the clock; \"front\": nothing else is both smaller and faster");
 }
 
 /// One row per video and setting.
-const CSV_COLUMNS: &[&str] = &["path", "class", "width", "height", "preset", "params", "crf", "kbps", "encode_secs_per_video_sec", "vmaf", "capped", "trials", "error"];
+const CSV_COLUMNS: &[&str] = &["path", "class", "width", "height", "preset", "params", "crf", "kbps", "encode_secs_per_video_sec", "vmaf", "capped", "trials", "error", "wall_secs_per_video_sec"];
 /// The CSV of a benchmark, as a report file.
 pub const CSV: crate::report_file::Kind = crate::report_file::Kind::Csv(CSV_COLUMNS);
 
@@ -580,6 +607,8 @@ pub fn write_csv(r: &Report, path: &Path, given: &[PathBuf]) -> Result<()> {
                 p.map_or(String::new(), |p| p.capped.to_string()),
                 cell.trials.len().to_string(),
                 cell.error.clone().or_else(|| v.error.clone()).unwrap_or_default().lines().next().unwrap_or("").to_string(),
+                // New columns go last so the ones before keep their place.
+                num(p.map(|p| p.wall_cost).filter(|c| !c.is_nan()), 3),
             ])?;
         }
     }
@@ -623,7 +652,7 @@ mod tests {
     fn video(class: Class, kbps: &[Option<f64>]) -> Video {
         let cells = kbps
             .iter()
-            .map(|k| Cell { point: k.map(|k| Point { crf: 35.0, bitrate: k * 1000.0, cost: 1.0, vmaf: 93.0, capped: false }), trials: Vec::new(), error: None })
+            .map(|k| Cell { point: k.map(|k| Point { crf: 35.0, bitrate: k * 1000.0, cost: 1.0, wall_cost: 2.0, vmaf: 93.0, capped: false }), trials: Vec::new(), error: None })
             .collect();
         Video { path: "v.mkv".into(), class, codec: "h264".into(), width: 1920, height: 1080, fps: 30.0, duration_s: 60.0, source_bitrate: 5e6, hdr: false, cells, error: None }
     }
@@ -785,9 +814,35 @@ mod tests {
         assert_eq!(rows.len(), 4, "{rows:?}");
         assert_eq!(rows[0][0], "path");
         assert!(rows.iter().all(|r| r.len() == rows[0].len()), "{rows:?}");
-        assert_eq!(rows[1], ["/v/one, two.mkv", "hd", "1920", "1080", "4", "tune=0", "35.00", "2000.0", "1.000", "93.00", "false", "0", ""]);
-        assert_eq!(rows[2], ["/v/one, two.mkv", "hd", "1920", "1080", "5", "tune=1", "", "", "", "", "", "0", "first line"]);
+        assert_eq!(rows[1], ["/v/one, two.mkv", "hd", "1920", "1080", "4", "tune=0", "35.00", "2000.0", "1.000", "93.00", "false", "0", "", "2.000"]);
+        assert_eq!(rows[2], ["/v/one, two.mkv", "hd", "1920", "1080", "5", "tune=1", "", "", "", "", "", "0", "first line", ""]);
         assert_eq!((rows[3][1].as_str(), rows[3][6].as_str(), rows[3][12].as_str()), ("sd", "", "no clips"));
+    }
+
+    #[test]
+    fn an_encode_at_work_is_told_from_other_programs() {
+        let is = |args: &[&str]| is_an_encode(args.join("\0").as_bytes());
+        assert!(is(&["/usr/bin/av1opt", "encode", "/v", "-o", "/out"]));
+        assert!(is(&["ffmpeg", "-i", "a.mkv", "-c:v", "libsvtav1", "out.mkv"]));
+        for other in [&["av1opt", "bench", "/v"][..], &["av1opt", "ui"], &["ffmpeg", "-i", "a.mkv", "-c:v", "libx264", "o.mkv"], &["vim", "encode"], &[""]] {
+            assert!(!is(other), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn a_look_through_the_processes_finds_encodes_other_than_this_one() {
+        let dir = std::env::temp_dir().join(format!("av1opt-bench-proc-{}", std::process::id()));
+        let process = |pid: &str, cmdline: &[u8]| {
+            std::fs::create_dir_all(dir.join(pid)).unwrap();
+            std::fs::write(dir.join(pid).join("cmdline"), cmdline).unwrap();
+        };
+        process("10", b"av1opt\0encode\0/v\0");
+        process("11", b"bash\0");
+        std::fs::create_dir_all(dir.join("sys")).unwrap();
+        assert!(!an_encode_is_running_in(&dir, 10), "this process does not count");
+        assert!(an_encode_is_running_in(&dir, 11));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!an_encode_is_running_in(&dir, 1), "no folder of processes, nothing known to run");
     }
 
     #[test]

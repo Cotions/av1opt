@@ -407,8 +407,10 @@ pub fn run(cfg: Config) -> Result<()> {
     // Before anything is read, wiped or restored.
     library::close_private_folders();
     let only_server = one_server_per_user()?;
-    let server = tiny_http::Server::http(("127.0.0.1", cfg.port)).map_err(|e| anyhow::anyhow!("cannot listen on 127.0.0.1:{}: {e}", cfg.port))?;
-    let port = server.server_addr().to_ip().context("not an IP listener")?.port();
+    connections::raise_open_file_limit();
+    // Held here and not by tiny_http, which closes it at the first failed accept: see `connections`.
+    let listener = std::net::TcpListener::bind(("127.0.0.1", cfg.port)).map_err(|e| anyhow::anyhow!("cannot listen on 127.0.0.1:{}: {e}", cfg.port))?;
+    let port = listener.local_addr().context("not an IP listener")?.port();
     let preview_dir = library::preview_dir()?;
     let mut notices = Vec::new();
     let mut settings = read_settings(&mut notices);
@@ -480,11 +482,14 @@ pub fn run(cfg: Config) -> Result<()> {
         open_browser(&url);
     }
     connections::start(port);
-    for req in server.incoming_requests() {
+    connections::serve(listener, move |req| {
         let app = app.clone();
-        std::thread::spawn(move || http::handle(&app, req));
-    }
-    Ok(())
+        // With no thread to be had, the request is dropped (tiny_http answers it with an error)
+        // and the server goes on.
+        if let Err(e) = std::thread::Builder::new().spawn(move || http::handle(&app, req)) {
+            eprintln!("warning: a request to the page was not answered: {e}");
+        }
+    })
 }
 
 static SIGNAL_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);

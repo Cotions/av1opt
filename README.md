@@ -858,7 +858,12 @@ gets it as a cookie). Requests with a foreign Host or Origin are refused, so are
 a program of another user of the machine, or from a connection the system no longer shows as
 anyone's (a browser sends the cookie to every port of the host, so the cookie alone would not
 keep them out). The system's own programs (root) pass while their connection is open, and where
-the system's list of connections can't be read the cookie alone decides. Media are only
+the system's list of connections can't be read the cookie alone decides. Past 64 connections
+open at once, the server closes the extra ones: another user's first, then the ones that have
+not sent a whole request, oldest first, and the page's own event stream, videos and pictures
+only when nothing else is left. It raises its open-file limit to the most the system allows,
+and when a connection cannot be taken (no file left, say) it takes new ones again a moment
+later instead of stopping. Media are only
 served for the video files the page already lists: those you picked, scanned, found as
 duplicates or queued, and the outputs and originals of its jobs and reports. Output folders on ZFS are refused (no override in the UI);
 replacing an original that is on ZFS needs a tick in the dialog, or the confirmation in Compare, which says so.

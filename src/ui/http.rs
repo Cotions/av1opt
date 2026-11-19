@@ -116,7 +116,7 @@ fn socket_row(tcp: &str, client: std::net::SocketAddrV4, port: u16) -> Option<Ve
 /// system's. A socket its program has closed stays listed for a while under user 0, and may
 /// be gone altogether: neither says whose it was, so user 0 only counts on a connection
 /// still established (state 01), and no row does not count.
-fn may_connect(tcp: &str, client: std::net::SocketAddrV4, port: u16, me: u32) -> bool {
+pub(super) fn may_connect(tcp: &str, client: std::net::SocketAddrV4, port: u16, me: u32) -> bool {
     match socket_owner(tcp, client, port) {
         Some(0) => socket_row(tcp, client, port).is_some_and(|row| row[3] == "01"),
         Some(uid) => uid == me,
@@ -143,6 +143,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 pub fn handle(app: &Arc<App>, mut req: Request) {
+    super::connections::heard(req.remote_addr());
     if !same_host(app, &req) {
         return reply(req, 403, "text/plain", "forbidden: av1opt only answers to http://127.0.0.1");
     }
@@ -170,6 +171,9 @@ pub fn handle(app: &Arc<App>, mut req: Request) {
     if !has_session(app, &req) {
         return reply(req, 401, "text/html", "<!doctype html><p>Not signed in. Open the link that <code>av1opt ui</code> printed in the terminal.</p>");
     }
+    // The answers that last, the event stream and what the page shows: too many connections
+    // close these last (see `connections`).
+    let _answering = matches!(path.as_str(), "/api/events" | "/media" | "/thumb").then(|| super::connections::answering(req.remote_addr()));
 
     let method = req.method().clone();
     if method == Method::Post {

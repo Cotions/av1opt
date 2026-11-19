@@ -333,6 +333,48 @@ fn a_settings_file_kept_elsewhere_stays_a_link() {
 }
 
 #[test]
+fn idle_connections_beyond_the_limit_go_before_a_signed_in_event_stream() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let s = Server::start("idle-flood", |_| {});
+    // Each connection holds two files: the server raised its own limit to the most allowed.
+    let limits = std::fs::read_to_string(format!("/proc/{}/limits", s.child.id())).unwrap();
+    let files: Vec<&str> = limits.lines().find(|l| l.starts_with("Max open files")).unwrap().split_whitespace().collect();
+    assert_eq!(files[3], files[4], "{limits}");
+
+    let stream = std::net::TcpStream::connect(("127.0.0.1", s.port)).unwrap();
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
+    write!(&stream, "GET /api/events HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nCookie: {}\r\n\r\n", s.port, s.cookie()).unwrap();
+    let mut events = BufReader::new(stream);
+    let mut next_data = || loop {
+        let mut line = String::new();
+        assert!(events.read_line(&mut line).unwrap() > 0, "the event stream was closed");
+        if let Some(data) = line.strip_prefix("data: ") {
+            return data.trim().to_string();
+        }
+    };
+    assert!(next_data().contains("hello"));
+
+    // Seventy connections opened after it and left doing nothing.
+    let idle: Vec<std::net::TcpStream> = (0..70).map(|_| std::net::TcpStream::connect(("127.0.0.1", s.port)).unwrap()).collect();
+    // Two looks at the connections, half a second apart, then one more for good measure.
+    std::thread::sleep(std::time::Duration::from_millis(1800));
+    let closed = idle
+        .iter()
+        .filter(|c| {
+            c.set_read_timeout(Some(std::time::Duration::from_millis(50))).unwrap();
+            let mut said = Vec::new();
+            (&**c).read_to_end(&mut said).is_ok() && (said.is_empty() || said.starts_with(b"HTTP/1.1 503"))
+        })
+        .count();
+    assert!(closed >= 7, "only {closed} of the idle connections were closed");
+
+    // The stream opened before them still delivers what happens.
+    assert_eq!(s.post("/api/queue/pause", &json!({ "paused": true })).status, 200);
+    assert!((0..10).any(|_| next_data().contains("\"jobs\"")));
+    drop(idle);
+}
+
+#[test]
 fn a_program_that_has_stopped_sending_is_still_answered() {
     use std::io::{Read, Write};
     let s = Server::start("half-closed", |_| {});

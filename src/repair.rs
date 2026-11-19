@@ -35,10 +35,12 @@ const ACCEPT: f64 = 0.25;
 /// A new encode this far above its aim is tried once more at a higher CRF: it spent bits
 /// the floor did not ask for.
 const OVERSHOOT: f64 = 1.5;
-/// VMAF gained per CRF step in a weak stretch, to start from: the five stretches of a real
-/// video's first minutes gained 0.9 to 1.15 a step, twice what the mean of a video gains
+/// VMAF gained per CRF step in a weak stretch, to start from: the weak stretches of real
+/// videos gained 0.72 to 0.93 a step, more than the mean of a video gains
 /// (`search::VMAF_PER_CRF`). Later tries go by what the stretch itself showed.
-const SLOPE: f64 = 1.0;
+const SLOPE: f64 = 0.8;
+/// The least gain per CRF step a later try goes by (see [`next_try`]).
+const LEAST_SLOPE: f64 = 0.5;
 /// How far below the video's CRF a stretch may go.
 const CRF_SPREAD: f64 = 16.0;
 /// A stretch that gains less than this over three or more CRF steps has nothing to gain
@@ -55,6 +57,32 @@ const ROUNDS: usize = 3;
 const NEAR: f64 = 1.0;
 /// GOPs longer than this are not cut out: their lossless reference would be too large.
 const MAX_GOP_SECS: f64 = 30.0;
+/// Where the imitation of a repair puts a stretch: this far above the floor it was encoded
+/// again for. Real stretches landed 0.6 to 1.1 above it.
+const IMITATED_LANDING: f64 = 0.75;
+/// The share of a video that may be encoded again to bring its mean up, on top of the repairs
+/// below the floor. Past that a lower CRF for the whole video is the cheaper way there.
+const MOST_TOPPED_UP: f64 = 0.25;
+/// A mean this close under the target gets no further round: it is less than two scores of the
+/// same frames differ by.
+pub const MEAN_SLACK: f64 = 0.05;
+/// How much higher GOPs may be lifted in the one further round a mean still short gets.
+const LEVEL_RAISE: f64 = 0.5;
+/// How far above the target the mean foretold after the repairs may lie before the video is
+/// encoded again at a higher CRF. Such a file is about 6% larger than it needs to be, which is
+/// worth one more encode; less is not.
+const MOST_OVER: f64 = 0.5;
+/// The least a GOP is lifted for the mean: about what a quarter step of CRF gives, so that an
+/// encode is not spent on less than it can deliver.
+const LEAST_LIFT: f64 = 0.25;
+/// A GOP encoded again for the mean counts as landed from this far below its level; what it
+/// falls short by is left to the GOPs after it.
+const LANDING_SHORT: f64 = 0.15;
+/// A GOP lifted for the mean is tried once more at a higher CRF from this far above its level.
+const LANDING_OVER: f64 = 0.5;
+/// What the levels are worked out to reach beyond the target, so that a last GOP landing a
+/// little low does not send one more GOP after a hundredth of a point.
+const MEAN_EXTRA: f64 = 0.01;
 
 const TIMES_FILE: &str = "survey-frames.txt";
 const LOG_FILE: &str = "survey-vmaf.json";
@@ -240,17 +268,47 @@ fn runs(blamed: &[bool], units: &[usize], frames: usize, secs: &[f64], max_secs:
     out
 }
 
+/// What a stretch is encoded again for.
+#[derive(Debug, Clone, Copy)]
+struct Goal {
+    /// The score asked for.
+    line: f64,
+    /// A new encode counts as reaching it from here.
+    holds_from: f64,
+    /// Where tries aim.
+    aim: f64,
+    /// A new encode above this spent bits nothing asked for.
+    too_much: f64,
+    /// The smallest step down in CRF a try takes.
+    least_step: f64,
+    /// Whether the stretch's own mean is what counts, rather than its lowest window.
+    by_mean: bool,
+}
+
+impl Goal {
+    /// Holding `floor` in the lowest window over the stretch.
+    fn holding(floor: f64) -> Goal {
+        let aim = floor + AIM_MARGIN;
+        Goal { line: floor, holds_from: floor + ACCEPT, aim, too_much: aim + OVERSHOOT, least_step: 1.0, by_mean: false }
+    }
+
+    /// Bringing the stretch's own mean to `level`, and no further than that needs.
+    fn mean(level: f64) -> Goal {
+        Goal { line: level, holds_from: level - LANDING_SHORT, aim: level, too_much: level + LANDING_OVER, least_step: 0.25, by_mean: true }
+    }
+}
+
 /// The CRF to try after the encodes so far, or `None` where another try has nothing to
-/// offer. `known` holds (CRF, lowest window) of what was measured, the last being the
-/// latest; `lo` is the lowest CRF allowed. The second value says the floor is out of reach.
-fn next_crf(known: &[(f64, f64)], floor: f64, lo: f64) -> (Option<f64>, bool) {
-    let aim = floor + AIM_MARGIN;
+/// offer. `known` holds (CRF, score) of what was measured, the last being the latest, the
+/// score being what `goal` goes by; `lo` is the lowest CRF allowed. The second value says the
+/// goal is out of reach.
+fn next_try(known: &[(f64, f64)], goal: Goal, lo: f64) -> (Option<f64>, bool) {
     let &(crf, vmaf) = known.last().expect("a first point is always known");
     // Two scores a CRF step or two apart say little about the gain per step (0.25 was read
     // off 1.5 steps of a stretch that then gained 0.7 a step, and its next try went four
-    // steps too far): no less than half the usual gain is gone by.
-    let slope_to = |other: (f64, f64)| ((vmaf - other.1) / (other.0 - crf)).clamp(SLOPE / 2.0, 2.0);
-    if vmaf < floor + ACCEPT {
+    // steps too far): no less than this is gone by.
+    let slope_to = |other: (f64, f64)| ((vmaf - other.1) / (other.0 - crf)).clamp(LEAST_SLOPE, 2.0);
+    if vmaf < goal.holds_from {
         // Short: lower, by the slope from the nearest higher CRF measured.
         if crf <= lo {
             return (None, true);
@@ -262,24 +320,24 @@ fn next_crf(known: &[(f64, f64)], floor: f64, lo: f64) -> (Option<f64>, bool) {
         {
             return (None, true);
         }
-        // At the gain it showed over two CRF steps or more, the floor lies below the
-        // lowest CRF allowed.
+        // At the gain it showed over two CRF steps or more, the goal lies below the lowest
+        // CRF allowed.
         if let Some(a) = above
             && a.0 - crf >= 2.0
-            && crf - (floor - vmaf) / ((vmaf - a.1) / (a.0 - crf)).max(1e-6) < lo
+            && crf - (goal.line - vmaf) / ((vmaf - a.1) / (a.0 - crf)).max(1e-6) < lo
         {
             return (None, true);
         }
         let slope = above.map_or(SLOPE, slope_to);
-        let next = search::quarter(crf - ((aim - vmaf) / slope).max(1.0)).max(lo);
+        let next = search::quarter(crf - ((goal.aim - vmaf) / slope).max(goal.least_step)).max(lo);
         ((next < crf).then_some(next), false)
-    } else if vmaf > aim + OVERSHOOT {
+    } else if vmaf > goal.too_much {
         // More than asked for: higher, toward the nearest higher CRF that fell short.
-        let Some(a) = known.iter().copied().filter(|k| k.0 > crf && k.1 < aim).min_by(|a, b| a.0.total_cmp(&b.0)) else { return (None, false) };
+        let Some(a) = known.iter().copied().filter(|k| k.0 > crf && k.1 < goal.aim).min_by(|a, b| a.0.total_cmp(&b.0)) else { return (None, false) };
         if a.0 - crf < 1.0 {
             return (None, false);
         }
-        let next = search::quarter(crf + (vmaf - aim) / slope_to(a)).clamp(crf + 0.5, a.0 - 0.5);
+        let next = search::quarter(crf + (vmaf - goal.aim) / slope_to(a)).clamp(crf + 0.5, a.0 - 0.5);
         (Some(next), false)
     } else {
         (None, false)
@@ -297,6 +355,8 @@ struct Fixed {
     before: f64,
     bytes: u64,
     out_of_reach: bool,
+    /// Encoded again for the video's mean, not for the floor.
+    for_mean: bool,
 }
 
 /// One stretch that was encoded again, for the report.
@@ -315,6 +375,9 @@ pub struct Stretch {
     /// No CRF brought it up to the floor (see [`LEVEL_OFF`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub out_of_reach: bool,
+    /// It stood above the floor, and was encoded again to bring the video's mean to the target.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub for_mean: bool,
 }
 
 /// The whole-video check and what it led to, for the report.
@@ -336,8 +399,26 @@ pub struct Summary {
     /// nearer to it, and that stays as the one pass made it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub left: Vec<f64>,
+    /// Mean VMAF of the whole video before anything was encoded again.
+    pub mean_before: f64,
+    /// What was done beyond the floor to bring the mean to the target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_up: Option<TopUp>,
     /// Seconds the scoring and the encoding again took.
     pub secs: f64,
+}
+
+/// GOPs above the floor encoded again to bring the video's mean to the target.
+#[derive(Debug, Clone, Serialize)]
+pub struct TopUp {
+    /// Mean VMAF of the video before them, with the stretches below the floor repaired.
+    pub mean_from: f64,
+    /// The highest level a GOP was lifted to.
+    pub level: f64,
+    pub stretches: usize,
+    pub secs: f64,
+    /// What they added to the file.
+    pub bytes: i64,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -421,9 +502,275 @@ pub struct Ctx<'a> {
     pub crf: f64,
     /// What five seconds may score at least.
     pub floor: f64,
+    /// What the mean of the whole video has to reach.
+    pub target: f64,
     pub min_crf: u8,
     pub threads: usize,
     pub dir: &'a Path,
+}
+
+/// What repairs at the floor would make of a video, imitated on its scores.
+#[derive(Debug, Clone, PartialEq)]
+struct Imitated {
+    scores: Vec<(usize, f64)>,
+    /// What is left of the GOPs: repaired runs count as one.
+    units: Vec<usize>,
+    repaired: Vec<Run>,
+    /// Seconds encoded again.
+    secs: f64,
+}
+
+/// Imitates the rounds of [`repair`] at `floor` on the frame scores: the same windows, the same
+/// blame, the same runs. A run encoded again is taken to rise evenly toward 100
+/// (`v + k * (100 - v)`, which is how real stretches rose) until its lowest window, judged as
+/// [`lowest_over`] judges it, is [`IMITATED_LANDING`] above the floor.
+fn imitate(secs: &[f64], scores: &[(usize, f64)], gops: &[usize], floor: f64, max_secs: f64) -> Imitated {
+    let frames = secs.len() - 1;
+    let mut scores = scores.to_vec();
+    let mut units = gops.to_vec();
+    let mut repaired: Vec<Run> = Vec::new();
+    // Where the windows lie does not depend on what the frames score.
+    let all = windows(secs, &Scores::new(&scores), 0, frames);
+    for _ in 0..ROUNDS {
+        let sc = Scores::new(&scores);
+        let low: Vec<Window> = all.iter().filter_map(|w| sc.mean(w.start, w.end).filter(|v| *v < floor).map(|vmaf| Window { vmaf, ..*w })).collect();
+        let todo = runs(&blame(&low, &units, frames, &sc, floor, &[]), &units, frames, secs, max_secs);
+        if todo.is_empty() {
+            break;
+        }
+        for run in todo {
+            if lift_run(&mut scores, &all, run, floor) {
+                units.retain(|&u| u <= run.start || u >= run.end);
+                repaired.retain(|r| !r.overlaps(run.start, run.end));
+                repaired.push(run);
+            }
+        }
+    }
+    repaired.sort_by_key(|r| r.start);
+    let seconds = repaired.iter().map(|r| secs[r.end] - secs[r.start]).sum();
+    Imitated { scores, units, repaired, secs: seconds }
+}
+
+/// Raises the scores of `run` as an encode for `floor` would. False where it stands at the
+/// floor already.
+fn lift_run(scores: &mut [(usize, f64)], all: &[Window], run: Run, floor: f64) -> bool {
+    let sc = Scores::new(scores);
+    let index = |f: usize| sc.at.partition_point(|&x| x < f);
+    let (first, last) = (index(run.start), index(run.end));
+    // For each window over the run: its score and its own part's, as sums that the lift adds
+    // to in proportion. Windows with no scored frame of the run say nothing of it.
+    struct Over {
+        count: f64,
+        sum: f64,
+        own_count: f64,
+        own_sum: f64,
+    }
+    let over: Vec<Over> = all
+        .iter()
+        .filter(|w| run.overlaps(w.start, w.end))
+        .filter_map(|w| {
+            let (a, b) = (index(w.start), index(w.end));
+            let (i, j) = (a.max(first), b.min(last));
+            (j > i && b > a).then(|| Over { count: (b - a) as f64, sum: sc.cum[b] - sc.cum[a], own_count: (j - i) as f64, own_sum: sc.cum[j] - sc.cum[i] })
+        })
+        .collect();
+    let lowest = |k: f64| {
+        over.iter()
+            .map(|w| {
+                let gain = k * (100.0 * w.own_count - w.own_sum);
+                ((w.own_sum + gain) / w.own_count).max((w.sum + gain) / w.count)
+            })
+            .fold(f64::INFINITY, f64::min)
+    };
+    if over.is_empty() || lowest(0.0) >= floor {
+        return false;
+    }
+    let aim = floor + IMITATED_LANDING;
+    let (mut below, mut above) = (0.0, 1.0);
+    for _ in 0..40 {
+        let k = (below + above) / 2.0;
+        if lowest(k) < aim {
+            below = k;
+        } else {
+            above = k;
+        }
+    }
+    for s in &mut scores[first..last] {
+        s.1 += above * (100.0 - s.1);
+    }
+    true
+}
+
+/// The GOPs of `units` nothing has been done to, that can be encoded again by themselves.
+fn spare_gops(units: &[usize], frames: usize, taken: &[Run], secs: &[f64], longest: f64) -> Vec<Run> {
+    let end_of = |i: usize| units.get(i + 1).copied().unwrap_or(frames);
+    (0..units.len())
+        .map(|i| Run { start: units[i], end: end_of(i) })
+        .filter(|r| !taken.iter().any(|t| t.overlaps(r.start, r.end)) && secs[r.end] - secs[r.start] <= longest)
+        .collect()
+}
+
+/// Which GOPs to lift for the mean, and how far.
+#[derive(Debug, Clone, PartialEq)]
+struct Lifts {
+    /// What each of them is brought to.
+    level: f64,
+    /// Lowest first.
+    runs: Vec<Run>,
+    /// Their length in seconds.
+    secs: f64,
+    /// Whether that brings the mean to what was asked. If not, it is as near as `cap` and
+    /// `budget` allow.
+    reaches: bool,
+}
+
+/// The lowest of the `spare` GOPs, lifted to one common level, just far enough for the mean of
+/// `scores` to come to `goal`: each GOP gets what it takes to stand level with the next, so none
+/// is pushed further than the ones after it would cost. The level stays within `cap`, the GOPs
+/// within `budget` seconds. Pushing stretches already repaired further cost 13 to 21% of the
+/// file per point of mean, 1.2 to 1.6 times what the CRF would; these GOPs are cheaper.
+fn plan_lifts(scores: &[(usize, f64)], spare: &[Run], secs: &[f64], goal: f64, cap: f64, budget: f64) -> Option<Lifts> {
+    let sc = Scores::new(scores);
+    let total: f64 = sc.cum[scores.len()];
+    let missing = goal * scores.len() as f64 - total;
+    if missing <= 0.0 {
+        return None;
+    }
+    let index = |f: usize| sc.at.partition_point(|&x| x < f);
+    // (mean, scored frames, run), lowest first.
+    let mut gops: Vec<(f64, f64, Run)> = spare
+        .iter()
+        .filter_map(|&r| {
+            let (i, j) = (index(r.start), index(r.end));
+            (j > i).then(|| ((sc.cum[j] - sc.cum[i]) / (j - i) as f64, (j - i) as f64, r))
+        })
+        .filter(|g| g.0 <= cap - LEAST_LIFT)
+        .collect();
+    gops.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let (mut count, mut sum, mut seconds) = (0.0, 0.0, 0.0);
+    let mut chosen = Vec::new();
+    let mut level = f64::INFINITY;
+    for (i, &(mean, n, run)) in gops.iter().enumerate() {
+        let length = secs[run.end] - secs[run.start];
+        if seconds + length > budget {
+            break;
+        }
+        seconds += length;
+        count += n;
+        sum += n * mean;
+        chosen.push(run);
+        level = (missing + sum) / count;
+        if level <= cap && gops.get(i + 1).is_none_or(|next| level <= next.0 + LEAST_LIFT) {
+            break;
+        }
+    }
+    let lowest = gops.first()?.0;
+    if chosen.is_empty() {
+        return None;
+    }
+    let reaches = level <= cap;
+    Some(Lifts { level: level.min(cap).max(lowest + LEAST_LIFT), runs: chosen, secs: seconds, reaches })
+}
+
+/// What the survey says of the mean the video will end with.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MeanPlan {
+    /// The mean after the repairs below the floor, which are done in any case.
+    pub mean: f64,
+    /// Seconds those repairs encode again.
+    pub secs: f64,
+    /// What it would take to bring that mean to the target, where it falls short.
+    top_up: Option<Lifts>,
+    /// Length of the video in seconds.
+    pub length: f64,
+}
+
+impl MeanPlan {
+    /// Seconds of GOPs that would be encoded again for the mean.
+    pub fn top_up_secs(&self) -> f64 {
+        self.top_up.as_ref().map_or(0.0, |t| t.secs)
+    }
+}
+
+/// Foretells, from the survey, the mean after the repairs at `floor` and what would make up the
+/// difference to `target`.
+pub fn plan_mean(survey: &Survey, info: &MediaInfo, floor: f64, target: f64) -> MeanPlan {
+    plan_from(&timeline(&survey.times), &survey.scores, &survey.gops, floor, target, scenes::Limits::for_video(info).max_secs)
+}
+
+fn plan_from(secs: &[f64], scores: &[(usize, f64)], gops: &[usize], floor: f64, target: f64, max_secs: f64) -> MeanPlan {
+    let length = secs[secs.len() - 1];
+    let done = imitate(secs, scores, gops, floor, max_secs);
+    let mean = done.scores.iter().map(|s| s.1).sum::<f64>() / done.scores.len().max(1) as f64;
+    let top_up = (mean < target).then(|| {
+        let spare = spare_gops(&done.units, secs.len() - 1, &done.repaired, secs, MAX_GOP_SECS.max(max_secs));
+        plan_lifts(&done.scores, &spare, secs, target + MEAN_EXTRA, target, MOST_TOPPED_UP * length)
+    });
+    MeanPlan { mean, secs: done.secs, top_up: top_up.flatten(), length }
+}
+
+/// What a further encode of the whole video would go by.
+#[derive(Debug, Clone, Copy)]
+pub struct MeanRules {
+    pub target: f64,
+    /// VMAF the mean loses per CRF step around the CRF of the encode.
+    pub slope: f64,
+    pub crf: f64,
+    pub min_crf: f64,
+    pub max_crf: f64,
+    /// False once the video has been encoded a second time: it is not done a third.
+    pub may_encode_again: bool,
+}
+
+/// The CRF to encode the whole video at once more, if the plan calls for that: its mean would
+/// end more than [`MOST_OVER`] above the target, or below the target by more than encoding
+/// [`MOST_TOPPED_UP`] of the video again could make up. A CRF that comes out the same as the
+/// encode's is no reason for an encode. Nor is a high mean with much of the video being repaired:
+/// what those stretches end at does not follow the video's CRF (a generated 24 s clip, 20 s of
+/// it repaired, was foretold 94.33 and after three CRF steps up 94.22).
+pub fn encode_again_at(plan: &MeanPlan, rules: &MeanRules) -> Option<f64> {
+    let over = plan.mean - rules.target;
+    let moved = search::nearest_quarter(rules.crf + over / rules.slope).clamp(rules.min_crf, rules.max_crf);
+    let called_for = if over > 0.0 { over > MOST_OVER && plan.secs <= MOST_TOPPED_UP * plan.length } else { over < 0.0 && !plan.top_up.as_ref().is_some_and(|t| t.reaches) };
+    (called_for && rules.may_encode_again && moved != rules.crf).then_some(moved)
+}
+
+/// Brings the mean of `scores` to `target` by lifting the lowest `spare` GOPs, one at a time and
+/// lowest first. `lift` encodes a GOP for a level and gives its new scores, `None` where nothing
+/// came of that. The plan is made afresh after each GOP from what it really scored, so that one
+/// landing off is made up by the next, and the last is as small as what is still missing. GOPs
+/// may take up [`MOST_TOPPED_UP`] of the video. If they run out with the mean more than
+/// [`MEAN_SLACK`] short, one further round may lift them [`LEVEL_RAISE`] higher. Gives the
+/// highest level a GOP was lifted to, if any was.
+fn top_up(
+    secs: &[f64],
+    scores: &mut Vec<(usize, f64)>,
+    mut spare: Vec<Run>,
+    target: f64,
+    mut lift: impl FnMut(Run, f64, &[(usize, f64)]) -> Result<Option<Vec<(usize, f64)>>>,
+) -> Result<Option<f64>> {
+    let mean = |s: &[(usize, f64)]| s.iter().map(|x| x.1).sum::<f64>() / s.len().max(1) as f64;
+    let (mut left, mut cap) = (MOST_TOPPED_UP * secs[secs.len() - 1], target);
+    let (mut highest, mut raised): (Option<f64>, bool) = (None, false);
+    while mean(scores) < target {
+        let Some(plan) = plan_lifts(scores, &spare, secs, target + MEAN_EXTRA, cap, left) else {
+            if raised || mean(scores) >= target - MEAN_SLACK {
+                break;
+            }
+            raised = true;
+            cap += LEVEL_RAISE;
+            continue;
+        };
+        let run = plan.runs[0];
+        spare.retain(|r| *r != run);
+        left -= secs[run.end] - secs[run.start];
+        let Some(new) = lift(run, plan.level, scores)? else { continue };
+        scores.retain(|s| s.0 < run.start || s.0 >= run.end);
+        scores.extend(new);
+        scores.sort_by_key(|s| s.0);
+        highest = Some(highest.map_or(plan.level, |h: f64| h.max(plan.level)));
+    }
+    Ok(highest)
 }
 
 /// Room for encoding stretches again, beside the encode of `output_bytes` that is already
@@ -436,7 +783,9 @@ fn room_to_repair(output_bytes: u64) -> u64 {
 
 /// Looks for stretches of `output` below the floor and encodes them again. Fails with
 /// [`StillLow`] where stretches stay short that more tries could have helped; a stretch no
-/// CRF brings up is kept at the best it was given.
+/// CRF brings up is kept at the best it was given. Where the mean of the video is then below
+/// the target, the lowest GOPs not yet touched are encoded again as well, each as far as it
+/// takes (see [`top_up`]); what was repaired stays as it landed.
 pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
     let frames = survey.times.pts.len();
     let secs = timeline(&survey.times);
@@ -445,14 +794,14 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
     let all = windows(&secs, &Scores::new(&scores), 0, frames);
     let lowest_before = lowest_of(&all);
     let mean = |scores: &[(usize, f64)]| scores.iter().map(|s| s.1).sum::<f64>() / scores.len().max(1) as f64;
+    let mean_before = mean(&scores);
     let low_count = all.iter().filter(|w| w.vmaf < c.floor).count();
     eprintln!(
-        "whole video: mean VMAF {:.2}, lowest {WINDOW_SECS:.0} s {lowest_before:.2}{}",
-        mean(&scores),
+        "whole video: mean VMAF {mean_before:.2}, lowest {WINDOW_SECS:.0} s {lowest_before:.2}{}",
         if low_count > 0 { format!(", {low_count} of {} stretches below {:.0}", all.len(), c.floor) } else { String::new() }
     );
-    if low_count == 0 {
-        let summary = Summary { mean_vmaf: mean(&scores), lowest_vmaf: lowest_before, lowest_before, floor: c.floor, stretches: Vec::new(), near: 0, left: Vec::new(), secs: 0.0 };
+    if low_count == 0 && mean_before >= c.target {
+        let summary = Summary { mean_vmaf: mean_before, lowest_vmaf: lowest_before, lowest_before, floor: c.floor, stretches: Vec::new(), near: 0, left: Vec::new(), mean_before, top_up: None, secs: 0.0 };
         return Ok(Outcome { summary, video: None, scores, secs });
     }
 
@@ -515,7 +864,7 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
                 continue;
             }
             let before = earlier.iter().map(|f| f.before).fold(now, f64::min);
-            let f = fix(c, &survey.times, &secs, &scores, *run, serial, from_crf, now, before)?;
+            let f = fix(c, Goal::holding(c.floor), &survey.times, &secs, &scores, *run, serial, from_crf, now, before)?;
             serial += 1;
             // Nothing lower is allowed, or nothing lower helps: what is there stays.
             let Some(f) = f else {
@@ -541,33 +890,11 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
             fixed.push(f);
         }
     }
-    fixed.sort_by_key(|f| f.run.start);
     let settled: Vec<Run> = settled.into_iter().map(|s| s.0).collect();
-    let after = windows(&secs, &Scores::new(&scores), 0, frames);
-    // What the video's own windows say of a stretch in the end: one given up on can sit
-    // among windows that hold, once its neighbours were encoded again.
-    let lowest_at = |run: &Run| after.iter().filter(|w| run.overlaps(w.start, w.end)).map(|w| w.vmaf).fold(f64::INFINITY, f64::min);
-    let left: Vec<f64> = left.iter().map(lowest_at).filter(|&v| v < c.floor).collect();
-    // Nothing was put in place of anything: the encode stays as it is.
-    if fixed.is_empty() {
-        let _ = std::fs::remove_file(&plain);
-        if after.iter().any(|w| w.vmaf < c.floor - NEAR && !settled.iter().any(|s| s.overlaps(w.start, w.end))) {
-            let still = after
-                .iter()
-                .filter(|w| w.vmaf < c.floor && !settled.iter().any(|s| s.overlaps(w.start, w.end)))
-                .map(|w| (secs[w.start], secs[w.end] - secs[w.start], w.vmaf))
-                .collect();
-            return Err(StillLow { windows: still }.into());
-        }
-        let summary = Summary { mean_vmaf: mean(&scores), lowest_vmaf: lowest_before, lowest_before, floor: c.floor, stretches: Vec::new(), near: 0, left, secs: 0.0 };
-        return Ok(Outcome { summary, video: None, scores, secs });
-    }
-
-    let still: Vec<(f64, f64, f64)> = after
-        .iter()
-        .filter(|w| w.vmaf < c.floor && !settled.iter().any(|s| s.overlaps(w.start, w.end)))
-        .map(|w| (secs[w.start], secs[w.end] - secs[w.start], w.vmaf))
-        .collect();
+    let short_of_floor = |after: &[Window]| -> Vec<(f64, f64, f64)> {
+        after.iter().filter(|w| w.vmaf < c.floor && !settled.iter().any(|s| s.overlaps(w.start, w.end))).map(|w| (secs[w.start], secs[w.end] - secs[w.start], w.vmaf)).collect()
+    };
+    let still = short_of_floor(&windows(&secs, &Scores::new(&scores), 0, frames));
     if still.iter().any(|w| w.2 < c.floor - NEAR) {
         // What was made here is of no use to the search and the encode that follow.
         let _ = std::fs::remove_file(&plain);
@@ -577,6 +904,43 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
         return Err(StillLow { windows: still }.into());
     }
 
+    // The floor holds. What the mean still lacks comes from GOPs nothing was done to yet.
+    let mean_from = mean(&scores);
+    let mut level = None;
+    if mean_from < c.target {
+        let taken: Vec<Run> = fixed.iter().map(|f| f.run).chain(settled.iter().copied()).chain(left.iter().copied()).collect();
+        let spare = spare_gops(&units, frames, &taken, &secs, MAX_GOP_SECS.max(max_secs));
+        let detail = format!("the lowest GOPs, for a mean of VMAF {} (now {mean_from:.2})", c.target);
+        eprintln!("encoding again: {detail}");
+        c.tools.emit(Event::Phase { phase: "repairing".into(), detail });
+        level = top_up(&secs, &mut scores, spare, c.target, |run, level, now| {
+            let Some(stands) = Scores::new(now).mean(run.start, run.end) else { return Ok(None) };
+            let before = lowest_over(&secs, now, None, run);
+            let f = fix(c, Goal::mean(level), &survey.times, &secs, now, run, serial, c.crf, stands, before)?;
+            serial += 1;
+            Ok(f.map(|mut f| {
+                f.for_mean = true;
+                let new = std::mem::take(&mut f.scores);
+                fixed.push(f);
+                new
+            }))
+        })?;
+    }
+
+    fixed.sort_by_key(|f| f.run.start);
+    let after = windows(&secs, &Scores::new(&scores), 0, frames);
+    // What the video's own windows say of a stretch in the end: one given up on can sit
+    // among windows that hold, once its neighbours were encoded again.
+    let lowest_at = |run: &Run| after.iter().filter(|w| run.overlaps(w.start, w.end)).map(|w| w.vmaf).fold(f64::INFINITY, f64::min);
+    let left: Vec<f64> = left.iter().map(lowest_at).filter(|&v| v < c.floor).collect();
+    // Nothing was put in place of anything: the encode stays as it is.
+    if fixed.is_empty() {
+        let _ = std::fs::remove_file(&plain);
+        let summary = Summary { mean_vmaf: mean(&scores), lowest_vmaf: lowest_before, lowest_before, floor: c.floor, stretches: Vec::new(), near: 0, left, mean_before, top_up: None, secs: 0.0 };
+        return Ok(Outcome { summary, video: None, scores, secs });
+    }
+
+    let still = short_of_floor(&after);
     let video = c.dir.join("repaired.ivf");
     splice(&plain, &head, &index, &fixed, &video)?;
     let _ = std::fs::remove_file(&plain);
@@ -592,32 +956,46 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
             bytes_before: index[f.run.start..f.run.end].iter().map(|x| x.size as u64).sum(),
             bytes: f.bytes,
             out_of_reach: f.out_of_reach && lowest_at(&f.run) < c.floor,
+            for_mean: f.for_mean,
         })
         .collect();
     for f in &fixed {
         let _ = std::fs::remove_file(&f.file);
     }
-    let summary = Summary { mean_vmaf: mean(&scores), lowest_vmaf: lowest_of(&after), lowest_before, floor: c.floor, stretches, near: still.len(), left, secs: 0.0 };
+    let top_up = level.map(|level| {
+        let lifted = || stretches.iter().filter(|s| s.for_mean);
+        TopUp {
+            mean_from,
+            level,
+            stretches: lifted().count(),
+            secs: lifted().map(|s| s.secs).sum(),
+            bytes: lifted().map(|s| s.bytes as i64 - s.bytes_before as i64).sum(),
+        }
+    });
+    let summary = Summary { mean_vmaf: mean(&scores), lowest_vmaf: lowest_of(&after), lowest_before, floor: c.floor, stretches, near: still.len(), left, mean_before, top_up, secs: 0.0 };
     Ok(Outcome { summary, video: Some(video), scores, secs })
 }
 
-/// Encodes the frames of `run` again, at the highest CRF found that keeps the lowest window
-/// over it above the floor (see [`lowest_over`]; `all` holds the scores of the video as it
-/// stands). `from_crf` and `now` are the CRF it stands at and its lowest window there;
-/// `before`, its lowest window in the one-pass encode. `None` where it stands at the lowest
-/// CRF allowed already.
+/// Encodes the frames of `run` again, at the highest CRF found that meets `goal`: the lowest
+/// window over it holding the floor (see [`lowest_over`]), or its own mean reaching a level.
+/// `all` holds the scores of the video as it stands. `from_crf` and `now` are the CRF the
+/// stretch stands at and its score there by that goal; `before`, its lowest window in the
+/// one-pass encode. `None` where it stands at the lowest CRF allowed already, or nothing tried
+/// was better than what is there.
 #[allow(clippy::too_many_arguments)]
-fn fix(c: &Ctx, times: &Times, secs: &[f64], all: &[(usize, f64)], run: Run, serial: usize, from_crf: f64, now: f64, before: f64) -> Result<Option<Fixed>> {
+fn fix(c: &Ctx, goal: Goal, times: &Times, secs: &[f64], all: &[(usize, f64)], run: Run, serial: usize, from_crf: f64, now: f64, before: f64) -> Result<Option<Fixed>> {
     struct Try {
         crf: f64,
-        lowest: f64,
+        score: f64,
+        /// It leaves the windows over the stretch no worse than the floor allows.
+        safe: bool,
         file: PathBuf,
         scores: Vec<(usize, f64)>,
     }
     let at = hms(secs[run.start]);
     let lo = (c.crf - CRF_SPREAD).max(c.min_crf as f64);
     // Nothing to try (it stands at the lowest CRF already): nothing to cut from the source.
-    if next_crf(&[(from_crf, now)], c.floor, lo).0.is_none() {
+    if next_try(&[(from_crf, now)], goal, lo).0.is_none() {
         return Ok(None);
     }
     let reference = c.dir.join(format!("repair{serial:04}.ref.mkv"));
@@ -629,10 +1007,13 @@ fn fix(c: &Ctx, times: &Times, secs: &[f64], all: &[(usize, f64)], run: Run, ser
         bail!("the stretch at {at} holds {got} frames cut from the source, {} in the encode", run.end - run.start);
     }
     let (model, pix) = (search::vmaf_model(c.info), search::reference_pix_fmt(c.info));
+    // A stretch encoded again for the mean must not leave a window lower than the floor allows.
+    let lowest_now = lowest_over(secs, all, None, run);
+    let measure = if goal.by_mean { "as its mean".to_string() } else { format!("in its lowest {WINDOW_SECS:.0} s") };
     let mut tries: Vec<Try> = Vec::new();
     let mut known = vec![(from_crf, now)];
     let out_of_reach = loop {
-        let (next, out_of_reach) = next_crf(&known, c.floor, lo);
+        let (next, out_of_reach) = next_try(&known, goal, lo);
         let Some(crf) = next.filter(|_| tries.len() < TRIES) else { break out_of_reach };
         let file = c.dir.join(format!("repair{serial:04}.{}.ivf", tries.len()));
         let mut args: Vec<String> = ["-y", "-v", "error", "-i", &path_arg(&reference)].map(String::from).to_vec();
@@ -649,23 +1030,26 @@ fn fix(c: &Ctx, times: &Times, secs: &[f64], all: &[(usize, f64)], run: Run, ser
         if !lowest.is_finite() {
             bail!("the stretch at {at} could not be scored");
         }
-        eprintln!("  {at} ({:.1} s): CRF {crf} gives VMAF {lowest:.2} in its lowest {WINDOW_SECS:.0} s (CRF {from_crf}: {now:.2})", secs[run.end] - secs[run.start]);
-        known.push((crf, lowest));
-        tries.push(Try { crf, lowest, file, scores });
+        let score = if goal.by_mean { scores.iter().map(|s| s.1).sum::<f64>() / scores.len().max(1) as f64 } else { lowest };
+        let safe = !goal.by_mean || lowest >= c.floor.min(lowest_now);
+        eprintln!("  {at} ({:.1} s): CRF {crf} gives VMAF {score:.2} {measure} (CRF {from_crf}: {now:.2})", secs[run.end] - secs[run.start]);
+        known.push((crf, score));
+        tries.push(Try { crf, score, safe, file, scores });
     };
     let _ = std::fs::remove_file(&reference);
-    // The smallest encode that holds the floor. Failing that, the best one, for the next
-    // round to go on from; or, where the floor is out of reach, the smallest within half a
-    // point of the best, which can be what stands there already: bits past it buy nothing.
-    let holds = |t: &Try| t.lowest >= c.floor + ACCEPT;
-    let best = tries.iter().map(|t| t.lowest).fold(f64::NEG_INFINITY, f64::max);
+    // The smallest encode that meets the goal. Failing that, the best one, for the next round
+    // to go on from; or, where the goal is out of reach, the smallest within half a point of
+    // the best, which can be what stands there already: bits past it buy nothing.
+    let holds = |t: &Try| t.safe && t.score >= goal.holds_from;
+    let best = tries.iter().filter(|t| t.safe).map(|t| t.score).fold(f64::NEG_INFINITY, f64::max);
     let by_crf = |a: &usize, b: &usize| tries[*a].crf.total_cmp(&tries[*b].crf);
     let pick = (0..tries.len()).filter(|&i| holds(&tries[i])).max_by(by_crf).or_else(|| {
         if out_of_reach {
             let stays = now >= best - LEVEL_OFF;
-            (0..tries.len()).filter(|&i| !stays && tries[i].lowest >= best - LEVEL_OFF).max_by(by_crf)
+            (0..tries.len()).filter(|&i| !stays && tries[i].safe && tries[i].score >= best - LEVEL_OFF).max_by(by_crf)
         } else {
-            (0..tries.len()).max_by(|&a, &b| tries[a].lowest.total_cmp(&tries[b].lowest))
+            // (For the mean, only what adds to it is worth its bytes.)
+            (0..tries.len()).filter(|&i| tries[i].safe && (!goal.by_mean || tries[i].score > now)).max_by(|&a, &b| tries[a].score.total_cmp(&tries[b].score))
         }
     });
     let Some(pick) = pick else {
@@ -680,7 +1064,7 @@ fn fix(c: &Ctx, times: &Times, secs: &[f64], all: &[(usize, f64)], run: Run, ser
     }
     let bytes = ivf_index(&kept.file)?.1.iter().map(|f| f.size as u64).sum();
     let out_of_reach = out_of_reach && !holds(&kept);
-    Ok(Some(Fixed { run, crf: kept.crf, file: kept.file, scores: kept.scores, before, bytes, out_of_reach }))
+    Ok(Some(Fixed { run, crf: kept.crf, file: kept.file, scores: kept.scores, before, bytes, out_of_reach, for_mean: false }))
 }
 
 /// Where a frame's bytes are in an IVF file, and its timestamp.
@@ -770,6 +1154,10 @@ fn splice(source: &Path, head: &[u8; 32], index: &[IvfFrame], fixed: &[Fixed], o
 mod tests {
     use super::*;
 
+    fn next_crf(known: &[(f64, f64)], floor: f64, lo: f64) -> (Option<f64>, bool) {
+        next_try(known, Goal::holding(floor), lo)
+    }
+
     #[test]
     fn encoding_stretches_again_asks_for_two_copies_and_a_stretch() {
         assert_eq!(room_to_repair(0), 1_500_000_000);
@@ -789,7 +1177,7 @@ mod tests {
         }
         let tools = Tools::new("false".into(), "false".into(), None);
         let (info, enc) = (MediaInfo::default(), EncodeSettings { preset: 8, pix_fmt_out: "yuv420p10le", params: String::new() });
-        let c = Ctx { tools: &tools, input: &dir.join("in.mkv"), info: &info, enc: &enc, crf: 30.0, floor: 90.0, min_crf: 20, threads: 1, dir: &dir };
+        let c = Ctx { tools: &tools, input: &dir.join("in.mkv"), info: &info, enc: &enc, crf: 30.0, floor: 90.0, target: 70.0, min_crf: 20, threads: 1, dir: &dir };
         let survey = Survey { scores: scored(300, |_| 70.0), times: Times { pts: (0..300).collect(), tb: (1, 30) }, gops: vec![0] };
         let why = repair(&c, &output, &survey).err().expect("no room").to_string();
         // One line: it ends up in the note that says the stretches were left as they are.
@@ -925,12 +1313,24 @@ mod tests {
 
     #[test]
     fn the_first_try_goes_by_the_usual_slope() {
-        // 85 at CRF 38, floor 89: aim 90, five points at one a step.
+        // 85 at CRF 38, floor 89: aim 90, five points at 0.8 a step.
         let (next, out) = next_crf(&[(38.0, 85.0)], 89.0, 20.0);
-        assert_eq!((next, out), (Some(33.0), false));
+        assert_eq!((next, out), (Some(31.75), false));
         // Never less than a whole step.
-        assert_eq!(next_crf(&[(38.0, 88.9)], 89.0, 20.0).0, Some(36.75));
-        assert_eq!(next_crf(&[(38.0, 89.1)], 89.0, 20.0).0, Some(37.0));
+        assert_eq!(next_crf(&[(38.0, 88.9)], 89.0, 20.0).0, Some(36.5));
+        assert_eq!(next_crf(&[(38.0, 89.1)], 89.0, 20.0).0, Some(36.75));
+    }
+
+    #[test]
+    fn a_gop_lifted_for_the_mean_takes_small_steps_and_stops_near_its_level() {
+        let goal = Goal::mean(92.0);
+        // 0.5 to go at 0.8 a step: less than a CRF step, where the floor would take a whole one.
+        assert_eq!(next_try(&[(38.0, 91.5)], goal, 20.0), (Some(37.25), false));
+        // Close enough under the level, and not far over it: done.
+        assert_eq!(next_try(&[(38.0, 91.6), (37.5, 91.9)], goal, 20.0), (None, false));
+        assert_eq!(next_try(&[(38.0, 91.6), (37.0, 92.4)], goal, 20.0), (None, false));
+        // Well over it, with room back toward the CRF that fell short: a higher CRF.
+        assert_eq!(next_try(&[(38.0, 91.6), (36.0, 93.0)], goal, 20.0), (Some(37.25), false));
     }
 
     #[test]
@@ -985,7 +1385,7 @@ mod tests {
     }
 
     fn fixed(run: Run, file: PathBuf) -> Fixed {
-        Fixed { run, crf: 30.0, file, scores: Vec::new(), before: 80.0, bytes: 0, out_of_reach: false }
+        Fixed { run, crf: 30.0, file, scores: Vec::new(), before: 80.0, bytes: 0, out_of_reach: false, for_mean: false }
     }
 
     #[test]
@@ -1031,10 +1431,181 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Every third frame of 30 fps video, each GOP of ten seconds at its own score.
+    fn gops_scoring(by_gop: &[f64]) -> (Vec<f64>, Vec<(usize, f64)>, Vec<usize>) {
+        let frames = by_gop.len() * 300;
+        (secs(frames), scored(frames, |f| by_gop[f / 300]), (0..by_gop.len()).map(|g| g * 300).collect())
+    }
+
+    fn average(scores: &[(usize, f64)]) -> f64 {
+        scores.iter().map(|s| s.1).sum::<f64>() / scores.len() as f64
+    }
+
+    fn gop(i: usize) -> Run {
+        Run { start: i * 300, end: (i + 1) * 300 }
+    }
+
+    #[test]
+    fn repairs_are_imitated_on_the_scores() {
+        let (s, scores, gops) = gops_scoring(&[94.0, 86.0, 94.0, 94.0, 94.0, 94.0]);
+        // The weak GOP alone is blamed, and rises to 0.75 above the floor.
+        let done = imitate(&s, &scores, &gops, 89.0, 20.0);
+        assert!((average(&done.scores) - (94.0 * 5.0 + 89.75) / 6.0).abs() < 1e-6, "{}", average(&done.scores));
+        assert_eq!((done.repaired.clone(), done.secs.round()), (vec![gop(1)], 10.0));
+        // Nothing below the floor: nothing changes.
+        let done = imitate(&s, &scores, &gops, 85.0, 20.0);
+        assert!(done.repaired.is_empty() && done.secs == 0.0 && done.scores == scores);
+        // Frames already high rise too, though less: the GOP is lifted as one piece.
+        let (s, scores, _) = gops_scoring(&[94.0, 94.0]);
+        let scores: Vec<(usize, f64)> = scores.into_iter().map(|(f, v)| (f, if (300..450).contains(&f) { 80.0 } else { v })).collect();
+        let mut lifted = scores.clone();
+        assert!(lift_run(&mut lifted, &windows(&s, &Scores::new(&scores), 0, 600), gop(1), 89.0));
+        assert!(lifted.iter().filter(|x| x.0 >= 450).all(|x| x.1 > 94.0), "{lifted:?}");
+    }
+
+    #[test]
+    fn neighbouring_gops_are_counted_once_and_joined_up_to_the_longest_run() {
+        let (s, scores, gops) = gops_scoring(&[80.0, 80.0, 80.0, 94.0]);
+        let done = imitate(&s, &scores, &gops, 89.0, 20.0);
+        assert!((done.secs - 30.0).abs() < 1e-9, "{}", done.secs);
+        assert_eq!(done.repaired, vec![Run { start: 0, end: 600 }, gop(2)]);
+        assert!((average(&done.scores) - (89.75 * 3.0 + 94.0) / 4.0).abs() < 1e-6, "{}", average(&done.scores));
+    }
+
+    #[test]
+    fn the_lowest_gops_left_are_lifted_to_one_level_just_high_enough() {
+        // Three points of GOP mean to find, over six GOPs.
+        let (s, scores, _) = gops_scoring(&[80.0, 90.0, 91.0, 95.0, 99.0, 100.0]);
+        let spare: Vec<Run> = (1..6).map(gop).collect();
+        let goal = average(&scores) + 3.0 / 6.0;
+        let lifts = plan_lifts(&scores, &spare, &s, goal, 93.0, 60.0).expect("something to lift");
+        assert!(lifts.reaches, "{lifts:?}");
+        assert_eq!(lifts.runs, vec![gop(1), gop(2)], "{lifts:?}");
+        // 90 and 91 brought level: the three points missing leave them at 92.
+        assert!((lifts.level - 92.0).abs() < 1e-9, "{lifts:?}");
+        assert!((lifts.secs - 20.0).abs() < 1e-9, "{lifts:?}");
+    }
+
+    #[test]
+    fn a_gop_is_lifted_by_a_quarter_at_least_and_never_past_the_cap() {
+        let (s, scores, _) = gops_scoring(&[90.0, 95.0]);
+        let spare = vec![gop(0), gop(1)];
+        // A hundredth of a point of the video's mean, that the lowest GOP could give at 90.02.
+        let goal = average(&scores) + 0.01;
+        let lifts = plan_lifts(&scores, &spare, &s, goal, 93.0, 20.0).unwrap();
+        assert_eq!((lifts.runs.clone(), lifts.level), (vec![gop(0)], 90.25), "{lifts:?}");
+        // More than the cap and the budget allow: as far as they do, and it says so.
+        let lifts = plan_lifts(&scores, &spare, &s, 94.5, 93.0, 10.0).unwrap();
+        assert_eq!((lifts.runs.clone(), lifts.level, lifts.reaches), (vec![gop(0)], 93.0, false), "{lifts:?}");
+        // A GOP that does not fit the budget, or stands at the cap, is not taken.
+        assert_eq!(plan_lifts(&scores, &spare, &s, 94.0, 93.0, 5.0), None);
+        assert_eq!(plan_lifts(&scores, &[gop(1)], &s, 96.0, 93.0, 20.0), None);
+        // Nothing missing, nothing to do.
+        assert_eq!(plan_lifts(&scores, &spare, &s, 92.0, 93.0, 20.0), None);
+    }
+
+    #[test]
+    fn repaired_stretches_stay_out_of_the_plan_for_the_mean() {
+        // The GOP below the floor is repaired, to 89.75; the mean is still short, and what makes
+        // it up are the next-lowest GOPs, not the repaired one.
+        let by_gop = [86.0, 92.0, 92.4, 93.7, 93.7, 93.7, 93.7, 93.7];
+        let (s, scores, gops) = gops_scoring(&by_gop);
+        let plan = plan_from(&s, &scores, &gops, 89.0, 93.0, 20.0);
+        assert!((plan.mean - (89.75 + 92.0 + 92.4 + 93.7 * 5.0) / 8.0).abs() < 1e-6, "{plan:?}");
+        let lifts = plan.top_up.clone().expect("short of the target");
+        assert!(lifts.reaches && !lifts.runs.contains(&gop(0)), "{plan:?}");
+        assert_eq!(lifts.runs[0], gop(1), "{plan:?}");
+        assert_eq!(plan.top_up_secs(), lifts.secs);
+        // Already there: nothing to plan.
+        let plan = plan_from(&s, &scores, &gops, 89.0, 92.0, 20.0);
+        assert_eq!(plan.top_up, None, "{plan:?}");
+    }
+
+    #[test]
+    fn the_mean_is_made_up_gop_by_gop_going_by_what_each_really_scored() {
+        let (s, start, _) = gops_scoring(&[90.0, 90.5, 91.0, 91.5, 94.0, 94.0, 94.0, 94.0, 94.0, 94.0, 94.0, 94.0]);
+        let spare: Vec<Run> = (0..12).map(gop).collect();
+        let mut scores = start.clone();
+        let mut asked = Vec::new();
+        // Every encode lands a little short of what it was asked for.
+        let level = top_up(&s, &mut scores, spare, 93.0, |run, level, _| {
+            asked.push(run);
+            Ok(Some(scored(run.end, |_| level - 0.1).into_iter().filter(|x| x.0 >= run.start).collect()))
+        })
+        .unwrap();
+        assert!(average(&scores) >= 93.0, "{}", average(&scores));
+        assert!(level.unwrap() <= 93.0, "{level:?}");
+        // Lowest first, and only as many as it took.
+        assert_eq!(asked[..2], [gop(0), gop(1)], "{asked:?}");
+        assert!(asked.len() <= 3, "{asked:?}");
+        assert!(scores.iter().filter(|x| x.0 >= 1200).all(|x| x.1 == 94.0));
+    }
+
+    #[test]
+    fn a_mean_still_short_gets_one_higher_round_and_then_is_left() {
+        // GOPs that give nothing, whatever is asked. The two below the cap are tried, then the
+        // cap rises once and takes in the next two, which is all the quarter of the video allows.
+        let mut by_gop = vec![92.9; 16];
+        (by_gop[0], by_gop[1]) = (88.0, 92.0);
+        let (s, start, _) = gops_scoring(&by_gop);
+        let spare: Vec<Run> = (0..16).map(gop).collect();
+        let mut scores = start.clone();
+        let mut levels = Vec::new();
+        let level = top_up(&s, &mut scores, spare, 93.0, |run, level, now| {
+            levels.push((run, level));
+            Ok(Some(now.iter().copied().filter(|x| x.0 >= run.start && x.0 < run.end).collect()))
+        })
+        .unwrap();
+        assert_eq!(levels.len(), 4, "{levels:?}");
+        assert!(levels[..2].iter().all(|l| l.1 <= 93.0) && levels[2..].iter().all(|l| l.1 > 93.0 && l.1 <= 93.5), "{levels:?}");
+        assert_eq!(level, Some(93.5), "{levels:?}");
+        // Close under the target there is no further round: this GOP, too near the cap to be
+        // lifted, is not asked for.
+        let (s, start, _) = gops_scoring(&[90.0, 93.0, 93.0, 93.0, 93.0, 93.0, 93.0, 93.0]);
+        let mut scores = start.iter().map(|&(f, v)| (f, if f < 300 { 92.8 } else { v })).collect::<Vec<_>>();
+        let mut asked = 0;
+        top_up(&s, &mut scores, vec![gop(0)], 93.0, |_, _, _| {
+            asked += 1;
+            Ok(None)
+        })
+        .unwrap();
+        assert_eq!(asked, 0);
+    }
+
+    fn plan(mean: f64, secs: f64, top_up: Option<(f64, bool)>) -> MeanPlan {
+        let lifts = |(level, reaches)| Lifts { level, runs: Vec::new(), secs: 30.0, reaches };
+        MeanPlan { mean, secs, top_up: top_up.map(lifts), length: 1000.0 }
+    }
+
+    #[test]
+    fn the_whole_video_is_encoded_again_only_where_stretches_will_not_do() {
+        let rules = MeanRules { target: 93.0, slope: 0.5, crf: 38.0, min_crf: 20.0, max_crf: 55.0, may_encode_again: true };
+        // On target after the repairs, or a little above: nothing more.
+        assert_eq!(encode_again_at(&plan(93.1, 100.0, None), &rules), None);
+        assert_eq!(encode_again_at(&plan(93.4, 100.0, None), &rules), None);
+        // Short, and the GOPs can make it up.
+        assert_eq!(encode_again_at(&plan(92.8, 100.0, Some((92.0, true))), &rules), None);
+        // Short beyond what they can: the CRF moves by what is missing.
+        assert_eq!(encode_again_at(&plan(92.8, 100.0, Some((93.0, false))), &rules), Some(37.5));
+        assert_eq!(encode_again_at(&plan(92.0, 100.0, None), &rules), Some(36.0));
+        // Well over the target: a higher CRF.
+        assert_eq!(encode_again_at(&plan(93.8, 100.0, None), &rules), Some(39.5));
+        // Not when much of the video is being repaired: its CRF hardly moves that mean.
+        assert_eq!(encode_again_at(&plan(94.3, 800.0, None), &rules), None);
+        // Once only.
+        let late = MeanRules { may_encode_again: false, ..rules };
+        assert_eq!(encode_again_at(&plan(93.8, 100.0, None), &late), None);
+        assert_eq!(encode_again_at(&plan(92.0, 100.0, None), &late), None);
+        // A correction too small to change the CRF is no reason for an encode.
+        assert_eq!(encode_again_at(&plan(92.95, 100.0, None), &rules), None);
+        // The CRF stays within the range allowed.
+        assert_eq!(encode_again_at(&plan(95.0, 100.0, None), &MeanRules { max_crf: 40.0, ..rules }), Some(40.0));
+    }
+
     #[test]
     fn outcome_reads_any_stretch() {
         let o = Outcome {
-            summary: Summary { mean_vmaf: 0.0, lowest_vmaf: 0.0, lowest_before: 0.0, floor: 89.0, stretches: Vec::new(), near: 0, left: Vec::new(), secs: 0.0 },
+            summary: Summary { mean_vmaf: 0.0, lowest_vmaf: 0.0, lowest_before: 0.0, floor: 89.0, stretches: Vec::new(), near: 0, left: Vec::new(), mean_before: 0.0, top_up: None, secs: 0.0 },
             video: None,
             scores: scored(900, |i| if i < 300 { 90.0 } else { 96.0 }),
             secs: secs(900),
@@ -1244,7 +1815,7 @@ mod tests {
 
     fn kept(frames: usize) -> Outcome {
         Outcome {
-            summary: Summary { mean_vmaf: 0.0, lowest_vmaf: 0.0, lowest_before: 0.0, floor: 89.0, stretches: Vec::new(), near: 0, left: Vec::new(), secs: 0.0 },
+            summary: Summary { mean_vmaf: 0.0, lowest_vmaf: 0.0, lowest_before: 0.0, floor: 89.0, stretches: Vec::new(), near: 0, left: Vec::new(), mean_before: 0.0, top_up: None, secs: 0.0 },
             video: None,
             scores: scored(frames, |_| 90.0),
             secs: secs(frames),

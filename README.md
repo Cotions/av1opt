@@ -211,14 +211,16 @@ For each file:
    the higher the CRF), every further one where the line through the two nearest measurements
    does, and the search stops as soon as that crossing lies close enough to measured CRFs to
    be trusted. On the measured curves of eight test clips (every CRF from 22 to 46, targets
-   88 to 97) that is 2.2 trial encodes on average from the fixed guess and 2.0 from a guess
-   within 3 CRF of the answer, never more than 4, and the CRF chosen is never more than 0.05
-   VMAF short of the target. A trial encodes the samples end to end as one clip and scores
-   them in one pass. With the 1-second clips of the usual case, the video's stretches more
-   than 4 below the target are going to be encoded again (step 5), which lifts the mean; so a
-   sample that scores below that line counts as 1.5 above it, about where such a stretch
-   ends up, and the search aims at the mean the video will have when it is done. The
-   answer is in SVT-AV1's quarter-step CRF. 4K uses the
+   88 to 97) that is 2.3 trial encodes on average from the fixed guess and 2.0 from a guess
+   within 3 CRF of the answer, never more than 4. A trial encodes the samples end to end as
+   one clip and scores them in one pass. With the 1-second clips of the usual case, the
+   video's stretches more than 4 below the target are going to be encoded again (step 5),
+   which lifts the mean; so every sample below the point 2 above that line counts as that
+   point, about where such a stretch ends up, and the search aims at the mean the video will
+   have when it is done, 0.2 short of the target because step 5 measures that mean and makes
+   up what is missing. The answer is the step of SVT-AV1's quarter-step CRF nearest the
+   crossing. In the other cases nothing makes up for a miss, so it is rounded toward quality,
+   and is never more than 0.05 VMAF short of the target. 4K uses the
    `vmaf_4k` model. Clips of 1 second are too short to speak for a stretch; in the 4-second
    scheme a sample 4 or more below the samples' mean gets a note that quality differs along
    the video (see [per-scene CRF](#per-scene-crf---scenes)), unless `--scenes` gives every
@@ -283,7 +285,16 @@ For each file:
    smallest encode within half a point of the best it got, which can be the one it had
    already. The report lists each
    stretch with its CRF, score and bytes before and after, and the mean and the lowest five
-   seconds of the whole video. Windows left less than a point under the line after three
+   seconds of the whole video. The mean is checked too. Where it is under the target after
+   the repairs, the lowest groups of pictures not yet touched are encoded again, lowest
+   first, each only as far as it takes, until the measured mean reaches the target; what was
+   repaired stays as it landed. That may take a quarter of the video at most, with one more
+   round allowed to lift them half a point higher if the mean is still more than 0.05
+   short; the report says how much was encoded again for the mean, at what cost, and whether
+   it stayed short. The scores foretell all this by imitating the repairs before any is
+   made: if the mean could not be brought up within that quarter, or would end more than 0.5
+   above the target, the whole video is encoded once more at a CRF moved by the difference,
+   once per video. Windows left less than a point under the line after three
    rounds are kept and noted; stretches further short become
    samples of a second search (the worst sample two points above the line this time) and
    the video is encoded once more at the lower CRF it finds, which the report says; if that

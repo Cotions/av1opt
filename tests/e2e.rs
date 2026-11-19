@@ -522,7 +522,9 @@ fn sound_tracks_are_copied_converted_or_shrunk() {
     assert_eq!(packets_md5(&out, "0:a:0"), packets_md5(&src, "0:a:0"));
     let r: Value = serde_json::from_slice(&std::fs::read(lean.join("src.av1opt.json")).unwrap()).unwrap();
     let notes: Vec<&str> = r["notes"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
-    assert_eq!(notes, ["audio 1: ac3 -> Opus 128 kbps", "audio 2: mp3 320 kbps -> Opus 96 kbps", "audio 3: flac -> Opus 128 kbps"]);
+    // (Only the sound's: what the check of the picture had to say is not this test's matter.)
+    let sound: Vec<&str> = notes.into_iter().filter(|n| n.starts_with("audio ")).collect();
+    assert_eq!(sound, ["audio 1: ac3 -> Opus 128 kbps", "audio 2: mp3 320 kbps -> Opus 96 kbps", "audio 3: flac -> Opus 128 kbps"]);
     // Every track still lasts as long as the video.
     for a in streams(&probe(&out), "audio") {
         let secs = tag(a, "DURATION").map(|d| d.split(':').fold(0.0, |acc, part| acc * 60.0 + part.parse::<f64>().unwrap_or(0.0))).unwrap_or(0.0);
@@ -1481,7 +1483,8 @@ fn scenes_are_encoded_apart_only_where_the_samples_disagree() {
     assert!(!stretches.is_empty(), "{rep}");
     for st in stretches {
         assert!(st["crf"].as_f64().unwrap() < chosen, "{rep}");
-        assert!(st["vmaf_before"].as_f64().unwrap() < 89.0, "{rep}");
+        // (Stretches above the floor are encoded again only to bring the mean up.)
+        assert!(st["vmaf_before"].as_f64().unwrap() < 89.0 || st["for_mean"] == true, "{rep}");
         assert!(st["vmaf"].as_f64().unwrap() >= 89.0 || st["out_of_reach"] == true, "{rep}");
     }
     assert!(w["lowest_vmaf"].as_f64().unwrap() > w["lowest_before"].as_f64().unwrap(), "{rep}");
@@ -1548,14 +1551,15 @@ fn scenes_are_encoded_apart_only_where_the_samples_disagree() {
     assert!(entries(&own, ".av1opt-").is_empty());
 
     // Three hard seconds between the two samples (at 5.5 s and 16.5 s) and inside the spot
-    // check at 13 s: the samples agree, the spot check fails, its stretch becomes a sample,
-    // and the second encode at the CRF found with it stands.
+    // check at 13 s, in a video whose frames stay for unequal times, so that spot checks are
+    // what it gets: the samples agree, the spot check fails, its stretch becomes a sample, and
+    // the second encode at the CRF found with it stands.
     c.ffmpeg(&[
         "-f", "lavfi", "-i", "testsrc2=s=640x360:r=24:d=13",
         "-f", "lavfi", "-i", "life=s=640x360:r=24:mold=10:ratio=0.1:seed=1:death_color=#C83232:life_color=#00ff00,trim=duration=3",
         "-f", "lavfi", "-i", "testsrc2=s=640x360:r=24:d=8",
-        "-filter_complex", "[0:v]format=yuv420p[a];[1:v]format=yuv420p[b];[2:v]format=yuv420p[c];[a][b][c]concat=n=3:v=1:a=0[v]",
-        "-map", "[v]", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "12", "hidden.mkv",
+        "-filter_complex", "[0:v]format=yuv420p[a];[1:v]format=yuv420p[b];[2:v]format=yuv420p[c];[a][b][c]concat=n=3:v=1:a=0,select='mod(n,6)'[v]",
+        "-map", "[v]", "-fps_mode", "vfr", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "12", "hidden.mkv",
     ]);
     let again = c.dir.join("again");
     let r = c.encode_into(&again, &[&c.videos().join("hidden.mkv")], &["--scenes=auto"]);

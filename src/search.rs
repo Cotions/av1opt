@@ -127,6 +127,11 @@ pub fn quarter(crf: f64) -> f64 {
     (crf * 4.0).floor() / 4.0
 }
 
+/// The nearest step of SVT-AV1's quarter-step CRF grid.
+pub fn nearest_quarter(crf: f64) -> f64 {
+    (crf * 4.0).round() / 4.0
+}
+
 /// Lossless reference pixel format matching the source bit depth.
 /// Codec of the lossless references (sample clips, scene chunks). Every trial reads each clip
 /// twice, as encoder input and as VMAF reference, so what counts is how cheap it is to
@@ -651,6 +656,29 @@ pub struct SearchParams {
     pub max_size_ratio: Option<f64>,
     /// VMAF the worst sample has to reach as well (None: only the mean counts).
     pub worst_sample: Option<f64>,
+    /// Which way the answer is rounded to a quarter step.
+    pub landing: Landing,
+}
+
+/// How the search settles on a quarter-step CRF between its measurements.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Landing {
+    /// Toward quality. For encodes nothing corrects afterwards: flooring cost 0.3 to 0.7% of the
+    /// bytes on simulated whole videos.
+    SafeSide,
+    /// As near the crossing as the quarter steps allow. Only for an encode whose mean is measured
+    /// and brought to the target afterwards: on its own this left 15 to 44% of sample placements
+    /// under the target.
+    Nearest,
+}
+
+impl Landing {
+    fn round(self, crf: f64) -> f64 {
+        match self {
+            Landing::SafeSide => quarter(crf),
+            Landing::Nearest => nearest_quarter(crf),
+        }
+    }
 }
 
 impl SearchParams {
@@ -782,12 +810,17 @@ const MAX_REACH: f64 = 6.0;
 /// promises more than the encoder gives; the estimate is moved toward quality by that much.
 const CURVATURE: f64 = 0.03;
 
+/// With every measurement failing, an answer read off them lies below all of them and rests
+/// on the curve bending as assumed. Up to this product of its distances to the two (see
+/// [`MAX_REACH`]) that is taken on trust; further off, the CRF is measured first.
+const MAX_UNMEASURED_REACH: f64 = 2.0;
+
 enum Step {
     Try(u8),
     Done(Option<Crossing>),
 }
 
-fn next_step(tried: &BTreeMap<u8, f64>, min: u8, max: u8, target: f64) -> Step {
+fn next_step(tried: &BTreeMap<u8, f64>, min: u8, max: u8, target: f64, landing: Landing) -> Step {
     // The highest passing CRF, and the lowest failing one above it (a failing score below a
     // passing one is noise).
     let pass = tried.iter().rev().find(|(_, v)| **v >= target).map(|(c, v)| (*c, *v));
@@ -797,7 +830,7 @@ fn next_step(tried: &BTreeMap<u8, f64>, min: u8, max: u8, target: f64) -> Step {
             let (lo, hi) = (p as f64, f as f64);
             let x = lo + (vp - target) / (vp - vf) * (hi - lo);
             if f - p <= 1 || (x - lo) * (hi - x) <= MAX_REACH {
-                return Step::Done(Some(Crossing { crf: quarter(x).clamp(lo, hi - 0.25), from: (p, f) }));
+                return Step::Done(Some(Crossing { crf: landing.round(x).clamp(lo, hi - 0.25), from: (p, f) }));
             }
             Step::Try((x.round() as u8).clamp(p + 1, f - 1))
         }
@@ -811,7 +844,7 @@ fn next_step(tried: &BTreeMap<u8, f64>, min: u8, max: u8, target: f64) -> Step {
             let reach = (x - p as f64) * (x - b as f64);
             if reach <= MAX_REACH && x <= max as f64 {
                 let safe = x - CURVATURE * reach / (2.0 * slope);
-                return Step::Done(Some(Crossing { crf: quarter(safe).max(p as f64), from: (b, p) }));
+                return Step::Done(Some(Crossing { crf: landing.round(safe).max(p as f64), from: (b, p) }));
             }
             Step::Try((x.round() as u8).clamp(p + 1, max))
         }
@@ -823,8 +856,12 @@ fn next_step(tried: &BTreeMap<u8, f64>, min: u8, max: u8, target: f64) -> Step {
             let slope = ((vf - vb) / (b - f) as f64).clamp(0.1, 2.0);
             let x = f as f64 - (target - vf) / slope;
             let reach = (f as f64 - x) * (b as f64 - x);
-            let safe = quarter(x - CURVATURE * reach / (2.0 * slope));
+            // (Never the failing CRF itself, which rounding to the nearest step could give.)
+            let safe = landing.round(x - CURVATURE * reach / (2.0 * slope)).min(f as f64 - 0.25);
             if reach <= MAX_REACH && safe >= min as f64 {
+                if reach > MAX_UNMEASURED_REACH {
+                    return Step::Try((safe.round() as u8).clamp(min, f - 1));
+                }
                 return Step::Done(Some(Crossing { crf: safe, from: (f, b) }));
             }
             Step::Try((x.round().max(0.0) as u8).clamp(min, f - 1))
@@ -842,12 +879,14 @@ pub type Scores = Vec<(u8, f64)>;
 /// that crossing is close enough to its measurements to be trusted ([`MAX_REACH`]), instead
 /// of narrowing down to two neighbouring CRFs as [`find_crf`] does. Usually 2-3 evaluations.
 /// Returns the crossing (None if even `min` fails) and every (crf, score) evaluated.
-pub fn find_crossing(
+#[allow(clippy::too_many_arguments)]
+fn find_crossing_landing(
     known: &[(u8, f64)],
     start: u8,
     min: u8,
     max: u8,
     target: f64,
+    landing: Landing,
     mut eval: impl FnMut(u8) -> Result<f64>,
 ) -> Result<(Option<Crossing>, Scores)> {
     if min > max {
@@ -866,12 +905,12 @@ pub fn find_crossing(
         (None, Some(f)) => start < f,
         (None, None) => true,
     };
-    let mut next = if guess_first { Step::Try(start) } else { next_step(&tried, min, max, target) };
+    let mut next = if guess_first { Step::Try(start) } else { next_step(&tried, min, max, target, landing) };
     loop {
         let found = match next {
             Step::Try(c) if !tried.contains_key(&c) => {
                 tried.insert(c, eval(c)?);
-                next = next_step(&tried, min, max, target);
+                next = next_step(&tried, min, max, target, landing);
                 continue;
             }
             // Scores that don't fall with the CRF could send the search back to a CRF it
@@ -883,7 +922,7 @@ pub fn find_crossing(
     }
 }
 
-/// Runs [`find_crossing`] with real sample encodes. Returns the outcome and all trials.
+/// Runs [`find_crossing_landing`] with real sample encodes. Returns the outcome and all trials.
 pub fn search(lab: &mut Lab, enc: &EncodeSettings, p: &SearchParams) -> Result<(Outcome, Vec<Trial>)> {
     let tools = lab.tools;
     // A second search of the same video (see `SearchParams::worst_sample`) does not list
@@ -917,7 +956,7 @@ pub fn search(lab: &mut Lab, enc: &EncodeSettings, p: &SearchParams) -> Result<(
     let known: Vec<(u8, f64)> = trials.iter().map(|(c, t)| (*c, p.score(t))).collect();
     let found = match trials.values().find(|t| too_large(t, &trials)) {
         Some(_) => Err(TooLarge.into()),
-        None => find_crossing(&known, p.start_crf, p.min_crf, p.max_crf, p.target_vmaf, |crf| {
+        None => find_crossing_landing(&known, p.start_crf, p.min_crf, p.max_crf, p.target_vmaf, p.landing, |crf| {
             let (t, known) = lab.trial(enc, crf as f64)?;
             show(&t, known, &mut lab.shown);
             trials.insert(crf, t);
@@ -938,6 +977,17 @@ pub fn search(lab: &mut Lab, enc: &EncodeSettings, p: &SearchParams) -> Result<(
         Err(e) => return Err(e),
     };
     Ok((outcome, trials.into_values().collect()))
+}
+
+/// VMAF lost per CRF step around `crf`, read off the two trials nearest to it; the usual
+/// figure where there are not two to go by.
+pub fn slope_at(trials: &[Trial], crf: f64) -> f64 {
+    let mut near: Vec<&Trial> = trials.iter().collect();
+    near.sort_by(|a, b| (a.crf - crf).abs().total_cmp(&(b.crf - crf).abs()));
+    match near[..] {
+        [a, b, ..] if a.crf != b.crf => ((a.mean_vmaf - b.mean_vmaf) / (b.crf - a.crf)).clamp(0.1, 2.0),
+        _ => VMAF_PER_CRF,
+    }
 }
 
 /// What an encode at `crf` should give, read off the line through two measured trials:
@@ -988,8 +1038,17 @@ pub fn trial(
 }
 
 /// How far above the floor of the whole-video check a sample is counted when it scores
-/// below that: see [`lifted_mean`].
-pub const LIFT_ABOVE_FLOOR: f64 = 1.5;
+/// below that: see [`lifted_mean`]. Only safe together with the check of the mean after the
+/// repairs ([`crate::repair`]): alone, 2.0 put 10 to 55% of simulated sample placements under
+/// the target.
+pub const LIFT_ABOVE_FLOOR: f64 = 2.0;
+
+/// How far below the target the search aims the mean counted that way, where the whole video
+/// is scored afterwards and what is missing is made up by encoding its next-lowest GOPs again.
+/// The samples are off by 0.1 to 0.25 either way, so aiming at the target itself ended above it
+/// by 0.18 on average; 0.3 low did no better than 0.2, and 0.1 about the same. The counted mean
+/// is nearly flat in the CRF, so 0.2 here lowers the mean before repairs by 0.4 to 1.1.
+pub const AIM_LOW: f64 = 0.2;
 
 /// The mean a video will have once its weak stretches have been encoded again, as far as
 /// its samples can tell: every sample below `lift_to` counts as `lift_to`.
@@ -1005,12 +1064,13 @@ pub const LIFT_ABOVE_FLOOR: f64 = 1.5;
 /// this way the same video came to 185 MB at 93.8, and another to 373 MB at 93.2 where it
 /// had been 430 MB at 94.2, the lowest five seconds of both where they were.
 ///
-/// What the samples can know of that was checked on three videos encoded whole at one CRF
-/// with every frame scored, repairs imitated on those scores (a ten-second stretch around
-/// any five seconds below the floor rises until those are 0.7 above it; that predicted the
-/// stretches and the mean of real runs to 0.3). Counting samples of one second below
-/// floor + 1.5 as floor + 1.5 foretold lifts of 2.4, 0.3 and 0.3 as 1.7, 0.2 and 0.3: a
-/// little short where the lift is large, which errs towards quality.
+/// What the samples can know of that was checked on seven whole encodes at one CRF with every
+/// third frame scored, repairs imitated on those scores: the mean foretold by samples of one
+/// second, less the mean after the imitated repairs, was -0.02 to -0.47 counting them as
+/// floor + 1.5 and -0.24 to +0.08 as floor + 2 (at floor + 2.5, +0.02 to +0.18: too much
+/// everywhere). A stretch is encoded again by whole groups of pictures, so frames already above
+/// the mark rise with it. Real runs agreed: floor + 1.5 fell short by 0.09 to 0.14. What the
+/// mark still misses is made up after the encode (see [`crate::repair::repair`]).
 pub fn lifted_mean(scores: &[f64], lift_to: Option<f64>) -> f64 {
     let floor = lift_to.unwrap_or(f64::NEG_INFINITY);
     scores.iter().map(|s| s.max(floor)).sum::<f64>() / scores.len().max(1) as f64
@@ -1083,6 +1143,11 @@ fn split_scores(frames: &[(u64, f64)], lengths: &[u64], stride: u64) -> Option<V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The search as encodes nothing corrects afterwards have it.
+    fn find_crossing(known: &[(u8, f64)], start: u8, min: u8, max: u8, target: f64, eval: impl FnMut(u8) -> Result<f64>) -> Result<(Option<Crossing>, Scores)> {
+        find_crossing_landing(known, start, min, max, target, Landing::SafeSide, eval)
+    }
 
     #[test]
     fn sample_clips_of_slow_videos_are_long_enough_to_be_scored() {
@@ -1350,7 +1415,8 @@ mod tests {
         }
         let mean = |n: &[usize]| n.iter().sum::<usize>() as f64 / n.len() as f64;
         eprintln!("trials: {:.2} from CRF {START_CRF} ({} cases), {:.2} from near the answer ({} cases)", mean(&far), far.len(), mean(&near), near.len());
-        assert!(mean(&far) <= 2.3 && mean(&near) <= 2.05);
+        // (A few of these measure a CRF the failing trials alone would have settled on.)
+        assert!(mean(&far) <= 2.35 && mean(&near) <= 2.05);
     }
 
     #[test]
@@ -1370,7 +1436,7 @@ mod tests {
     fn the_worst_sample_can_hold_the_crf_down() {
         // Mean 93 at CRF 40; the worst sample is 7 below the mean there and gains 0.9 a step.
         let trial = |crf: u8| Trial { crf: crf as f64, mean_vmaf: 93.0 + (40.0 - crf as f64) * 0.45, min_vmaf: 86.0 + (40.0 - crf as f64) * 0.9, size_ratio: 0.1 };
-        let p = |worst_sample| SearchParams { target_vmaf: 93.0, min_crf: 20, max_crf: 55, start_crf: 41, max_size_ratio: None, worst_sample };
+        let p = |worst_sample| SearchParams { target_vmaf: 93.0, min_crf: 20, max_crf: 55, start_crf: 41, max_size_ratio: None, worst_sample, landing: Landing::SafeSide };
         let find = |p: &SearchParams| find_crossing(&[], p.start_crf, p.min_crf, p.max_crf, p.target_vmaf, |c| Ok(p.score(&trial(c)))).unwrap().0.unwrap().crf;
         assert_eq!(find(&p(None)), 40.0);
         // 89 for the worst sample is reached at CRF 36.67: a quarter step on the safe side.
@@ -1708,7 +1774,7 @@ mod tests {
     fn samples_below_the_mark_count_as_the_mark() {
         let scores = [96.0, 95.0, 93.0, 90.0, 86.0, 80.0];
         assert_eq!(lifted_mean(&scores, None), 90.0);
-        // 90 stays, 86 and 80 count as 90.5: (96 + 95 + 93 + 90.5 * 3) / 6.
+        // 90 and below count as 90.5: (96 + 95 + 93 + 90.5 * 3) / 6.
         assert!((lifted_mean(&scores, Some(90.5)) - 92.583333).abs() < 1e-5);
         // Nothing below the mark: the plain mean.
         assert_eq!(lifted_mean(&scores, Some(70.0)), 90.0);
@@ -1776,5 +1842,106 @@ mod tests {
         assert_eq!(pos.len(), 8);
         assert!(pos.iter().enumerate().all(|(i, p)| (p.0 - share * (i as f64 + 0.5)).abs() < 1e-9), "{pos:?}");
         assert!(pos[0].0 < 45.0 * 2.0 && pos[7].0 + 4.0 > 900.0 - 45.0 * 2.0, "{pos:?}");
+    }
+
+    #[test]
+    fn the_answer_is_the_quarter_nearest_the_true_crossing_and_stays_between_the_trials() {
+        // Curved as the measured curves are: the slope grows by 0.03 VMAF with each CRF step.
+        let f = |c: f64| 112.0 - 0.15 * c - 0.015 * c * c;
+        let crossing = |target: f64| (-0.15 + (0.15f64 * 0.15 + 0.06 * (112.0 - target)).sqrt()) / 0.03;
+        let (lo, hi) = (32u8, 35u8);
+        let tried: BTreeMap<u8, f64> = [(lo, f(lo as f64)), (hi, f(hi as f64))].into();
+        let mut below = 0;
+        for i in 1..60 {
+            let target = f(hi as f64) + (f(lo as f64) - f(hi as f64)) * i as f64 / 60.0;
+            let Step::Done(Some(c)) = next_step(&tried, 20, 55, target, Landing::Nearest) else { panic!("target {target}: not settled") };
+            let want = crossing(target);
+            assert!(c.crf >= lo as f64 && c.crf <= hi as f64 - 0.25, "target {target}: {c:?}");
+            assert_eq!(c.crf * 4.0, (c.crf * 4.0).round(), "{c:?}");
+            // The clamp keeps a crossing right at the failing trial a quarter step below it.
+            let room = (want - (hi as f64 - 0.25)).max(0.0);
+            assert!((c.crf - want).abs() <= 0.125 + 0.01 + room, "target {target}: {} for a crossing at {want:.3}", c.crf);
+            below += usize::from(c.crf < want);
+        }
+        // As often on one side as on the other, where flooring was below it every time.
+        assert!((20..=40).contains(&below), "{below} of 59 below the crossing");
+    }
+
+    #[test]
+    fn a_crossing_is_never_settled_on_a_crf_that_failed() {
+        // Both trials fail, and the first only just: the crossing rounds to it.
+        let tried: BTreeMap<u8, f64> = [(30, 92.99), (32, 92.0)].into();
+        let Step::Done(Some(c)) = next_step(&tried, 20, 55, 93.0, Landing::Nearest) else { panic!("not settled") };
+        assert_eq!(c.crf, 29.75);
+    }
+
+    #[test]
+    fn with_only_failing_trials_a_far_answer_is_measured_first() {
+        // 0.5 a step: 40 and 38 fail by 2.5 and 1.5, so the line crosses at about 35, three steps
+        // below anything measured.
+        let f = |c: u8| 93.0 + (35.0 - c as f64) * 0.5;
+        let mut asked = Vec::new();
+        let (got, tried) = find_crossing(&[(40, f(40))], 38, 20, 55, 93.0, |c| {
+            asked.push(c);
+            Ok(f(c))
+        })
+        .unwrap();
+        assert!(asked.len() >= 2, "{asked:?}");
+        let got = got.unwrap();
+        // It rests on a CRF that passed, or on one right next to what was measured.
+        let lowest = tried.iter().map(|t| t.0).min().unwrap() as f64;
+        assert!(got.crf >= lowest - 1.0, "{got:?} {tried:?}");
+        assert!(tried.iter().any(|t| t.1 >= 93.0), "no passing trial: {tried:?}");
+        // Close by, the answer is still taken from the two failing trials: nothing to gain.
+        let tried: BTreeMap<u8, f64> = [(36, 92.9), (37, 92.4)].into();
+        assert!(matches!(next_step(&tried, 20, 55, 93.0, Landing::SafeSide), Step::Done(Some(_))));
+    }
+
+    /// Mean of what `one` gives for each target and start on the measured curves, the way the
+    /// reviewer's simulation went over them.
+    fn over_measured(landing: Landing) -> (f64, f64, f64) {
+        let (mut off, mut over, mut trials, mut cases) = (0.0, 0.0, 0.0, 0.0);
+        for curve in &MEASURED {
+            let f = measured(curve);
+            for target in (0..=45).map(|i| 88.0 + i as f64 * 0.2) {
+                let Some(want) = crossing(22, 46, target, f) else { continue };
+                if !(23.0..=45.0).contains(&want) {
+                    continue;
+                }
+                let near = (-3..=3).map(|d| (want.round() as i32 + d).clamp(22, 46) as u8);
+                for start in std::iter::once(START_CRF).chain(near) {
+                    let (got, tried) = find_crossing_landing(&[], start, 22, 46, target, landing, |c| Ok(f(c))).unwrap();
+                    let got = got.expect("reachable").crf;
+                    let lo = got.floor() as u8;
+                    let score = if lo >= 46 { f(46) } else { f(lo) + (f(lo + 1) - f(lo)) * (got - lo as f64) };
+                    off += got - want;
+                    over += score - target;
+                    trials += tried.len() as f64;
+                    cases += 1.0;
+                }
+            }
+        }
+        (off / cases, over / cases, trials / cases)
+    }
+
+    #[test]
+    fn on_measured_curves_the_nearest_landing_has_no_lean() {
+        let (safe_off, safe_over, _) = over_measured(Landing::SafeSide);
+        let (off, over, trials) = over_measured(Landing::Nearest);
+        eprintln!("safe side: {safe_off:+.3} CRF, {safe_over:+.3} VMAF; nearest: {off:+.3} CRF, {over:+.3} VMAF, {trials:.2} trials");
+        assert!(safe_off < -0.1 && safe_over > 0.04, "{safe_off} {safe_over}");
+        assert!(off.abs() < 0.04 && over.abs() < 0.02, "{off} {over}");
+        assert!(trials < 2.5, "{trials}");
+    }
+
+    #[test]
+    fn the_slope_comes_from_the_two_nearest_trials() {
+        let t = |crf: f64, mean_vmaf: f64| Trial { crf, mean_vmaf, min_vmaf: 80.0, size_ratio: 0.3 };
+        let trials = [t(30.0, 96.0), t(38.0, 93.0), t(40.0, 92.0)];
+        assert!((slope_at(&trials, 38.75) - 0.5).abs() < 1e-9);
+        // Nothing to read it from: the usual one.
+        assert_eq!(slope_at(&trials[..1], 38.0), VMAF_PER_CRF);
+        // Noise cannot make it absurd.
+        assert_eq!(slope_at(&[t(38.0, 93.0), t(39.0, 93.5)], 38.5), 0.1);
     }
 }

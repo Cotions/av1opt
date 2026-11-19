@@ -634,6 +634,9 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     // a few long ones (see `search::MEAN_SAMPLE_SECS`). Clips asked for by number or length
     // are laid out as they always were.
     let mean_only = o.scenes == Scenes::Off && cut.is_none() && !info.hdr && o.samples.is_none() && o.sample_secs.is_none();
+    // How far below the target such a search aims (see `search::AIM_LOW`): the scores it hands
+    // on are that much below what the video is expected to end at.
+    let aimed_low = if mean_only { search::AIM_LOW } else { 0.0 };
     let t0 = tools.stopwatch();
     let (best, mut trials, mut lab, params, positions) = match &saved {
         Some(p) => {
@@ -666,9 +669,12 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
             let again = if mean_only { lasting() } else { pos.clone() };
             let cache = search::TrialCache::open(input, size, &pos, tools.encoder_version(), !o.fresh_search, lift_to);
             let mut lab = search::Lab::new(tools, input, &info, &tmp.path, pos.clone(), vmaf_threads, cache).lifting(lift_to);
-            let params = SearchParams { target_vmaf: o.target_vmaf, min_crf: o.min_crf, max_crf: o.max_crf, start_crf, max_size_ratio, worst_sample: None };
+            let params = SearchParams { target_vmaf: o.target_vmaf, min_crf: o.min_crf, max_crf: o.max_crf, start_crf, max_size_ratio, worst_sample: None, landing: search::Landing::SafeSide };
+            // Where the mean is measured and brought to the target afterwards, the answer need
+            // not lean toward quality, and can start a little short of what it will end at.
+            let first = if mean_only { SearchParams { target_vmaf: o.target_vmaf - search::AIM_LOW, landing: search::Landing::Nearest, ..params } } else { params };
             tools.emit(Event::Phase { phase: "searching".into(), detail: format!("VMAF >= {} ({model}, preset {preset}), from CRF {start_crf}", o.target_vmaf) });
-            let (best, trials) = search::search(&mut lab, &enc, &params)?;
+            let (best, trials) = search::search(&mut lab, &enc, &first)?;
             (best, trials, Some(lab), Some(params), Some(again))
         }
     };
@@ -723,8 +729,8 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
         hold_worst_sample(lab, &enc, params, o, &mut best, &mut trials, &mut notes)?;
     }
     let predicted_savings = 1.0 - best.size_ratio;
-    tools.emit(Event::Chosen { crf: best.crf, vmaf: best.mean_vmaf, predicted_savings });
-    eprintln!("chose crf {} (VMAF {:.2}), predicted video savings {:.0}%", best.crf, best.mean_vmaf, predicted_savings * 100.0);
+    tools.emit(Event::Chosen { crf: best.crf, vmaf: best.mean_vmaf + aimed_low, predicted_savings });
+    eprintln!("chose crf {} (VMAF {:.2}), predicted video savings {:.0}%", best.crf, best.mean_vmaf + aimed_low, predicted_savings * 100.0);
     if predicted_savings < o.min_savings && !o.force && cut.is_none() {
         skip!("predicted savings {:.0}% below --min-savings {:.0}%", predicted_savings * 100.0, o.min_savings * 100.0);
     }
@@ -870,8 +876,15 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
         }
     }
 
-    let lifted_crf = mean_only.then_some(best.crf);
-    let floor_for = |best: &search::Trial| o.target_vmaf.min(best.mean_vmaf) - VERIFY_SLACK;
+    let mut lifted_crf = mean_only.then_some(best.crf);
+    // (A search aimed low and rounded to the nearest step says little about what the video can
+    // reach: its target stands.)
+    let goal_for = |best: &search::Trial| if mean_only { o.target_vmaf } else { o.target_vmaf.min(best.mean_vmaf) };
+    let floor_for = |best: &search::Trial| goal_for(best) - VERIFY_SLACK;
+    // What the mean loses per CRF step, as the search measured it. A further encode is allowed
+    // only in answer to the first check.
+    let mean_slope = search::slope_at(&trials, best.crf);
+    let may_encode_again = std::cell::Cell::new(whole_check);
     let remux = |video: &Path, out: &Path, said: &mut Vec<String>| -> Result<(Vec<String>, Streams)> {
         Ok(mux_args(video, false, first_video_time(tools, video)?, input, &info, o.container, o.audio, &covers, &meta, &o.meta, out, said))
     };
@@ -881,20 +894,46 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
         if whole_check {
             eprintln!("verifying: the whole video against its source");
             tools.emit(Event::Phase { phase: "verifying".into(), detail: "streams, duration, VMAF of the whole video".into() });
+            let rules = repair::MeanRules {
+                target: goal_for(best),
+                slope: mean_slope,
+                crf: best.crf,
+                min_crf: o.min_crf as f64,
+                max_crf: o.max_crf as f64,
+                may_encode_again: may_encode_again.get(),
+            };
             if let Some((scores, out_info, summary)) =
-                verify_whole(tools, input, &info, &partial, &streams, &enc, best.crf, floor_for(best), o.min_crf, vmaf_threads, &tmp.path, &remux, notes)?
+                verify_whole(tools, input, &info, &partial, &streams, &enc, &rules, floor_for(best), o.min_crf, vmaf_threads, &tmp.path, &remux, notes)?
             {
                 return Ok((scores, out_info, Some(summary)));
             }
         }
         eprintln!("verifying");
         tools.emit(Event::Phase { phase: "verifying".into(), detail: "streams, duration, VMAF spot checks".into() });
-        verify(tools, input, &info, &partial, &streams, expect_frames, cut.as_ref(), o.target_vmaf.min(best.mean_vmaf), vmaf_threads, &tmp.path).map(|(v, i)| (v, i, None))
+        verify(tools, input, &info, &partial, &streams, expect_frames, cut.as_ref(), goal_for(best), vmaf_threads, &tmp.path).map(|(v, i)| (v, i, None))
     };
     let t_check = tools.stopwatch();
     let mut verified = check(&best, &mut notes);
     if whole_check {
         encode_secs += t_check.secs(tools);
+    }
+    may_encode_again.set(false);
+    // The scores of the whole video say that another CRF fits it better: one more encode.
+    if let Some(again) = verified.as_ref().err().and_then(|e| e.downcast_ref::<EncodeAgain>()) {
+        let (crf, why) = (again.crf, again.why.clone());
+        let t = tools.stopwatch();
+        let n = format!("CRF {crf} instead of {}: encoded a second time, as {why}", best.crf);
+        eprintln!("note: {n}");
+        tools.emit(Event::Note { text: n.clone() });
+        notes.push(n);
+        best = search::Trial { crf, ..best };
+        lifted_crf = lifted_crf.map(|_| crf);
+        tools.emit(Event::Chosen { crf, vmaf: goal_for(&best), predicted_savings: 1.0 - best.size_ratio });
+        let (args, _) = full_encode_args(input, &info, &enc, crf, o.container, o.audio, &covers, &meta, &o.meta, None, &partial, &mut Vec::new());
+        tools.emit(Event::Phase { phase: "encoding".into(), detail: format!("crf {crf}, preset {preset}") });
+        tools.run_with_progress(&args, out_duration, "encoding")?;
+        verified = check(&best, &mut notes);
+        encode_secs += t.secs(tools);
     }
     // A stretch the samples missed: now that it is known, it is a sample. One CRF found
     // with it, one more encode; a second failure stands.
@@ -2239,6 +2278,22 @@ fn verify(
     Ok((scores, out_info))
 }
 
+/// The survey of a finished encode says the video should be encoded once more, at this CRF.
+#[derive(Debug)]
+struct EncodeAgain {
+    crf: f64,
+    /// Why, to finish the sentence of a note.
+    why: String,
+}
+
+impl std::fmt::Display for EncodeAgain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the video is to be encoded again at CRF {}: {}", self.crf, self.why)
+    }
+}
+
+impl std::error::Error for EncodeAgain {}
+
 /// How far below what a stretch scored by itself it may read in the joined video before the
 /// join is taken for broken: frames a step apart read ten or more lower.
 const JOIN_SLACK: f64 = 3.0;
@@ -2249,8 +2304,11 @@ type Remux<'a> = dyn Fn(&Path, &Path, &mut Vec<String>) -> Result<(Vec<String>, 
 
 /// Verification of a one-pass encode along its whole length: every frame is scored against
 /// the source's, and stretches below the floor are encoded again and put in place (see
-/// [`repair`]). The scores returned are those of the usual spot-check places. `None` where
-/// the whole video can't be gone by, for the spot checks to decide.
+/// [`repair`]). The scores also tell what mean those repairs will leave: where that misses
+/// the target the next-lowest GOPs are encoded again too, and where that would take too much of
+/// the video, or the mean would end well above the target, this fails with [`EncodeAgain`] (see
+/// [`repair::encode_again_at`]). The scores returned are those of the usual spot-check places.
+/// `None` where the whole video can't be gone by, for the spot checks to decide.
 ///
 /// `remux` gives the ffmpeg arguments that put a bare video stream together with the
 /// source's other streams, and what the result holds; it says what it cannot keep.
@@ -2262,7 +2320,7 @@ fn verify_whole(
     out: &Path,
     streams: &Streams,
     enc: &EncodeSettings,
-    crf: f64,
+    rules: &repair::MeanRules,
     floor: f64,
     min_crf: u8,
     threads: usize,
@@ -2286,7 +2344,23 @@ fn verify_whole(
         }
     };
     let frames = survey.times.pts.len() as u64;
-    let ctx = repair::Ctx { tools, input, info, enc, crf, floor, min_crf, threads, dir: tmp };
+    let (crf, target) = (rules.crf, rules.target);
+    let plan = repair::plan_mean(&survey, info, floor, target);
+    eprintln!(
+        "foretold after repairs below VMAF {floor:.0}: mean {:.2} ({} encoded again){}",
+        plan.mean,
+        hms(plan.secs),
+        if plan.top_up_secs() > 0.0 { format!(", and {} more to bring it to {target}", hms(plan.top_up_secs())) } else { String::new() }
+    );
+    if let Some(again) = repair::encode_again_at(&plan, rules) {
+        let why = if again > crf {
+            format!("its mean would have ended at VMAF {:.2}, more than the target of {target} calls for", plan.mean)
+        } else {
+            format!("its mean would have ended at VMAF {:.2}, and encoding stretches again could not bring that to {target} without redoing more than a quarter of the video", plan.mean)
+        };
+        return Err(EncodeAgain { crf: again, why }.into());
+    }
+    let ctx = repair::Ctx { tools, input, info, enc, crf, floor, target, min_crf, threads, dir: tmp };
     let outcome = match repair::repair(&ctx, out, &survey) {
         Ok(o) => o,
         Err(e) if crate::events::is_cancelled(&e) => return Err(e),
@@ -2346,22 +2420,26 @@ fn verify_whole(
                 bail!("the stretch at {} was encoded again but scores VMAF {v:.2} once put back into the video, against {alone:.2} on its own; {FAILED_INSIDE}", hms(st.start_secs));
             }
         }
-        let (count, total) = (s.stretches.len(), s.stretches.iter().map(|x| x.secs).sum::<f64>());
-        let (lo, hi) = s.stretches.iter().fold((f64::INFINITY, 0.0_f64), |(lo, hi), x| (lo.min(x.crf), hi.max(x.crf)));
-        let crfs = if lo == hi { format!("{lo}") } else { format!("{lo}-{hi}") };
-        let grown = s.stretches.iter().map(|x| x.bytes as f64 - x.bytes_before as f64).sum::<f64>() / 1e6;
-        let n = format!(
-            "{count} stretch{} ({} in all) scored below VMAF {floor:.0} and {} encoded again at CRF {crfs}: the lowest {:.0} s of the video went from VMAF {:.1} to {:.1}, for {grown:+.1} MB",
-            if count == 1 { "" } else { "es" },
-            hms(total),
-            if count == 1 { "was" } else { "were" },
-            repair::WINDOW_SECS,
-            s.lowest_before,
-            s.lowest_vmaf,
-        );
-        eprintln!("note: {n}");
-        tools.emit(Event::Note { text: n.clone() });
-        notes.push(n);
+        // (What was encoded again for the mean has its own note.)
+        let below: Vec<&repair::Stretch> = s.stretches.iter().filter(|x| !x.for_mean).collect();
+        if !below.is_empty() {
+            let (count, total) = (below.len(), below.iter().map(|x| x.secs).sum::<f64>());
+            let (lo, hi) = below.iter().fold((f64::INFINITY, 0.0_f64), |(lo, hi), x| (lo.min(x.crf), hi.max(x.crf)));
+            let crfs = if lo == hi { format!("{lo}") } else { format!("{lo}-{hi}") };
+            let grown = below.iter().map(|x| x.bytes as f64 - x.bytes_before as f64).sum::<f64>() / 1e6;
+            let n = format!(
+                "{count} stretch{} ({} in all) scored below VMAF {floor:.0} and {} encoded again at CRF {crfs}: the lowest {:.0} s of the video went from VMAF {:.1} to {:.1}, for {grown:+.1} MB",
+                if count == 1 { "" } else { "es" },
+                hms(total),
+                if count == 1 { "was" } else { "were" },
+                repair::WINDOW_SECS,
+                s.lowest_before,
+                s.lowest_vmaf,
+            );
+            eprintln!("note: {n}");
+            tools.emit(Event::Note { text: n.clone() });
+            notes.push(n);
+        }
     }
     let short: Vec<f64> = s.stretches.iter().filter(|x| x.out_of_reach).map(|x| x.vmaf).chain(s.left.iter().copied()).collect();
     if let Some(lowest) = short.iter().copied().min_by(f64::total_cmp) {
@@ -2383,6 +2461,26 @@ fn verify_whole(
             s.lowest_vmaf,
             if s.near == 1 { "it is" } else { "they are" }
         );
+        eprintln!("note: {n}");
+        tools.emit(Event::Note { text: n.clone() });
+        notes.push(n);
+    }
+    if let Some(t) = &s.top_up {
+        let n = format!(
+            "mean topped up from VMAF {:.2} to {:.2}: {} more stretch{} above the floor encoded again ({}), for {:+.1} MB",
+            t.mean_from,
+            s.mean_vmaf,
+            t.stretches,
+            if t.stretches == 1 { "" } else { "es" },
+            hms(t.secs),
+            t.bytes as f64 / 1e6
+        );
+        eprintln!("note: {n}");
+        tools.emit(Event::Note { text: n.clone() });
+        notes.push(n);
+    }
+    if s.mean_vmaf < target - repair::MEAN_SLACK {
+        let n = format!("the whole video's mean is VMAF {:.2}, below the target of {target}: encoding more of it again was not worth what it would take", s.mean_vmaf);
         eprintln!("note: {n}");
         tools.emit(Event::Note { text: n.clone() });
         notes.push(n);

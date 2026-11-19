@@ -286,6 +286,7 @@ fn api(app: &Arc<App>, m: &Method, path: &str, q: &[(String, String)], body: &Va
         (Method::Post, ["watch", id, "remove"]) => watch::remove(app, id.parse()?),
         (Method::Post, ["watch", id, "enabled"]) => watch::set_enabled(app, id.parse()?, body),
         (Method::Post, ["watch", id, "look"]) => watch::look_now(app, id.parse()?),
+        (Method::Post, ["watch", id, "use-output-folder"]) => watch::use_output_folder(app, id.parse()?),
         (Method::Get, ["history"]) => Ok(library::history(app)),
         (Method::Post, ["settings", "tools"]) => library::set_tools(app, body),
         (Method::Post, ["history", "dirs"]) => library::add_history_dir(app, body),

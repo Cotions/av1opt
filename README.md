@@ -733,8 +733,14 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
   nothing is written under the mount point of a drive that is away: without it the job fails
   saying so and stays in the saved queue for the next start, until you remove it (**Clear
   finished** leaves it). Such a job also checks the folder before each file, so one whose
-  drive is lost on the way waits in the same manner. Jobs and watches saved by earlier versions
-  get their folder made once.
+  drive is lost on the way waits in the same manner. A folder also counts as away when it is on
+  another drive than before, when it is at or under a mount point `/etc/fstab` lists with nothing
+  mounted on it, and when it is empty on the same drive as the folder above it with nothing
+  saying it is the right one, since an unmounted drive's mount point looks like that.
+  **Queue again** on such a job, or **Use this folder** on a watch, says the folder is the right
+  one: it asks first if a drive may be missing, notes where the folder is now, and makes a missing
+  folder when the folder above it is in use. Only a drive that `/etc/fstab` expects cannot be
+  overruled this way. Jobs and watches saved by earlier versions get their folder made once.
   **Pause** holds the queue until
   you resume, and **Hours…** sets the hours of the day encodes may run in (for example 23:00
   to 07:00). Either way nothing new starts and the running encode is held where it is: its

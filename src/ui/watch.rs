@@ -119,9 +119,22 @@ struct Folder {
     /// When the folder was last walked through to its end.
     #[serde(default)]
     found_at: Option<u64>,
+    /// The error is that the output folder is away or cannot be relied on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    out_dir_away: bool,
+    /// It is there, and only a person can say that it is the right one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    out_dir_to_confirm: bool,
 }
 
 impl Folder {
+    /// Notes what the last look ran into, or that it ran into nothing.
+    fn note_problem(&mut self, problem: Option<&anyhow::Error>) {
+        self.error = problem.map(|e| format!("{e:#}"));
+        self.out_dir_away = problem.is_some_and(crate::batch::is_out_dir_problem);
+        self.out_dir_to_confirm = problem.is_some_and(crate::batch::out_dir_needs_confirming);
+    }
+
     /// The videos waiting to be read. Only those the latest look found: what is known of the
     /// others is kept for a drive that comes back, but nothing of theirs is being waited for.
     fn unread(&self) -> impl Iterator<Item = (&PathBuf, &Seen)> {
@@ -338,26 +351,50 @@ struct Judged {
 /// and notes where it is. Once: from then on a folder missing or elsewhere means a drive that is
 /// away.
 fn make_output_once(app: &App, w: &mut Watch) -> Result<()> {
-    if w.out_dir_made && w.out_dir_place.is_some() {
+    let saved_place = w.out_dir_place.take();
+    w.out_dir_place = saved_place.clone().filter(crate::batch::OutDirPlace::can_be_relied_on);
+    if w.out_dir_made && w.out_dir_place.is_some() && w.out_dir_place == saved_place {
         return Ok(());
     }
     let made_now = !w.out_dir_made;
+    let mut made_here = false;
     if made_now {
         crate::fsguard::ensure_writable_location(&w.out_dir, false)?;
-        crate::batch::make_out_dir_once(&w.out_dir)?;
+        made_here = crate::batch::make_out_dir_once(&w.out_dir)?;
         w.out_dir_made = true;
     }
-    w.out_dir_place = crate::batch::OutDirPlace::of(&w.out_dir);
-    // A folder that was made once and is away now is seen when it is back.
-    if !made_now && w.out_dir_place.is_none() {
+    if w.out_dir_place.is_none() {
+        w.out_dir_place = if made_here { crate::batch::OutDirPlace::confirmed_of(&w.out_dir) } else { crate::batch::OutDirPlace::first_seen(&w.out_dir) };
+    }
+    // A folder that was made once and says nothing now is looked at again next time.
+    if !made_now && w.out_dir_place == saved_place {
         return Ok(());
     }
+    remember_output(app, w);
+    Ok(())
+}
+
+/// Saves what is known of a watch's output folder.
+fn remember_output(app: &App, w: &Watch) {
     if let Some(saved) = app.settings.lock().unwrap().watches.iter_mut().find(|s| s.id == w.id) {
         saved.out_dir_made = w.out_dir_made;
         saved.out_dir_place.clone_from(&w.out_dir_place);
     }
     app.save_settings();
-    Ok(())
+}
+
+/// A person says the output folder of a watch is the right one, wherever it is now.
+pub fn use_output_folder(app: &App, id: u64) -> Result<Value> {
+    let mut w = find(app, id)?;
+    crate::fsguard::ensure_writable_location(&w.out_dir, false)?;
+    let Some(place) = crate::batch::confirm_out_dir(&w.out_dir)? else {
+        return Err(crate::batch::out_dir_problem(&w.out_dir, None).unwrap_or_else(|| anyhow::anyhow!("the output folder {} cannot be used now", w.out_dir.display())));
+    };
+    w.out_dir_made = true;
+    w.out_dir_place = Some(place);
+    remember_output(app, &w);
+    look(app, id, false)?;
+    Ok(list(app))
 }
 
 /// Sorts `ready` into the videos worth encoding, those to leave and those it cannot tell of yet.
@@ -397,6 +434,8 @@ fn look(app: &App, id: u64, by_hand: bool) -> Result<()> {
     // Also for a watch saved before this was refused: it stays listed and says what is wrong.
     let found = output_problem(&w.path, &w.out_dir).and_then(|()| make_output_once(app, &mut w)).and_then(|()| videos(&w.path, &w.out_dir));
     let walk_secs = started.elapsed().as_secs_f64();
+    // Said even with nothing to queue, so that the drive is seen to be away before it matters.
+    let output_away = found.as_ref().ok().and_then(|_| crate::batch::out_dir_problem(&w.out_dir, w.out_dir_place.as_ref()));
     let at = now();
     let (ready, mut changed) = {
         let mut folders = app.watch.folders.lock().unwrap();
@@ -408,13 +447,16 @@ fn look(app: &App, id: u64, by_hand: bool) -> Result<()> {
         match found {
             Ok(found) => {
                 let first = if std::mem::take(&mut f.skip_existing) { Mark::Before } else { Mark::Fresh };
-                let had_error = f.error.take().is_some();
+                let had_error = f.error.take();
                 let (ready, changed) = settle(&mut f.files, found, at, first);
                 f.found_at = Some(at);
-                (with_few_retries(&f.files, ready, at, by_hand), changed || had_error)
+                f.note_problem(output_away.as_ref());
+                // With the output folder away the videos wait, as a job queued now could only fail.
+                let ready = if f.error.is_some() { Vec::new() } else { with_few_retries(&f.files, ready, at, by_hand) };
+                (ready, changed || had_error != f.error)
             }
             Err(e) => {
-                f.error = Some(format!("{e:#}"));
+                f.note_problem(Some(&e));
                 (Vec::new(), true)
             }
         }
@@ -446,7 +488,7 @@ fn look(app: &App, id: u64, by_hand: bool) -> Result<()> {
                 count_failed_probes(&mut f.files, judged.unjudged, at);
             }
             // They stay fresh and are tried again at the next look.
-            Err(e) => f.error = Some(format!("{e:#}")),
+            Err(e) => f.note_problem(Some(&e)),
         }
         changed = true;
     }
@@ -506,6 +548,8 @@ pub fn list(app: &App) -> Value {
                 "looked": f.and_then(|f| f.looked),
                 "next_secs": f.and_then(|f| f.looked).map(|t| (t + every).saturating_sub(at)),
                 "error": f.and_then(|f| f.error.clone()),
+                "out_dir_away": f.is_some_and(|f| f.out_dir_away),
+                "out_dir_to_confirm": f.is_some_and(|f| f.out_dir_to_confirm),
                 "videos": f.map_or(0, |f| f.files.len()),
                 "fresh": fresh, "unread": unread().count(), "unread_files": unread_files,
                 "queued": count(Mark::Queued), "left": count(Mark::Left), "before": count(Mark::Before),
@@ -547,8 +591,11 @@ pub fn add(app: &App, body: &Value) -> Result<Value> {
     }
     // Made now, while someone is here to choose it. From here on a missing folder means a
     // drive that is away, and the jobs of this watch will not make one in its place.
+    if let Some(problem) = crate::batch::under_unmounted_mount_point(&r.out_dir) {
+        return Err(problem);
+    }
     std::fs::create_dir_all(&r.out_dir).with_context(|| format!("cannot create {}", r.out_dir.display()))?;
-    let out_dir_place = crate::batch::OutDirPlace::of(&r.out_dir);
+    let out_dir_place = crate::batch::OutDirPlace::confirmed_of(&r.out_dir);
     let id = {
         let mut s = app.settings.lock().unwrap();
         if s.watches.iter().any(|w| w.path == path) {

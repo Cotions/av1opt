@@ -15,13 +15,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const LOG_NAME: &str = "av1opt-log.tsv";
 
+/// How a person tells av1opt that an output folder is the right one, for the messages below.
+const HOW_TO_CONFIRM: &str = "choose Queue again on the job, or Use this folder on the watched folder";
+
 /// A job's output folder is not there, and the job may not make it.
 #[derive(Debug)]
 pub struct OutDirMissing(pub PathBuf);
 
 impl std::fmt::Display for OutDirMissing {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "the output folder {} is not there; its drive may not be mounted", self.0.display())
+        write!(
+            f,
+            "the output folder {} is not there; its drive may not be mounted. Mount it, or if the folder simply has to be made, {HOW_TO_CONFIRM}: that makes it, unless the folder above it is missing or empty as an unmounted drive's would be, and then you have to make it yourself",
+            self.0.display()
+        )
     }
 }
 
@@ -34,19 +41,65 @@ pub struct OutDirElsewhere(pub PathBuf);
 
 impl std::fmt::Display for OutDirElsewhere {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "the output folder {} is now on another drive than when it was queued; its drive may be unmounted, or mounted elsewhere", self.0.display())
+        write!(
+            f,
+            "the output folder {} is now on another drive than when it was queued; its drive may be unmounted, or mounted elsewhere. Mount it where it was, or if the folder belongs where it is now, {HOW_TO_CONFIRM}",
+            self.0.display()
+        )
     }
 }
 
 impl std::error::Error for OutDirElsewhere {}
+
+/// A job's output folder is empty and on the same drive as the folder above it, and nothing
+/// says that it was ever anything else: it may be the mount point of a drive that is away.
+#[derive(Debug)]
+pub struct OutDirUnconfirmed(pub PathBuf);
+
+impl std::fmt::Display for OutDirUnconfirmed {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "the output folder {} is empty and may be the mount point of a drive that is not mounted, so nothing was written there. Mount the drive if one belongs there; if this is the folder you mean, {HOW_TO_CONFIRM}",
+            self.0.display()
+        )
+    }
+}
+
+impl std::error::Error for OutDirUnconfirmed {}
+
+/// A job's output folder lies at or under a mount point that `/etc/fstab` lists and that has
+/// nothing mounted on it. What is at that path now is on the disk below, even a folder with
+/// files in it, left there by an earlier write.
+#[derive(Debug)]
+pub struct OutDirUnmounted {
+    pub out_dir: PathBuf,
+    pub mount_point: PathBuf,
+}
+
+impl std::fmt::Display for OutDirUnmounted {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "the output folder {} is on {}, which /etc/fstab lists as a mount point and which has nothing mounted on it now. Mount it and queue the job again, or choose another output folder",
+            self.out_dir.display(),
+            self.mount_point.display()
+        )
+    }
+}
+
+impl std::error::Error for OutDirUnmounted {}
 
 /// Where a job's output folder was when it was made or first seen. Saved with the job.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OutDirPlace {
     /// The device id of the file system holding it.
     pub device: u64,
-    /// The top folder of that file system.
+    /// The top folder of that file system, or the mount point it is reached through.
     pub mount: PathBuf,
+    /// A person chose this folder, or said that it is the right one, or av1opt made it itself.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub confirmed: bool,
 }
 
 impl OutDirPlace {
@@ -54,45 +107,172 @@ impl OutDirPlace {
     pub fn of(dir: &Path) -> Option<OutDirPlace> {
         let dir = std::fs::canonicalize(dir).ok()?;
         let device = std::fs::metadata(&dir).ok()?.dev();
-        let mut mount = dir.as_path();
-        while let Some(parent) = mount.parent().filter(|p| std::fs::metadata(p).is_ok_and(|m| m.dev() == device)) {
-            mount = parent;
+        let mut top = dir.as_path();
+        while let Some(parent) = top.parent().filter(|p| std::fs::metadata(p).is_ok_and(|m| m.dev() == device)) {
+            top = parent;
         }
-        Some(OutDirPlace { device, mount: mount.to_path_buf() })
+        // A bind mount keeps the device of what it shows, so only the list of mounts tells it.
+        let listed = mounted_targets().unwrap_or_default().into_iter().filter(|m| dir.starts_with(m)).max_by_key(|m| m.components().count());
+        let mount = listed.filter(|m| m.starts_with(top)).unwrap_or_else(|| top.to_path_buf());
+        Some(OutDirPlace { device, mount, confirmed: false })
     }
 
-    /// Whether a folder found at `now` is still on this drive. The device id alone would not
-    /// do: many file systems get a new one at each mount, and a drive back after a restart
-    /// would count as another. So a file system at or below the same top folder counts too.
-    fn holds(&self, now: &OutDirPlace) -> bool {
-        now.device == self.device || now.mount.starts_with(&self.mount)
+    /// Where a folder nobody has vouched for is, if that says anything. Nothing does for an
+    /// empty folder on its parent's drive, which may be a mount point with its drive away, nor
+    /// for a place on the root file system: every folder is under `/`, so no later absence
+    /// would ever show.
+    #[cfg(any(feature = "ui", test))]
+    pub fn first_seen(dir: &Path) -> Option<OutDirPlace> {
+        OutDirPlace::of(dir).filter(OutDirPlace::can_be_relied_on).filter(|_| !could_be_empty_mount_point(dir))
     }
+
+    /// The place of a folder someone has vouched for.
+    #[cfg(any(feature = "ui", test))]
+    pub fn confirmed_of(dir: &Path) -> Option<OutDirPlace> {
+        OutDirPlace::of(dir).map(|place| OutDirPlace { confirmed: true, ..place })
+    }
+
+    /// False for a place on the root file system that was noted without anyone choosing it, as
+    /// earlier versions did even for the empty mount point of a drive that was away.
+    pub fn can_be_relied_on(&self) -> bool {
+        self.confirmed || self.mount != Path::new("/")
+    }
+
+    /// Whether a folder found at `now` is still on this drive. The same top folder or one below
+    /// it counts: many file systems get a new device id at each mount, and a drive back after a
+    /// restart would count as another. The same device id counts too, for a drive mounted
+    /// somewhere else, but not when what is found now is above the place: a bind mount that is
+    /// gone leaves the file system it was made from, with the same device id.
+    fn holds(&self, now: &OutDirPlace) -> bool {
+        now.mount.starts_with(&self.mount) || (now.device == self.device && !self.mount.starts_with(&now.mount))
+    }
+}
+
+/// The mount points named by a table in the form of `/etc/fstab` or `/proc/self/mounts`.
+/// Swap has none, and in those files a space in a name is written as `\040`.
+fn table_targets(table: &str) -> Vec<PathBuf> {
+    table
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace().skip(1);
+            let target = fields.next()?;
+            (fields.next() != Some("swap")).then(|| undo_table_escapes(target))
+        })
+        .filter(|target| target.is_absolute())
+        .collect()
+}
+
+fn undo_table_escapes(field: &str) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    let bytes = field.as_bytes();
+    let (mut out, mut i) = (Vec::with_capacity(bytes.len()), 0);
+    while i < bytes.len() {
+        let octal = (bytes[i] == b'\\').then(|| bytes.get(i + 1..i + 4)).flatten().filter(|d| d.iter().all(|c| (b'0'..=b'7').contains(c)));
+        let value = octal.map(|d| d.iter().fold(0u32, |n, c| n * 8 + u32::from(c - b'0'))).filter(|n| *n <= 255);
+        match value {
+            Some(n) => {
+                out.push(n as u8);
+                i += 4;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    std::ffi::OsString::from_vec(out).into()
+}
+
+/// What is mounted now. None if that cannot be read: nothing can then be concluded from it.
+fn mounted_targets() -> Option<Vec<PathBuf>> {
+    std::fs::read_to_string("/proc/self/mounts").ok().map(|table| table_targets(&table))
+}
+
+/// The deepest of the `listed` mount points that `dir` is at or under and that has nothing
+/// mounted on it. The root is left out, and so is a listed folder that `dir` reaches only
+/// through something mounted further down.
+fn unmounted_target_above(dir: &Path, listed: &[PathBuf], mounted: &[PathBuf]) -> Option<PathBuf> {
+    listed
+        .iter()
+        .filter(|target| target.as_path() != Path::new("/") && dir.starts_with(target))
+        .filter(|target| !mounted.iter().any(|m| m.starts_with(target) && dir.starts_with(m)))
+        .max_by_key(|target| target.components().count())
+        .cloned()
+}
+
+/// `dir` with the part of it that exists resolved: it may well not exist as a whole.
+fn resolved_as_far_as_it_exists(dir: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut at = dir;
+    loop {
+        if let Ok(mut real) = std::fs::canonicalize(at) {
+            real.extend(rest.iter().rev());
+            return real;
+        }
+        match (at.parent(), at.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name);
+                at = parent;
+            }
+            _ => return dir.to_path_buf(),
+        }
+    }
+}
+
+/// The problem with `out_dir` if it lies at or under a mount point that `/etc/fstab` lists and
+/// that has nothing mounted on it. This is the only thing that gives away a folder with old
+/// files in it under the mount point of a drive that is away.
+pub fn under_unmounted_mount_point(out_dir: &Path) -> Option<anyhow::Error> {
+    let table = std::fs::read_to_string("/etc/fstab").ok()?;
+    let listed: Vec<PathBuf> = table_targets(&table).into_iter().map(|t| std::fs::canonicalize(&t).unwrap_or(t)).collect();
+    let mount_point = unmounted_target_above(&resolved_as_far_as_it_exists(out_dir), &listed, &mounted_targets()?)?;
+    Some(OutDirUnmounted { out_dir: out_dir.to_path_buf(), mount_point }.into())
 }
 
 /// What stops a job from writing to its output folder now, if anything.
 pub fn out_dir_problem(out_dir: &Path, place: Option<&OutDirPlace>) -> Option<anyhow::Error> {
+    if let Some(problem) = under_unmounted_mount_point(out_dir) {
+        return Some(problem);
+    }
     if !out_dir.is_dir() {
         return Some(OutDirMissing(out_dir.to_path_buf()).into());
     }
-    let now = OutDirPlace::of(out_dir)?;
-    place.filter(|then| !then.holds(&now)).map(|_| OutDirElsewhere(out_dir.to_path_buf()).into())
+    match place.filter(|then| then.can_be_relied_on()) {
+        Some(then) => {
+            let now = OutDirPlace::of(out_dir)?;
+            (!then.holds(&now)).then(|| OutDirElsewhere(out_dir.to_path_buf()).into())
+        }
+        None => could_be_empty_mount_point(out_dir).then(|| OutDirUnconfirmed(out_dir.to_path_buf()).into()),
+    }
 }
 
 /// Whether `error` says the output folder is away, which ends once the drive is back.
 pub fn is_out_dir_problem(error: &anyhow::Error) -> bool {
-    error.chain().any(|e| e.is::<OutDirMissing>() || e.is::<OutDirElsewhere>())
+    error.chain().any(|e| e.is::<OutDirMissing>() || e.is::<OutDirElsewhere>() || e.is::<OutDirUnconfirmed>() || e.is::<OutDirUnmounted>())
+}
+
+/// Whether `error` is about a folder that is there and that only a person can tell is the right
+/// one, so that going on means taking their word for it.
+#[cfg(any(feature = "ui", test))]
+pub fn out_dir_needs_confirming(error: &anyhow::Error) -> bool {
+    error.chain().any(|e| e.is::<OutDirElsewhere>() || e.is::<OutDirUnconfirmed>())
 }
 
 /// Makes the output folder of a job or watch saved by a version that did not make it when it
-/// was queued. Nothing says yet whether its absence means a drive that is away, so only the
-/// last part of the path is made: with its parent missing the drive is taken to be away, and
-/// the same with a parent that is empty and on the same drive as the folder above it, which is
-/// what the mount point of an unmounted drive looks like.
+/// was queued, and returns whether it had to be made. Nothing says yet whether its absence means
+/// a drive that is away, so only the last part of the path is made: with its parent missing the
+/// drive is taken to be away, and the same with a parent that is empty and on the same drive as
+/// the folder above it, which is what the mount point of an unmounted drive looks like, or that
+/// is under a mount point `/etc/fstab` lists with nothing mounted on it.
 #[cfg(any(feature = "ui", test))]
-pub fn make_out_dir_once(out_dir: &Path) -> Result<()> {
+pub fn make_out_dir_once(out_dir: &Path) -> Result<bool> {
     use anyhow::Context;
+    if let Some(problem) = under_unmounted_mount_point(out_dir) {
+        return Err(problem);
+    }
     if out_dir.is_dir() {
-        return Ok(());
+        return Ok(false);
     }
     let away = || anyhow::Error::from(OutDirMissing(out_dir.to_path_buf()));
     let parent = out_dir.parent().ok_or_else(away)?;
@@ -101,16 +281,37 @@ pub fn make_out_dir_once(out_dir: &Path) -> Result<()> {
     }
     match std::fs::create_dir(out_dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(away()),
-        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => Err(e).with_context(|| format!("cannot create {}", out_dir.display())),
-        _ => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("cannot create {}", out_dir.display())),
+        Ok(()) => Ok(true),
     }
 }
 
+/// A person says `out_dir` is the right folder: it is made if it can safely be, and its place
+/// now is the one to hold it to. None when it still cannot be used, which the job or watch then
+/// says in its own words: a drive that `/etc/fstab` expects there is not mounted, or the folder
+/// is missing and what is above it could be the mount point of a drive that is away.
 #[cfg(any(feature = "ui", test))]
+pub fn confirm_out_dir(out_dir: &Path) -> Result<Option<OutDirPlace>> {
+    match make_out_dir_once(out_dir) {
+        Ok(_) => Ok(OutDirPlace::confirmed_of(out_dir)),
+        Err(e) if is_out_dir_problem(&e) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether an empty folder may be a mount point with its drive away: it is on the same drive
+/// as the folder above it, and nothing is mounted on it.
+fn seems_an_empty_mount_point(empty: bool, device: Option<u64>, device_above: Option<u64>, mounted_here: bool) -> bool {
+    empty && !mounted_here && device.is_some() && device == device_above
+}
+
 fn could_be_empty_mount_point(dir: &Path) -> bool {
+    let Ok(real) = std::fs::canonicalize(dir) else { return false };
     let device = |p: &Path| std::fs::metadata(p).ok().map(|m| m.dev());
-    let empty = std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_none());
-    empty && dir.parent().is_some_and(|above| device(above).is_some() && device(above) == device(dir))
+    let empty = std::fs::read_dir(&real).is_ok_and(|mut entries| entries.next().is_none());
+    let mounted_here = mounted_targets().is_some_and(|mounted| mounted.contains(&real));
+    seems_an_empty_mount_point(empty, device(&real), real.parent().and_then(device), mounted_here)
 }
 
 /// One input file and the folder its output goes to.
@@ -1061,17 +1262,17 @@ mod tests {
     fn an_output_folder_on_another_drive_than_it_was_stops_the_job() {
         let source = Folder::new("place-in", &["c.mkv"]);
         let out = Folder::new("place-out", &[]);
-        let here = OutDirPlace::of(&out.0).unwrap();
+        let here = OutDirPlace::confirmed_of(&out.0).unwrap();
         assert!(out_dir_problem(&out.0, Some(&here)).is_none());
         assert!(out.0.starts_with(&here.mount), "{here:?}");
 
         // Its drive has gone and something else stands at the path.
-        let away = OutDirPlace { device: here.device + 1, mount: out.0.join("gone") };
+        let away = OutDirPlace { device: here.device + 1, mount: out.0.join("gone"), confirmed: false };
         let e = out_dir_problem(&out.0, Some(&away)).unwrap();
         assert!(e.is::<OutDirElsewhere>() && is_out_dir_problem(&e), "{e}");
         assert!(e.to_string().contains("on another drive than when it was queued"), "{e}");
         // Back after a restart with a new device id, at the same place: the same drive.
-        assert!(out_dir_problem(&out.0, Some(&OutDirPlace { device: here.device + 1, mount: here.mount.clone() })).is_none());
+        assert!(out_dir_problem(&out.0, Some(&OutDirPlace { device: here.device + 1, ..here.clone() })).is_none());
         assert!(is_out_dir_problem(&out_dir_problem(&out.0.join("nowhere"), None).unwrap()));
 
         // Every file fails without anything being written, and the run says why.
@@ -1083,6 +1284,119 @@ mod tests {
         assert_eq!(sum.failed, 1);
         assert!(sum.out_dir_lost.is_some_and(|e| e.is::<OutDirElsewhere>()));
         assert_eq!(std::fs::read_dir(&out.0).unwrap().count(), 0, "nothing is written there, not even the log");
+    }
+
+    fn place(device: u64, mount: &str) -> OutDirPlace {
+        OutDirPlace { device, mount: mount.into(), confirmed: false }
+    }
+
+    #[test]
+    fn a_place_holds_for_its_drive_wherever_that_is_mounted_and_for_nothing_above_it() {
+        // Mounted somewhere else: the same device.
+        assert!(place(5, "/media/a").holds(&place(5, "/media/b")));
+        // Back at the same place with a new device id, or a drive mounted further down.
+        assert!(place(5, "/media/a").holds(&place(9, "/media/a")));
+        assert!(place(5, "/media/a").holds(&place(9, "/media/a/deeper")));
+        // Its drive is away, and the disk underneath shows at the path.
+        assert!(!place(5, "/media/a").holds(&place(2, "/")));
+        // A bind mount that is gone leaves the file system it came from: the same device.
+        assert!(!place(2, "/mnt/bound").holds(&place(2, "/")));
+    }
+
+    #[test]
+    fn a_place_on_the_root_says_something_only_if_someone_vouched_for_it() {
+        assert!(!place(2, "/").can_be_relied_on());
+        assert!(OutDirPlace { confirmed: true, ..place(2, "/") }.can_be_relied_on());
+        assert!(place(2, "/mnt/usb").can_be_relied_on());
+        // What earlier versions saved has no mark, and reads as not vouched for.
+        let saved: OutDirPlace = serde_json::from_str(r#"{"device":2,"mount":"/"}"#).unwrap();
+        assert_eq!(saved, place(2, "/"));
+        assert_eq!(serde_json::to_string(&saved).unwrap(), r#"{"device":2,"mount":"/"}"#);
+    }
+
+    #[test]
+    fn only_an_empty_folder_on_its_parents_drive_with_nothing_mounted_on_it_may_be_a_mount_point() {
+        assert!(seems_an_empty_mount_point(true, Some(1), Some(1), false));
+        // A drive is mounted on it, by its device or, for a bind mount, by the list of mounts.
+        assert!(!seems_an_empty_mount_point(true, Some(2), Some(1), false));
+        assert!(!seems_an_empty_mount_point(true, Some(1), Some(1), true));
+        assert!(!seems_an_empty_mount_point(false, Some(1), Some(1), false));
+        assert!(!seems_an_empty_mount_point(true, None, None, false));
+    }
+
+    #[test]
+    fn mount_tables_are_read_as_the_system_writes_them() {
+        let fstab = "# /etc/fstab\n\nUUID=1 / ext4 defaults 0 1\nUUID=2 none swap sw 0 0\n/swapfile /swap swap sw 0 0\nLABEL=a /mnt/my\\040films ntfs-3g nofail 0 0\nserver:/x relative nfs defaults 0 0\n  # indented\n";
+        assert_eq!(table_targets(fstab), [PathBuf::from("/"), PathBuf::from("/mnt/my films")]);
+        assert_eq!(undo_table_escapes(r"/a\011b\134c\012"), Path::new("/a\tb\\c\n"));
+        // What only looks like an escape stays as it is.
+        assert_eq!(undo_table_escapes(r"/a\9b\04"), Path::new(r"/a\9b\04"));
+    }
+
+    #[test]
+    fn a_listed_mount_point_with_nothing_on_it_is_found_above_the_folder() {
+        let paths = |l: &[&str]| l.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let listed = paths(&["/", "/mnt/usb", "/mnt/usb/inner", "/mnt/other"]);
+        let found = |dir: &str, mounted: &[&str]| unmounted_target_above(Path::new(dir), &listed, &paths(mounted));
+        assert_eq!(found("/mnt/usb", &["/"]), Some("/mnt/usb".into()));
+        assert_eq!(found("/mnt/usb/out/deep", &["/"]), Some("/mnt/usb".into()));
+        assert_eq!(found("/mnt/usb/inner/out", &["/"]), Some("/mnt/usb/inner".into()), "the deepest is named");
+        assert_eq!(found("/mnt/usb/out", &["/", "/mnt/usb"]), None);
+        assert_eq!(found("/mnt/usb/inner/out", &["/", "/mnt/usb/inner"]), None, "reached through what is mounted further down");
+        assert_eq!(found("/mnt/usb2/out", &["/"]), None, "a whole name, not its beginning");
+        assert_eq!(found("/home/me/out", &["/"]), None, "the root says nothing");
+    }
+
+    #[test]
+    fn an_empty_folder_nobody_vouched_for_counts_as_possibly_away() {
+        let top = Folder::new("unconfirmed", &[]);
+        let out = top.0.join("out");
+        std::fs::create_dir(&out).unwrap();
+        assert_eq!(OutDirPlace::first_seen(&out), None, "an empty folder says nothing about its drive");
+        let e = out_dir_problem(&out, None).unwrap();
+        assert!(e.is::<OutDirUnconfirmed>() && is_out_dir_problem(&e) && out_dir_needs_confirming(&e), "{e}");
+        assert!(e.to_string().contains("Queue again"), "it says what to do: {e}");
+        // The same with a place from an earlier version that says nothing.
+        assert!(out_dir_problem(&out, Some(&place(1, "/"))).is_some_and(|e| e.is::<OutDirUnconfirmed>()));
+        // Vouched for, it is used, and so it is once it holds something.
+        assert!(out_dir_problem(&out, OutDirPlace::confirmed_of(&out).as_ref()).is_none());
+        std::fs::write(out.join("a file"), b"x").unwrap();
+        assert!(out_dir_problem(&out, None).is_none());
+    }
+
+    #[test]
+    fn a_folder_confirmed_by_a_person_is_made_unless_its_parent_may_be_a_mount_point() {
+        let top = Folder::new("confirm", &["a file"]);
+        // Above it is a folder in use: it is made, and its place noted.
+        let out = top.0.join("out");
+        let confirmed = confirm_out_dir(&out).unwrap().unwrap();
+        assert!(out.is_dir() && confirmed.confirmed, "{confirmed:?}");
+        assert_eq!(confirm_out_dir(&out).unwrap().unwrap(), confirmed, "there already");
+        // Above it is an empty folder, or nothing: the person's word does not reach that far.
+        let empty = top.0.join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        assert_eq!(confirm_out_dir(&empty.join("out")).unwrap(), None);
+        assert_eq!(confirm_out_dir(&top.0.join("gone/out")).unwrap(), None);
+        assert!(!empty.join("out").exists() && !top.0.join("gone").exists());
+        assert!(OutDirMissing(empty.join("out")).to_string().contains("make it yourself"));
+    }
+
+    #[test]
+    fn a_failed_encode_whose_folder_went_meanwhile_counts_as_lost_to_the_drive() {
+        let source = Folder::new("lost-in", &["a.mkv"]);
+        let top = Folder::new("lost-out", &[]);
+        let out = top.0.join("out");
+        std::fs::create_dir(&out).unwrap();
+        // The drive goes while the file is looked at, which then fails for a reason of its own.
+        let ffprobe = top.0.join("ffprobe");
+        crate::files::write_script(&ffprobe, &format!("rm -rf '{}'\nexit 1\n", out.display()));
+        let mut o = options();
+        o.out_dir_must_exist = true;
+        let jobs = vec![Job { input: source.0.join("a.mkv"), out_dir: out.clone(), also_at: None }];
+        let tools = Tools::new("false".into(), ffprobe.to_str().unwrap().into(), None);
+        let sum = run_placed(&tools, &jobs, &out, OutDirPlace::confirmed_of(&out).as_ref(), &o, false).unwrap();
+        assert_eq!(sum.failed, 1);
+        assert!(sum.out_dir_lost.is_some_and(|e| e.is::<OutDirMissing>()));
     }
 
     #[test]

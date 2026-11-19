@@ -1373,6 +1373,12 @@ views.dups = (root) => {
 // (master) file playable, so the likelier one goes there.
 function playRank(codec) { return { av1: 0, h264: 1, vp9: 1, vp8: 1, hevc: 3 }[codec] ?? 4; }
 
+// Asks whether a folder that may be the empty mount point of a drive that is away is the one meant.
+function confirmOutputFolder(folder) {
+  return confirmDialog({ title: "Use this output folder?", action: "Use this folder",
+    body: [h("p", { class: "mono" }, folder), h("p", { class: "dim" }, "If a drive belongs here and is not mounted, what is written now goes to the disk underneath and disappears from view when the drive comes back. Mount the drive first in that case.")] });
+}
+
 // Asks before something that can't be taken back with one click. Resolves true on "yes".
 function confirmDialog({ title, body, action }) {
   return new Promise((resolve) => {
@@ -2160,7 +2166,11 @@ views.queue = (root) => {
           w.enabled && w.next_secs != null ? `, again ${w.next_secs < 45 ? "in a moment" : "in " + span(w.next_secs)}` : "",
           counts.map((c) => [" · ", typeof c === "string" ? c : h("span", { title: c.title }, c.text)])),
         ...unread,
-        ...(w.error ? [h("div", { class: "bad sub" }, w.error)] : []));
+        ...(w.error ? [h("div", { class: "bad sub" }, w.error)] : []),
+        ...(w.out_dir_away ? [h("div", { class: "sub" }, h("button", { class: "small", disabled: watchBusy.has(`${id}:use`), title: "Use the output folder as it is now", onclick: async () => {
+          if (w.out_dir_to_confirm && !await confirmOutputFolder(w.out_dir)) return;
+          watchAct(id, "use", `/api/watch/${id}/use-output-folder`, {});
+        } }, "Use this folder"))] : []));
     };
     return { box, draw };
   };
@@ -2349,7 +2359,7 @@ views.queue = (root) => {
         ? h("button", { class: "small", title: "Start this job before the other waiting ones", onclick: async (e) => { const b = e.target; b.disabled = true; try { await api(`/api/jobs/${j.id}/first`, {}); } catch (er) { toast(er.message, true); } finally { b.disabled = false; } load(); } }, "Do next")
         : null,
       j.status === "cancelled" || j.status === "failed"
-        ? h("button", { class: "small", title: "Queue these files again with the same settings. Finished files are skipped and scene chunks resume.", onclick: async (e) => { const b = e.target; b.disabled = true; try { await api(`/api/jobs/${j.id}/again`, {}); toast("Queued again"); } catch (er) { toast(er.message, true); } finally { b.disabled = false; } load(); } }, "Queue again")
+        ? h("button", { class: "small", title: "Queue these files again with the same settings. Finished files are skipped and scene chunks resume.", onclick: async (e) => { const b = e.target; if (j.out_dir_to_confirm && !await confirmOutputFolder(j.out_dir)) return; b.disabled = true; try { await api(`/api/jobs/${j.id}/again`, {}); toast("Queued again"); } catch (er) { toast(er.message, true); } finally { b.disabled = false; } load(); } }, "Queue again")
         : null,
       j.status === "running" || j.status === "queued"
         ? h("button", { class: "danger small", onclick: async (e) => { const b = e.target; b.disabled = true; try { await api(`/api/jobs/${j.id}/cancel`, {}); toast("Cancelling… (finished chunks are kept; re-queue to resume)"); } catch (er) { toast(er.message, true); } finally { b.disabled = false; } } }, "Cancel")

@@ -214,6 +214,9 @@ pub struct Job {
     /// It failed for that reason, and stays in the saved queue for when the drive is back.
     #[serde(skip)]
     out_dir_missing: bool,
+    /// The folder is there, and whether it is the right one is for a person to say.
+    #[serde(skip)]
+    out_dir_to_confirm: bool,
     /// The output folder was made for this job once. Jobs saved before folders were made at
     /// queue time lack this, and get theirs made when they come back.
     #[serde(skip)]
@@ -356,6 +359,7 @@ fn head(j: &Job) -> Value {
         "left_secs": left, "left_unknown": unknown,
         "paused": j.hooks.as_ref().is_some_and(|h| h.is_paused()),
         "note": job_note(j),
+        "out_dir_to_confirm": j.out_dir_to_confirm,
     })
 }
 
@@ -564,7 +568,12 @@ fn prepare(app: &App, body: &Value, origin: Origin, known: &Known) -> Result<Job
     // A folder asked for now is made now, and a name that cannot be used is said at once. After
     // this a missing folder means a drive that is away: see `out_dir_place`.
     let asked_now = origin == Origin::Asked && r.watch.is_none();
+    let mut made_here = false;
     let out_dir_made = if asked_now {
+        // Made now it would land on the disk under the mount point.
+        if let Some(problem) = batch::under_unmounted_mount_point(&r.out_dir) {
+            return Err(problem);
+        }
         std::fs::create_dir_all(&r.out_dir).with_context(|| format!("cannot create {}", r.out_dir.display()))?;
         true
     } else if origin == Origin::Saved && !r.out_dir_made {
@@ -574,11 +583,18 @@ fn prepare(app: &App, body: &Value, origin: Origin, known: &Known) -> Result<Job
         if let Err(e) = &made {
             eprintln!("warning: {e:#}");
         }
+        made_here = matches!(made, Ok(true));
         made.is_ok()
     } else {
         true
     };
-    let out_dir_place = r.out_dir_place.filter(|_| !asked_now).or_else(|| OutDirPlace::of(&r.out_dir));
+    // The person asking has chosen the folder, and one just made is known to be the right one.
+    // Any other is taken as it is found only if that says something: see `first_seen`.
+    let out_dir_place = if asked_now || made_here {
+        OutDirPlace::confirmed_of(&r.out_dir)
+    } else {
+        r.out_dir_place.filter(OutDirPlace::can_be_relied_on).or_else(|| OutDirPlace::first_seen(&r.out_dir))
+    };
     // Time estimates for files a scan has seen; the others get theirs when they are probed.
     let time = crate::estimate::TimeModel::fit(&known.history, opts.preset);
     // Estimates are for the way the files will be encoded. "Where uneven" is not known
@@ -627,6 +643,7 @@ fn prepare(app: &App, body: &Value, origin: Origin, known: &Known) -> Result<Job
         dropped,
         out_dir_place,
         out_dir_missing: false,
+        out_dir_to_confirm: false,
         out_dir_made,
         folders_queued,
         not_text,
@@ -945,9 +962,10 @@ pub fn first(app: &App, id: u64) -> Result<Value> {
 
 /// Queues the files of a cancelled or failed job once more, with the same options, and
 /// drops the old entry. Files that were finished are recognised as done and scene chunks
-/// resume, as with any re-run.
+/// resume, as with any re-run. For a job that was waiting for its output folder this is a person
+/// saying the folder is the right one: where it is now is noted, and it is made if that is safe.
 pub fn again(app: &App, id: u64) -> Result<Value> {
-    let body = {
+    let (mut body, waited_for_folder) = {
         let jobs = app.jobs.jobs.lock().unwrap();
         let j = find(&jobs, id)?;
         if !matches!(j.status.as_str(), "cancelled" | "failed") {
@@ -959,8 +977,17 @@ pub fn again(app: &App, id: u64) -> Result<Value> {
         if let Some(dropped) = body["dropped"].as_array_mut() {
             dropped.extend(set_apart);
         }
-        body
+        (body, j.out_dir_missing)
     };
+    if waited_for_folder {
+        let out_dir = PathBuf::from(body["out_dir"].as_str().unwrap_or_default());
+        crate::fsguard::ensure_writable_location(&out_dir, false)?;
+        // When it still cannot be used, the job queued below says why.
+        if let Some(place) = batch::confirm_out_dir(&out_dir)? {
+            body["out_dir_place"] = json!(place);
+            body["out_dir_made"] = json!(true);
+        }
+    }
     let r = add_checked(app, &body, Origin::Saved)?;
     // Only once the new job exists: a refused request leaves the old entry on screen.
     app.jobs.jobs.lock().unwrap().retain(|j| j.id != id);
@@ -1101,6 +1128,7 @@ pub fn start_worker(app: Arc<App>) {
                         j.status = "failed".into();
                         j.error = Some(format!("{e:#}"));
                         j.out_dir_missing = batch::is_out_dir_problem(&e);
+                        j.out_dir_to_confirm = batch::out_dir_needs_confirming(&e);
                         // A job that waits for its folder comes back whole.
                         if !j.out_dir_missing {
                             keep_left_out(&app.jobs, j, false);
@@ -1131,7 +1159,7 @@ fn run_job(app: &Arc<App>, id: u64, opts: Result<Options>, retry: bool, out_dir:
     if let Some(problem) = batch::out_dir_problem(out_dir, place.as_ref()) {
         return Err(problem);
     }
-    let place = place.or_else(|| OutDirPlace::of(out_dir));
+    let place = place.filter(OutDirPlace::can_be_relied_on).or_else(|| OutDirPlace::first_seen(out_dir));
     let sink_app = app.clone();
     let hooks = Arc::new(Hooks::new(move |e: Event| {
         let file = {
@@ -1173,14 +1201,18 @@ fn run_job(app: &Arc<App>, id: u64, opts: Result<Options>, retry: bool, out_dir:
     if let Some(j) = app.jobs.jobs.lock().unwrap().iter_mut().find(|j| j.id == id) {
         j.batch = batch_jobs;
     }
-    let mut summary = r?;
+    let summary = r?;
     if summary.cancelled {
         return Ok(summary);
     }
-    // Lost on the way, the folder failed the files after that, even if it is back by now. The
-    // job waits for the drive like one that found it missing at the start, or those files
-    // would be forgotten.
-    match summary.out_dir_lost.take().or_else(|| batch::out_dir_problem(out_dir, place.as_ref())) {
+    outcome_of_run(summary, out_dir, place.as_ref())
+}
+
+/// What a run that went to its end comes to. Lost on the way, the folder failed the files after
+/// that, even if it is back by now. The job waits for the drive like one that found it missing
+/// at the start, or those files would be forgotten.
+fn outcome_of_run(mut summary: batch::Summary, out_dir: &Path, place: Option<&OutDirPlace>) -> Result<batch::Summary> {
+    match summary.out_dir_lost.take().or_else(|| batch::out_dir_problem(out_dir, place)) {
         Some(problem) => Err(problem),
         None => Ok(summary),
     }
@@ -1203,6 +1235,19 @@ mod tests {
         assert!(serde_json::from_value::<JobOptions>(json!({ "remove": [[null, 2]] })).is_err());
         let backwards: JobOptions = serde_json::from_value(json!({ "remove": [[5, 2]] })).unwrap();
         assert!(backwards.to_options().is_err());
+    }
+
+    #[test]
+    fn a_folder_lost_during_a_run_fails_the_job_even_if_it_is_back_by_the_end() {
+        let dir = std::env::temp_dir().join(format!("av1opt-run-outcome-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a file"), b"x").unwrap();
+        let place = OutDirPlace::confirmed_of(&dir);
+        let lost = batch::Summary { out_dir_lost: Some(batch::OutDirMissing(dir.clone()).into()), ..Default::default() };
+        let e = outcome_of_run(lost, &dir, place.as_ref()).err().expect("the job fails");
+        assert!(batch::is_out_dir_problem(&e), "{e}");
+        assert!(outcome_of_run(batch::Summary::default(), &dir, place.as_ref()).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

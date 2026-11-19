@@ -165,15 +165,87 @@ function rowOrder(key, direction, compare = (a, b) => (a < b ? -1 : a > b ? 1 : 
   };
 }
 
-// ---------- end of the part that runs alone ----------
+// What the server takes for each number of a form (src/ui/fields.rs, which has the command
+// line's ranges), and the page's percent of savings for the share it is sent as.
+const RANGES = {
+  vmaf: { above: 0, max: 100 },
+  preset: { whole: true, min: 0, max: 13 },
+  workers: { whole: true, min: 1, max: 8 },
+  savingsPct: { min: 0, max: 95 },
+  tolerance: { whole: true, min: 0, max: 20 },
+  videos: { whole: true, min: 1, max: 50 },
+  clips: { whole: true, min: 1, max: 8 },
+  clipSecs: { min: 2, max: 30 },
+  hours: { above: 0, max: 10000 },
+};
+// What is wrong with `text` as a number of `range`, as "enter ...", or null if nothing is.
+function numberProblem(text, range = {}) {
+  const t = String(text ?? "").trim();
+  const n = t === "" ? NaN : Number(t);
+  const span = range.above != null ? ` above ${range.above} and up to ${range.max}` : range.min != null ? ` from ${range.min} to ${range.max}` : "";
+  const wanted = `enter ${range.whole ? "a whole number" : "a number"}${span}`;
+  if (!Number.isFinite(n) || (range.whole && !Number.isInteger(n))) return wanted;
+  if ((range.above != null && n <= range.above) || (range.min != null && n < range.min) || (range.max != null && n > range.max)) return wanted;
+  return null;
+}
 
-function savedClass(x) { return x < 0 ? "warn" : "ok"; }
+// Whether a remembered value can stand for `d`, the value used without one: of the same kind,
+// a list for a list and text for text. What it holds is for its field to check.
+function sameKind(v, d) {
+  if (v == null || d == null) return false;
+  if (Array.isArray(d) || Array.isArray(v)) return Array.isArray(d) && Array.isArray(v);
+  return typeof v === typeof d;
+}
+
+// A form's values as remembered, over `defaults`: those of the kind of their default.
+function rememberedForm(defaults, saved) {
+  const o = { ...defaults };
+  if (!saved || typeof saved !== "object" || Array.isArray(saved)) return o;
+  for (const k of Object.keys(defaults)) if (sameKind(saved[k], defaults[k])) o[k] = saved[k];
+  return o;
+}
+
+// The encode dialog's options as remembered, over `defaults`: each of the kind its default is,
+// and the tags as pairs of texts. Settings saved before "auto" existed hold true or false for
+// per-scene CRF.
+function rememberedOptions(defaults, saved) {
+  const o = rememberedForm(defaults, saved);
+  if (saved && typeof saved.scenes === "boolean") o.scenes = saved.scenes;
+  if (!["mp4", "mkv"].includes(o.container)) o.container = defaults.container;
+  o.meta_tags = o.meta_tags.filter((t) => Array.isArray(t) && t.length === 2 && t.every((x) => typeof x === "string"));
+  return o;
+}
+
+// What a one-pass encode's report says of its CRF, for people. After the whole-video check
+// stretches may have been encoded again at lower CRFs (`stretches`, each { crf, secs }),
+// up to the whole video, and the video may have been encoded a second time at another CRF
+// (`first_crf`, in reports since that was kept). `video_secs` is the output's length, where
+// the report has it. Gives the mode, the CRF in full and the CRF in short, for a table.
+function oneCrfText({ crf, first_crf: first, stretches, video_secs: length }) {
+  const again = Array.isArray(stretches) ? stretches.filter((x) => isNumber(x.crf) && isNumber(x.secs)) : [];
+  const second = isNumber(first) && first !== crf ? `, encoded a second time (the first time at ${first})` : "";
+  if (!again.length) return { mode: second ? "one CRF, encoded a second time after the check" : "one CRF", crf: `${crf}${second}`, short: `${crf}` };
+  const crfs = again.map((x) => x.crf), lo = Math.min(...crfs), hi = Math.max(...crfs);
+  const range = lo === hi ? `${lo}` : `${lo}–${hi}`;
+  const secs = again.reduce((a, x) => a + x.secs, 0);
+  const n = again.length === 1 ? "1 stretch" : `${again.length} stretches`;
+  // Within a frame or so of the length, the whole video was encoded again.
+  if (isNumber(length) && length > 0 && secs >= length - 0.1) {
+    return { mode: "one CRF, encoded again whole after the check", crf: `${range} (first ${crf}${second}; the check had the whole video encoded again)`, short: range };
+  }
+  const of = isNumber(length) && length > 0 ? ` of ${hms(length)}` : "";
+  return { mode: `one CRF, ${n} encoded again`, crf: `${crf}${second}; ${range} in ${n} (${hms(secs)}${of}) after the check`, short: `${crf} · ${range}` };
+}
 function hms(sec) {
   if (sec == null || isNaN(sec)) return "–";
   sec = Math.max(0, Math.round(sec));
   const hh = Math.floor(sec / 3600), mm = Math.floor(sec / 60) % 60, ss = sec % 60;
   return (hh ? hh + ":" + String(mm).padStart(2, "0") : mm) + ":" + String(ss).padStart(2, "0");
 }
+
+// ---------- end of the part that runs alone ----------
+
+function savedClass(x) { return x < 0 ? "warn" : "ok"; }
 function span(sec) { // a length of time for people: minutes, hours, then days
   if (sec == null || isNaN(sec) || sec <= 0) return "–";
   if (sec < 60) return "<1 min";
@@ -200,24 +272,23 @@ function toast(msg, err) {
   toastTimer = setTimeout(() => (t.hidden = true), err ? 7000 : 3000);
 }
 
-// The numbers in `fields` ([input, label, whole?] each), or null after marking the first that
-// is empty or no number and saying which it is. Number("") is 0, which a field left empty must
-// not be sent as, and a number input whose text is no number reads as empty. Whether a number
-// is in range is the server's to say, with the same names.
+// The numbers in `fields` ([input, label, range] each, a range of RANGES), or null after
+// marking the first that is empty, no number or out of its range and saying which it is and
+// what it takes. Number("") is 0, which a field left empty must not be sent as, and a number
+// input whose text is no number reads as empty. The server checks the same ranges again.
 function readNumbers(fields) {
   const numbers = [];
-  for (const [input, label, whole] of fields) {
-    const text = input.value.trim();
-    const n = text === "" ? NaN : Number(text);
-    if (!Number.isFinite(n) || (whole && !Number.isInteger(n))) {
+  for (const [input, label, range] of fields) {
+    const problem = numberProblem(input.value, range);
+    if (problem) {
       input.classList.add("invalid");
       input.addEventListener("input", () => input.classList.remove("invalid"), { once: true });
       input.focus();
-      toast(`${label}: enter ${whole ? "a whole number" : "a number"}`, true);
+      toast(`${label}: ${problem}`, true);
       return null;
     }
     input.classList.remove("invalid");
-    numbers.push(n);
+    numbers.push(Number(input.value.trim()));
   }
   return numbers;
 }
@@ -267,10 +338,33 @@ function isVideoFile(p, files) {
   return !!m && VIDEO_EXTS.includes(m[1].toLowerCase());
 }
 
+// What the page remembers of its forms and views is kept by av1opt, in its settings file: what
+// a browser keeps belongs to one address, and the port, and with it the address, is new at
+// every start. It comes with the state. A change is sent on its way and not waited for; one
+// that does not get through is only not remembered. One key goes at a time, so that two tabs
+// each keep theirs.
+// Folder lists are the server's own settings, which it also sets when a scan, a search or a
+// benchmark starts: one list each, not a second copy here.
+const FOLDER_PREFS = { scanRoots: "scan_paths", dupRoots: "dup_paths", dupPrefer: "dup_prefer", benchRoots: "bench_paths" };
 const prefs = {
-  get(k, d) { try { const v = localStorage.getItem("av1opt." + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
-  // Storage can be full or blocked. What was asked for goes on; it is only not remembered.
-  set(k, v) { try { localStorage.setItem("av1opt." + k, JSON.stringify(v)); } catch { /* see above */ } },
+  // What comes back is a remembered form value and no more: one of another kind than `d`
+  // is not used, and what goes into a field is checked from there as typed input is.
+  get(k, d) {
+    const s = STATE && STATE.settings;
+    if (!s) return d;
+    const own = Object.prototype.hasOwnProperty;
+    if (own.call(FOLDER_PREFS, k)) { const v = s[FOLDER_PREFS[k]]; return Array.isArray(v) ? v.filter((p) => typeof p === "string") : d; }
+    const v = s.page && own.call(s.page, k) ? s.page[k] : null;
+    return sameKind(v, d) ? v : d;
+  },
+  set(k, v) {
+    if (STATE) {
+      STATE.settings = STATE.settings || {};
+      if (Object.prototype.hasOwnProperty.call(FOLDER_PREFS, k)) STATE.settings[FOLDER_PREFS[k]] = v;
+      else STATE.settings.page = { ...(STATE.settings.page || {}), [k]: v };
+    }
+    api("/api/prefs", { key: k, value: v === undefined ? null : v }).catch(() => { /* see above */ });
+  },
 };
 
 // ---------- live events ----------
@@ -385,16 +479,19 @@ onEvent((m) => { if (m.kind === "reopened") loadState().catch(() => {}); });
 
 // Shown on every view while encodes cannot run (usually: ffmpeg without libvmaf), and for what
 // went wrong at start (a settings file or saved queue that could not be read) until dismissed.
-const noticesRead = new Set();
+// A notice dismissed is remembered by its text, which names the damaged file and the name it
+// was kept under: a file damaged again says so again. Only those still told are kept.
 function renderBanner() {
   const b = document.getElementById("banner");
   const p = STATE && STATE.tools && STATE.tools.problem;
-  const notices = ((STATE && STATE.notices) || []).filter((n) => !noticesRead.has(n));
+  const told = (STATE && STATE.notices) || [];
+  const read = new Set(prefs.get("noticesRead", []));
+  const notices = told.filter((n) => !read.has(n));
   b.hidden = !p && !notices.length && !isSignedOut;
   b.replaceChildren(
     ...(isSignedOut ? [h("div", {}, "This page is not signed in any more, usually because av1opt was started again. Open it again from the link av1opt printed.")] : []),
     ...(p ? [h("div", {}, "Encoding is off: " + p + ".", h("a", { href: "#/settings" }, "Settings"))] : []),
-    ...notices.map((n) => h("div", {}, n + " ", h("button", { class: "small", onclick: () => { noticesRead.add(n); renderBanner(); } }, "Dismiss"))));
+    ...notices.map((n) => h("div", {}, n + " ", h("button", { class: "small", onclick: () => { prefs.set("noticesRead", told.filter((x) => x === n || read.has(x))); renderBanner(); } }, "Dismiss"))));
 }
 
 // ---------- folder / file picker ----------
@@ -408,7 +505,7 @@ const desktop = window.av1optDesktop || null;
 
 function pick({ title, mode = "dir", start }) {
   if (desktop && mode === "dir") {
-    return desktop.pickFolder(title, start || prefs.get("pickerDir", null) || (STATE && STATE.home) || "").then((p) => {
+    return desktop.pickFolder(title, start || prefs.get("pickerDir", "") || (STATE && STATE.home) || "").then((p) => {
       if (!p) return null;
       prefs.set("pickerDir", p);
       return [p];
@@ -417,7 +514,7 @@ function pick({ title, mode = "dir", start }) {
   return new Promise((resolve) => {
     const selected = new Set();
     const files = new Set();
-    let cur = start || prefs.get("pickerDir", null) || (STATE && STATE.home) || "/";
+    let cur = start || prefs.get("pickerDir", "") || (STATE && STATE.home) || "/";
     let hidden = false;
     const pathEl = h("div", { class: "picker-path" });
     const list = h("ul", { class: "picker-list" });
@@ -540,7 +637,7 @@ function scenesMode(v) {
 }
 
 function defaultOptions() {
-  return Object.assign({
+  return rememberedOptions({
     container: "mp4", target_vmaf: 93, preset: 5, svt_params: "", tuned: false, scenes: "off", workers: 1, min_savings: 0.15, force: false, retry_skipped: false,
     keep_metadata: true, keep_dates: false, info_json: true, meta_preset: "", meta_tags: [], shrink_audio: false,
   }, prefs.get("encodeOptions", {}));
@@ -596,7 +693,7 @@ function metaEditor(o, one) {
               r.tags.map(([k, v]) => [h("span", { class: "k" }, k), h("span", { class: "mono" }, short(v))]),
               kept.map(([k, v]) => [h("span", { class: "k" }, k), h("span", { class: "mono dim", title: "kept from the source" }, short(v))]))
           : h("div", { class: "dim" }, "No tags would be written."),
-        !r.keep && Object.keys(r.source).length ? h("div", { class: "dim" }, `${Object.keys(r.source).length} source tags dropped`) : null);
+        ...(!r.keep && Object.keys(r.source).length ? [h("div", { class: "dim" }, `${Object.keys(r.source).length} source tags dropped`)] : []));
     } catch (e) { toast(e.message, true); }
     previewBtn.disabled = false;
   } }, "Preview tags");
@@ -637,6 +734,8 @@ function fmtTime(t) {
 // Removed (start, end) sections → the kept parts, as the encoder works them out: sorted,
 // merged, clipped to the video, and kept slivers under 0.25 s dropped too.
 const MIN_KEEP = 0.25;
+// What has to stay of the video in all: the server refuses less (MIN_OUTPUT in sections.rs).
+const MIN_OUTPUT = 1;
 function keptParts(removed, duration) {
   const r = removed.map(([a, b]) => [a, Math.min(b, duration)]).filter(([a, b]) => a < duration && b > a).sort((x, y) => x[0] - y[0]);
   const keep = [];
@@ -704,8 +803,9 @@ function sectionsEditor(path) {
     const keep = keptParts(removed, duration);
     const kept = keep.reduce((t, [a, b]) => t + b - a, 0);
     summary.textContent = removed.length
-      ? `Output ${fmtTime(kept)} of ${fmtTime(duration)}: ${fmtTime(duration - kept)} removed in ${removed.length} section${removed.length === 1 ? "" : "s"}. Cuts are frame-accurate; audio is re-encoded to Opus.`
+      ? `Output ${fmtTime(kept)} of ${fmtTime(duration)}: ${fmtTime(duration - kept)} removed in ${removed.length} section${removed.length === 1 ? "" : "s"}. ${kept < MIN_OUTPUT ? `At least ${MIN_OUTPUT} s has to stay: these cannot be queued.` : "Cuts are frame-accurate; audio is re-encoded to Opus."}`
       : "Nothing removed.";
+    summary.classList.toggle("warn", removed.length > 0 && kept < MIN_OUTPUT);
   }
   function addRow(a, b, focus) {
     const si = h("input", { type: "text", class: "mono", value: a == null ? "" : fmtTime(a), placeholder: "start", spellcheck: "false" });
@@ -839,12 +939,36 @@ function sectionsEditor(path) {
       h("button", { class: "small", onclick: () => addRow(null, null, true) }, "+ Section"),
       h("label", { class: "check", title: "While playing here, jump over the sections marked for removal" }, skip, "Skip removed parts while playing")),
     summary);
-  return { el, get: () => readRows(true).sort((x, y) => x[0] - y[0]).map(([a, b]) => [a, Number.isFinite(b) ? b : null]), stop: () => { closed = true; cancelAnimationFrame(raf); document.removeEventListener("keydown", onKey); v.pause(); v.removeAttribute("src"); v.load(); } };
+  // With the length known, what the sections leave is judged here as av1opt judges it.
+  const get = () => {
+    const removed = readRows(true).sort((x, y) => x[0] - y[0]);
+    if (duration && removed.length) {
+      const kept = keptParts(removed, duration).reduce((t, [a, b]) => t + b - a, 0);
+      if (kept === 0) throw new Error("These sections remove the whole video: nothing would be left to encode");
+      if (kept < MIN_OUTPUT) throw new Error(`These sections leave ${fmtTime(kept)} of the video: at least ${MIN_OUTPUT} s has to stay`);
+    }
+    return removed.map(([a, b]) => [a, Number.isFinite(b) ? b : null]);
+  };
+  return { el, get, stop: () => { closed = true; cancelAnimationFrame(raf); document.removeEventListener("keydown", onKey); v.pause(); v.removeAttribute("src"); v.load(); } };
 }
 
-// One label / control / hint line of a .form-grid.
+// One label / control / hint line of a .form-grid. The label names the first field of the
+// control, so that a click on it lands there and a screen reader says what the field is.
+let settingIds = 0;
+function firstField(el) {
+  if (!(el instanceof Node)) return null;
+  if (/^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName || "")) return el;
+  for (const kid of el.children || []) { const found = firstField(kid); if (found) return found; }
+  return null;
+}
 function setting(label, control, hint) {
-  return [h("label", { class: "k" }, label), h("div", { class: "ctl" }, control, hint ? h("span", { class: "dim hint" }, hint) : null)];
+  const k = h("label", { class: "k" }, label);
+  const field = firstField(control);
+  if (field) {
+    if (!field.id) field.id = `field-${++settingIds}`;
+    k.setAttribute("for", field.id);
+  }
+  return [k, h("div", { class: "ctl" }, control, hint ? h("span", { class: "dim hint" }, hint) : null)];
 }
 
 // Shows the encode dialog for `inputs` (paths). Resolves true if queued. With `watch`, the
@@ -853,7 +977,8 @@ function setting(label, control, hint) {
 function encodeDialog(inputs, roots = [], watch = false, files = null) {
   return new Promise((resolve) => {
     const o = defaultOptions();
-    let outDir = prefs.get("outDir", null) || (STATE && STATE.default_out_dir) || "";
+    // The folder of the last encode queued by hand, which av1opt keeps.
+    let outDir = (STATE && typeof STATE.default_out_dir === "string" && STATE.default_out_dir) || "";
     const outEl = h("code", {}, outDir);
     const vmaf = h("input", { type: "number", step: "0.5", min: "50", max: "99.5", value: o.target_vmaf });
     const preset = h("input", { type: "number", min: "0", max: "13", value: o.preset });
@@ -887,14 +1012,14 @@ function encodeDialog(inputs, roots = [], watch = false, files = null) {
     let busy = false;
     const close = (v) => { if (cuts) cuts.stop(); bg.remove(); release(); resolve(v); };
     const go = h("button", { class: "primary", onclick: async () => {
-      const numbers = readNumbers([[vmaf, "Target VMAF"], [preset, "Preset", true], [minSav, "Skip if saving under"]]);
+      const numbers = readNumbers([[vmaf, "Target VMAF", RANGES.vmaf], [preset, "Preset", RANGES.preset], [minSav, "Skip if saving under", RANGES.savingsPct]]);
       if (!numbers) return;
       const [targetVmaf, presetNumber, minSavings] = numbers;
       // Scenes at once is greyed out and means nothing with per-scene CRF off: what it holds
       // then is no reason to refuse, and is not sent if it could not be taken.
       let sceneWorkers = Number.isInteger(o.workers) && o.workers >= 1 && o.workers <= 8 ? o.workers : 1;
       if (!workers.disabled) {
-        const read = readNumbers([[workers, "Scenes at once", true]]);
+        const read = readNumbers([[workers, "Scenes at once", RANGES.workers]]);
         if (!read) return;
         [sceneWorkers] = read;
       }
@@ -923,7 +1048,8 @@ function encodeDialog(inputs, roots = [], watch = false, files = null) {
       try {
         const r = await api("/api/jobs", { inputs, out_dir: outDir, roots, options });
         prefs.set("encodeOptions", remembered);
-        prefs.set("outDir", outDir);
+        // As the server now has it, for the next dialog.
+        if (STATE) STATE.default_out_dir = outDir;
         toast(`Queued ${r.files} file${r.files === 1 ? "" : "s"}`);
         close(true);
         location.hash = "#/queue";
@@ -1010,8 +1136,7 @@ function route() {
 let lastScanId = null;
 
 views.scan = (root) => {
-  const saved = (STATE && STATE.settings.scan_paths) || [];
-  const roots = new Set(prefs.get("scanRoots", saved));
+  const roots = new Set(prefs.get("scanRoots", []));
   const chips = h("div", { class: "chips" });
   const minSav = h("input", { type: "number", min: "0", max: "95", value: prefs.get("scanMinSavings", 15) });
   const vmaf = h("input", { type: "number", step: "0.5", value: prefs.get("scanVmaf", 93) });
@@ -1035,7 +1160,7 @@ views.scan = (root) => {
   drawChips();
 
   start.onclick = async () => {
-    const numbers = readNumbers([[minSav, "Min savings %"], [vmaf, "Target VMAF"]]);
+    const numbers = readNumbers([[minSav, "Min savings %", RANGES.savingsPct], [vmaf, "Target VMAF", RANGES.vmaf]]);
     if (!numbers) return;
     const [minSavings, targetVmaf] = numbers;
     scanBusy = true;
@@ -1111,7 +1236,7 @@ views.scan = (root) => {
 
 function renderScan(out, r) {
   const t = r.totals;
-  let filter = prefs.get("scanFilter", "candidate");
+  let filter = [prefs.get("scanFilter", "candidate")].find((f) => ["candidate", "skip", "all"].includes(f)) || "candidate";
   let sortKey = "saved", sortDir = -1;
   const selected = new Set();
   const savedOf = (row) => row.size - row.estimate.likely;
@@ -1144,8 +1269,9 @@ function renderScan(out, r) {
   // "What is worth encoding tonight": the candidates that save the most in so many hours.
   const hoursIn = h("input", { type: "number", min: "0.5", max: "999", step: "0.5", value: prefs.get("pickHours", 8), title: "Hours of encoding to fill" });
   const pickBtn = h("button", { title: "Selects the candidates that save the most together in this many hours of encoding. Not simply the best per hour first: a long video can leave a gap that shorter ones fill better", onclick: async () => {
-    const hours = Number(hoursIn.value);
-    if (!(hours > 0)) { toast("Give a number of hours", true); return; }
+    const numbers = readNumbers([[hoursIn, "Hours", RANGES.hours]]);
+    if (!numbers) return;
+    const [hours] = numbers;
     pickBtn.disabled = true;
     try {
       const p = await api(`/api/scans/${r.id}/pick`, { hours });
@@ -1160,7 +1286,7 @@ function renderScan(out, r) {
     } catch (e) { toast(e.message, true); } finally { pickBtn.disabled = false; }
   } }, "Pick");
   // With encoding hours set, a night is as long as they are.
-  if (prefs.get("pickHours", null) == null) {
+  if (prefs.get("pickHours", -1) < 0) {
     api("/api/jobs/heads").then(({ queue }) => {
       const sch = queue && queue.schedule;
       if (!sch || !sch.on) return;
@@ -1231,11 +1357,13 @@ const DUP_GROUPS_SHOWN = 60;
 
 views.dups = (root) => {
   const st = (STATE && STATE.settings) || {};
-  const roots = new Set(prefs.get("dupRoots", st.dup_paths && st.dup_paths.length ? st.dup_paths : st.scan_paths || []));
-  let prefer = prefs.get("dupPrefer", st.dup_prefer || []);
+  // A first search looks in the folders of the scan.
+  const own = prefs.get("dupRoots", []);
+  const roots = new Set(own.length ? own : prefs.get("scanRoots", []));
+  let prefer = prefs.get("dupPrefer", []);
   const chips = h("div", { class: "chips" });
   const preferChips = h("div", { class: "chips" });
-  const avoid = h("input", { type: "text", class: "grow", value: prefs.get("dupAvoid", (st.dup_avoid || []).join(", ")), placeholder: "e.g. trash, tmp", spellcheck: "false" });
+  const avoid = h("input", { type: "text", class: "grow", value: (Array.isArray(st.dup_avoid) ? st.dup_avoid.filter((x) => typeof x === "string") : []).join(", "), placeholder: "e.g. trash, tmp", spellcheck: "false" });
   const tol = h("input", { type: "number", min: "0", max: "20", value: prefs.get("dupTolerance", 10) });
   const refresh = h("input", { type: "checkbox" });
   const start = h("button", { class: "primary" }, "Find duplicates");
@@ -1283,14 +1411,15 @@ views.dups = (root) => {
 
   start.onclick = async () => {
     const avoidList = avoid.value.split(",").map((x) => x.trim()).filter(Boolean);
-    const numbers = readNumbers([[tol, "Tolerance", true]]);
+    const numbers = readNumbers([[tol, "Tolerance", RANGES.tolerance]]);
     if (!numbers) return;
     const [tolerance] = numbers;
     start.disabled = true;
     try {
       const r = await api("/api/dups", { paths: [...roots], prefer, avoid: avoidList, tolerance, refresh: refresh.checked });
-      prefs.set("dupAvoid", avoid.value);
       prefs.set("dupTolerance", tolerance);
+      // What the server keeps of the search from now on.
+      if (STATE && STATE.settings) Object.assign(STATE.settings, { dup_paths: [...roots], dup_prefer: prefer, dup_avoid: avoidList });
       runId = lastDupId = r.id;
       dupStatus = null;
       shownPart.limit = DUP_GROUPS_SHOWN;
@@ -1399,7 +1528,7 @@ function confirmDialog({ title, body, action }) {
 // place on the page.
 function renderDups(out, run, reload, shownPart) {
   const rep = run.report, files = rep.files;
-  let filter = prefs.get("dupFilter", "same");
+  let filter = [prefs.get("dupFilter", "same")].find((f) => ["same", "partial", "all"].includes(f)) || "same";
   const scrolledTo = window.scrollY;
   // Files moved to the trash since the search are out of the picture; a group needs two copies.
   const gone = new Set(run.trashed || []);
@@ -1587,15 +1716,19 @@ const CLASS_LABEL = { sd: "720p and below", hd: "1080p", uhd: "above 1080p" };
 function configLabel(c) { return c ? `preset ${c.preset} · ${c.params || "SVT-AV1 defaults"}` : "–"; }
 views.bench = (root) => {
   const st = (STATE && STATE.settings) || {};
-  const roots = new Set(prefs.get("benchRoots", st.bench_paths && st.bench_paths.length ? st.bench_paths : st.scan_paths || []));
-  const f = Object.assign({ presets: null, params: null, vmaf: 93, videos: 6, samples: 2, secs: 6 }, prefs.get("benchForm", {}));
+  const own = prefs.get("benchRoots", []);
+  const roots = new Set(own.length ? own : prefs.get("scanRoots", []));
+  const saved = prefs.get("benchForm", {});
+  // Presets and parameter sets left unset are the server's.
+  const f = { ...rememberedForm({ vmaf: 93, videos: 6, samples: 2, secs: 6 }, saved),
+    presets: Array.isArray(saved.presets) ? saved.presets.filter(Number.isInteger) : null, params: typeof saved.params === "string" ? saved.params : null };
   const chips = h("div", { class: "chips" });
   const presetBoxes = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map((p) => [p, h("input", { type: "checkbox" })]);
   const params = h("textarea", { rows: "5", spellcheck: "false", class: "mono" });
   const vmaf = h("input", { type: "number", step: "0.5", min: "50", max: "99.5", value: f.vmaf });
   const videos = h("input", { type: "number", min: "1", max: "50", value: f.videos });
   const samples = h("input", { type: "number", min: "1", max: "8", value: f.samples });
-  const secs = h("input", { type: "number", min: "2", max: "30", value: f.secs });
+  const secs = h("input", { type: "number", min: "2", max: "30", value: f.secs, "aria-label": "Seconds per clip" });
   const refresh = h("input", { type: "checkbox" });
   const planText = h("p", { class: "dim" });
   const start = h("button", { class: "primary" }, "Start benchmark");
@@ -1627,6 +1760,10 @@ views.bench = (root) => {
   const plan = () => {
     const { presets, param_sets } = form();
     if (!presets.length) { planText.textContent = "No preset is ticked: tick at least one under “What to measure”."; return; }
+    // A plan of numbers the server would refuse says nothing: what is wrong is said instead.
+    const wrong = [[videos, "Videos", RANGES.videos], [samples, "Clips per video", RANGES.clips], [secs, "Seconds per clip", RANGES.clipSecs]]
+      .map(([input, label, range]) => { const problem = numberProblem(input.value, range); return problem && `${label}: ${problem}.`; }).filter(Boolean);
+    if (wrong.length) { planText.textContent = wrong.join(" "); return; }
     const sets = param_sets.length ? param_sets : (defaults ? defaults.param_sets : []);
     const seen = new Set([`${base.preset} ${base.params}`]);
     for (const p of presets) for (const x of sets) seen.add(`${p} ${x}`);
@@ -1681,7 +1818,7 @@ views.bench = (root) => {
 
   start.onclick = async () => {
     const { presets, param_sets } = form();
-    const numbers = readNumbers([[vmaf, "Target VMAF"], [videos, "Videos", true], [samples, "Clips per video", true], [secs, "Seconds per clip"]]);
+    const numbers = readNumbers([[vmaf, "Target VMAF", RANGES.vmaf], [videos, "Videos", RANGES.videos], [samples, "Clips per video", RANGES.clips], [secs, "Seconds per clip", RANGES.clipSecs]]);
     if (!numbers) return;
     const [targetVmaf, maxVideos, clips, clipSecs] = numbers;
     start.disabled = true;
@@ -1689,6 +1826,7 @@ views.bench = (root) => {
       await api("/api/bench", { paths: [...roots], presets, param_sets, target_vmaf: targetVmaf, max_videos: maxVideos,
         samples: clips, sample_secs: clipSecs, refresh: refresh.checked });
       prefs.set("benchForm", { presets, params: params.value, vmaf: targetVmaf, videos: maxVideos, samples: clips, secs: clipSecs });
+      if (STATE && STATE.settings) STATE.settings.bench_paths = [...roots];
       refresh.checked = false;
       etaStart = null;
       progress.firstChild.style.width = "0%";
@@ -2220,10 +2358,15 @@ views.queue = (root) => {
       if (sure) act("forget", key)();
     };
     // Videos left out of a job someone stopped start only from their own row.
-    const ordinary = un.some((u) => !u.only_by_hand);
+    // The heading says what each kind waits for, as the line of each says (src/ui/jobs.rs).
+    const byHand = un.filter((u) => u.only_by_hand).length, ordinary = un.length - byHand;
+    const saved = `${plural(un.length, "saved job")} not in the queue`;
+    const heading = !byHand ? `${saved}, kept for when ${un.length === 1 ? "its files are" : "their files are"} back`
+      : !ordinary ? `${saved}, left out of a job you stopped: ${un.length === 1 ? "it starts" : "they start"} only if you choose Try again`
+        : `${saved}: ${ordinary} kept for when their files are back, ${byHand} left out of a job you stopped, which start only if you choose Try again on their row`;
     missing.replaceChildren(h("div", { class: "panel" },
-      h("div", { class: "row" }, h("strong", { class: "warn grow" }, `${un.length} saved job${un.length === 1 ? "" : "s"} not in the queue, kept for when ${un.length === 1 ? "its files are" : "their files are"} back`),
-        ordinary && h("button", { title: "Queue those whose files are back. Videos left out of a job you stopped wait for the button on their own row", onclick: act("retry") }, "Try again"),
+      h("div", { class: "row" }, h("strong", { class: "warn grow" }, heading),
+        ordinary > 0 && h("button", { title: "Queue those whose files are back. Videos left out of a job you stopped wait for the button on their own row", onclick: act("retry") }, "Try again"),
         h("button", { class: "danger", onclick: forget() }, un.length === 1 ? "Forget" : "Forget all")),
       cutList(un, UNRESTORED_SHOWN, (u) => {
         const inputs = Array.isArray(u.inputs) ? cutList(u.inputs, UNRESTORED_INPUTS_SHOWN, (p) => p, (n) => `and ${n} more`).join(", ") : "(its list of videos cannot be read)";
@@ -2627,6 +2770,7 @@ views.history = (root) => {
     // Once the view is left nothing would stop a chart made now.
     if (left || !isNewest()) return;
     const reps = r.reports;
+    if (STATE && isNumber(r.history_encodes)) STATE.history_encodes = r.history_encodes;
     const stateOf = (x) => (x.replace || {}).state;
     ready = reps.filter((x) => stateOf(x) === "ready");
     const replaced = reps.filter((x) => stateOf(x) === "replaced").length;
@@ -2645,8 +2789,8 @@ views.history = (root) => {
         x.output_exists === false ? h("span", { class: "pill bad" }, "output gone") : null,
         stateOf(x) === "not_recorded" ? h("span", { class: "pill", title: x.replace.why }, "not made here") : null,
         stateOf(x) === "needs_confirming" ? h("span", { class: "pill warn", title: x.replace.why }, "date changed") : null),
-      h("td", {}, x.mode === "scenes" ? `scenes (${x.chunks})` : "whole"),
-      h("td", { class: "num" }, x.crf),
+      h("td", {}, x.mode === "scenes" ? `scenes (${x.chunks})` : oneCrfText(x).mode === "one CRF" ? "whole" : "whole, encoded again"),
+      x.mode === "scenes" ? h("td", { class: "num" }, x.crf) : h("td", { class: "num", title: oneCrfText(x).crf }, oneCrfText(x).short),
       h("td", { class: "num" }, x.target_vmaf),
       h("td", { class: "num" }, x.mean_vmaf != null ? num(x.mean_vmaf) : (x.verify_vmaf || []).map((v) => num(v, 1)).join(" / ")),
       h("td", { class: "num" }, bytes(x.source_bytes)),
@@ -2670,8 +2814,8 @@ views.history = (root) => {
         h("div", { class: "stat" }, h("div", { class: "v" }, reps.length), h("div", { class: "l" }, replaced ? `encodes · ${replaced} in place of their original` : "encodes")),
         h("div", { class: "stat" }, h("div", { class: "v" }, `${bytes(tin)} → ${bytes(tout)}`), h("div", { class: "l" }, "source → AV1")),
         h("div", { class: "stat" }, h("div", { class: "v " + savedClass(tin - tout) }, bytes(tin - tout)), h("div", { class: "l" }, `saved (${savedPct(tin ? 1 - tout / tin : 0)})`)),
-        h("div", { class: "stat" }, h("div", { class: "v" }, STATE ? STATE.history_encodes : "–"), h("div", { class: "l" }, "encodes calibrating scan estimates"))),
-      chart ? h("div", { class: "panel" }, h("h3", {}, "Space saved over time"), chart.el) : null,
+        h("div", { class: "stat" }, h("div", { class: "v" }, isNumber(r.history_encodes) ? r.history_encodes : STATE ? STATE.history_encodes : "–"), h("div", { class: "l" }, "encodes calibrating scan estimates"))),
+      ...(chart ? [h("div", { class: "panel" }, h("h3", {}, "Space saved over time"), chart.el)] : []),
       h("div", { class: "panel" }, reps.length
         ? h("div", { class: "tablewrap" }, h("table", {}, h("thead", {}, h("tr", {}, ["When", "File", "Mode", "CRF", "Target", "VMAF", "Source", "AV1", "Saved", "Time"].map((t, k) => h("th", { class: k >= 3 ? "num" : "" }, t)))), tbody))
         : h("div", { class: "empty" }, "No reports found in these folders.")));
@@ -2739,7 +2883,7 @@ function replaceDialog(rows, reload) {
     cancel.textContent = "Close";
     total.textContent = `${plural(done, "original")} replaced`;
     list.replaceChildren(
-      failed ? h("p", {}, h("strong", { class: "bad" }, `${plural(failed, "original")} not replaced; ${failed === 1 ? "it is" : "they are"} still where ${failed === 1 ? "it was" : "they were"}`)) : null,
+      ...(failed ? [h("p", {}, h("strong", { class: "bad" }, `${plural(failed, "original")} not replaced; ${failed === 1 ? "it is" : "they are"} still where ${failed === 1 ? "it was" : "they were"}`))] : []),
       ...problems.map((q) => h("div", { class: "dim mono" }, `${q.path}: ${q.text}`)));
   };
   const bg = h("div", { class: "modal-bg", onclick: (e) => { if (e.target === bg && !finished) close(); } },
@@ -2864,7 +3008,7 @@ function comparePlayer(root, r) {
   });
 
   // ---- controls ----
-  const playBtn = h("button", { class: "primary", onclick: () => togglePlay() }, "Play");
+  const playBtn = h("button", { class: "primary", disabled: true, onclick: () => togglePlay() }, "Play");
   const seek = h("input", { type: "range", min: "0", max: String(duration), step: "0.01", value: "0" });
   const timeEl = h("span", { class: "mono" }, "0:00.0");
   const speed = h("select", { onchange: () => { vo.playbackRate = Number(speed.value); } }, ["0.25", "0.5", "1", "1.5", "2"].map((x) => h("option", { value: x }, x + "×")));
@@ -2898,11 +3042,18 @@ function comparePlayer(root, r) {
   };
   const pixDiff = (a, b) => { let d = 0; for (let i = 0; i < a.length; i += 4) d += Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]); return d; };
   let aligning = false;
+  // The output plays only beside its source. Until the source has loaded, or has failed to
+  // for good, while a preview clip of it is made, and while the two are aligned, Play waits:
+  // the output would otherwise run on alone, and an alignment would move it under the person.
+  let srcSettled = false;
+  const canPlay = () => srcSettled && srcMode !== "loading" && !aligning;
+  const syncPlay = () => { playBtn.disabled = !canPlay(); if (!canPlay() && !vo.paused) vo.pause(); };
   async function autoAlign() {
     if (closed || aligning || srcMode === "loading" || !vs.videoWidth || !vo.videoWidth) return;
     aligning = true;
     const was = vo.currentTime;
     vo.pause();
+    syncPlay();
     alignEl.textContent = "aligning…";
     try {
       const lo = srcMode === "preview" ? offset : 0, hi = srcMode === "preview" ? segEnd : duration;
@@ -2926,9 +3077,10 @@ function comparePlayer(root, r) {
     } catch (e) {
       alignEl.textContent = "align failed";
     } finally {
-      aligning = false;
       await seekWait(vo, was);
       vs.currentTime = srcTime(was);
+      aligning = false;
+      syncPlay();
     }
   }
 
@@ -2942,7 +3094,9 @@ function comparePlayer(root, r) {
   const timeline = h("div", { class: "timeline" }, tl, tip);
   const chunks = r.chunks || [];
   const segs = chunks.map((c) => ({ ...c, end: c.start_secs + c.frames / fps }));
-  const vs_ = segs.map((c) => c.vmaf).concat(r.verify_vmaf || [], [target]);
+  // A one-pass encode checked along its whole length: the stretches encoded again after it.
+  const again = (r.whole && Array.isArray(r.whole.stretches) ? r.whole.stretches : []).map((x) => ({ ...x, end: x.start_secs + x.secs }));
+  const vs_ = segs.map((c) => c.vmaf).concat(again.map((x) => x.vmaf), r.verify_vmaf || [], [target]);
   const lo = Math.floor(Math.min(...vs_, target - 2) - 0.5), hi = Math.ceil(Math.max(...vs_, target + 2) + 0.5);
   const y = (v) => 92 - (v - lo) / (hi - lo) * 84;
   const x = (t) => (duration ? t / duration * 1000 : 0);
@@ -2956,6 +3110,11 @@ function comparePlayer(root, r) {
   for (const c of segs) {
     const rect = s("rect", { x: x(c.start_secs), width: Math.max(0.5, x(c.end) - x(c.start_secs) - 0.6), y: y(c.vmaf), height: Math.max(1, 96 - y(c.vmaf)), fill: vmafColor(c.vmaf, target), opacity: 0.85 });
     rect.dataset.tip = `chunk ${c.index + 1} · ${tc(c.start_secs)}–${tc(c.end)} · CRF ${c.crf}${c.corrected ? " (corrected)" : ""} · VMAF ${num(c.vmaf)}${c.out_of_reach ? " (target out of reach at any CRF)" : ""} · ${bytes(c.bytes)} · ${num(c.bytes * 8 / (c.end - c.start_secs) / 1e6, 2)} Mbps`;
+    tl.append(rect);
+  }
+  for (const st of again) {
+    const rect = s("rect", { x: x(st.start_secs), width: Math.max(0.5, x(st.end) - x(st.start_secs) - 0.6), y: y(st.vmaf), height: Math.max(1, 96 - y(st.vmaf)), fill: vmafColor(st.vmaf, target), opacity: 0.6 });
+    rect.dataset.tip = `encoded again after the check · ${tc(st.start_secs)}–${tc(st.end)} · CRF ${st.crf} (the rest ${r.crf}) · lowest 5 s VMAF ${num(st.vmaf_before)} → ${num(st.vmaf)}`;
     tl.append(rect);
   }
   // Verification spot checks: 5 s windows at 30% and 70% of (duration − 5 s), spread the
@@ -2985,7 +3144,9 @@ function comparePlayer(root, r) {
   const head = s("line", { x1: 0, x2: 0, y1: 0, y2: 100, stroke: "#fff", "stroke-width": 1.5, "vector-effect": "non-scaling-stroke" });
   tl.append(head);
   const tlLabel = r.pair ? h("div", { class: "row dim" }, "Click the bar to seek.") : h("div", { class: "row dim" },
-    h("span", {}, chunks.length ? `Per-chunk VMAF (${chunks.length} chunks, ${lo}–${hi}); dashed line = target ${target}. Click to seek.` : "Whole-file encode: one CRF, no per-chunk scores (use per-scene CRF for a timeline). Dots = verification spot checks."),
+    h("span", {}, chunks.length ? `Per-chunk VMAF (${chunks.length} chunks, ${lo}–${hi}); dashed line = target ${target}. Click to seek.`
+      : r.whole ? `Whole-file encode at one CRF, every frame checked against the source${again.length ? `; bars = the ${again.length === 1 ? "stretch" : `${again.length} stretches`} encoded again at a lower CRF, at their lowest 5 s` : ""}. Dots = the scores at the spot-check places; dashed line = target ${target}. Click to seek.`
+      : "Whole-file encode: one CRF, no per-chunk scores (use per-scene CRF for a timeline). Dots = verification spot checks."),
     h("span", { class: "spacer" }), h("span", { class: "ok" }, "■ ≥ target"), h("span", { class: "warn" }, "■ within 1"), h("span", { class: "bad" }, "■ below"));
   tl.addEventListener("mousemove", (e) => {
     const t = e.target.dataset && e.target.dataset.tip;
@@ -3071,6 +3232,7 @@ function comparePlayer(root, r) {
     : rp.state === "not_recorded" ? h("p", { class: "dim" }, `${rp.why}.`)
     : h("p", { class: "dim" }, `The AV1 file can't take the original's place: ${rp.why}.`));
 
+  const oneCrf = oneCrfText({ ...r, stretches: again, video_secs: isNumber(r.video_secs) ? r.video_secs : oi.duration_s });
   const side = h("div", {},
     r.pair ? h("div", { class: "panel" },
       h("h3", {}, "Copies"),
@@ -3084,8 +3246,8 @@ function comparePlayer(root, r) {
         kv("Size", `${bytes(r.source_bytes)} → ${bytes(r.output_bytes)}`),
         removed.length ? kv("Removed", removed.map(([a, b]) => `${fmtTime(a)}–${fmtTime(b)}`).join(", ")) : null,
         kv("Saved", h("span", { class: savedClass(r.savings) }, savedPct(r.savings, 1))),
-        kv("Mode", r.mode === "scenes" ? `per-scene CRF, ${chunks.length} chunks` : "one CRF"),
-        kv("CRF", r.mode === "scenes" && chunks.length ? `${Math.min(...chunks.map((c) => c.crf))}–${Math.max(...chunks.map((c) => c.crf))} (start ${r.crf})` : r.crf),
+        kv("Mode", r.mode === "scenes" ? `per-scene CRF, ${chunks.length} chunks` : oneCrf.mode),
+        kv("CRF", r.mode === "scenes" && chunks.length ? `${Math.min(...chunks.map((c) => c.crf))}–${Math.max(...chunks.map((c) => c.crf))} (start ${r.crf})` : oneCrf.crf),
         kv("Encoder", `preset ${r.preset}${r.svt_params ? " · " + r.svt_params : ""}`),
         kv("Target", `VMAF ${target} (${r.vmaf_model})`),
         r.mean_vmaf != null ? kv("Mean VMAF", num(r.mean_vmaf)) : null,
@@ -3122,6 +3284,7 @@ function comparePlayer(root, r) {
   }
   function togglePlay() {
     if (vo.paused) {
+      if (!canPlay()) return;
       if (srcMode === "preview" && vo.currentTime >= segEnd - 0.1) seekTo(offset);
       vo.play().catch((e) => toast("Cannot play: " + e.message, true));
     } else vo.pause();
@@ -3210,6 +3373,7 @@ function comparePlayer(root, r) {
     previewBtn.disabled = true;
     const prev = { offset, segEnd, srcOff, srcMode, src: vs.src };
     srcMode = "loading";
+    syncPlay();
     try {
       // The clip starts where the source lines up with the output, shift included.
       const p = await api("/api/preview", { path: r.input_path, kind: "transcode", start: Math.max(0, toSrc(start) + nudge), secs });
@@ -3217,6 +3381,7 @@ function comparePlayer(root, r) {
       await tryLoad(vs, p.url);
       if (closed) return;
       offset = start; segEnd = start + p.secs; srcOff = p.start; srcMode = "preview";
+      srcSettled = true;
       segRect.setAttribute("x", x(offset)); segRect.setAttribute("width", x(segEnd) - x(offset));
       srcStatus.replaceChildren(h("span", { class: "warn" }, `${leftName}: preview clip `), `${tc(srcOff)}–${tc(srcOff + p.secs)}. The browser can't decode ${ii.codec || "this file"} directly, so this clip is re-encoded near-losslessly (H.264 CRF 12)${ii.hdr ? "; HDR shown without tone mapping" : ""}. Click the timeline outside the shaded part for a new clip.`);
       tagL.textContent = `${leftName} preview · ${ii.codec || "?"} → H.264 near-lossless`;
@@ -3231,7 +3396,9 @@ function comparePlayer(root, r) {
       busy(null);
       overlay.hidden = false;
       overlay.replaceChildren(h("div", { class: "bad" }, "Could not make a source preview: " + e.message));
-    } finally { previewBtn.disabled = false; }
+      // With no source to show, the output can still be watched by itself.
+      srcSettled = true;
+    } finally { previewBtn.disabled = false; syncPlay(); }
   }
 
   (async () => {
@@ -3256,12 +3423,14 @@ function comparePlayer(root, r) {
       }
     }
     if (closed) return;
-    if (ii.error) { busy(null); overlay.hidden = false; overlay.replaceChildren(h("div", { class: "bad" }, ii.error)); return; }
+    if (ii.error) { busy(null); overlay.hidden = false; overlay.replaceChildren(h("div", { class: "bad" }, ii.error)); srcSettled = true; syncPlay(); return; }
     try {
       await tryLoad(vs, mediaUrl(r.input_path));
       if (closed) return;
       srcStatus.replaceChildren(h("span", { class: "ok" }, `${leftName}: original file`), " played directly.");
       busy(null);
+      srcSettled = true;
+      syncPlay();
       autoAlign();
     } catch (e) {
       if (closed) return;
@@ -3321,12 +3490,12 @@ views.settings = (root) => {
       h("div", { class: "form" }, h("label", {}, "ffmpeg"), ffmpeg, h("label", {}, "ffprobe"), ffprobe),
       h("div", { class: "row gap-top" }, save),
       result),
-    desktop && desktop.openLog ? h("div", { class: "panel" },
+    ...(desktop && desktop.openLog ? [h("div", { class: "panel" },
       h("h3", {}, "Log"),
       h("p", { class: "dim" }, "Messages from av1opt while the desktop app runs, with times. Useful when an encode failed overnight."),
       h("div", { class: "row" },
         h("button", { onclick: () => desktop.openLog(false).then((ok) => ok || toast("Could not open the log", true), () => toast("Could not open the log", true)) }, "Open log"),
-        h("button", { onclick: () => desktop.openLog(true).catch(() => toast("Could not open the log", true)) }, "Show in folder"))) : null,
+        h("button", { onclick: () => desktop.openLog(true).catch(() => toast("Could not open the log", true)) }, "Show in folder")))] : []),
     h("div", { class: "panel" },
       h("h3", {}, "About"),
       h("div", { class: "kv" },

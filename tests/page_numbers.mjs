@@ -9,7 +9,7 @@ const source = readFileSync(new URL("../ui/app.js", import.meta.url), "utf8");
 const from = source.indexOf("// ---------- numbers and names ----------");
 const to = source.indexOf("// ---------- end of the part that runs alone ----------");
 assert.ok(from >= 0 && to > from, "the markers of the part that runs alone are in ui/app.js");
-const names = ["bytes", "pct", "floorPct", "sizeChange", "savedPct", "num", "rel", "times", "plural", "pathList", "leftOutOfList", "shownPath", "copiesLeft", "newestOnly", "refusalText", "presetFrom", "NAME_ORDER", "rowOrder"];
+const names = ["bytes", "pct", "floorPct", "sizeChange", "savedPct", "num", "rel", "times", "plural", "pathList", "leftOutOfList", "shownPath", "copiesLeft", "newestOnly", "refusalText", "presetFrom", "NAME_ORDER", "rowOrder", "numberProblem", "RANGES", "sameKind", "rememberedForm", "rememberedOptions", "oneCrfText"];
 const page = new Function(`"use strict";\n${source.slice(from, to)}\nreturn { ${names.join(", ")} };`)();
 
 // Each case is [argument, what is shown]; arguments in an array are spread.
@@ -176,4 +176,49 @@ test("counts name one thing or several", () => {
   assert.equal(page.plural(1, "file"), "1 file");
   assert.equal(page.plural(2, "file"), "2 files");
   assert.equal(page.plural(0, "file"), "0 files");
+});
+
+test("a number out of a form's range is named in the page's words, with the server's range", () => {
+  const { numberProblem: problem, RANGES } = page;
+  for (const text of ["", " ", "abc", "120", "95.5", "-1", "Infinity"]) assert.equal(problem(text, RANGES.savingsPct), "enter a number from 0 to 95", text);
+  for (const text of ["0", "20", "95", " 7.5 "]) assert.equal(problem(text, RANGES.savingsPct), null, text);
+  assert.equal(problem("0", RANGES.vmaf), "enter a number above 0 and up to 100");
+  assert.equal(problem("100", RANGES.vmaf), null);
+  assert.equal(problem("0", RANGES.videos), "enter a whole number from 1 to 50");
+  assert.equal(problem("2.5", RANGES.clips), "enter a whole number from 1 to 8");
+  assert.equal(problem("-3", RANGES.clipSecs), "enter a number from 2 to 30");
+  assert.equal(problem("2.5", RANGES.clipSecs), null);
+  assert.equal(problem("14", RANGES.preset), "enter a whole number from 0 to 13");
+  assert.equal(problem("0", RANGES.hours), "enter a number above 0 and up to 10000");
+});
+
+test("a remembered value stands for its default only when it is of the same kind", () => {
+  const { sameKind, rememberedForm, rememberedOptions } = page;
+  assert.equal(sameKind(3, 1), true);
+  assert.equal(sameKind("3", 1), false);
+  assert.equal(sameKind({}, []), false);
+  assert.equal(sameKind([], []), true);
+  assert.equal(sameKind(null, 1), false);
+  assert.deepEqual(rememberedForm({ vmaf: 93, videos: 6 }, { vmaf: "x", videos: 4, other: 1 }), { vmaf: 93, videos: 4 });
+  assert.deepEqual(rememberedForm({ vmaf: 93 }, ["vmaf"]), { vmaf: 93 });
+  const defaults = { preset: 5, container: "mp4", scenes: "auto", meta_tags: [] };
+  assert.deepEqual(rememberedOptions(defaults, { preset: 0, container: "avi", scenes: false, meta_tags: [["a", "b"], ["c", 1], "d"] }),
+    { preset: 0, container: "mp4", scenes: false, meta_tags: [["a", "b"]] });
+});
+
+test("a one-CRF encode says the CRF that made the file, after a second encode or a repair", () => {
+  const { oneCrfText: text } = page;
+  assert.deepEqual(text({ crf: 30 }), { mode: "one CRF", crf: "30", short: "30" });
+  // Reports from before first_crf and video_secs were kept still read.
+  assert.equal(text({ crf: 30, stretches: null }).short, "30");
+  const second = text({ crf: 27, first_crf: 30 });
+  assert.equal(second.mode, "one CRF, encoded a second time after the check");
+  assert.equal(second.crf, "27, encoded a second time (the first time at 30)");
+  const whole = text({ crf: 45.25, stretches: [{ crf: 38.25, secs: 19.98 }], video_secs: 20 });
+  assert.equal(whole.mode, "one CRF, encoded again whole after the check");
+  assert.equal(whole.short, "38.25");
+  const some = text({ crf: 30, stretches: [{ crf: 26, secs: 4 }, { crf: 24, secs: 2 }], video_secs: 600 });
+  assert.equal(some.mode, "one CRF, 2 stretches encoded again");
+  assert.equal(some.short, "30 · 24–26");
+  assert.equal(some.crf, "30; 24–26 in 2 stretches (0:06 of 10:00) after the check");
 });

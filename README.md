@@ -784,9 +784,10 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
   without a usable trash gives an error instead of a copy to another disk.
 - **Encode dialog**: target VMAF, preset, container, encoder parameters, metadata, sections
   to remove, and **Shrink heavy sound tracks to Opus** (`--audio shrink`, off by default).
-  It opens with the settings of the last encode queued from that browser (or that desktop
-  window), and the scan's times go by its preset: a preset chosen once stays, and a new default
-  shows only where nothing was queued yet.
+  It opens with the settings of the last encode queued, and the scan's times go by its
+  preset: a preset chosen once stays, and a new default shows only where nothing was queued
+  yet. Its number fields take the ranges of the command line and say which field is out of
+  range, and why, before anything is queued.
 - **Queue**: encodes run one at a time with live progress: CRF search trials, chosen CRF,
   the estimated time left per job and for the whole queue (files no scan has seen are
   estimated once they are probed),
@@ -847,7 +848,11 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
   drive that was not mounted does not come back as a folder full of new videos.
 - **Compare**: source and AV1 output on top of each other with a split slider, synced playback,
   frame stepping and zoom, plus the per-chunk VMAF timeline from the `.av1opt.json` report
-  (click to seek). Sources the browser can't decode (HEVC in some browsers, MPEG-2, ...) are shown as a
+  (click to seek). For a one-CRF encode the timeline shows the stretches the whole-video check
+  had encoded again, and the CRF row says the CRF of the file as kept: the stretches' CRFs, the
+  first CRF where the whole video was encoded a second time, and where the check encoded all
+  of it again, that it did. History's CRF column says the same in short. Play waits until the
+  source has loaded beside the output (or has failed to, when the output plays alone). Sources the browser can't decode (HEVC in some browsers, MPEG-2, ...) are shown as a
   20 s near-lossless H.264 preview made on demand in `~/.cache/av1opt/previews`, never next to
   the source; MKV outputs the browser won't open are remuxed to MP4 there too. The **Original**
   panel replaces this one original by its output (after a confirmation that shows the new
@@ -869,6 +874,17 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
   that is still in the encode queue is refused. The page acts only on outputs in av1opt's private
   record (see `replace`). Others are marked "not made here" until `av1opt adopt` has been run on
   their folder in a terminal.
+
+What the page remembers of its forms is kept by the server in `ui.json`, not in the browser:
+the browser keeps such things per address, and the port, so the address, is new at every
+start. That is the encode dialog's settings and output folder, the values of the scan,
+duplicate and benchmark forms, their folders, filters and tabs, the folder the picker was in,
+and which start-up notices were dismissed (a notice about a file damaged again comes back).
+Every browser and desktop window sees the same values. Two tabs that change the same value
+leave the later one, and neither takes the other's away. What is kept is a remembered form
+value and no more: the server keeps at most 64 values of 16 KiB each, 64 KiB in all, and
+folder lists of absolute paths; the page puts a value back only into a field of its kind and
+checks it from there as if it had been typed.
 
 The server listens on 127.0.0.1 only, on a free port unless `--port` names one, and prints its
 address and a sign-in link with a random token (the browser

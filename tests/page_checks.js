@@ -16,7 +16,7 @@ class Text extends Node {
 class Element extends Node {
   constructor(tag) {
     super();
-    Object.assign(this, { tag, children: [], parent: null, attrs: {}, style: {}, dataset: {}, listeners: {}, value: "", className: "", hidden: false, disabled: false, checked: false });
+    Object.assign(this, { tag, children: [], parent: null, attrs: {}, style: {}, dataset: {}, listeners: {}, value: "", className: "", hidden: false, disabled: false, checked: false, paused: true });
     const element = this;
     this.classList = {
       add: (...names) => { element.className = [...new Set([...element.names(), ...names])].join(" "); },
@@ -26,6 +26,7 @@ class Element extends Node {
     };
   }
   names() { return this.className.split(/\s+/).filter(Boolean); }
+  get tagName() { return this.tag.toUpperCase(); }
   setAttribute(k, v) { this.attrs[k] = String(v); if (k === "value") this.value = String(v); if (k === "checked" || k === "disabled" || k === "hidden") this[k] = true; }
   getAttribute(k) { return k in this.attrs ? this.attrs[k] : null; }
   removeAttribute(k) { delete this.attrs[k]; }
@@ -35,6 +36,9 @@ class Element extends Node {
   click() { if (this.onclick) return this.onclick({ target: this }); for (const fn of this.listeners.click || []) return fn({ target: this, preventDefault() {}, stopPropagation() {} }); }
   focus() { this.ownerDocument.activeElement = this; }
   blur() {}
+  pause() { if (!this.paused) { this.paused = true; this.dispatch("pause"); } }
+  play() { if (this.paused) { this.paused = false; this.dispatch("play"); } return Promise.resolve(); }
+  load() {}
   scrollIntoView() {}
   getBoundingClientRect() { return { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 }; }
   getContext() { return null; }
@@ -84,8 +88,21 @@ class Element extends Node {
 
 // The page in a world of its own. `answer(path, body)` stands for the server: what it returns
 // is the reply, and a { refuse: text } is an error.
-function openPage(answer, stored = {}) {
-  const page = { posts: [], toasts: [], stored: Object.fromEntries(Object.entries(stored).map(([k, v]) => ["av1opt." + k, JSON.stringify(v)])) };
+// `stored` is what the server remembers for the page, sent with the state as ui.json holds it:
+// the folder lists in their own settings, the rest in `page`. What the page posts to
+// /api/prefs is kept there as the server would keep it, so a page opened again with
+// `page.stored` reads it back.
+const FOLDER_FIELDS = { scanRoots: "scan_paths", dupRoots: "dup_paths", dupPrefer: "dup_prefer", benchRoots: "bench_paths" };
+function stateWith(stored, extra = {}) {
+  const settings = { ...state.settings, page: {} };
+  for (const [k, v] of Object.entries(stored)) {
+    if (k in FOLDER_FIELDS) settings[FOLDER_FIELDS[k]] = v;
+    else settings.page[k] = v;
+  }
+  return { ...state, ...extra, settings };
+}
+function openPage(answer, stored = {}, extra = {}) {
+  const page = { posts: [], toasts: [], stored: JSON.parse(JSON.stringify(stored)) };
   const named = {};
   const document = {
     activeElement: null,
@@ -103,14 +120,21 @@ function openPage(answer, stored = {}) {
     const body = options.body ? JSON.parse(options.body) : undefined;
     if (body) page.posts.push({ path, body });
     if (page.signedOut) return { ok: false, status: 401, statusText: "Unauthorized", headers: { get: () => "text/html" }, text: async () => "<p>Not signed in</p>" };
-    const reply = (path === "/api/state" ? state : await answer(path, body)) || {};
+    if (path === "/api/prefs" && body) {
+      if (page.prefsFail) return { ok: false, status: 500, statusText: "", headers: { get: () => "application/json" }, text: async () => JSON.stringify({ error: "cannot be saved" }) };
+      if (body.value === null) delete page.stored[body.key];
+      else page.stored[body.key] = JSON.parse(JSON.stringify(body.value));
+      return { ok: true, status: 200, statusText: "", headers: { get: () => "application/json" }, text: async () => "{}" };
+    }
+    const reply = (path === "/api/state" ? stateWith(page.stored, extra) : await answer(path, body)) || {};
     return { ok: !reply.refuse, status: reply.refuse ? 400 : 200, statusText: "", headers: { get: () => "application/json" }, text: async () => JSON.stringify(reply.refuse ? { error: reply.refuse } : reply) };
   };
   const world = {
-    Node, document, console, URLSearchParams, setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {}, requestAnimationFrame() {}, performance,
+    Node, document, console, URLSearchParams, setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {}, requestAnimationFrame() {}, cancelAnimationFrame() {}, performance,
     fetch: respond,
     location: { hash: "#/none", href: "", reload() {} },
-    localStorage: { getItem: (k) => (k in page.stored ? page.stored[k] : null), setItem: (k, v) => { page.stored[k] = v; }, removeItem: (k) => { delete page.stored[k]; } },
+    // The page keeps nothing in the browser: what it remembers goes to the server.
+    localStorage: { getItem: () => { throw new Error("localStorage read"); }, setItem: () => { throw new Error("localStorage written"); }, removeItem: () => { throw new Error("localStorage written"); } },
     EventSource: class { static CLOSED = 2; constructor() { page.stream = this; } addEventListener() {} close() {} },
     ResizeObserver: class { observe() {} disconnect() {} },
     matchMedia: () => ({ matches: false, addEventListener() {} }),
@@ -125,7 +149,7 @@ function openPage(answer, stored = {}) {
   world.__told = (message, bad) => page.toasts.push({ message, bad });
   page.run("toast = __told");
   page.document = document;
-  page.remembered = (k) => (("av1opt." + k) in page.stored ? JSON.parse(page.stored["av1opt." + k]) : undefined);
+  page.remembered = (k) => page.stored[k];
   page.show = (view) => {
     const root = document.createElement("div");
     document.body.append(root);
@@ -222,6 +246,21 @@ for (const watch of [false, true]) {
       assert(go.isConnected, "dialog closed");
     }
   };
+  checks[`${name}: each field is named by its label`] = async () => {
+    const { box } = await open();
+    const labels = box.all().filter((e) => e.tag === "label" && e.classList.contains("k"));
+    assert(labels.length > 5, `${labels.length} labels`);
+    const ids = new Map(box.all().filter((e) => e.id).map((e) => [e.id, e]));
+    for (const label of ["Target VMAF", "Preset", "Skip if saving under"]) {
+      const at = labels.find((e) => e.textContent.startsWith(label));
+      assert(at && ids.get(at.getAttribute("for")) === box.field(label), label);
+    }
+    for (const at of labels) {
+      const control = at.parent.children[at.parent.children.indexOf(at) + 1];
+      const field = control.all().find((e) => ["input", "select", "textarea"].includes(e.tag));
+      if (field) assert.strictEqual(ids.get(at.getAttribute("for")), field, at.textContent);
+    }
+  };
   checks[`${name}: scenes at once counts only while it is in use`] = async () => {
     const { page, box, go } = await open();
     const scenes = box.field("Per-scene CRF");
@@ -273,6 +312,20 @@ checks["queue: saved jobs that could not come back are listed in a bounded way"]
   assert(root.textContent.includes("and 480 more jobs"), root.textContent.slice(0, 200));
   assert(root.textContent.includes("500 saved jobs"));
   noElementFromText(root);
+};
+checks["queue: the heading of saved jobs says what each kind waits for, as its rows do"] = async () => {
+  const away = { inputs: ["/v/a.mp4"], out_dir: "/out", error: "they were not there when the rest of their job ran; they are queued when they are back" };
+  const stopped = { inputs: ["/v/b.mp4"], out_dir: "/out", only_by_hand: true, error: "they were left out of a job you cancelled or removed; they start only if you choose Try again" };
+  const heading = (root) => root.all().find((e) => e.tag === "strong" && e.textContent.includes("not in the queue")).textContent;
+  const buttons = (root) => root.all().filter((e) => e.tag === "button" && e.textContent === "Try again").length;
+  let root = await openQueue({ unrestored: [stopped] });
+  assert.strictEqual(heading(root), "1 saved job not in the queue, left out of a job you stopped: it starts only if you choose Try again");
+  assert.strictEqual(buttons(root), 1, "only the row's own button");
+  root = await openQueue({ unrestored: [away, away] });
+  assert.strictEqual(heading(root), "2 saved jobs not in the queue, kept for when their files are back");
+  assert.strictEqual(buttons(root), 3);
+  root = await openQueue({ unrestored: [away, stopped] });
+  assert.strictEqual(heading(root), "2 saved jobs not in the queue: 1 kept for when their files are back, 1 left out of a job you stopped, which start only if you choose Try again on their row");
 };
 checks["queue: a saved job without a list of videos or an output folder still reads"] = async () => {
   const root = await openQueue({ unrestored: [{ out_dir: null, error: "cannot be read" }] });
@@ -409,10 +462,145 @@ checks["routes: names every object inherits are no views"] = async () => {
   await settled();
   for (const name of ["constructor", "valueOf", "toString", "__proto__"]) page.run(`location.hash = "#/${name}"; route(); route()`);
 };
-checks["remembering: full storage neither stops anything nor throws"] = async () => {
+checks["remembering: a value that cannot be saved stops nothing and is still used here"] = async () => {
   const page = openPage(() => ({}));
   await settled();
-  page.run(`localStorage.setItem = () => { throw new Error("full"); }; prefs.set("x", 1)`);
+  page.prefsFail = true;
+  page.run(`prefs.set("benchTab", "one")`);
+  await settled();
+  assert.strictEqual(page.run(`prefs.get("benchTab", "all")`), "one");
+  assert.deepStrictEqual(page.toasts, []);
+};
+checks["remembering: what a form remembers is there when the page is opened again"] = async () => {
+  const answer = (path, body) => (body ? { id: 1 } : { id: 1, status: "running" });
+  const first = openPage(answer);
+  await settled();
+  const root = first.show("scan");
+  await settled();
+  root.field("Target VMAF").value = "91";
+  await root.named("button", "Scan").click();
+  await settled();
+  // Each value is sent on its own, so that another tab's values are not written over.
+  assert(posted(first, "/api/prefs").every((p) => Object.keys(p.body).sort().join() === "key,value"));
+  assert.strictEqual(first.remembered("scanVmaf"), 91);
+  const again = openPage(answer, first.stored);
+  await settled();
+  assert.strictEqual(again.show("scan").field("Target VMAF").value, "91");
+};
+checks["remembering: a remembered value of the wrong kind gives way to the usual one"] = async () => {
+  const page = openPage(() => ({ id: 1, status: "running" }), { scanVmaf: "<b>", scanFilter: "everything", encodeOptions: { preset: "x", container: "avi", meta_tags: [["a", 1]] } });
+  await settled();
+  assert.strictEqual(page.show("scan").field("Target VMAF").value, "93");
+  assert.strictEqual(page.run(`prefs.get("scanVmaf", 93)`), 93);
+  const o = page.run("defaultOptions()");
+  assert.strictEqual(o.preset, 5);
+  assert.strictEqual(o.container, "mp4");
+  assert.strictEqual(JSON.stringify(o.meta_tags || []), "[]");
+};
+checks["banner: a dismissed notice stays dismissed when the page is opened again"] = async () => {
+  const notices = { notices: ["ui.json could not be read; it was kept as ui.json.damaged"] };
+  const first = openPage(() => ({}), {}, notices);
+  await settled();
+  const banner = first.document.getElementById("banner");
+  assert(!banner.hidden && banner.textContent.includes("ui.json"), banner.textContent);
+  banner.named("button", "Dismiss").click();
+  await settled();
+  assert(banner.hidden);
+  const again = openPage(() => ({}), first.stored, notices);
+  await settled();
+  assert(again.document.getElementById("banner").hidden, again.document.getElementById("banner").textContent);
+  // Another notice, or the same file damaged again under a new name, is shown.
+  const other = openPage(() => ({}), first.stored, { notices: ["queue.json could not be read"] });
+  await settled();
+  assert(!other.document.getElementById("banner").hidden);
+};
+checks["no view shows the word null where a part is left out"] = async () => {
+  const page = openPage((path) => (path === "/api/history" ? { reports: [], dirs: [], history_encodes: 3 } : {}));
+  await settled();
+  const shown = [];
+  for (const view of ["history", "settings"]) {
+    const root = page.show(view);
+    await settled();
+    if (/null/.test(root.textContent)) shown.push(`${view}: ${root.textContent}`);
+  }
+  assert.deepStrictEqual(shown, []);
+};
+checks["history: the count of encodes behind scan estimates is the one just read"] = async () => {
+  const page = openPage((path) => (path === "/api/history" ? { reports: [], dirs: [], history_encodes: 12 } : {}), {}, { history_encodes: 4 });
+  await settled();
+  const root = page.show("history");
+  await settled();
+  assert(root.textContent.includes("12encodes calibrating"), root.textContent.slice(0, 400));
+  assert(page.show("settings").textContent.includes("Encodes behind scan estimates12"));
+};
+checks["scan: a share of savings out of range is refused in the page's own words"] = async () => {
+  const page = openPage((path, body) => (body ? { id: 1 } : { id: 1, status: "running" }));
+  await settled();
+  const root = page.show("scan");
+  await settled();
+  for (const text of ["120", "96", "-1"]) {
+    root.field("Min savings %").value = text;
+    await root.named("button", "Scan").click();
+    await settled();
+    assert.deepStrictEqual(posted(page, "/api/scans"), [], text);
+    assert.strictEqual(lastToast(page), "Min savings %: enter a number from 0 to 95");
+  }
+  root.field("Min savings %").value = "95";
+  await root.named("button", "Scan").click();
+  await settled();
+  assert.strictEqual(posted(page, "/api/scans")[0].body.min_savings, 0.95);
+};
+checks["benchmark: counts and lengths out of range are refused, and the plan says why"] = async () => {
+  const page = openPage((path, body) => (body ? {} : path === "/api/bench" ? benchReply : {}), { benchRoots: ["/videos"] });
+  await settled();
+  const root = page.show("bench");
+  await settled();
+  const plan = () => root.all().find((e) => e.tag === "p" && /^(Videos|Seconds|Clips|No preset|\d+ settings?:)/.test(e.textContent)).textContent;
+  // The clip length sits in the row of the clip count, after it.
+  const clipRow = root.field("Clips per video").parent.all().filter((e) => e.tag === "input");
+  const inputs = { Videos: root.field("Videos"), "Clips per video": clipRow[0], "Seconds per clip": clipRow[1] };
+  for (const [field, text, said] of [["Videos", "0", "Videos: enter a whole number from 1 to 50"], ["Seconds per clip", "-3", "Seconds per clip: enter a number from 2 to 30"], ["Clips per video", "2.5", "Clips per video: enter a whole number from 1 to 8"]]) {
+    const input = inputs[field], was = input.value;
+    input.value = text;
+    input.dispatch("input");
+    assert(plan().startsWith(said), plan());
+    await root.named("button", "Start benchmark").click();
+    await settled();
+    assert.deepStrictEqual(posted(page, "/api/bench"), [], `${field} ${text}`);
+    assert.strictEqual(lastToast(page), said);
+    input.value = was;
+    input.dispatch("input");
+  }
+  assert(/setting/.test(plan()), plan());
+};
+checks["sections: removing all of a video, or all but a moment, is refused before it is queued"] = async () => {
+  const page = openPage((path) => (path === "/api/source" ? { duration_s: 10, fps: 25, url: "/media/x" } : {}));
+  await settled();
+  page.run(`var cuts = sectionsEditor("/v/a.mp4")`);
+  await settled();
+  const el = page.run("cuts.el");
+  const add = async (a, b) => {
+    el.named("button", "+ Section").click();
+    const row = el.querySelectorAll(".cut-row").pop();
+    const [start, end] = row.querySelectorAll("input");
+    start.value = a; end.value = b;
+    start.dispatch("input");
+    return row;
+  };
+  const refusal = () => { try { page.run("cuts.get()"); return ""; } catch (e) { return e.message; } };
+  const row = await add("0", "end");
+  assert.strictEqual(refusal(), "These sections remove the whole video: nothing would be left to encode");
+  row.querySelectorAll("input")[0].value = "0:09.5";
+  row.querySelectorAll("input")[0].dispatch("input");
+  assert.strictEqual(refusal(), "");
+  row.querySelectorAll("input")[0].value = "0:00.5";
+  row.querySelectorAll("input")[0].dispatch("input");
+  assert(refusal().endsWith("at least 1 s has to stay"), refusal());
+  assert(el.textContent.includes("At least 1 s has to stay"), el.textContent);
+  row.querySelectorAll("input")[0].value = "0:01";
+  row.querySelectorAll("input")[0].dispatch("input");
+  assert.strictEqual(refusal(), "");
+  page.run("cuts.stop()");
 };
 
 checks["queue: forgetting saved jobs asks first"] = async () => {
@@ -488,6 +676,32 @@ checks["compare: a failed load and a player that cannot start both say why"] = a
   await settled();
   assert(broken.context.__root.textContent.includes("cannot draw it"));
   assert.strictEqual(lastToast(broken), "cannot draw it");
+};
+
+checks["compare: the output does not play before its source is there to play beside it"] = async () => {
+  const page = openPage(() => ({}));
+  await settled();
+  page.context.__root = page.document.createElement("div");
+  page.run(`var leave = comparePlayer(__root, { output_path: "/o.mp4", input_path: "/i.mp4", output_info: { fps: 25, duration_s: 10 }, input_info: { fps: 25, duration_s: 10 }, target_vmaf: 93, verify_vmaf: [94] })`);
+  await settled();
+  const root = page.context.__root;
+  const videos = root.all().filter((e) => e.tag === "video");
+  const vs = videos.find((v) => "muted" in v.attrs), vo = videos.find((v) => !("muted" in v.attrs));
+  const play = root.named("button", "Play");
+  // Loaded, as the browser says it; with no picture size after, so that no alignment starts.
+  const loaded = (v) => { v.videoWidth = 64; v.dispatch("loadeddata"); v.videoWidth = 0; };
+  assert(play.disabled);
+  loaded(vo);
+  await settled();
+  assert(play.disabled, "Play is on with the output alone");
+  play.click();
+  assert(vo.paused, "the output plays before the source");
+  loaded(vs);
+  await settled();
+  assert(!play.disabled);
+  play.click();
+  assert(!vo.paused && !vs.paused);
+  page.run("leave()");
 };
 
 // Answers held back until the check lets them go, so that they can arrive in any order.

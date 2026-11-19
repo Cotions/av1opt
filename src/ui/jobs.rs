@@ -57,9 +57,16 @@ pub struct JobOptions {
     /// Re-encode sound tracks far above what Opus needs.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shrink_audio: bool,
-    /// Sections left out of the output, (start, end) seconds. Only for single-file jobs.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Sections left out of the output, (start, end) seconds. Only for single-file jobs. An end
+    /// of `null` is the end of the video, for when the page could not learn its length: it
+    /// stands for infinity here, which JSON cannot hold and is written back as `null`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "sections_with_open_ends")]
     pub remove: Vec<(f64, f64)>,
+}
+
+fn sections_with_open_ends<'de, D: serde::Deserializer<'de>>(from: D) -> std::result::Result<Vec<(f64, f64)>, D::Error> {
+    let sections = Vec::<(f64, Option<f64>)>::deserialize(from)?;
+    Ok(sections.into_iter().map(|(start, end)| (start, end.unwrap_or(f64::INFINITY))).collect())
 }
 
 fn d_true() -> bool {
@@ -87,7 +94,7 @@ impl JobOptions {
         super::fields::PRESET.check(self.preset.into())?;
         super::fields::WORKERS.check(self.workers.into())?;
         for &(a, b) in &self.remove {
-            if !(a.is_finite() && b.is_finite() && a >= 0.0 && b > a) {
+            if !(a.is_finite() && !b.is_nan() && a >= 0.0 && b > a) {
                 bail!("section {a}-{b} is not a valid range");
             }
         }
@@ -1182,6 +1189,21 @@ fn run_job(app: &Arc<App>, id: u64, opts: Result<Options>, retry: bool, out_dir:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_section_can_run_to_an_end_not_known_yet() {
+        let options: JobOptions = serde_json::from_value(json!({ "remove": [[90.5, null], [1, 2]] })).unwrap();
+        assert_eq!(options.remove, [(90.5, f64::INFINITY), (1.0, 2.0)]);
+        assert_eq!(options.to_options().unwrap().remove, options.remove);
+        // A saved queue reads back the same.
+        let saved = serde_json::to_value(&options).unwrap();
+        assert_eq!(saved["remove"][0], json!([90.5, null]));
+        assert_eq!(serde_json::from_value::<JobOptions>(saved).unwrap().remove, options.remove);
+        // A start still has to be a time, and an end to come after it.
+        assert!(serde_json::from_value::<JobOptions>(json!({ "remove": [[null, 2]] })).is_err());
+        let backwards: JobOptions = serde_json::from_value(json!({ "remove": [[5, 2]] })).unwrap();
+        assert!(backwards.to_options().is_err());
+    }
 
     #[test]
     fn a_save_that_was_waiting_when_the_server_began_to_stop_writes_nothing() {

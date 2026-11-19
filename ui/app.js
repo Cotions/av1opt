@@ -598,7 +598,10 @@ function sectionsEditor(path) {
     const out = [];
     for (const r of rows.querySelectorAll(".cut-row")) {
       const [si, ei] = r.querySelectorAll("input");
-      const a = parseTime(si.value), b = ei.value.trim() === "" || /^end$/i.test(ei.value.trim()) ? duration : parseTime(ei.value);
+      // An end left empty or typed as "end" is the end of the video. While its length is not
+      // known here that is open, and the server settles it.
+      const toEnd = ei.value.trim() === "" || /^end$/i.test(ei.value.trim());
+      const a = parseTime(si.value), b = toEnd ? duration || Infinity : parseTime(ei.value);
       const bad = a == null || b == null || b <= a || (duration && a >= duration);
       r.classList.toggle("invalid", bad);
       if (bad) { if (strict) throw new Error(`Section "${si.value} – ${ei.value}" is not a valid range`); continue; }
@@ -621,7 +624,7 @@ function sectionsEditor(path) {
   function addRow(a, b, focus) {
     const si = h("input", { type: "text", class: "mono", value: a == null ? "" : fmtTime(a), placeholder: "start", spellcheck: "false" });
     const ei = h("input", { type: "text", class: "mono", value: b == null ? "" : b >= duration && duration ? "end" : fmtTime(b), placeholder: "end", spellcheck: "false" });
-    const go = (inp) => () => { const t = /^end$/i.test(inp.value.trim()) ? duration : parseTime(inp.value); if (t != null) seek(t); };
+    const go = (inp) => () => { const t = /^end$/i.test(inp.value.trim()) ? duration || null : parseTime(inp.value); if (t != null) seek(t); };
     const row = h("div", { class: "cut-row" },
       h("button", { class: "small", title: "Go to the start", onclick: go(si) }, "▶"), si, h("span", { class: "dim" }, "to"), ei,
       h("button", { class: "small", title: "Go to the end", onclick: go(ei) }, "▶"),
@@ -662,7 +665,7 @@ function sectionsEditor(path) {
     playhead.style.left = (duration ? (t / duration) * 100 : 0) + "%";
     if (skip.checked && !v.paused) {
       const hit = readRows(false).find(([a, b]) => t >= a && t < b - 0.05);
-      if (hit) seek(hit[1]);
+      if (hit && Number.isFinite(hit[1])) seek(hit[1]);
     }
   };
   const onKey = (e) => {
@@ -750,7 +753,7 @@ function sectionsEditor(path) {
       h("button", { class: "small", onclick: () => addRow(null, null, true) }, "+ Section"),
       h("label", { class: "check", title: "While playing here, jump over the sections marked for removal" }, skip, "Skip removed parts while playing")),
     summary);
-  return { el, get: () => readRows(true).sort((x, y) => x[0] - y[0]), stop: () => { closed = true; cancelAnimationFrame(raf); document.removeEventListener("keydown", onKey); v.pause(); v.removeAttribute("src"); v.load(); } };
+  return { el, get: () => readRows(true).sort((x, y) => x[0] - y[0]).map(([a, b]) => [a, Number.isFinite(b) ? b : null]), stop: () => { closed = true; cancelAnimationFrame(raf); document.removeEventListener("keydown", onKey); v.pause(); v.removeAttribute("src"); v.load(); } };
 }
 
 // One label / control / hint line of a .form-grid.

@@ -58,7 +58,11 @@ class Element extends Node {
   get textContent() { return this.children.map((k) => k.textContent).join(""); }
   set textContent(text) { this.replaceChildren(); if (text !== "" && text != null) this.adopt([String(text)]); }
   querySelector() { return null; }
-  querySelectorAll() { return []; }
+  // Enough for the lists the page reads back: one class or one tag name.
+  querySelectorAll(selector) {
+    if (!/^\.?[a-z-]+$/.test(selector)) return [];
+    return this.all().filter((e) => (selector[0] === "." ? e.classList.contains(selector.slice(1)) : e.tag === selector));
+  }
   all() { return this.children.filter((k) => k instanceof Element).flatMap((k) => [k, ...k.all()]); }
   // The button or other element with exactly this text.
   named(tag, text) {
@@ -334,6 +338,26 @@ checks["duplicates: the trash dialog says which marks are not on screen and list
   assert(dialog.textContent.includes("1 marked file is not on screen"), dialog.textContent);
   const lines = dialog.all().filter((e) => e.classList.contains("trash-list")).flatMap((e) => e.children.map((k) => k.textContent));
   assert.deepStrictEqual(lines, ["/v/a\u240a/home/me/keep.mp4", "/v/s2.mp4"]);
+};
+
+checks["sections: with the length unknown an end can stay open, and a typed one is kept"] = async () => {
+  const page = openPage((path) => (path === "/api/source" ? { error: "cannot read it" } : {}));
+  await settled();
+  page.context.__cuts = page.run(`sectionsEditor("/videos/a.mp4")`);
+  await settled();
+  const box = page.context.__cuts.el;
+  page.document.body.append(box);
+  assert(box.textContent.includes("You can still type the times"), box.textContent.slice(0, 300));
+  for (const [start, end] of [["1:30", ""], ["0:10", "END"], ["0:01", "0:02"]]) {
+    box.named("button", "+ Section").click();
+    const inputs = box.querySelectorAll(".cut-row").pop().querySelectorAll("input");
+    inputs[0].value = start;
+    inputs[1].value = end;
+  }
+  assert.deepStrictEqual(JSON.parse(page.run("JSON.stringify(__cuts.get())")), [[1, 2], [10, null], [90, null]]);
+  const last = box.querySelectorAll(".cut-row").pop().querySelectorAll("input");
+  last[1].value = "0:01";
+  assert.throws(() => page.run("__cuts.get()"), /not a valid range/);
 };
 
 (async () => {

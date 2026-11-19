@@ -404,8 +404,12 @@ fn mix_word(hash: u64, word: u64) -> u64 {
 /// file is still the one it was, wherever it was written to. Not one against someone who wants
 /// two files to match. Adds the bytes read to `got`; `stop` ends it early with an error.
 pub fn whole_digest(path: &Path, size: u64, got: &AtomicU64, stop: &AtomicBool) -> std::io::Result<u64> {
+    whole_digest_of(std::fs::File::open(path)?, size, got, stop)
+}
+
+/// [`whole_digest`] of a file already open, read from where it stands.
+pub fn whole_digest_of(mut file: std::fs::File, size: u64, got: &AtomicU64, stop: &AtomicBool) -> std::io::Result<u64> {
     const BLOCK: usize = 1 << 20;
-    let mut file = std::fs::File::open(path)?;
     let mut hash = mix_word(0xcbf29ce484222325, size);
     let mut buffer = vec![0; BLOCK];
     let mut left = size;

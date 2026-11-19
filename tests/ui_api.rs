@@ -722,6 +722,54 @@ fn a_planted_report_cannot_send_a_video_to_the_trash() {
     assert!(!s.dir.join("videos/movie.mkv").exists() && nothing_in_the_trash(&s));
 }
 
+/// A report that holds a hash of the original, and its time, as an encode of today writes it.
+/// The hash is of something else, as it is for a file rewritten since.
+fn report_of_a_rewritten_original(original: &Path, output: &Path) -> Value {
+    let time = std::fs::metadata(original).unwrap().modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    json!({
+        "format": 1, "input": original, "output": output, "source_bytes": 3000, "output_bytes": 1000,
+        "source_mtime": time, "source_hash": "0123456789abcdef",
+    })
+}
+
+#[test]
+fn an_original_rewritten_with_its_date_set_back_stays_where_it_is() {
+    // On the page.
+    let s = Server::start("date-set-back", |d| {
+        std::fs::write(d.join("videos/movie.mp4"), vec![b's'; 3000]).unwrap();
+        std::fs::create_dir_all(d.join("out")).unwrap();
+        std::fs::write(d.join("out/movie.mkv"), vec![b'o'; 1000]).unwrap();
+        write_record(d, &[encoded_line(&d.join("videos/movie.mp4"), &d.join("out/movie.mkv"))]);
+        write_report(&d.join("out/movie.av1opt.json"), report_of_a_rewritten_original(&d.join("videos/movie.mp4"), &d.join("out/movie.mkv")));
+    });
+    add_history_folder(&s, "out");
+    let r = s.post("/api/replace", &json!({ "report": s.dir.join("out/movie.av1opt.json") }));
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert!(r.body.contains("the original changed since the encode"), "{}", r.body);
+    assert_eq!(std::fs::read(s.dir.join("videos/movie.mp4")).unwrap(), vec![b's'; 3000]);
+    assert!(s.dir.join("out/movie.mkv").exists() && nothing_in_the_trash(&s));
+
+    // On the command line, where the dry run says what --apply will do.
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ui-date-set-back");
+    let _ = std::fs::remove_dir_all(&dir);
+    for folder in ["videos", "out", "data"] {
+        std::fs::create_dir_all(dir.join(folder)).unwrap();
+    }
+    let (original, output) = (dir.join("videos/film.mp4"), dir.join("out/film.mkv"));
+    std::fs::write(&original, vec![b's'; 3000]).unwrap();
+    std::fs::write(&output, vec![b'o'; 1000]).unwrap();
+    write_report(&dir.join("out/film.av1opt.json"), report_of_a_rewritten_original(&original, &output));
+    let run = replace_command(&dir, &[dir.as_os_str()]);
+    let said = String::from_utf8_lossy(&run.stdout).into_owned();
+    assert!(said.contains("1 output can take") && said.contains("With --apply, 1 original is read whole first"), "{said}");
+    let run = replace_command(&dir, &[dir.as_os_str(), std::ffi::OsStr::new("--apply")]);
+    let said = String::from_utf8_lossy(&run.stderr).into_owned();
+    assert!(!run.status.success() && said.contains("the original changed since the encode"), "{said}");
+    assert_eq!(said.matches("reading all of").count(), 1, "{said}");
+    assert_eq!(std::fs::read(&original).unwrap(), vec![b's'; 3000]);
+    assert!(output.exists() && !dir.join("videos/film.mkv").exists());
+}
+
 #[test]
 fn a_recorded_output_swapped_for_another_file_does_not_take_the_originals_place() {
     let s = Server::start("planted-swap", |d| {

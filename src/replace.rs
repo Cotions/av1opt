@@ -7,7 +7,7 @@
 //! land on an existing file. Space is only freed when the trash is emptied.
 
 use crate::encode::REPORT_FORMAT;
-use crate::source::{Recorded, Stamp, Verdict};
+use crate::source::{Recorded, Stamp, Verdict, WholeReads};
 use crate::trash;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -41,6 +41,8 @@ pub struct Plan {
     pub removed: usize,
     /// What the report says of the original, which it was found to match.
     pub original: Recorded,
+    /// How the original stood when it was last checked, for what is about to act on that check.
+    pub source_stamp: Option<Stamp>,
 }
 
 /// An original that was replaced earlier, as its report tells it.
@@ -157,14 +159,20 @@ fn place_beside_aside(report: &Path, from: &Path) -> Option<PathBuf> {
 
 /// How far to go in telling whether an original is the file that was encoded.
 #[derive(Clone, Copy, Default)]
-struct Judging {
+struct Judging<'a> {
     /// For a list of many reports: whole files are not read for it. See `source::compare_for_list`.
     for_list: bool,
     /// Asked for on the command line: an original the report cannot tell about counts as the same.
     accept_changed_date: bool,
     /// The refusal may mention what the command line can do about it.
     on_command_line: bool,
+    /// Whole files read for this act, so that it reads none of them twice.
+    remember: Option<&'a WholeReads>,
+    /// The original is about to go to the trash on this answer, so its date settles nothing.
+    acting: bool,
 }
+
+const CHANGED_WHILE_CHECKED: &str = "the original changed while it was being checked";
 
 /// Looks at one report and the two files it names. Changes nothing. May read the whole original.
 pub fn check(report: &Path) -> Check {
@@ -257,7 +265,17 @@ fn check_inner(report: &Path, judging: Judging) -> Result<Check, String> {
     // The original goes to the trash on the strength of this: it has to be the file that was
     // encoded, not one that took over its name and size since.
     let then = crate::source::Recorded::in_report(&r);
-    let verdict = if judging.for_list { crate::source::compare_for_list(&then, &source) } else { crate::source::compare(&then, &source) };
+    let mut source_stamp = None;
+    let verdict = match judging.remember {
+        _ if judging.for_list => crate::source::compare_for_list(&then, &source),
+        Some(reads) if judging.acting => {
+            let (verdict, stamp) = crate::source::compare_to_act(&then, &source, reads);
+            source_stamp = stamp;
+            verdict
+        }
+        Some(reads) => crate::source::compare_remembering(&then, &source, reads),
+        None => crate::source::compare(&then, &source),
+    };
     match verdict {
         Verdict::Same => {}
         Verdict::OtherSize { .. } | Verdict::Changed => return Err("the original changed since the encode".into()),
@@ -272,6 +290,9 @@ fn check_inner(report: &Path, judging: Judging) -> Result<Check, String> {
         }
         Verdict::Unreadable(e) => return Err(format!("the original cannot be read to check that it is the file that was encoded: {e}")),
     }
+    if judging.acting && source_stamp.is_none() {
+        return Err(CHANGED_WHILE_CHECKED.into());
+    }
     let dir = source.parent().ok_or("the original has no folder")?;
     let dest = match output.extension() {
         Some(ext) => source.with_extension(ext),
@@ -284,7 +305,7 @@ fn check_inner(report: &Path, judging: Judging) -> Result<Check, String> {
     let copy = dest != output && dev(dir)? != dev(&output)?;
     let zfs = crate::fsguard::ensure_writable_location(dir, false).is_err();
     let removed = r["removed"].as_array().map_or(0, Vec::len);
-    Ok(Check::Ready(Plan { report: report.to_path_buf(), source, output, dest, source_bytes, output_bytes, copy, zfs, removed, original: then }))
+    Ok(Check::Ready(Plan { report: report.to_path_buf(), source, output, dest, source_bytes, output_bytes, copy, zfs, removed, original: then, source_stamp }))
 }
 
 /// A replacement that went through.
@@ -552,11 +573,14 @@ type AcceptOutput<'a> = &'a dyn Fn(&Plan, &OpenFile) -> Result<(), String>;
 
 fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: &dyn Fn(&Path) -> Result<PathBuf>, accept: AcceptOutput) -> Result<Done> {
     let _lock = lock(report)?;
+    let reads_of_this_one = WholeReads::default();
+    let judging = Judging { acting: true, remember: judging.remember.or(Some(&reads_of_this_one)), ..judging };
     let p = match check_judging(report, judging) {
         Check::Ready(p) => p,
         Check::Replaced(_) => bail!("already replaced"),
         Check::No(why) => bail!("{why}"),
     };
+    let source_stamp = p.source_stamp.context(CHANGED_WHILE_CHECKED)?;
     let output = OpenFile::open(&p.output, p.output_bytes)?;
     accept(&p, &output).map_err(|why| anyhow!(why))?;
     if p.zfs && !allow_zfs {
@@ -577,6 +601,14 @@ fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: &dy
     if !in_place && p.copy {
         staged_first = Some(stage()?);
     }
+    // Reading a large original takes minutes, and a write behind the place being read would not
+    // have shown in what was read.
+    if !std::fs::symlink_metadata(&p.source).is_ok_and(|m| Stamp::of(&m) == source_stamp) {
+        if staged_first.is_some() {
+            let _ = std::fs::remove_file(&staged);
+        }
+        bail!("{CHANGED_WHILE_CHECKED}, so nothing was changed");
+    }
     let trashed = match to_trash(&p.source) {
         Ok(t) => t,
         Err(e) => {
@@ -586,6 +618,16 @@ fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: &dy
             return Err(e.context("the original could not be moved to the trash; nothing was changed"));
         }
     };
+    // What went is what was checked, or it comes back.
+    if !std::fs::symlink_metadata(&trashed).is_ok_and(|m| source_stamp.same_after_move(&m)) {
+        if staged_first.is_some() {
+            let _ = std::fs::remove_file(&staged);
+        }
+        return Err(match trash::restore(&trashed, &p.source) {
+            Ok(()) => anyhow!("{CHANGED_WHILE_CHECKED}; it is back in its place"),
+            Err(b) => anyhow!("{CHANGED_WHILE_CHECKED}, and it is still in the trash at {} ({b:#})", trashed.display()),
+        });
+    }
     // Some(copy): the output was copied, and its old file is still in the output folder.
     let placed: Result<Option<OpenFile>> = if in_place {
         if output.is_at(&p.output) { Ok(None) } else { Err(anyhow!("{} was replaced by another file", p.output.display())) }
@@ -805,7 +847,9 @@ fn outside_named(source: &Path) -> String {
 /// folders in `paths` are left alone unless `anywhere` is set.
 pub fn run(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_changed_date: bool, anywhere: bool) -> Result<()> {
     use crate::report::gb;
-    let judging = Judging { accept_changed_date, on_command_line: true, ..Judging::default() };
+    // Only what is going to be replaced is worth keeping reads for.
+    let reads = WholeReads::default();
+    let judging = Judging { accept_changed_date, on_command_line: true, remember: go.then_some(&reads), ..Judging::default() };
     let reports = reports_for(paths);
     if reports.is_empty() {
         bail!("no av1opt reports (*.av1opt.json) found there");
@@ -897,6 +941,10 @@ pub fn run(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_chan
         if !go {
             if !ready.is_empty() {
                 println!("\nNothing was changed. Add --apply to replace {}.", if ready.len() == 1 { "it" } else { "them" });
+                let to_read = ready.iter().filter(|p| p.original.whole.is_some()).count();
+                if to_read > 0 {
+                    println!("With --apply, {} read whole first, to be sure of what goes to the trash; on large files this can take minutes.", plural(to_read, "original is", "originals are"));
+                }
             }
             return Ok(());
         }
@@ -1209,6 +1257,112 @@ mod tests {
         assert!(bin.join("info/a.mp4.trashinfo").exists(), "the entry is whole again");
         trash::restore_if(&trashed, &to, &|_| true).unwrap();
         assert!(to.exists() && !bin.join("info/a.mp4.trashinfo").exists());
+    }
+
+    /// Gives the report what an encode of today writes about the original as it is now.
+    fn record_whole_hash(report: &Path, source: &Path) -> u64 {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        let size = std::fs::metadata(source).unwrap().len();
+        let hash = crate::files::whole_digest(source, size, &AtomicU64::new(0), &AtomicBool::new(false)).unwrap();
+        let time = crate::source::modified_seconds(&std::fs::metadata(source).unwrap()).unwrap();
+        let mut r: Value = serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
+        r["source_hash"] = json!(format!("{hash:016x}"));
+        r["source_mtime"] = json!(time);
+        std::fs::write(report, serde_json::to_vec_pretty(&r).unwrap()).unwrap();
+        time
+    }
+
+    fn set_time(path: &Path, seconds: u64) {
+        let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds);
+        File::options().write(true).open(path).unwrap().set_modified(time).unwrap();
+    }
+
+    #[test]
+    fn an_original_rewritten_with_its_date_set_back_does_not_go_to_the_trash() {
+        let f = Fix::new("date-back");
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        let source = f.lib("a.mp4");
+        let time = record_whole_hash(&report, &source);
+        std::fs::write(&source, vec![b'x'; 1000]).unwrap();
+        set_time(&source, time);
+        // A list and a dry run go by the date, as they may.
+        assert!(matches!(check(&report), Check::Ready(_)));
+        let err = f.apply(&report).unwrap_err();
+        assert!(err.to_string().contains("the original changed since the encode"), "{err}");
+        assert_eq!(std::fs::read(&source).unwrap(), vec![b'x'; 1000]);
+        assert!(f.out("a.mkv").exists() && !f.lib("a.mkv").exists());
+    }
+
+    #[test]
+    fn an_original_written_to_after_it_was_read_does_not_go_to_the_trash() {
+        // After the read, with everything still to come.
+        let f = Fix::new("written-early");
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        let source = f.lib("a.mp4");
+        record_whole_hash(&report, &source);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let err = apply_judging(&report, true, Judging::default(), &trash::trash, &|_, _| {
+            std::os::unix::fs::FileExt::write_all_at(&File::options().write(true).open(&source).unwrap(), b"x", 999).unwrap();
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "the original changed while it was being checked, so nothing was changed");
+        assert!(source.exists() && f.out("a.mkv").exists() && !f.lib("a.mkv").exists());
+
+        // In the last moment before it moves: it is back, and so is everything else.
+        let f = Fix::new("written-late");
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        let source = f.lib("a.mp4");
+        record_whole_hash(&report, &source);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let home = f.dir.join("Trash");
+        let err = apply_with(&report, true, &|p| {
+            std::os::unix::fs::FileExt::write_all_at(&File::options().write(true).open(p).unwrap(), b"x", 999).unwrap();
+            trash::trash_with(p, Some(&home), 1000, "2026-11-10T22:15:03".into())
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "the original changed while it was being checked; it is back in its place");
+        assert_eq!(std::fs::read(&source).unwrap().last(), Some(&b'x'));
+        assert!(f.out("a.mkv").exists() && !f.lib("a.mkv").exists());
+        assert_eq!(std::fs::read_dir(home.join("files")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn one_apply_reads_each_original_once() {
+        let home = |f: &Fix| f.dir.join("Trash");
+        let run = |f: &Fix, report: &Path, reads: &WholeReads| {
+            let judging = Judging { remember: Some(reads), ..Judging::default() };
+            assert!(matches!(check_judging(report, judging), Check::Ready(_)), "listed first, as the command does");
+            apply_judging(report, true, judging, &|p| trash::trash_with(p, Some(&home(f)), 1000, "2026-11-10T22:15:03".into()), &|_, _| Ok(()))
+        };
+        // Its date as recorded: the list leaves the reading to the replacement.
+        let f = Fix::new("once-same-date");
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        record_whole_hash(&report, &f.lib("a.mp4"));
+        let reads = WholeReads::default();
+        run(&f, &report, &reads).unwrap();
+        assert_eq!(reads.reads_made(), 1);
+
+        // Another date: the list has to read it, and the replacement goes by that.
+        let f = Fix::new("once-other-date");
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        let time = record_whole_hash(&report, &f.lib("a.mp4"));
+        set_time(&f.lib("a.mp4"), time - 1000);
+        let reads = WholeReads::default();
+        run(&f, &report, &reads).unwrap();
+        assert_eq!(reads.reads_made(), 1);
+
+        // A file touched between the two is read again.
+        let f = Fix::new("once-touched");
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        let time = record_whole_hash(&report, &f.lib("a.mp4"));
+        set_time(&f.lib("a.mp4"), time - 1000);
+        let reads = WholeReads::default();
+        let judging = Judging { remember: Some(&reads), ..Judging::default() };
+        assert!(matches!(check_judging(&report, judging), Check::Ready(_)));
+        set_time(&f.lib("a.mp4"), time - 2000);
+        apply_judging(&report, true, judging, &|p| trash::trash_with(p, Some(&home(&f)), 1000, "2026-11-10T22:15:03".into()), &|_, _| Ok(())).unwrap();
+        assert_eq!(reads.reads_made(), 2);
     }
 
     #[test]

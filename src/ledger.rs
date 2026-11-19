@@ -718,6 +718,7 @@ mod tests {
                 zfs: false,
                 removed: 0,
                 original: known(),
+                source_stamp: None,
             }
         }
     }

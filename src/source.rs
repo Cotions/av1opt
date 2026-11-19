@@ -12,8 +12,9 @@
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -80,6 +81,56 @@ impl Stamp {
     pub fn same_file(&self, meta: &std::fs::Metadata) -> bool {
         let now = Stamp::of(meta);
         meta.is_file() && (now.device, now.inode) == (self.device, self.inode)
+    }
+
+    /// Whether `meta` is this file as it was, now that it has been moved, which itself counts as
+    /// a change to it: so only its size and the time it was written can tell.
+    pub fn same_after_move(&self, meta: &std::fs::Metadata) -> bool {
+        let now = Stamp::of(meta);
+        self.same_file(meta) && (now.size, now.written) == (self.size, self.written)
+    }
+}
+
+/// What whole files were found to hold during one act, like one `replace --apply`, so that none
+/// is read twice for it. An answer counts only for a file that is exactly as it was when its read
+/// began, and nothing is kept after the act.
+#[derive(Default)]
+pub struct WholeReads {
+    found: Mutex<HashMap<Stamp, String>>,
+    reads: AtomicUsize,
+}
+
+impl WholeReads {
+    /// The hash of all of the plain file at `path`, read through one open file unless the file is
+    /// still as it was when that was last done. A link is not followed.
+    fn hash_of(&self, path: &Path, date_is_the_same: bool) -> std::io::Result<String> {
+        let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
+        let meta = file.metadata()?;
+        must_be_regular(&meta)?;
+        let stamp = Stamp::of(&meta);
+        if let Some(found) = self.found.lock().unwrap().get(&stamp) {
+            return Ok(found.clone());
+        }
+        if date_is_the_same {
+            eprintln!("reading all of {} to make sure it is still the file that was encoded before it goes to the trash (on a large file this can take minutes)", path.display());
+        } else {
+            eprintln!("reading all of {} to see whether it is still the file that was encoded: its date changed (on a large file this can take minutes)", path.display());
+        }
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        let reader = file.try_clone()?;
+        let size = meta.len();
+        let hash = read_watched(move |got| Ok(format!("{:016x}", crate::files::whole_digest_of(reader, size, got, &AtomicBool::new(false))?)))?;
+        // A write during the read may have landed behind it: such a hash is of no file.
+        if file.metadata().is_ok_and(|now| Stamp::of(&now) == stamp) {
+            self.found.lock().unwrap().insert(stamp, hash.clone());
+            remember(&WHOLE_HASHES, path, &meta, &hash);
+        }
+        Ok(hash)
+    }
+
+    #[cfg(test)]
+    pub fn reads_made(&self) -> usize {
+        self.reads.load(Ordering::Relaxed)
     }
 }
 
@@ -234,17 +285,42 @@ pub enum Verdict {
 /// Compares the file at `path` with what was recorded of it. Whatever it needs is read from the
 /// file now, which can mean all of it; nothing remembered counts.
 pub fn compare(then: &Recorded, path: &Path) -> Verdict {
-    judge(then, path, false)
+    judge(then, path, Look::Now)
 }
 
 /// [`compare`] for a list of many files, which may go by what earlier looks found. Where only
 /// reading a whole file could tell, and no earlier look did, the file counts as the same for now.
 /// So the answer is for showing: whatever acts on it has to ask [`compare`].
 pub fn compare_for_list(then: &Recorded, path: &Path) -> Verdict {
-    judge(then, path, true)
+    judge(then, path, Look::ForList)
 }
 
-fn judge(then: &Recorded, path: &Path, for_list: bool) -> Verdict {
+/// [`compare`] on the way to acting, whose whole reads are kept in `reads` for the act itself.
+pub fn compare_remembering(then: &Recorded, path: &Path, reads: &WholeReads) -> Verdict {
+    judge(then, path, Look::Remembering(reads))
+}
+
+/// [`compare`] for what is about to act on the answer. A date can be set back, so where a hash was
+/// recorded the file is read whatever its date says (once per act: see [`WholeReads`]). Comes
+/// with how the file stood when the look began, for the caller to compare with just before it
+/// acts; None if the file changed during the look, or could not be looked at.
+pub fn compare_to_act(then: &Recorded, path: &Path, reads: &WholeReads) -> (Verdict, Option<Stamp>) {
+    let stamp = || std::fs::symlink_metadata(path).ok().map(|m| Stamp::of(&m));
+    let before = stamp();
+    let verdict = judge(then, path, Look::ToAct(reads));
+    (verdict, before.filter(|_| stamp() == before))
+}
+
+/// How far a look at a file goes.
+#[derive(Clone, Copy)]
+enum Look<'a> {
+    Now,
+    ForList,
+    Remembering(&'a WholeReads),
+    ToAct(&'a WholeReads),
+}
+
+fn judge(then: &Recorded, path: &Path, look: Look) -> Verdict {
     let meta = match std::fs::metadata(path) {
         Ok(meta) => meta,
         Err(e) => return Verdict::Unreadable(e),
@@ -255,20 +331,23 @@ fn judge(then: &Recorded, path: &Path, for_list: bool) -> Verdict {
     if let Some(size) = then.size.filter(|size| *size != meta.len()) {
         return Verdict::OtherSize { then: size, now: meta.len() };
     }
-    if matches!((then.modified, modified_seconds(&meta)), (Some(a), Some(b)) if a.abs_diff(b) <= SAME_TIME_WITHIN) {
+    let date_is_the_same = matches!((then.modified, modified_seconds(&meta)), (Some(a), Some(b)) if a.abs_diff(b) <= SAME_TIME_WITHIN);
+    if date_is_the_same && !(matches!(look, Look::ToAct(_)) && then.whole.is_some()) {
         return Verdict::Same;
     }
     let is = |same: bool, otherwise: Verdict| if same { Verdict::Same } else { otherwise };
     if let Some(hash) = &then.whole {
-        if for_list {
-            return recall(&WHOLE_HASHES, path, &meta).map_or(Verdict::Same, |now| is(now == *hash, Verdict::Changed));
-        }
-        return match fresh_whole_hash(path, &meta) {
+        let now = match look {
+            Look::ForList => return recall(&WHOLE_HASHES, path, &meta).map_or(Verdict::Same, |now| is(now == *hash, Verdict::Changed)),
+            Look::Now => fresh_whole_hash(path, &meta),
+            Look::Remembering(reads) | Look::ToAct(reads) => reads.hash_of(path, date_is_the_same),
+        };
+        return match now {
             Ok(now) => is(now == *hash, Verdict::Changed),
             Err(e) => Verdict::Unreadable(e),
         };
     }
-    let remembered = if for_list { recall(&FINGERPRINTS, path, &meta) } else { None };
+    let remembered = if matches!(look, Look::ForList) { recall(&FINGERPRINTS, path, &meta) } else { None };
     match &then.fingerprint {
         // Samples that differ show a change. Samples that match show nothing: what was written
         // may lie between them.

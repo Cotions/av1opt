@@ -197,6 +197,26 @@ fn whole_hash_stopped_by(path: &Path, size: u64, stop: Arc<AtomicBool>) -> std::
     answer
 }
 
+/// The fingerprint of a file already open, read through it: of that file, whatever its name leads
+/// to by now.
+pub fn fingerprint_of_open(file: &std::fs::File) -> std::io::Result<String> {
+    let (file, size) = (file.try_clone()?, file.metadata()?.len());
+    read_watched(move |got| Ok(format!("{:016x}", crate::files::sample_digest_of(file, size, FINGERPRINT_SAMPLE, got)?)))
+}
+
+/// The hash of all of a file already open, read through it from its start.
+pub fn whole_hash_of_open(file: &std::fs::File) -> std::io::Result<String> {
+    use std::io::Seek;
+    let (mut file, size) = (file.try_clone()?, file.metadata()?.len());
+    file.seek(std::io::SeekFrom::Start(0))?;
+    read_watched(move |got| Ok(format!("{:016x}", crate::files::whole_digest_of(file, size, got, &AtomicBool::new(false))?)))
+}
+
+/// Whether two times, in the seconds a report keeps, count as the same.
+pub fn same_time(a: u64, b: u64) -> bool {
+    a.abs_diff(b) <= SAME_TIME_WITHIN
+}
+
 type Known = HashMap<(PathBuf, u64, SystemTime), String>;
 
 /// What was last found in files, by path, size and time, for the History page: it checks every

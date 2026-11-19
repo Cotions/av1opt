@@ -170,6 +170,9 @@ struct Judging<'a> {
     remember: Option<&'a WholeReads>,
     /// The original is about to go to the trash on this answer, so its date settles nothing.
     acting: bool,
+    /// Only listed: an original in the trash is looked at as for a list of many, and what puts
+    /// it back reads it in full first.
+    listing: bool,
 }
 
 const CHANGED_WHILE_CHECKED: &str = "the original changed while it was being checked";
@@ -230,7 +233,7 @@ fn check_inner(report: &Path, judging: Judging) -> Result<Check, String> {
             return Err("the report does not say where the AV1 file went in a way `replace` would have".into());
         }
         let original = original_in_trash(&r).ok_or("report has no sizes")?;
-        let in_trash = if judging.for_list { trash::holds_for_list(&trash, &source, &original) } else { trash::holds(&trash, &source, &original) };
+        let in_trash = if judging.for_list || judging.listing { trash::holds_for_list(&trash, &source, &original) } else { trash::holds(&trash, &source, &original) };
         let can_undo = file_size(&output) == Some(output_bytes) && in_trash;
         let zfs = source.parent().is_some_and(crate::fsguard::on_zfs);
         return Ok(Check::Replaced(Replaced { report: report.to_path_buf(), source, dest: output, from, recorded_from: recorded, trash, source_bytes, output_bytes, original, can_undo, zfs }));
@@ -289,6 +292,17 @@ fn check_inner(report: &Path, judging: Judging) -> Result<Check, String> {
             ));
         }
         Verdict::Unreadable(e) => return Err(format!("the original cannot be read to check that it is the file that was encoded: {e}")),
+    }
+    // Size and date are all such a report holds, and another file can have both: one written
+    // into the original's place, its date set back.
+    if then.fingerprint.is_none() && then.whole.is_none() && !judging.accept_changed_date {
+        // The page asks for the person's word itself, with this as what cannot be checked.
+        let or_accept = if judging.on_command_line { "; or, if you know that it is, add --accept-changed-date to take it on what its report holds" } else { "" };
+        return Err(format!(
+            "its report, from an earlier version, holds only the original's size{}, which another file can have too, so av1opt cannot tell whether it is still the file that was encoded; to go on, delete {} and encode the original again{or_accept}",
+            if then.modified.is_some() { " and date" } else { "" },
+            output.display()
+        ));
     }
     if judging.acting && source_stamp.is_none() {
         return Err(CHANGED_WHILE_CHECKED.into());
@@ -753,9 +767,10 @@ fn undo_watched(report: &Path, allow_zfs: bool, accept: Accept<Replaced>, before
     if !trash::says_came_from(&d.trash, &d.source) {
         bail!("the trash does not say that {} came from {}", d.trash.display(), d.source.display());
     }
-    // Opened before it is judged, so that the file judged can be told from one put there later.
+    // Opened before it is judged, and judged through what was opened, so that the file judged
+    // can be told from one put there later.
     let original = OpenFile::open(&d.trash, d.source_bytes).context("the file in the trash is not the original")?;
-    if !trash::is_file_recorded(&d.trash, &d.original) {
+    if !trash::is_open_file_recorded(&original.file, &d.original) {
         bail!("the file in the trash is not the original: it changed after the original went there");
     }
     // The original goes back to its folder: the same rule as when it left.
@@ -897,7 +912,7 @@ pub fn run(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_chan
     use crate::report::gb;
     // Only what is going to be replaced is worth keeping reads for.
     let reads = WholeReads::default();
-    let judging = Judging { accept_changed_date, on_command_line: true, remember: go.then_some(&reads), ..Judging::default() };
+    let judging = Judging { accept_changed_date, on_command_line: true, remember: go.then_some(&reads), listing: true, ..Judging::default() };
     let reports = reports_for(paths);
     if reports.is_empty() {
         bail!("no av1opt reports (*.av1opt.json) found there");
@@ -1202,7 +1217,10 @@ mod tests {
             std::fs::write(&s, vec![b's'; source_len]).unwrap();
             std::fs::write(&o, vec![b'o'; output_len]).unwrap();
             let report = o.with_extension("av1opt.json");
-            let r = json!({ "format": 1, "input": s, "output": o, "source_bytes": source_len, "output_bytes": output_len, "crf": 30.0 });
+            // What a report of today holds of its original but the whole hash, which takes a
+            // test of its own to be about.
+            let (_, known) = crate::source::Recorded::of(&s).unwrap();
+            let r = json!({ "format": 1, "input": s, "output": o, "source_bytes": source_len, "source_mtime": known.modified, "source_fingerprint": known.fingerprint, "output_bytes": output_len, "crf": 30.0 });
             std::fs::write(&report, serde_json::to_vec_pretty(&r).unwrap()).unwrap();
             report
         }
@@ -1682,9 +1700,19 @@ mod tests {
         assert!(matches!(check_judging(&report, accepting), Check::Ready(_)));
         rewrite_report(json!({ "source_mtime": then.modified, "source_fingerprint": null }));
         assert!(no(&report).contains("could not be read when its encode began"));
-        // One that holds neither goes by the size, as it always did.
-        rewrite_report(json!({}));
-        assert!(matches!(check(&report), Check::Ready(_)));
+        // Nor do the size and the date alone, though the date is the same: another file can
+        // have both. Nor the size alone. Only the command line, asked to, takes them.
+        set_time(then.modified.unwrap());
+        for holds in [json!({ "source_mtime": then.modified }), json!({})] {
+            rewrite_report(holds);
+            let why = no(&report);
+            assert!(why.contains("holds only the original's size") && why.contains("cannot tell") && !why.contains("--accept-changed-date"), "{why}");
+            let Check::No(why) = check_judging(&report, command_line) else { panic!() };
+            assert!(why.contains("add --accept-changed-date"), "{why}");
+            assert!(matches!(check_judging(&report, accepting), Check::Ready(_)));
+            assert!(f.apply(&report).is_err() && source.exists());
+        }
+        set_time(1_500_000_000);
 
         // The download finished into its allocated space: same size, other contents. No flag
         // gets past that.
@@ -1737,13 +1765,22 @@ mod tests {
         old["replaced"].as_object_mut().unwrap().remove("source_mtime");
         write_report(&old);
         assert!(!can_undo());
+        // The time on record being that of the file there settles nothing: its contents are
+        // read where a hash of them is on record, and only its samples where those are.
         old["source_mtime"] = json!(1_600_000_060u64);
         write_report(&old);
-        assert!(can_undo(), "the time on record is that of the file there");
-        old["source_mtime"] = json!(1_600_000_000u64);
-        old.as_object_mut().unwrap().remove("source_fingerprint");
-        write_report(&old);
-        assert!(!can_undo(), "another time and no fingerprint to settle it");
+        assert!(!can_undo(), "the same time, and another file");
+        let mut samples_only = old.clone();
+        samples_only.as_object_mut().unwrap().remove("source_hash");
+        write_report(&samples_only);
+        assert!(!can_undo(), "the same time, and other samples");
+        // With neither on record, a date that differs is the one thing that can tell.
+        samples_only.as_object_mut().unwrap().remove("source_fingerprint");
+        write_report(&samples_only);
+        assert!(can_undo(), "the same size and time, and nothing else to go by");
+        samples_only["source_mtime"] = json!(1_600_000_000u64);
+        write_report(&samples_only);
+        assert!(!can_undo(), "another time and nothing to settle it");
 
         // The original's contents back under another time: still the original.
         std::fs::write(&done.trash, vec![b's'; 1000]).unwrap();
@@ -1757,6 +1794,37 @@ mod tests {
         assert!(can_undo());
         undo(&report, true).unwrap();
         assert!(f.lib("a.mp4").exists());
+    }
+
+    #[test]
+    fn a_file_in_the_trash_changed_at_its_size_and_date_does_not_come_back() {
+        let f = Fix::new("trash-rot");
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        let source = f.lib("a.mp4");
+        let hash = crate::source::WholeHash::start(&source, 1000).finish(&|| false).unwrap();
+        for with_hash in [true, false] {
+            let mut r: Value = serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+            if with_hash {
+                r["source_hash"] = json!(hash);
+            }
+            std::fs::write(&report, r.to_string()).unwrap();
+            let done = f.apply(&report).unwrap();
+            let date = std::fs::metadata(&done.trash).unwrap().modified().unwrap();
+            // One byte changed, as a drive that rots or a tool that keeps dates would leave it.
+            let mut bytes = std::fs::read(&done.trash).unwrap();
+            bytes[300] = b'x';
+            std::fs::write(&done.trash, &bytes).unwrap();
+            std::fs::File::options().write(true).open(&done.trash).unwrap().set_modified(date).unwrap();
+            let err = undo(&report, true).unwrap_err();
+            assert!(err.to_string().starts_with("the file in the trash is not the original"), "{err}");
+            assert!(!source.exists() && done.trash.exists() && f.lib("a.mkv").exists());
+            // As it was, it comes back.
+            bytes[300] = b's';
+            std::fs::write(&done.trash, &bytes).unwrap();
+            std::fs::File::options().write(true).open(&done.trash).unwrap().set_modified(date).unwrap();
+            undo(&report, true).unwrap();
+            assert!(source.exists() && f.out("a.mkv").exists());
+        }
     }
 
     #[test]

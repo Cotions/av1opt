@@ -270,13 +270,29 @@ fn decode_path(s: &str) -> Option<PathBuf> {
     Some(PathBuf::from(std::ffi::OsString::from_vec(out)))
 }
 
-/// Whether the plain file at `path` is the one `known` describes, by the rule for sources: its
-/// size, then its time, then the hash of the whole file. Going into the trash changes none of
-/// them. Reports without that hash count here when their samples match: nothing is lost by
-/// putting a file back where nothing stands, and originals that were only touched went to the
-/// trash on that same evidence.
+/// Whether the plain file at `path` is the one `known` describes: see [`is_open_file_recorded`].
+/// A link is not followed.
 pub fn is_file_recorded(path: &Path, known: &Recorded) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) && counts_as_recorded(crate::source::compare(known, path), known)
+    let opened = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path);
+    opened.is_ok_and(|file| is_open_file_recorded(&file, known))
+}
+
+/// Whether the open file is the one `known` describes, for a file about to leave the trash on
+/// that answer. Its size has to be the same, and then all of it is read where the hash of the
+/// whole file is on record, or its samples where only those are: a date says nothing of a file
+/// rewritten (or rotted) in place, and going into the trash changes none of its contents. With
+/// neither on record, as in reports of before 2026-11-18, its date has to be the same, if one
+/// was written down; nothing is lost by putting a file back where nothing stands.
+pub fn is_open_file_recorded(file: &std::fs::File, known: &Recorded) -> bool {
+    let Ok(meta) = file.metadata() else { return false };
+    if !meta.is_file() || known.size.is_some_and(|size| size != meta.len()) {
+        return false;
+    }
+    match (&known.whole, &known.fingerprint) {
+        (Some(hash), _) => crate::source::whole_hash_of_open(file).is_ok_and(|now| now == *hash),
+        (None, Some(print)) => crate::source::fingerprint_of_open(file).is_ok_and(|now| now == *print),
+        (None, None) => known.modified.is_none_or(|then| crate::source::modified_seconds(&meta).is_some_and(|now| crate::source::same_time(then, now))),
+    }
 }
 
 fn counts_as_recorded(verdict: Verdict, known: &Recorded) -> bool {
@@ -288,7 +304,7 @@ fn counts_as_recorded(verdict: Verdict, known: &Recorded) -> bool {
 }
 
 /// Whether `trashed` is the file `known` describes, in a trash that says it came from
-/// `original`. An info file alone is no proof: it can be stale, its name taken over by a later
+/// `original`, reading as much of it as [`is_open_file_recorded`] does. An info file alone is no proof: it can be stale, its name taken over by a later
 /// file, or planted to pass another file off as the original, which [`restore`] would then
 /// put in the original's place.
 pub fn holds(trashed: &Path, original: &Path, known: &Recorded) -> bool {

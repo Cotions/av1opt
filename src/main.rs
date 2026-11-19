@@ -152,9 +152,11 @@ enum Cmd {
         #[arg(long)]
         allow_zfs: bool,
         /// Take an original whose date changed as the file that was encoded, where its report
-        /// cannot tell (reports written before the whole file was hashed). The risk is yours: if
-        /// the file was in fact completed or rewritten since, its newer contents go to the trash
-        /// in favour of an encode of the older ones. Originals seen to differ are still refused.
+        /// cannot tell (reports written before the whole file was hashed), and one whose report
+        /// holds nothing of it but its size and date (reports written before 2026-11-18). The
+        /// risk is yours: if the file was in fact completed or rewritten since, its newer
+        /// contents go to the trash in favour of an encode of the older ones. Originals seen to
+        /// differ are still refused.
         #[arg(long, conflicts_with = "undo")]
         accept_changed_date: bool,
         /// Follow reports to originals wherever they are, not only in the folders named. A

@@ -594,10 +594,10 @@ fn originals_are_replaced_and_put_back_through_reports_in_history() {
         std::fs::write(d.join("videos/film.mp4"), vec![b's'; 3000]).unwrap();
         for dir in ["out", "elsewhere"] {
             std::fs::create_dir_all(d.join(dir)).unwrap();
-            let r = json!({
+            let r = knowing(&d.join("videos/film.mp4"), json!({
                 "format": 1, "input": d.join("videos/film.mp4"), "output": d.join("out/film.mkv"), "source_bytes": 3000, "output_bytes": 1000,
                 "savings": 0.667, "mode": "whole", "crf": 30.0, "preset": 6, "target_vmaf": 93.0,
-            });
+            }));
             std::fs::write(d.join(dir).join("film.av1opt.json"), r.to_string()).unwrap();
         }
         std::fs::write(d.join("out/film.mkv"), vec![b'o'; 1000]).unwrap();
@@ -727,10 +727,27 @@ fn sha256(p: &Path) -> String {
 /// The line an encode of `source` to `output` leaves, both files being there.
 fn encoded_line(source: &Path, output: &Path) -> Value {
     let size = |p: &Path| std::fs::metadata(p).unwrap().len();
-    json!({
+    knowing(source, json!({
         "format": 1, "time": 1, "event": "encoded", "output": output, "report": output.with_extension("av1opt.json"), "source": source,
         "source_bytes": size(source), "output_bytes": size(output), "output_sha256": sha256(output),
-    })
+    }))
+}
+
+/// `report` with what an encode of today writes down of the original besides its size and the
+/// hash of all of it: its date, and its fingerprint (FNV-1a of its size and of a megabyte at its
+/// start, middle and end, which for a file this small is all of it, three times).
+fn knowing(original: &Path, mut report: Value) -> Value {
+    let bytes = std::fs::read(original).unwrap();
+    assert!(bytes.len() <= 1 << 20, "the fingerprint is worked out here for small files only");
+    let add = |hash: u64, bytes: &[u8]| bytes.iter().fold(hash, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100000001b3));
+    let mut print = add(0xcbf29ce484222325, &(bytes.len() as u64).to_le_bytes());
+    for _ in 0..3 {
+        print = add(print, &bytes);
+    }
+    let time = std::fs::metadata(original).unwrap().modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    report["source_mtime"] = json!(time);
+    report["source_fingerprint"] = json!(format!("{print:016x}"));
+    report
 }
 
 /// A file in the (scratch) trash that says it came from `original`, as a real entry does.
@@ -840,7 +857,7 @@ fn a_recorded_output_swapped_for_another_file_does_not_take_the_originals_place(
         std::fs::create_dir_all(d.join("out")).unwrap();
         std::fs::write(d.join("out/movie.mkv"), vec![b'o'; 1000]).unwrap();
         write_record(d, &[encoded_line(&d.join("videos/movie.mp4"), &d.join("out/movie.mkv"))]);
-        let r = json!({ "format": 1, "input": d.join("videos/movie.mp4"), "output": d.join("out/movie.mkv"), "source_bytes": 3000, "output_bytes": 1000 });
+        let r = knowing(&d.join("videos/movie.mp4"), json!({ "format": 1, "input": d.join("videos/movie.mp4"), "output": d.join("out/movie.mkv"), "source_bytes": 3000, "output_bytes": 1000 }));
         write_report(&d.join("out/movie.av1opt.json"), r);
         // Someone who can write to the output folder changes the file, keeping its size.
         std::fs::write(d.join("out/movie.mkv"), vec![b'e'; 1000]).unwrap();
@@ -874,7 +891,8 @@ fn a_report_rewritten_to_fit_a_changed_original_is_not_believed() {
         write_record(d, &[line]);
         // The time the file has now, so that by the report alone it is the file encoded.
         let now = modified(&d.join("videos/movie.mp4"));
-        let r = json!({ "format": 1, "input": d.join("videos/movie.mp4"), "output": d.join("out/movie.mkv"), "source_bytes": 3000, "output_bytes": 1000, "source_mtime": now });
+        let r = knowing(&d.join("videos/movie.mp4"), json!({ "format": 1, "input": d.join("videos/movie.mp4"), "output": d.join("out/movie.mkv"), "source_bytes": 3000, "output_bytes": 1000 }));
+        assert_eq!(r["source_mtime"], json!(now));
         write_report(&d.join("out/movie.av1opt.json"), r);
     });
     add_history_folder(&s, "out");
@@ -1081,7 +1099,7 @@ fn the_command_follows_a_report_only_into_the_folders_it_was_given() {
     let (original, output, placed) = (dir.join("videos/film.mp4"), dir.join("out/film.mkv"), dir.join("videos/film.mkv"));
     std::fs::write(&original, vec![b's'; 3000]).unwrap();
     std::fs::write(&output, vec![b'o'; 1000]).unwrap();
-    write_report(&dir.join("out/film.av1opt.json"), json!({ "format": 1, "input": original, "output": output, "source_bytes": 3000, "output_bytes": 1000 }));
+    write_report(&dir.join("out/film.av1opt.json"), knowing(&original, json!({ "format": 1, "input": original, "output": output, "source_bytes": 3000, "output_bytes": 1000 })));
     let (out, videos) = (dir.join("out"), dir.join("videos"));
     let apply = std::ffi::OsStr::new("--apply");
     let undo = std::ffi::OsStr::new("--undo");
@@ -1127,7 +1145,7 @@ fn command_folder(name: &str) -> (PathBuf, PathBuf, PathBuf) {
     let (original, output) = (dir.join("videos/film.mp4"), dir.join("out/film.mkv"));
     std::fs::write(&original, vec![b's'; 3000]).unwrap();
     std::fs::write(&output, vec![b'o'; 1000]).unwrap();
-    write_report(&dir.join("out/film.av1opt.json"), json!({ "format": 1, "input": original, "output": output, "source_bytes": 3000, "output_bytes": 1000 }));
+    write_report(&dir.join("out/film.av1opt.json"), knowing(&original, json!({ "format": 1, "input": original, "output": output, "source_bytes": 3000, "output_bytes": 1000 })));
     (dir, original, output)
 }
 
@@ -1156,7 +1174,7 @@ fn outputs_from_before_the_record_are_adopted_and_then_work_on_the_page() {
         std::fs::write(d.join("videos/movie.mp4"), vec![b's'; 3000]).unwrap();
         std::fs::create_dir_all(d.join("out")).unwrap();
         std::fs::write(d.join("out/movie.mkv"), vec![b'o'; 1000]).unwrap();
-        write_report(&d.join("out/movie.av1opt.json"), json!({ "format": 1, "input": d.join("videos/movie.mp4"), "output": d.join("out/movie.mkv"), "source_bytes": 3000, "output_bytes": 1000 }));
+        write_report(&d.join("out/movie.av1opt.json"), knowing(&d.join("videos/movie.mp4"), json!({ "format": 1, "input": d.join("videos/movie.mp4"), "output": d.join("out/movie.mkv"), "source_bytes": 3000, "output_bytes": 1000 })));
     });
     add_history_folder(&s, "out");
     let (original, output, placed, report) = (s.dir.join("videos/movie.mp4"), s.dir.join("out/movie.mkv"), s.dir.join("videos/movie.mkv"), s.dir.join("out/movie.av1opt.json"));
@@ -1201,7 +1219,7 @@ fn an_output_that_already_replaced_its_original_is_adopted_and_can_be_put_back()
         std::fs::write(d.join("videos/movie.mp4"), vec![b's'; 3000]).unwrap();
         std::fs::create_dir_all(d.join("out")).unwrap();
         std::fs::write(d.join("out/movie.mkv"), vec![b'o'; 1000]).unwrap();
-        write_report(&d.join("out/movie.av1opt.json"), json!({ "format": 1, "input": d.join("videos/movie.mp4"), "output": d.join("out/movie.mkv"), "source_bytes": 3000, "output_bytes": 1000 }));
+        write_report(&d.join("out/movie.av1opt.json"), knowing(&d.join("videos/movie.mp4"), json!({ "format": 1, "input": d.join("videos/movie.mp4"), "output": d.join("out/movie.mkv"), "source_bytes": 3000, "output_bytes": 1000 })));
         let run = replace_command(d, &[d.join("out").as_os_str(), d.join("videos").as_os_str(), std::ffi::OsStr::new("--apply")]);
         assert!(run.status.success(), "{}", out_of(&run));
         // As it was before the record began.
@@ -1226,6 +1244,62 @@ fn an_output_that_already_replaced_its_original_is_adopted_and_can_be_put_back()
     let r = s.post("/api/replace", &json!({ "report": report }));
     assert_eq!(r.status, 200, "{}", r.body);
     assert!(placed.exists() && !original.exists());
+}
+
+/// Changes a byte of `file` and gives it its date back, as a drive that rots or a tool that keeps
+/// dates would leave it.
+fn changed_in_place(file: &Path) {
+    let date = std::fs::metadata(file).unwrap().modified().unwrap();
+    let mut bytes = std::fs::read(file).unwrap();
+    bytes[1500] ^= 1;
+    std::fs::write(file, bytes).unwrap();
+    std::fs::File::options().write(true).open(file).unwrap().set_modified(date).unwrap();
+}
+
+#[test]
+fn a_file_changed_in_the_trash_at_its_size_and_date_is_not_put_back() {
+    let s = Server::start("trash-changed", |d| {
+        std::fs::write(d.join("videos/movie.mp4"), vec![b's'; 3000]).unwrap();
+        std::fs::create_dir_all(d.join("out")).unwrap();
+        std::fs::write(d.join("out/movie.mkv"), vec![b'o'; 1000]).unwrap();
+        write_record(d, &[encoded_line(&d.join("videos/movie.mp4"), &d.join("out/movie.mkv"))]);
+        write_report(&d.join("out/movie.av1opt.json"), knowing(&d.join("videos/movie.mp4"), json!({ "format": 1, "input": d.join("videos/movie.mp4"), "output": d.join("out/movie.mkv"), "source_bytes": 3000, "output_bytes": 1000 })));
+    });
+    add_history_folder(&s, "out");
+    let (original, placed, report, trashed) = (s.dir.join("videos/movie.mp4"), s.dir.join("videos/movie.mkv"), s.dir.join("out/movie.av1opt.json"), s.dir.join("data/Trash/files/movie.mp4"));
+    let r = s.post("/api/replace", &json!({ "report": report }));
+    assert_eq!(r.status, 200, "{}", r.body);
+    changed_in_place(&trashed);
+
+    let r = s.post("/api/replace/undo", &json!({ "report": report }));
+    assert!(r.status == 400 && r.body.contains("the file in the trash is not the original"), "{}", r.body);
+    assert!(!original.exists() && placed.exists() && trashed.exists());
+    let (out, videos) = (s.dir.join("out"), s.dir.join("videos"));
+    let run = replace_command(&s.dir, &[out.as_os_str(), videos.as_os_str(), std::ffi::OsStr::new("--undo"), std::ffi::OsStr::new("--apply")]);
+    let said = out_of(&run);
+    assert!(!run.status.success() && said.contains("FAILED") && said.contains("the file in the trash is not the original"), "{said}");
+    assert!(!original.exists() && placed.exists() && trashed.exists());
+}
+
+#[test]
+fn a_report_that_holds_only_sizes_and_dates_sends_nothing_to_the_trash_unless_asked() {
+    let (dir, original, output) = command_folder("ui-replace-sizes-only");
+    let placed = dir.join("videos/film.mkv");
+    let (out, videos, apply) = (dir.join("out"), dir.join("videos"), std::ffi::OsStr::new("--apply"));
+    let time = std::fs::metadata(&original).unwrap().modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    for report in [
+        json!({ "format": 1, "input": original, "output": output, "source_bytes": 3000, "output_bytes": 1000 }),
+        json!({ "format": 1, "input": original, "output": output, "source_bytes": 3000, "output_bytes": 1000, "source_mtime": time }),
+    ] {
+        write_report(&dir.join("out/film.av1opt.json"), report);
+        let run = replace_command(&dir, &[out.as_os_str(), videos.as_os_str(), apply]);
+        let said = out_of(&run);
+        assert!(said.contains("holds only the original's size") && said.contains("--accept-changed-date") && said.contains("0 originals replaced"), "{said}");
+        assert!(original.exists() && output.exists() && !placed.exists());
+    }
+    // Asked for, on the command line.
+    let run = replace_command(&dir, &[out.as_os_str(), videos.as_os_str(), apply, std::ffi::OsStr::new("--accept-changed-date")]);
+    assert!(run.status.success() && placed.exists() && !original.exists(), "{}", out_of(&run));
 }
 
 #[test]
@@ -1272,7 +1346,7 @@ fn reports_that_do_not_check_out_are_not_adopted() {
     std::fs::remove_file(&report).unwrap();
 
     // A file on record is not given another past by a report.
-    write_report(&report, json!({ "format": 1, "input": original, "output": output, "source_bytes": 3000, "output_bytes": 1000 }));
+    write_report(&report, knowing(&original, json!({ "format": 1, "input": original, "output": output, "source_bytes": 3000, "output_bytes": 1000 })));
     let other = dir.join("videos/other.mp4");
     std::fs::write(&other, vec![b't'; 3000]).unwrap();
     write_record(&dir, &[encoded_line(&other, &output)]);

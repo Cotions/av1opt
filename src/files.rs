@@ -384,8 +384,12 @@ pub fn sample_digest(path: &Path, size: u64, chunk: u64) -> std::io::Result<u64>
 /// [`sample_digest`], adding the bytes read to `got` as they arrive, for whoever is watching
 /// whether the drive still answers.
 pub fn sample_digest_counting(path: &Path, size: u64, chunk: u64, got: &AtomicU64) -> std::io::Result<u64> {
+    sample_digest_of(std::fs::File::open(path)?, size, chunk, got)
+}
+
+/// [`sample_digest_counting`] of a file already open.
+pub fn sample_digest_of(mut file: std::fs::File, size: u64, chunk: u64, got: &AtomicU64) -> std::io::Result<u64> {
     let add = |hash: u64, bytes: &[u8]| bytes.iter().fold(hash, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100000001b3));
-    let mut file = std::fs::File::open(path)?;
     let mut hash = add(0xcbf29ce484222325, &size.to_le_bytes());
     let mut buffer = vec![0; (1 << 16).min(chunk as usize)];
     for start in [0, (size / 2).saturating_sub(chunk / 2), size.saturating_sub(chunk)] {

@@ -622,9 +622,11 @@ single output files.
   touched or copied is replaced, while one rewritten, one that cannot be read and one whose
   report has no fingerprint to tell by are refused, unless you say that only the date changed
   (`--accept-changed-date`, or **Replace original…** on the Compare page, which first says what
-  cannot be checked). Originals that are links, reports without
-  full paths (very old ones) and a new name that is already taken in the original's folder are
-  refused too.
+  cannot be checked). A report that holds nothing of the original but its size and date (one
+  written before 2026-11-18) cannot tell it from another file of that size and date, so its
+  original stays where it is whatever its date, unless you say the same. Originals that are
+  links, reports without full paths (very old ones) and a new name that is already taken in the
+  original's folder are refused too.
 - An output with sections removed takes its original's place like any other, and the list
   says so. The removed sections are then only in the original in the trash.
 - A report is a file like any other, so it is only followed where `encode` writes one: next
@@ -657,7 +659,9 @@ single output files.
   time, the output's old path, the place in the trash). `--undo` uses that to put things back
   while the original is still in the trash: the AV1 file returns to the output folder, the
   original to its place. After the trash is emptied there is nothing to undo. The trash has
-  to agree: a file goes back only if the trash's own record says it came from that place.
+  to agree: a file goes back only if the trash's own record says it came from that place, and
+  only if all of it is still what was recorded of the original (read whole against its hash, or
+  against its samples where a report has only those), whatever its date says.
 - Originals on ZFS are left alone unless `--allow-zfs` is given, and are put back there by
   `--undo` only with it.
 - A later `encode` or `scan` over the library sees the replaced files as AV1 and skips them.

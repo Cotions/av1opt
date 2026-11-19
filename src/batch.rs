@@ -748,11 +748,14 @@ fn before_encoding(output: &Path, clash: Option<&Clash>, input: &Path, o: &Optio
     if let Ok(there) = std::fs::symlink_metadata(output)
         && !there.is_file()
     {
-        return Before::Refuse(format!(
-            "{} is {}, not a file av1opt made, so nothing was done; move it away to encode this file there",
-            output.display(),
-            crate::files::kind_of(&there)
-        ));
+        // A link is most often someone's way of keeping the encode elsewhere, and the run never
+        // writes through one: what they can do instead is said.
+        let instead = if there.file_type().is_symlink() {
+            "replace the link with the file it points to, or choose the folder it points into as the output folder"
+        } else {
+            "move it away to encode this file there"
+        };
+        return Before::Refuse(format!("{} is {}, not a file av1opt made, so nothing was done; {instead}", output.display(), crate::files::kind_of(&there)));
     }
     let exists = output.exists();
     let made = if exists { report_input(output) } else { None };
@@ -1313,6 +1316,8 @@ mod tests {
                 let (sum, ends) = source.walk(&out.0, &o);
                 assert_eq!((sum.already_done, sum.failed, sum.ok), (0, 1, 0), "{kind}: {:?}", ends["c.mkv"]);
                 assert!(ends["c.mkv"].1.contains(&format!("c.mp4 is {kind}, not a file av1opt made")), "{:?}", ends["c.mkv"]);
+                let instead = if kind == "a link" { "replace the link with the file it points to" } else { "move it away" };
+                assert!(ends["c.mkv"].1.contains(instead), "{:?}", ends["c.mkv"]);
             }
             assert!(std::fs::symlink_metadata(&output).is_ok_and(|m| !m.is_file()), "{kind} was taken away");
             let _ = std::fs::remove_dir(&output);

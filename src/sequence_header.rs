@@ -52,17 +52,16 @@ impl Bits<'_> {
         Ok(value)
     }
 
-    /// The specification's uvlc(): a count of zeros, a one, then as many bits more.
+    /// The specification's uvlc(): a count of zeros, a one, then as many bits more. From 32
+    /// zeros on, no bits follow the one and the value is 2^32 - 1 (section 4.10.3). The zeros
+    /// are counted only as far as the header goes, so a run of them ends there.
     fn uvlc(&mut self, name: &str) -> Result<u64> {
         let at = self.at;
         let mut zeros = 0;
         while self.read(1)? == 0 {
             zeros += 1;
-            if zeros >= 32 {
-                bail!("the sequence header has a number too long to be one");
-            }
         }
-        let value = self.read(zeros)? + (1u64 << zeros) - 1;
+        let value = if zeros >= 32 { u64::from(u32::MAX) } else { self.read(zeros)? + (1u64 << zeros) - 1 };
         self.fields.push(Field { name: name.into(), value, at, bits: self.at - at });
         Ok(value)
     }
@@ -429,6 +428,23 @@ mod tests {
         assert!(joinable(&h, &with(&both, "color_range", 0)).unwrap_err().contains("range"));
         // Bytes that are no header.
         assert!(joinable(&h, &[0xff]).is_err());
+    }
+
+    #[test]
+    fn a_uvlc_of_32_zeros_or_more_is_the_largest_number_it_holds() {
+        let read = |data: &[u8]| {
+            let mut b = Bits { data, at: 0, fields: Vec::new() };
+            b.uvlc("n").map(|v| (v, b.at))
+        };
+        // 1, 010, 011, 00100: 0, 1, 2, 3.
+        assert_eq!(read(&[0b1010_0110, 0b0100_0000]).unwrap(), (0, 1));
+        assert_eq!(read(&[0b0010_0000]).unwrap(), (3, 5));
+        // 31 zeros: 31 bits follow. 32 zeros and more: none do.
+        assert_eq!(read(&[0, 0, 0, 1, 0xff, 0xff, 0xff, 0xfe]).unwrap(), ((1u64 << 32) - 2, 63));
+        assert_eq!(read(&[0, 0, 0, 0, 0x80]).unwrap(), (u64::from(u32::MAX), 33));
+        assert_eq!(read(&[0, 0, 0, 0, 0, 0x40]).unwrap(), (u64::from(u32::MAX), 42));
+        // A header that ends among the zeros is not read.
+        assert!(read(&[0, 0, 0, 0, 0]).is_err());
     }
 
     #[test]

@@ -679,16 +679,8 @@ single output files.
   replacement and undo. A report on record is followed wherever its original is, because the
   record vouches for that path. Any other report is followed only to originals inside the folders
   you name, so name the originals' folder as well or add `--anywhere`.
-- `av1opt adopt FOLDER... [--apply] [--anywhere]` takes outputs that are not on record, such as
-  those made before it began, onto it. It lists what it would add and writes nothing without
-  `--apply`, and then only to the record. Naming a folder says that you trust the reports in it.
-  As with `replace`, a report is followed only to originals inside the folders you name (or
-  anywhere with `--anywhere`). A report has to hold the original's date and a fingerprint or
-  hash of it, which reports written before 2026-11-18 lack (`replace --accept-changed-date` still
-  replaces those), and a report whose output or original fails the checks above is refused. An
-  output that already replaced its original is taken too if it is where `replace` puts it, in the
-  original's place, and the file in the trash says it came from there and is, read in full, the
-  one the report describes. Nothing is adopted without this command.
+- Outputs that are not on record, such as those made before it began, are taken onto it by
+  [`av1opt adopt`](#adopt).
 - Nothing is deleted and no file is written over. The original goes to the trash of the drive
   it is on (as in the duplicates view), and the space is freed when you empty the trash. If the
   output can't be put in place after that, the original is taken back out of the trash. An
@@ -736,11 +728,18 @@ av1opt adopt ~/av1opt-out            # lists what it would add to the record
 av1opt adopt ~/av1opt-out --apply
 ```
 
-Takes outputs that are not on av1opt's private record, such as those made before it kept one,
-onto it, so that the page can replace them and put their originals back. It reads the reports
-under the folders named and writes only to the record. Naming a folder here says that you
-trust the reports in it, as naming it to `replace` does, and a report is refused unless its
-output and original pass the checks `replace` makes.
+Takes outputs that are not on av1opt's private record (see [replace](#replace)), such as those
+made before it kept one, onto it, so that the page can replace them and put their originals
+back. It reads the reports under the folders named, lists what it would add, and writes
+nothing without `--apply`, and then only to the record; nothing is adopted without this
+command. Naming a folder here says that you trust the reports in it, as naming it to `replace`
+does. As with `replace`, a report is followed only to originals inside the folders you name
+(or anywhere with `--anywhere`). A report has to hold the original's date and a fingerprint or
+hash of it, which reports written before 2026-11-18 lack (`replace --accept-changed-date` still
+replaces those), and a report whose output or original fails the checks `replace` makes is
+refused. An output that already replaced its original is taken too if it is where `replace`
+puts it, in the original's place, and the file in the trash says it came from there and is,
+read in full, the one the report describes.
 
 | Option | Default | What it does |
 |---|---|---|

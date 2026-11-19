@@ -953,6 +953,23 @@ mod tests {
     }
 
     #[test]
+    fn the_record_vouches_only_for_a_pair_as_it_recorded_it() {
+        let s = Scratch::new("vouches");
+        let (source, output) = s.encoded("a");
+        let ledger = load();
+        assert!(ledger.vouches_for(&s.plan(&source, &output)));
+        // The same pair, with a report that tells another story of the original or the output:
+        // `replace` compared the files with the report, not with the record.
+        let other_original = Plan { original: Recorded { fingerprint: Some("other samples".into()), ..known() }, ..s.plan(&source, &output) };
+        assert!(!ledger.vouches_for(&other_original));
+        let other_output = Plan { output_bytes: 999, ..s.plan(&source, &output) };
+        assert!(!ledger.vouches_for(&other_output));
+        let replaced = s.0.join("a.mkv");
+        moved(&source, &s.0.join("Trash/files/a.mp4"), &replaced, &output).unwrap();
+        assert!(!load().vouches_for(&s.plan(&source, &replaced)));
+    }
+
+    #[test]
     fn a_damaged_line_costs_only_that_line() {
         let s = Scratch::new("damaged");
         let (first, first_out) = s.encoded("a");

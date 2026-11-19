@@ -43,6 +43,23 @@ end in `.mp4`, `.mkv`, `.m4v`, `.mov`, `.webm`, `.avi`, `.wmv`, `.flv`, `.ts`, `
 another name when it is named on its own, as long as what is in it is a video format ffmpeg
 reads.
 
+### `scan` options
+
+`av1opt scan <folders or files>...`
+
+| Option | Default | What it does |
+|---|---|---|
+| `--ffprobe` | `ffprobe` (or `AV1OPT_FFPROBE`) | ffprobe program to use. |
+| `-j`, `--jobs` | 6 | ffprobe runs at once (1-64); keep it low on slow or FUSE-mounted drives. |
+| `--min-savings` | 0.15 | Share of its video stream (0-0.95) a file must be expected to save to be a candidate. |
+| `--csv` | none | Write one row per file to this CSV file. |
+| `--top` | 15 | Number of top candidates listed. |
+| `--target-vmaf` | 93 | VMAF target the estimates assume. |
+| `--preset` | 5 | SVT-AV1 preset the time estimates assume. |
+| `--sort` | `savings` | Order of the top list: `savings` or `per-hour` (saving per hour of encoding). |
+| `--hours` | none | Also list the candidates that save the most together in this many hours of encoding. |
+| `--list` | none | Write the paths `--hours` picked to this file, one per line. |
+
 Every run of ffprobe on a video, here and in the other commands, has a time limit that only
 a stalled drive should reach: at most two minutes, and for a run that reads every packet of a
 file, as counting its frames does, a minute more for each gigabyte begun. A file ffprobe could
@@ -137,6 +154,25 @@ credits can show up as *same start* or *same end*; that is why these are listed 
 Compare is one click away. An upscaled copy cannot be told from a sharper one at this cost: it
 counts as the higher resolution, so compare before you trust that reason. Subtitles burnt into
 the picture are not seen either: a copy with them groups with a clean one and can be the spare.
+
+### `dups` options
+
+`av1opt dups <folders or files>...`
+
+| Option | Default | What it does |
+|---|---|---|
+| `-j`, `--jobs` | 6 | Videos read at once (1-64). |
+| `--prefer` | none | Between equally good copies, keep the one under this folder. Repeatable; the first wins. |
+| `--avoid` | none | Never suggest keeping a copy whose path contains this text if another copy exists. Repeatable. |
+| `--tolerance` | 10 | Bits (0-20 of 63) two frame hashes may differ by and still be the same picture. |
+| `--refresh` | off | Fingerprint every video again instead of using the cache. |
+| `--top` | 20 | Number of groups listed. |
+| `--csv` | none | Write one row per file of every group to this CSV file. |
+| `--json` | none | Write the full result to this JSON file. |
+| `--ffmpeg` | `ffmpeg` (or `AV1OPT_FFMPEG`) | ffmpeg program that reads the frames. |
+| `--ffprobe` | `ffprobe` (or `AV1OPT_FFPROBE`) | ffprobe program to use. |
+| `--memory-limit` | `auto` | Memory cap shared by the ffmpeg runs, written as for `encode`. |
+| `--nice` | 10 | CPU priority (0-19; higher leaves more to the desktop). |
 
 ## encode
 
@@ -423,6 +459,44 @@ folder), the file is refused before any sample is cut, with a message to rename 
 `av1opt-log.tsv` writes a tab, a line break or a backslash in a name as `\t`, `\n`, `\r` or
 `\\`, so a name with a tab is not taken for the same name with a space.
 
+### `encode` options
+
+`av1opt encode <folders or files>... -o <folder>`
+
+| Option | Default | What it does |
+|---|---|---|
+| `-o`, `--out-dir` | required | Folder for the finished files and their `.av1opt.json` reports; not on ZFS. |
+| `--container` | `mp4` | `mp4` (plays in browsers; image subtitles dropped) or `mkv` (keeps every subtitle and attachment). |
+| `--target-vmaf` | 93 | Mean VMAF the samples must reach. |
+| `--preset` | 5 | SVT-AV1 preset: lower is slower and smaller. |
+| `--svt-params` | `tune=0` | SVT-AV1 parameters besides the CRF, as `key=value:key=value`. |
+| `--tuned` | off | Use the preset and parameters `bench --save` picked for each resolution class. |
+| `--min-crf` | 20 | Lowest CRF the search tries. |
+| `--max-crf` | 55 | Highest CRF the search tries. |
+| `--samples` | as described under Sample | Number of sample clips the CRF search goes by (1-200). |
+| `--sample-secs` | as described under Sample | Length of a sample clip in seconds (1-60). |
+| `--min-savings` | 0.15 | Skip the full encode when the predicted saving of the video stream is below this (0-0.95). |
+| `--force` | off | Encode even an AV1 file or one below `--min-savings`; skips noted in the log do not count. |
+| `--overwrite` | off | Encode again over an output already there if its report says it was made from this same file. |
+| `--retry-skipped` | off | Try again the files an earlier run skipped. |
+| `--order` | `given` | Which file goes first: `given`, `savings` or `per-hour`. |
+| `--keep-temp` | off | Keep the temporary folder and a per-scene work folder, for debugging. |
+| `--allow-zfs` | off | Allow writing the output to ZFS. |
+| `--ffmpeg` | `ffmpeg` (or `AV1OPT_FFMPEG`) | ffmpeg program to use: a build with libsvtav1 and libvmaf. |
+| `--ffprobe` | `ffprobe` (or `AV1OPT_FFPROBE`) | ffprobe program to use. |
+| `--scenes[=WHEN]` | `off` | A CRF per scene: `off`, `auto` (where the samples differ in quality at one CRF) or `always`; `--scenes` alone is `always`. |
+| `--workers` | 1 | Chunks encoded at once with `--scenes` (1-8); changes nothing for a video encoded in one pass. |
+| `--memory-limit` | `auto` | Memory cap for each ffmpeg run: `auto` (40% of RAM), `none` or `infinity`, a whole number of bytes, or a number with K, M, G, T or %. |
+| `--nice` | 10 | CPU priority for encodes (0-19). |
+| `--strip-metadata` | off | Drop the source's tags and chapters (languages and track names stay). |
+| `--keep-dates` | off | Give each output the source's modification time. |
+| `--meta-preset` | none | Add tags from a preset: `youtube`, `movie`, `tv` or `music`. |
+| `--meta` | none | Set a tag, `KEY=VALUE`, with `{field}` filled from the `.info.json` or the source. Repeatable. |
+| `--no-info-json` | off | Don't read yt-dlp `.info.json` files. |
+| `--fresh-search` | off | Measure every CRF trial again instead of reusing those of earlier runs. |
+| `--audio` | `keep` | `keep` copies AAC, Opus and MP3 and turns the rest into Opus; `shrink` also re-encodes tracks far above what Opus needs. |
+| `--remove` | none | Leave a section out, `START-END`; repeatable, one input file only. |
+
 ## bench
 
 ```
@@ -487,6 +561,42 @@ Read the result with these in mind:
 - Parameter names SVT-AV1 doesn't know are refused up front: ffmpeg would only warn and encode
   without them.
 
+### `bench` options
+
+`av1opt bench <folders or files>...`
+
+| Option | Default | What it does |
+|---|---|---|
+| `--presets` | 4,5,8 | Presets to try. |
+| `--params` | `tune=0`, `tune=1`, `tune=2`, `tune=0` with `qm-min=0`, `tune=0` with variance boost | An SVT-AV1 parameter set to try with every preset. Repeatable. |
+| `--target-vmaf` | 93 | Mean VMAF the samples must reach under every setting. |
+| `--max-videos` | 6 | Most videos used, spread over the folders and resolution classes. |
+| `--samples` | 2 | Sample clips per video (1-8). |
+| `--sample-secs` | 6 | Length of a sample clip in seconds (2-30). |
+| `--min-crf` | 20 | Lowest CRF the search tries. |
+| `--max-crf` | 55 | Highest CRF the search tries. |
+| `--refresh` | off | Measure everything again instead of using remembered sample encodes. |
+| `--work-dir` | `~/.cache/av1opt` | Folder for the lossless sample clips; not on ZFS. |
+| `--save [PICK]` | off | Make `encode --tuned` use the winners: `balanced` (the default pick), `smallest` or `fastest`. |
+| `--csv` | none | Write one row per video and setting to this CSV file. |
+| `--json` | none | Write the full result to this JSON file. |
+| `-j`, `--jobs` | 6 | ffprobe runs at once while the videos are collected (1-64). |
+| `--ffmpeg` | `ffmpeg` (or `AV1OPT_FFMPEG`) | ffmpeg program to use: a build with libsvtav1 and libvmaf. |
+| `--ffprobe` | `ffprobe` (or `AV1OPT_FFPROBE`) | ffprobe program to use. |
+| `--memory-limit` | `auto` | Memory cap for each ffmpeg run, written as for `encode`. |
+| `--nice` | 10 | CPU priority (0-19). |
+
+## tuning
+
+```
+av1opt tuning            # shows the settings `encode --tuned` uses
+av1opt tuning --clear    # forgets them
+```
+
+| Option | Default | What it does |
+|---|---|---|
+| `--clear` | off | Forget the tuned settings `bench --save` saved. |
+
 ## replace
 
 ```
@@ -546,6 +656,35 @@ single output files.
 - Originals on ZFS are left alone unless `--allow-zfs` is given, and are put back there by
   `--undo` only with it.
 - A later `encode` or `scan` over the library sees the replaced files as AV1 and skips them.
+
+### `replace` options
+
+`av1opt replace <paths>...`: output folders, the folders of the originals, reports or output files.
+
+| Option | Default | What it does |
+|---|---|---|
+| `--apply` | off | Do it; without it the command only lists. |
+| `--undo` | off | Take replaced originals back out of the trash and return the AV1 files (acts only with `--apply`). |
+| `--allow-zfs` | off | Also replace originals stored on ZFS. |
+| `--accept-changed-date` | off | Take an original whose date changed as the file that was encoded, where its report cannot tell; originals seen to differ are still refused. |
+| `--anywhere` | off | Follow reports to originals wherever they are, not only in the folders named. |
+
+## adopt
+
+```
+av1opt adopt ~/av1opt-out            # lists what it would add to the record
+av1opt adopt ~/av1opt-out --apply
+```
+
+Takes outputs that are not on av1opt's private record, such as those made before it kept one,
+onto it, so that the page can replace them and put their originals back. It reads the reports
+under the folders named and writes only to the record. Naming a folder here says that you
+trust the reports in it, as naming it to `replace` does, and a report is refused unless its
+output and original pass the checks `replace` makes.
+
+| Option | Default | What it does |
+|---|---|---|
+| `--apply` | off | Write to the record; without it the command only lists. |
 
 ## ui (optional)
 
@@ -669,6 +808,16 @@ What is kept is the file the path leads to, links followed, and that file has to
 `AV1OPT_UI_TOKEN` sets the token (for a desktop wrapper loading the same page);
 `AV1OPT_UI_DEV=<repo>/ui` serves the page files from disk while working on them.
 
+| Option | Default | What it does |
+|---|---|---|
+| `--port` | 0 | Port to listen on; 0 picks a free one. |
+| `--no-open` | off | Don't open a browser; only print the sign-in link. |
+| `--ffmpeg` | `ffmpeg` (or `AV1OPT_FFMPEG`) | ffmpeg program to use, unless Settings name another. |
+| `--ffprobe` | `ffprobe` (or `AV1OPT_FFPROBE`) | ffprobe program to use, unless Settings name another. |
+| `--memory-limit` | `auto` | Memory cap for each ffmpeg run, written as for `encode`. |
+| `--nice` | 10 | CPU priority for encodes (0-19). |
+| `-j`, `--jobs` | 6 | ffprobe runs at once for scans (1-64). |
+
 **Settings** sets the ffmpeg and ffprobe programs (saved in `~/.local/share/av1opt/ui.json`,
 winning over `--ffmpeg` / `AV1OPT_FFMPEG`) and checks them for libsvtav1 and libvmaf. While they
 lack either, a banner says so and queued jobs wait instead of failing. `av1opt encode` runs the
@@ -757,6 +906,24 @@ all the same once the search is done with them.
 checks sign-in, request checks, media access, the job queue, its pause and hours, the duplicate search (and what its
 trash action refuses), replacing an original and putting it back (and which reports may do that)
 and the benchmark's requests and tuned settings over HTTP (no ffmpeg needed).
+
+## Environment
+
+A variable set to nothing counts as not set. Base folders that are not absolute paths are
+ignored, as the XDG specification says, and the default under the home folder is used.
+
+| Variable | What it does |
+|---|---|
+| `AV1OPT_FFMPEG`, `AV1OPT_FFPROBE` | The programs used where `--ffmpeg` and `--ffprobe` are not given. |
+| `AV1OPT_HISTORY` | The file of past encodes the estimates learn from, instead of `~/.local/share/av1opt/history.jsonl`. It has to name a file: a folder is said once and no history is used. |
+| `AV1OPT_DEBUG` | Any value prints every ffmpeg command. |
+| `AV1OPT_UI_TOKEN` | The sign-in token of `av1opt ui`, at least 16 letters or digits, for a wrapper that loads the page itself. |
+| `AV1OPT_UI_EXIT_WITH_STDIN` | `1` makes `av1opt ui` stop when its standard input closes, so that it ends with the program that started it. |
+| `AV1OPT_UI_DEV` | A folder `av1opt ui` reads the page files from instead of those built in, while working on them. |
+| `AV1OPT_PREVIEW_LIMIT_SECS` | Seconds the page lets ffmpeg take to make a playable preview, instead of 600. |
+| `AV1OPT_BIN`, `AV1OPT_UI_ARGS` | For the desktop app: the `av1opt` binary to start, and extra arguments for `av1opt ui`. |
+| `XDG_CACHE_HOME` | Caches (probes, fingerprints, CRF trials, benchmark measurements) go in `av1opt/` in it; default `~/.cache`. |
+| `XDG_DATA_HOME` | The history, the record, the tuned settings and the page's settings go in `av1opt/` in it, and the trash is `Trash/` in it; default `~/.local/share`. |
 
 ## Lessons baked in
 

@@ -117,8 +117,10 @@ enum Cmd {
         /// Write the full result to this JSON file.
         #[arg(long)]
         json: Option<PathBuf>,
+        /// ffmpeg binary that reads the frames
         #[arg(long, env = "AV1OPT_FFMPEG", default_value = "ffmpeg", value_parser = tool_path)]
         ffmpeg: String,
+        /// ffprobe binary to use
         #[arg(long, env = "AV1OPT_FFPROBE", default_value = "ffprobe", value_parser = tool_path)]
         ffprobe: String,
         /// Memory cap shared by the ffmpeg runs, as for `encode`.
@@ -190,6 +192,7 @@ enum Cmd {
         /// tune=0 with variance boost.
         #[arg(long = "params", value_name = "PARAMS", value_parser = search::parse_params)]
         param_sets: Vec<String>,
+        /// Mean VMAF the samples must reach under every setting, as for `encode`
         #[arg(long, default_value_t = 93.0, value_parser = parse_target)]
         target_vmaf: f64,
         /// Use at most this many videos (1 or more), spread over the folders and resolution classes.
@@ -201,8 +204,10 @@ enum Cmd {
         /// Length of a sample clip in seconds (2-30).
         #[arg(long, default_value_t = 6.0, value_parser = parse_bench_sample_secs)]
         sample_secs: f64,
+        /// Lowest CRF the search tries
         #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u8).range(1..=63))]
         min_crf: u8,
+        /// Highest CRF the search tries
         #[arg(long, default_value_t = 55, value_parser = clap::value_parser!(u8).range(1..=63))]
         max_crf: u8,
         /// Measure everything again instead of using remembered sample encodes.
@@ -225,8 +230,10 @@ enum Cmd {
         /// Parallel ffprobe processes while collecting the videos (1-64).
         #[arg(short, long, default_value_t = 6, value_parser = whole::<1, 64>)]
         jobs: usize,
+        /// ffmpeg binary to use: a build with libsvtav1 and libvmaf
         #[arg(long, env = "AV1OPT_FFMPEG", default_value = "ffmpeg", value_parser = tool_path)]
         ffmpeg: String,
+        /// ffprobe binary to use
         #[arg(long, env = "AV1OPT_FFPROBE", default_value = "ffprobe", value_parser = tool_path)]
         ffprobe: String,
         /// Memory cap for each ffmpeg run, as for `encode`.
@@ -252,6 +259,7 @@ enum Cmd {
         /// Folder for finished files (plus a .av1opt.json report each). Must not be on ZFS.
         #[arg(short, long)]
         out_dir: PathBuf,
+        /// Container of the outputs
         #[arg(long, value_enum, default_value_t = encode::Container::Mp4)]
         container: encode::Container,
         /// Mean VMAF the samples must reach. 93 is hard to tell apart from an already-lossy source.
@@ -268,8 +276,10 @@ enum Cmd {
         /// resolution class; --preset and --svt-params apply to classes without a pick.
         #[arg(long)]
         tuned: bool,
+        /// Lowest CRF the search tries
         #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u8).range(1..=63))]
         min_crf: u8,
+        /// Highest CRF the search tries
         #[arg(long, default_value_t = 55, value_parser = clap::value_parser!(u8).range(1..=63))]
         max_crf: u8,
         /// Number of sample clips the CRF search goes by. Without it and --sample-secs: 1 s
@@ -306,8 +316,10 @@ enum Cmd {
         /// Allow writing output to ZFS.
         #[arg(long)]
         allow_zfs: bool,
+        /// ffmpeg binary to use: a build with libsvtav1 and libvmaf
         #[arg(long, env = "AV1OPT_FFMPEG", default_value = "ffmpeg", value_parser = tool_path)]
         ffmpeg: String,
+        /// ffprobe binary to use
         #[arg(long, env = "AV1OPT_FFPROBE", default_value = "ffprobe", value_parser = tool_path)]
         ffprobe: String,
         /// Choose the CRF per scene: split at scene changes, target VMAF for each chunk, then join.
@@ -363,6 +375,7 @@ enum Cmd {
     /// JSON line per CRF. The CRF search is tested against curves measured this way.
     #[command(hide = true)]
     Curve {
+        /// Video to measure
         input: PathBuf,
         /// CRFs to measure: ranges and single values, e.g. 24-40 or 28,28.25,28.5.
         #[arg(long, default_value = "24-40")]
@@ -370,19 +383,25 @@ enum Cmd {
         /// Folder for the sample clips (removed afterwards).
         #[arg(long)]
         tmp: PathBuf,
+        /// SVT-AV1 preset of the sample encodes
         #[arg(long, default_value_t = search::DEFAULT_PRESET, value_parser = clap::value_parser!(u8).range(0..=13))]
         preset: u8,
+        /// SVT-AV1 parameters of the sample encodes, as for `encode`
         #[arg(long, default_value = search::DEFAULT_PARAMS, value_parser = search::parse_params)]
         svt_params: String,
         /// Number of sample clips (1-200). Without it: as many as `encode` would take.
         #[arg(long, value_parser = whole::<1, 200>)]
         samples: Option<usize>,
+        /// Length of a sample clip in seconds (1-60)
         #[arg(long, default_value_t = search::SAMPLE_SECS, value_parser = parse_sample_secs)]
         sample_secs: f64,
+        /// ffmpeg binary to use: a build with libsvtav1 and libvmaf
         #[arg(long, env = "AV1OPT_FFMPEG", default_value = "ffmpeg", value_parser = tool_path)]
         ffmpeg: String,
+        /// ffprobe binary to use
         #[arg(long, env = "AV1OPT_FFPROBE", default_value = "ffprobe", value_parser = tool_path)]
         ffprobe: String,
+        /// Memory cap for each ffmpeg run, as for `encode`
         #[arg(long, default_value = "auto", value_parser = parse_memory)]
         memory_limit: String,
     },
@@ -396,8 +415,10 @@ enum Cmd {
         /// Don't open a browser; just print the sign-in link.
         #[arg(long)]
         no_open: bool,
+        /// ffmpeg binary to use, unless the page's settings name another
         #[arg(long, env = "AV1OPT_FFMPEG", default_value = "ffmpeg", value_parser = tool_path)]
         ffmpeg: String,
+        /// ffprobe binary to use, unless the page's settings name another
         #[arg(long, env = "AV1OPT_FFPROBE", default_value = "ffprobe", value_parser = tool_path)]
         ffprobe: String,
         /// Memory cap for each ffmpeg run, as for `encode`.

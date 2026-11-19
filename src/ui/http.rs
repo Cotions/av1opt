@@ -342,7 +342,8 @@ fn media(app: &App, req: Request, path: PathBuf) {
     let Some(path) = app.is_allowed(&path) else {
         return reply(req, 403, "text/plain", library::NOT_LISTED);
     };
-    let Ok(mut f) = std::fs::File::open(&path) else { return reply(req, 404, "text/plain", "cannot open") };
+    // Served from the very file that was checked, or not at all.
+    let Some(mut f) = super::open_as_checked(&path, &|| {}) else { return reply(req, 404, "text/plain", "cannot open") };
     let len = f.metadata().map_or(0, |m| m.len());
     let range = get_header(&req, "Range").and_then(|r| parse_range(r, len));
     let ctype = content_type(&path);

@@ -1028,7 +1028,9 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     }
     let output_bytes = std::fs::metadata(&output)?.len();
     let abs_input = std::fs::canonicalize(input)?;
-    let abs_output = std::fs::canonicalize(&output)?;
+    // From the folder and the name this run wrote to: the name itself can have been made a link
+    // since, and what the record says of it is what the page serves and moves.
+    let abs_output = std::fs::canonicalize(out_dir)?.join(output.file_name().context("the output has no file name")?);
     let report = Report {
         format: REPORT_FORMAT,
         av1opt: env!("CARGO_PKG_VERSION"),

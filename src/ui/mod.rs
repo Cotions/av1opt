@@ -122,6 +122,24 @@ pub struct App {
     _only_server: Option<std::fs::File>,
 }
 
+/// Opens `checked`, a path with its links resolved that [`App::is_allowed`] let through, and only that: what
+/// was checked is a name, and whoever can write to a folder on its way can put a link there once
+/// the check is done. The file is opened once, a link at its end not followed, and kept only if
+/// it is a plain file that the name still leads to, and whose own path is the one checked.
+/// `after_check` is called before it is opened.
+pub(crate) fn open_as_checked(checked: &Path, after_check: &dyn Fn()) -> Option<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    after_check();
+    let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(checked).ok()?;
+    let opened = file.metadata().ok()?;
+    let named = std::fs::symlink_metadata(checked).ok()?;
+    // A link put in place of a folder on the way is followed by the open; the path the kernel
+    // has for what was opened shows it.
+    let path_of_opened = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()?;
+    (opened.is_file() && (opened.dev(), opened.ino()) == (named.dev(), named.ino()) && path_of_opened == checked).then_some(file)
+}
+
 /// `p`, if the page can be told it. What goes to the page is JSON, which holds text and has no
 /// way to write other bytes: a request can only arrive at such a path through a link, and
 /// answering it would end the thread that answers, with whatever lock it holds.
@@ -574,6 +592,39 @@ pub fn err_json(e: &anyhow::Error) -> Value {
 mod save_tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn a_link_put_in_place_after_the_check_is_not_opened() {
+        let dir = std::env::temp_dir().join(format!("av1opt-media-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for folder in ["videos", "private"] {
+            std::fs::create_dir_all(dir.join(folder)).unwrap();
+        }
+        std::fs::write(dir.join("videos/a.mkv"), b"video").unwrap();
+        std::fs::write(dir.join("private/a.mkv"), b"secret").unwrap();
+        let checked = std::fs::canonicalize(dir.join("videos/a.mkv")).unwrap();
+        let read = |f: std::fs::File| std::io::read_to_string(f).unwrap();
+        assert_eq!(open_as_checked(&checked, &|| {}).map(read).as_deref(), Some("video"));
+        // The file itself, swapped for a link once it was checked.
+        let swap_file = || {
+            std::fs::rename(&checked, dir.join("videos/a.real")).unwrap();
+            std::os::unix::fs::symlink(dir.join("private/a.mkv"), &checked).unwrap();
+        };
+        assert!(open_as_checked(&checked, &swap_file).is_none());
+        std::fs::remove_file(&checked).unwrap();
+        std::fs::rename(dir.join("videos/a.real"), &checked).unwrap();
+        // Its folder, swapped for a link to a folder holding a file of that name.
+        let swap_folder = || {
+            std::fs::rename(dir.join("videos"), dir.join("videos.real")).unwrap();
+            std::os::unix::fs::symlink(dir.join("private"), dir.join("videos")).unwrap();
+        };
+        assert!(open_as_checked(&checked, &swap_folder).is_none());
+        // Nor is anything but a plain file.
+        std::fs::remove_file(dir.join("videos")).unwrap();
+        std::fs::create_dir_all(dir.join("videos/b.mkv")).unwrap();
+        assert!(open_as_checked(&std::fs::canonicalize(dir.join("videos/b.mkv")).unwrap(), &|| {}).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_failing_save_is_said_once_until_saving_works_again() {

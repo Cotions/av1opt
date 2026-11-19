@@ -528,9 +528,13 @@ pub fn print(r: &Report) {
 }
 
 /// One row per video and setting.
-pub fn write_csv(r: &Report, path: &Path) -> Result<()> {
-    let mut w = csv::Writer::from_path(path)?;
-    w.write_record(["path", "class", "width", "height", "preset", "params", "crf", "kbps", "encode_secs_per_video_sec", "vmaf", "capped", "trials", "error"])?;
+const CSV_COLUMNS: &[&str] = &["path", "class", "width", "height", "preset", "params", "crf", "kbps", "encode_secs_per_video_sec", "vmaf", "capped", "trials", "error"];
+/// The CSV of a benchmark, as a report file.
+pub const CSV: crate::report_file::Kind = crate::report_file::Kind::Csv(CSV_COLUMNS);
+
+pub fn write_csv(r: &Report, path: &Path, given: &[PathBuf]) -> Result<()> {
+    let mut w = csv::Writer::from_writer(Vec::new());
+    w.write_record(CSV_COLUMNS)?;
     for v in &r.videos {
         for (cell, c) in v.cells.iter().zip(&r.configs) {
             let p = cell.point;
@@ -552,8 +556,7 @@ pub fn write_csv(r: &Report, path: &Path) -> Result<()> {
             ])?;
         }
     }
-    w.flush()?;
-    Ok(())
+    crate::report_file::write_csv(w, path, CSV, given)
 }
 
 #[cfg(test)]
@@ -731,7 +734,7 @@ mod tests {
         let mut b = video(Class::Sd, &[None]);
         b.error = Some("no clips\nmore".into());
         let file = dir.join("r.csv");
-        write_csv(&report(vec![a, b], settings(2)), &file).unwrap();
+        write_csv(&report(vec![a, b], settings(2)), &file, &[]).unwrap();
         let rows: Vec<Vec<String>> = csv::ReaderBuilder::new().has_headers(false).from_path(&file).unwrap().records().map(|r| r.unwrap().iter().map(String::from).collect()).collect();
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(rows.len(), 4, "{rows:?}");

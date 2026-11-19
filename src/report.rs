@@ -2,9 +2,18 @@
 
 use crate::scan::FileResult;
 use crate::estimate::{TimeModel, Verdict, bits_per_pixel};
+use crate::report_file::{self, Kind};
 use anyhow::Result;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+const CSV_COLUMNS: &[&str] = &[
+    "path", "verdict", "size_bytes", "est_size_likely", "est_size_low", "est_size_high", "codec", "width",
+    "height", "fps", "duration_s", "video_mbps", "bpp", "pix_fmt", "hdr", "interlaced", "audio_streams",
+    "subtitle_streams", "error", "est_encode_secs",
+];
+/// The CSV of a scan, as a report file.
+pub const CSV: Kind = Kind::Csv(CSV_COLUMNS);
 
 /// Size with a unit that keeps small folders readable (GB for big totals, MB below 1 GB).
 pub fn gb(bytes: f64) -> String {
@@ -195,13 +204,9 @@ pub fn print_pick(picked: &[&FileResult], hours: f64, results: &[FileResult], ti
     }
 }
 
-pub fn write_csv(results: &[FileResult], path: &Path, time: &TimeModel) -> Result<()> {
-    let mut w = csv::Writer::from_path(path)?;
-    w.write_record([
-        "path", "verdict", "size_bytes", "est_size_likely", "est_size_low", "est_size_high", "codec", "width",
-        "height", "fps", "duration_s", "video_mbps", "bpp", "pix_fmt", "hdr", "interlaced", "audio_streams",
-        "subtitle_streams", "error", "est_encode_secs",
-    ])?;
+pub fn write_csv(results: &[FileResult], path: &Path, time: &TimeModel, given: &[PathBuf]) -> Result<()> {
+    let mut w = csv::Writer::from_writer(Vec::new());
+    w.write_record(CSV_COLUMNS)?;
     for r in results {
         let mut row = vec![
             r.path.display().to_string(),
@@ -234,8 +239,7 @@ pub fn write_csv(results: &[FileResult], path: &Path, time: &TimeModel) -> Resul
         row.push(r.info.as_ref().map(|i| time.secs(i)).filter(|s| *s > 0.0).map_or(String::new(), |s| format!("{s:.0}")));
         w.write_record(&row)?;
     }
-    w.flush()?;
-    Ok(())
+    report_file::write_csv(w, path, CSV, given)
 }
 
 #[cfg(test)]

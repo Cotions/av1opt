@@ -17,6 +17,7 @@ mod probe;
 mod repair;
 mod replace;
 mod report;
+mod report_file;
 mod scan;
 mod scenes;
 mod search;
@@ -30,6 +31,7 @@ mod ui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use report_file::Kind;
 use scan::is_video;
 use std::path::{Path, PathBuf};
 
@@ -435,6 +437,7 @@ fn main() -> Result<()> {
         Cmd::Dups { paths, jobs, prefer, avoid, tolerance, refresh, top, csv, json, ffmpeg, ffprobe, memory_limit, nice } => {
             let abs = |p: &PathBuf| std::path::absolute(p).unwrap_or_else(|_| p.clone());
             let paths: Vec<PathBuf> = paths.iter().map(abs).collect();
+            check_reports(&[(csv.as_deref(), dups::CSV), (json.as_deref(), Kind::Json)], &paths)?;
             // SAFETY: plain syscall on our own process; children inherit the priority.
             unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) };
             let jobs = jobs.clamp(1, 64);
@@ -456,11 +459,11 @@ fn main() -> Result<()> {
             // The files first: printing ends the program once nobody reads standard output.
             let written = (|| -> Result<()> {
                 if let Some(csv) = csv {
-                    dups::write_csv(&report, &csv)?;
+                    dups::write_csv(&report, &csv, &paths)?;
                     eprintln!("wrote {}", csv.display());
                 }
                 if let Some(json) = json {
-                    std::fs::write(&json, serde_json::to_vec_pretty(&report)?)?;
+                    report_file::write(&json, Kind::Json, &paths, &serde_json::to_vec_pretty(&report)?)?;
                     eprintln!("wrote {}", json.display());
                 }
                 Ok(())
@@ -477,6 +480,7 @@ fn main() -> Result<()> {
             jobs, ffmpeg, ffprobe, memory_limit, nice,
         } => {
             let paths: Vec<PathBuf> = paths.iter().map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone())).collect();
+            check_reports(&[(csv.as_deref(), bench::CSV), (json.as_deref(), Kind::Json)], &paths)?;
             let param_sets = if param_sets.is_empty() { bench::DEFAULT_PARAM_SETS.map(String::from).to_vec() } else { param_sets };
             let configs = bench::matrix(&presets, &param_sets);
             // SAFETY: plain syscall on our own process; children inherit the priority.
@@ -523,11 +527,11 @@ fn main() -> Result<()> {
             let mut said = Vec::new();
             let written = (|| -> Result<()> {
                 if let Some(csv) = csv {
-                    bench::write_csv(&report, &csv)?;
+                    bench::write_csv(&report, &csv, &paths)?;
                     eprintln!("wrote {}", csv.display());
                 }
                 if let Some(json) = json {
-                    std::fs::write(&json, serde_json::to_vec_pretty(&report)?)?;
+                    report_file::write(&json, Kind::Json, &paths, &serde_json::to_vec_pretty(&report)?)?;
                     eprintln!("wrote {}", json.display());
                 }
                 if let Some(pick) = save {
@@ -759,6 +763,12 @@ fn order_jobs(jobs: &mut [batch::Job], inputs: &[PathBuf], ffprobe: &str, o: &en
     Ok(())
 }
 
+/// Refuses, before the work, the report files named that could not be written after it.
+fn check_reports(named: &[(Option<&Path>, Kind)], given: &[PathBuf]) -> Result<()> {
+    let reports: Vec<(&Path, Kind)> = named.iter().filter_map(|&(path, kind)| Some((path?, kind))).collect();
+    report_file::check_all(&reports, given)
+}
+
 fn positive_hours(s: &str) -> Result<f64, String> {
     match s.parse::<f64>() {
         Ok(h) if h > 0.0 && h <= 10_000.0 => Ok(h),
@@ -779,6 +789,8 @@ fn scan(
     sort: report::TopBy,
     pick: Option<(f64, Option<PathBuf>)>,
 ) -> Result<()> {
+    let list = pick.as_ref().and_then(|(_, list)| list.as_deref());
+    check_reports(&[(list, Kind::List), (csv, report::CSV)], paths)?;
     let progress = |n: usize, total: usize| {
         if n == 0 {
             eprintln!("found {total} video files");
@@ -813,11 +825,11 @@ fn scan(
                     None => eprintln!("warning: left out of {}: {}", list.display(), r.path.display()),
                 }
             }
-            std::fs::write(list, text).map_err(|e| anyhow::anyhow!("writing {}: {e}", list.display()))?;
+            report_file::write(list, Kind::List, paths, text.as_bytes())?;
             eprintln!("wrote {}", list.display());
         }
         if let Some(csv) = csv {
-            report::write_csv(&results, csv, time)?;
+            report::write_csv(&results, csv, time, paths)?;
             eprintln!("wrote {}", csv.display());
         }
         Ok(())

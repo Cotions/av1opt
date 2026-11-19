@@ -428,9 +428,13 @@ fn role(r: &Report, g: &Group, k: usize) -> &'static str {
     }
 }
 
-pub fn write_csv(r: &Report, path: &Path) -> Result<()> {
-    let mut w = csv::Writer::from_path(path)?;
-    w.write_record(["group", "kind", "match", "role", "reason", "path", "size_bytes", "codec", "width", "height", "duration_s", "video_mbps", "identical"])?;
+const CSV_COLUMNS: &[&str] = &["group", "kind", "match", "role", "reason", "path", "size_bytes", "codec", "width", "height", "duration_s", "video_mbps", "identical"];
+/// The CSV of a duplicate search, as a report file.
+pub const CSV: crate::report_file::Kind = crate::report_file::Kind::Csv(CSV_COLUMNS);
+
+pub fn write_csv(r: &Report, path: &Path, given: &[PathBuf]) -> Result<()> {
+    let mut w = csv::Writer::from_writer(Vec::new());
+    w.write_record(CSV_COLUMNS)?;
     for (n, g) in r.groups.iter().enumerate() {
         for (k, &i) in g.members.iter().enumerate() {
             let f = &r.files[i];
@@ -458,8 +462,7 @@ pub fn write_csv(r: &Report, path: &Path) -> Result<()> {
         row[5] = u.path.display().to_string();
         w.write_record(&row)?;
     }
-    w.flush()?;
-    Ok(())
+    crate::report_file::write_csv(w, path, CSV, given)
 }
 
 #[cfg(test)]
@@ -547,7 +550,7 @@ mod tests {
         let path = dir.join("dups.csv");
         let (mut r, _) = report(Kind::Same, &[10.0, 10.0]);
         r.unreadable.push(Unreadable { path: "/v/bad.mp4".into(), error: "first line\nmoov atom not found\n".into() });
-        write_csv(&r, &path).unwrap();
+        write_csv(&r, &path, &[]).unwrap();
         let rows: Vec<csv::StringRecord> = csv::Reader::from_path(&path).unwrap().records().map(Result::unwrap).collect();
         let head = csv::Reader::from_path(&path).unwrap().headers().unwrap().clone();
         std::fs::remove_dir_all(&dir).unwrap();

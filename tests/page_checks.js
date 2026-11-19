@@ -101,6 +101,7 @@ function openPage(answer, stored = {}) {
   const respond = async (path, options = {}) => {
     const body = options.body ? JSON.parse(options.body) : undefined;
     if (body) page.posts.push({ path, body });
+    if (page.signedOut) return { ok: false, status: 401, statusText: "Unauthorized", headers: { get: () => "text/html" }, text: async () => "<p>Not signed in</p>" };
     const reply = (path === "/api/state" ? state : await answer(path, body)) || {};
     return { ok: !reply.refuse, status: reply.refuse ? 400 : 200, statusText: "", headers: { get: () => "application/json" }, text: async () => JSON.stringify(reply.refuse ? { error: reply.refuse } : reply) };
   };
@@ -109,7 +110,7 @@ function openPage(answer, stored = {}) {
     fetch: respond,
     location: { hash: "#/none", href: "", reload() {} },
     localStorage: { getItem: (k) => (k in page.stored ? page.stored[k] : null), setItem: (k, v) => { page.stored[k] = v; }, removeItem: (k) => { delete page.stored[k]; } },
-    EventSource: class { addEventListener() {} close() {} },
+    EventSource: class { static CLOSED = 2; constructor() { page.stream = this; } addEventListener() {} close() {} },
     ResizeObserver: class { observe() {} disconnect() {} },
     matchMedia: () => ({ matches: false, addEventListener() {} }),
     navigator: {},
@@ -358,6 +359,59 @@ checks["sections: with the length unknown an end can stay open, and a typed one 
   const last = box.querySelectorAll(".cut-row").pop().querySelectorAll("input");
   last[1].value = "0:01";
   assert.throws(() => page.run("__cuts.get()"), /not a valid range/);
+};
+
+const hello = (page, server) => page.stream.onmessage({ data: JSON.stringify({ kind: "hello", server }) });
+
+checks["restart: what the page holds from an earlier run of the server is dropped"] = async () => {
+  const page = openPage(() => ({ runs: [] }));
+  await settled();
+  hello(page, "first");
+  await settled();
+  page.run(`lastScanId = 4; lastDupId = 7; dupMarks.add("/v/a.mp4"); watchBusy.add("1:look")`);
+  page.context.__closed = page.run("confirmDialog({ title: 'Sure?', body: [], action: 'Yes' })");
+  hello(page, "first");
+  assert.strictEqual(page.run("lastDupId"), 7, "the same run keeps them");
+  assert.strictEqual(page.run("openDialogs.size"), 1);
+  hello(page, "second");
+  await settled();
+  assert.deepStrictEqual(JSON.parse(page.run("JSON.stringify([lastScanId, lastDupId, dupMarks.size, watchBusy.size, openDialogs.size])")), [null, null, 0, 0, 0]);
+  assert.strictEqual(await page.context.__closed, false);
+  assert(lastToast(page).includes("started again"), lastToast(page));
+};
+checks["reconnecting: views are told, and the state is read again"] = async () => {
+  const page = openPage(() => ({}));
+  await settled();
+  hello(page, "one");
+  page.run(`STATE = { stale: true, tools: {} }; var told = []; onEvent((m) => told.push(m.kind))`);
+  page.stream.onerror();
+  hello(page, "one");
+  await settled();
+  assert.deepStrictEqual(Array.from(page.run("told")), ["reopened"]);
+  assert.strictEqual(page.run("STATE.stale"), undefined);
+};
+checks["sign-in lost: the stream refused with 401 says so and is not tried again"] = async () => {
+  const page = openPage(() => ({}));
+  await settled();
+  const stream = page.stream;
+  page.signedOut = true;
+  stream.readyState = 2;
+  stream.onerror();
+  await settled();
+  const banner = page.document.getElementById("banner");
+  assert(!banner.hidden && banner.textContent.includes("link av1opt printed"), banner.textContent);
+  assert.strictEqual(page.document.getElementById("conn").title, "Not signed in");
+  assert.strictEqual(page.stream, stream);
+};
+checks["routes: names every object inherits are no views"] = async () => {
+  const page = openPage(() => ({}));
+  await settled();
+  for (const name of ["constructor", "valueOf", "toString", "__proto__"]) page.run(`location.hash = "#/${name}"; route(); route()`);
+};
+checks["remembering: full storage neither stops anything nor throws"] = async () => {
+  const page = openPage(() => ({}));
+  await settled();
+  page.run(`localStorage.setItem = () => { throw new Error("full"); }; prefs.set("x", 1)`);
 };
 
 (async () => {

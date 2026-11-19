@@ -89,6 +89,9 @@ pub struct Settings {
 pub struct App {
     pub cfg: Config,
     pub token: String,
+    /// New at every start. Numbers of jobs and searches begin again with the server, so a page
+    /// that stayed open needs this to know that the ones it holds mean nothing any more.
+    pub start_id: String,
     pub port: u16,
     pub settings: Mutex<Settings>,
     /// Held from taking the settings to having written them, so that of two saves the later
@@ -412,6 +415,7 @@ pub fn run(cfg: Config) -> Result<()> {
     let app = Arc::new(App {
         cfg,
         token,
+        start_id: random_hex(8)?,
         port,
         settings: Mutex::new(settings),
         settings_save: Mutex::new(()),

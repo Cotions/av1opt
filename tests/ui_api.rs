@@ -2462,6 +2462,31 @@ fn watched_folders_are_kept_looked_at_and_never_queue_what_was_there() {
     assert_eq!(state["folders"], json!({}));
 }
 
+/// The first message of the event stream, which stays open.
+fn first_event(s: &Server) -> Value {
+    use std::io::{BufRead, Write};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", s.port)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    write!(stream, "GET /api/events HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nCookie: {}\r\n\r\n", s.port, s.cookie()).unwrap();
+    let line = std::io::BufReader::new(stream).lines().map(Result::unwrap).find(|l| l.starts_with("data: ")).unwrap();
+    serde_json::from_str(&line["data: ".len()..]).unwrap()
+}
+
+#[test]
+fn each_start_of_the_server_has_an_id_of_its_own() {
+    let mut s = Server::start("start-id", |_| {});
+    let id = s.get("/api/state").json()["server"].as_str().unwrap().to_string();
+    assert_eq!(id.len(), 16, "{id}");
+    assert_eq!(first_event(&s), json!({ "kind": "hello", "server": id }));
+    assert_eq!(s.get("/api/state").json()["server"], id.as_str(), "it stays for as long as the server runs");
+
+    assert!(s.terminate());
+    let again = Server::start_in(&s.dir, "false", "false");
+    let new = again.get("/api/state").json()["server"].as_str().unwrap().to_string();
+    assert_ne!(new, id);
+    assert_eq!(first_event(&again)["server"], new.as_str());
+}
+
 #[test]
 fn a_request_too_large_is_refused_with_how_much_fits() {
     let s = Server::start("big-body", |_| {});

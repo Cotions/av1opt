@@ -35,6 +35,7 @@ async function api(path, body) {
   const text = await r.text().catch(() => "");
   let j = null;
   try { j = JSON.parse(text); } catch { /* not JSON */ }
+  if (r.status === 401) signedOut();
   if (!r.ok) throw new Error(refusalText(r.status, r.statusText, r.headers.get("Content-Type"), text, j));
   return j;
 }
@@ -203,10 +204,15 @@ function readNumbers(fields) {
   return numbers;
 }
 
+// What cancels each open dialog, the oldest first. One that is waiting for an answer stays.
+const openDialogs = new Set();
+function closeDialogs() { for (const cancel of [...openDialogs].reverse()) cancel(); }
+
 // Keeps the keyboard in an open dialog: focus moves into it (to `first`, else to the dialog
 // itself), Tab stays inside, and Escape calls `onEscape`. Only the dialog on top listens.
 // Returns what to call when the dialog closes: focus goes back to where it was.
 function holdFocus(bg, onEscape, first) {
+  openDialogs.add(onEscape);
   const opener = document.activeElement;
   const box = bg.firstElementChild;
   box.setAttribute("tabindex", "-1");
@@ -227,6 +233,7 @@ function holdFocus(bg, onEscape, first) {
   return () => {
     if (released) return;
     released = true;
+    openDialogs.delete(onEscape);
     document.removeEventListener("keydown", onKey);
     if (opener && opener.isConnected && opener !== document.body) opener.focus();
   };
@@ -244,7 +251,8 @@ function isVideoFile(p, files) {
 
 const prefs = {
   get(k, d) { try { const v = localStorage.getItem("av1opt." + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
-  set(k, v) { localStorage.setItem("av1opt." + k, JSON.stringify(v)); },
+  // Storage can be full or blocked. What was asked for goes on; it is only not remembered.
+  set(k, v) { try { localStorage.setItem("av1opt." + k, JSON.stringify(v)); } catch { /* see above */ } },
 };
 
 // ---------- live events ----------
@@ -252,22 +260,64 @@ const prefs = {
 const listeners = new Set();
 function onEvent(fn) { listeners.add(fn); return () => listeners.delete(fn); }
 
+// Which run of the server this page has been talking to. Numbers of jobs and searches begin
+// again with each run, so what the page holds from an earlier one must not be used.
+let serverId = null;
+function sameServer(id) {
+  if (id == null || id === serverId) return true;
+  const first = serverId == null;
+  serverId = id;
+  return first;
+}
+function serverRestarted() {
+  lastScanId = lastDupId = null;
+  dupMarks.clear();
+  pendingTrashFailures = null;
+  watchBusy.clear();
+  loadState().catch(() => {});
+  refreshBadge();
+  route();
+  toast("av1opt was started again: this page now shows what it knows");
+}
+
+// The session is gone: nothing works until the page is opened from a new link.
+let isSignedOut = false;
+function signedOut() {
+  if (isSignedOut) return;
+  isSignedOut = true;
+  const dot = document.getElementById("conn");
+  dot.classList.remove("on");
+  dot.title = "Not signed in";
+  renderBanner();
+}
+
+// Events sent while the connection was down are lost: views are told when it is back.
+let eventsDropped = false;
 function connect() {
   const es = new EventSource("/api/events");
   const dot = document.getElementById("conn");
-  // Events sent while the connection was down are lost: views are told when it is back.
-  let dropped = false;
-  es.onopen = () => {
-    dot.classList.add("on"); dot.title = "Live updates connected";
-    if (dropped) { dropped = false; for (const fn of [...listeners]) fn({ kind: "reopened" }); }
+  es.onopen = () => { dot.classList.add("on"); dot.title = "Live updates connected"; };
+  es.onerror = () => {
+    dot.classList.remove("on"); dot.title = "Reconnecting…"; eventsDropped = true;
+    // The browser tries again after a lost connection, but not after a refusal.
+    if (es.readyState === EventSource.CLOSED) streamRefused();
   };
-  es.onerror = () => { dot.classList.remove("on"); dot.title = "Reconnecting…"; dropped = true; };
   es.onmessage = (m) => {
     let msg;
     try { msg = JSON.parse(m.data); } catch { return; }
-    for (const fn of [...listeners]) fn(msg);
+    if (msg.kind !== "hello") { for (const fn of [...listeners]) fn(msg); return; }
+    const dropped = eventsDropped;
+    eventsDropped = false;
+    if (!sameServer(msg.server)) serverRestarted();
+    else if (dropped) for (const fn of [...listeners]) fn({ kind: "reopened" });
   };
 }
+async function streamRefused() {
+  let status = 0;
+  try { status = (await fetch("/api/state")).status; } catch { /* not reachable */ }
+  if (status === 401) signedOut(); else setTimeout(connect, EVENTS_RETRY_MS);
+}
+const EVENTS_RETRY_MS = 3000;
 
 // Queue badge: number of queued + running jobs.
 async function refreshBadge() {
@@ -299,7 +349,18 @@ onEvent((m) => {
 // ---------- state ----------
 
 let STATE = null;
-async function loadState() { STATE = await api("/api/state"); renderBanner(); return STATE; }
+const askState = newestOnly();
+async function loadState() {
+  const isNewest = askState();
+  const state = await api("/api/state");
+  if (!isNewest()) return STATE;
+  STATE = state;
+  renderBanner();
+  if (!sameServer(state.server)) serverRestarted();
+  return STATE;
+}
+// Notices, tool problems and defaults can have changed while the connection was down.
+onEvent((m) => { if (m.kind === "reopened") loadState().catch(() => {}); });
 
 // Shown on every view while encodes cannot run (usually: ffmpeg without libvmaf), and for what
 // went wrong at start (a settings file or saved queue that could not be read) until dismissed.
@@ -308,8 +369,9 @@ function renderBanner() {
   const b = document.getElementById("banner");
   const p = STATE && STATE.tools && STATE.tools.problem;
   const notices = ((STATE && STATE.notices) || []).filter((n) => !noticesRead.has(n));
-  b.hidden = !p && !notices.length;
+  b.hidden = !p && !notices.length && !isSignedOut;
   b.replaceChildren(
+    ...(isSignedOut ? [h("div", {}, "This page is not signed in any more, usually because av1opt was started again. Open it again from the link av1opt printed.")] : []),
     ...(p ? [h("div", {}, "Encoding is off: " + p + ".", h("a", { href: "#/settings" }, "Settings"))] : []),
     ...notices.map((n) => h("div", {}, n + " ", h("button", { class: "small", onclick: () => { noticesRead.add(n); renderBanner(); } }, "Dismiss"))));
 }
@@ -902,13 +964,17 @@ function pathBlock(paths, first = 12) {
 
 const views = {};
 let cleanup = null;
+// Watched folders with a request on its way, as "id:what": kept while the list is redrawn.
+const watchBusy = new Set();
 
 function route() {
+  closeDialogs();
   if (cleanup) { cleanup(); cleanup = null; }
   const hash = location.hash || "#/scan";
   const [path, qs] = hash.slice(2).split("?");
   const params = new URLSearchParams(qs || "");
-  const name = views[path] ? path : "scan";
+  // Own names only: "constructor" and the like are found on every object.
+  const name = Object.hasOwn(views, path) ? path : "scan";
   for (const a of document.querySelectorAll("nav a")) a.classList.toggle("active", a.dataset.view === name);
   const root = document.getElementById("view");
   root.replaceChildren();
@@ -2126,6 +2192,10 @@ views.queue = (root) => {
     }
     patchHead(e, j);
     j.files.forEach((f, i) => patchFile(e, j, f, i));
+    // A job can come back with fewer files than were drawn for it.
+    for (let i = j.files.length; i < e.nodes.length; i++) { e.nodes[i].remove(); fileEls.delete(`${j.id}:${i}`); }
+    e.nodes.splice(j.files.length);
+    e.sigs.splice(j.files.length);
     return e.box;
   }
 
@@ -3110,8 +3180,15 @@ views.settings = (root) => {
 // ---------- start ----------
 
 window.addEventListener("hashchange", route);
+// Without the state the views have no folders or defaults: it is asked for until it comes.
+function retryState() {
+  setTimeout(async () => {
+    if (isSignedOut) return;
+    try { await loadState(); route(); } catch { retryState(); }
+  }, EVENTS_RETRY_MS);
+}
 (async () => {
-  try { await loadState(); } catch (e) { toast("Cannot reach av1opt: " + e.message, true); }
+  try { await loadState(); } catch (e) { toast("Cannot reach av1opt: " + e.message, true); retryState(); }
   connect();
   refreshBadge();
   route();

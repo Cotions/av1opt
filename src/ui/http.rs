@@ -307,7 +307,9 @@ fn events(app: &App, req: Request) {
     let mut w = req.into_writer();
     let security: String = SECURITY_HEADERS.iter().map(|(name, value)| format!("{name}: {value}\r\n")).collect();
     let head = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n{security}\r\n");
-    if w.write_all(head.as_bytes()).and_then(|_| w.write_all(b"retry: 2000\n\n")).and_then(|_| w.flush()).is_err() {
+    // The first message says which run of the server this is: see `App::start_id`.
+    let hello = format!("retry: 2000\n\ndata: {}\n\n", json!({ "kind": "hello", "server": app.start_id }));
+    if w.write_all(head.as_bytes()).and_then(|_| w.write_all(hello.as_bytes())).and_then(|_| w.flush()).is_err() {
         return;
     }
     loop {

@@ -202,6 +202,13 @@ pub struct Job {
     /// Cancel arrived before the job's hooks existed.
     #[serde(skip)]
     cancel_requested: bool,
+    /// Someone cancelled it. It is over from then on, also while its encode is still stopping.
+    #[serde(skip)]
+    cancelled_by_person: bool,
+    /// Its run ended while the server was stopping, however it ended: it stays in the saved
+    /// queue and the next start sees what is left of it.
+    #[serde(skip)]
+    ended_while_stopping: bool,
     /// Inputs of the saved job that were gone when it was queued. Kept with it, so that they
     /// rejoin the job if they are back at the next start.
     #[serde(skip)]
@@ -259,6 +266,9 @@ pub struct Queue {
     next_id: Mutex<u64>,
     /// Set while the server stops: jobs interrupted now stay in the saved queue.
     shutting_down: AtomicBool,
+    /// The saved queue has been read. Before that, what is in memory says nothing of what the
+    /// file holds, and writing it would lose the file's jobs.
+    saved_queue_read: AtomicBool,
     /// Saved jobs that could not be restored (say, a drive not mounted yet). Kept in the saved
     /// queue so they come back once their files are there again.
     unrestored: Mutex<Vec<(Value, String)>>,
@@ -320,6 +330,11 @@ pub fn shutdown(app: &App) {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // Saves were held off from the start of all this, and a job cancelled just before or during
+    // it must not come back at the next start.
+    if let Some(path) = queue_path() {
+        app.jobs.save_while_stopping(&path);
     }
 }
 
@@ -640,6 +655,8 @@ fn prepare(app: &App, body: &Value, origin: Origin, known: &Known) -> Result<Job
         batch: batch_jobs,
         hooks: None,
         cancel_requested: false,
+        cancelled_by_person: false,
+        ended_while_stopping: false,
         dropped,
         out_dir_place,
         out_dir_missing: false,
@@ -722,29 +739,61 @@ fn persist(app: &App) {
     }
 }
 
+/// A job someone cancelled is over even while its encode is still stopping: saved as running, it
+/// would start again at the next start of the server.
+fn belongs_in_saved_queue(j: &Job) -> bool {
+    !j.cancelled_by_person && (matches!(j.status.as_str(), "queued" | "running") || j.out_dir_missing || j.ended_while_stopping)
+}
+
 impl Queue {
+    fn saved_contents(&self) -> Option<Vec<u8>> {
+        let pending: Vec<Value> = self
+            .jobs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|j| belongs_in_saved_queue(j))
+            .map(saved_form)
+            .chain(self.unrestored.lock().unwrap().iter().map(|(j, _)| j.clone()))
+            .chain(self.to_restore.lock().unwrap().iter().cloned())
+            .collect();
+        serde_json::to_vec_pretty(&json!({ "format": QUEUE_FORMAT, "jobs": pending })).ok()
+    }
+
     fn save(&self, path: &Path) {
         let stopping = || self.shutting_down.load(Ordering::SeqCst);
         if stopping() {
             return;
         }
         self.saves.write("the queue", path, || {
-            let pending: Vec<Value> = self
-                .jobs
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|j| matches!(j.status.as_str(), "queued" | "running") || j.out_dir_missing)
-                .map(saved_form)
-                .chain(self.unrestored.lock().unwrap().iter().map(|(j, _)| j.clone()))
-                .chain(self.to_restore.lock().unwrap().iter().cloned())
-                .collect();
+            let contents = self.saved_contents();
             // Looked at after the copy is taken. Shutting down sets this before it cancels the
             // running job, so a copy that lacks the job for that reason is never written.
             if stopping() {
                 return None;
             }
-            serde_json::to_vec_pretty(&json!({ "format": QUEUE_FORMAT, "jobs": pending })).ok()
+            contents
+        });
+    }
+
+    /// The last save, once the server has stopped what it could. Jobs interrupted by the stop
+    /// are in it as what they were.
+    fn save_while_stopping(&self, path: &Path) {
+        if self.saved_queue_read.load(Ordering::SeqCst) {
+            self.saves.write("the queue", path, || self.saved_contents());
+        }
+    }
+
+    /// Takes the jobs that are over off the list. Those waiting for their output folder are not
+    /// over: they stay saved for when the drive is back, until they are removed one by one.
+    fn clear_finished(&self) {
+        self.jobs.lock().unwrap().retain_mut(|j| {
+            let stays = matches!(j.status.as_str(), "queued" | "running") || j.out_dir_missing;
+            if !stays {
+                let stopped = j.status == "cancelled";
+                keep_left_out(self, j, stopped);
+            }
+            stays
         });
     }
 }
@@ -792,10 +841,12 @@ fn read_saved(app: &App, path: &Path) -> Vec<Value> {
 pub fn restore(app: &Arc<App>) {
     let Some(path) = queue_path() else { return };
     let saved = read_saved(app, &path);
-    if saved.is_empty() {
+    let nothing_saved = saved.is_empty();
+    *app.jobs.to_restore.lock().unwrap() = saved.into();
+    app.jobs.saved_queue_read.store(true, Ordering::SeqCst);
+    if nothing_saved {
         return;
     }
-    *app.jobs.to_restore.lock().unwrap() = saved.into();
     let app = app.clone();
     std::thread::spawn(move || {
         {
@@ -867,12 +918,18 @@ fn finish_bringing_back(app: &App, all_read: bool) {
     }
 }
 
+/// What names an entry of that list to the page. Entries have no number of their own, and two
+/// with the same key are the same job saved twice.
+fn entry_key(entry: &Value) -> String {
+    format!("{:016x}", crate::scenes::fnv1a(&entry.to_string()))
+}
+
 /// Saved jobs that could not be restored, with the reason.
 fn unrestored_list(app: &App) -> Vec<Value> {
     let list = app.jobs.unrestored.lock().unwrap();
     list.iter()
         .map(|(j, why)| {
-            let mut entry = json!({ "out_dir": j["out_dir"], "error": why });
+            let mut entry = json!({ "key": entry_key(j), "out_dir": j["out_dir"], "error": why, "only_by_hand": j["only_by_hand"] == true });
             // A saved file can hold anything, and this one could not be understood perhaps
             // for that reason: the page gets a list of names or none.
             if j["inputs"].as_array().is_some_and(|l| l.iter().all(Value::is_string)) {
@@ -883,8 +940,14 @@ fn unrestored_list(app: &App) -> Vec<Value> {
         .collect()
 }
 
-/// Tries the saved-but-missing jobs again (say, after mounting a drive), or forgets them.
-pub fn unrestored_action(app: &App, retry: bool) -> Result<Value> {
+/// Tries saved jobs that are not in the queue again (say, after mounting a drive), or forgets them:
+/// the one whose `key` the request names, or else all of them. Trying all again leaves out the
+/// inputs of jobs someone stopped, which start only when that entry itself is asked for.
+pub fn unrestored_action(app: &App, retry: bool, body: &Value) -> Result<Value> {
+    let key = match body.get("key") {
+        None | Some(Value::Null) => None,
+        Some(key) => Some(key.as_str().context("the saved job has to be named by its key, as text")?),
+    };
     let one = match app.jobs.restoring.try_lock() {
         Ok(one) => one,
         Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
@@ -892,12 +955,18 @@ pub fn unrestored_action(app: &App, retry: bool) -> Result<Value> {
     };
     {
         let _saving = app.jobs.saves.hold();
-        let list = std::mem::take(&mut *app.jobs.unrestored.lock().unwrap());
+        let mut list = app.jobs.unrestored.lock().unwrap();
+        let chosen_by = |job: &Value| key.map_or(!retry || job["only_by_hand"] != true, |key| entry_key(job) == key);
+        let (chosen, others): (Vec<_>, Vec<_>) = std::mem::take(&mut *list).into_iter().partition(|(job, _)| chosen_by(job));
+        *list = others;
+        if key.is_some() && chosen.is_empty() {
+            bail!("that saved job is not in the list any more; reload the page to see what is");
+        }
         if retry {
-            app.jobs.to_restore.lock().unwrap().extend(list.into_iter().map(|(job, _)| job));
+            app.jobs.to_restore.lock().unwrap().extend(chosen.into_iter().map(|(job, _)| job));
         }
     }
-    let (restored, all_read) = if retry { bring_back(app, true) } else { (0, true) };
+    let (restored, all_read) = if retry { bring_back(app, key.is_some()) } else { (0, true) };
     finish_bringing_back(app, all_read);
     drop(one);
     app.broadcast(json!({ "kind": "jobs" }));
@@ -913,13 +982,20 @@ pub fn cancel(app: &App, id: u64) -> Result<Value> {
             for f in &mut j.files {
                 f.status = "cancelled".into();
             }
+            j.cancelled_by_person = true;
             // A cancelled job is not saved: what it left out would go with it.
             keep_left_out(&app.jobs, j, true);
         }
-        "running" => match &j.hooks {
-            Some(h) => h.cancel(),
-            None => j.cancel_requested = true,
-        },
+        "running" => {
+            // Now and not when the encode has stopped: the save below is the one that counts
+            // if the server stops first.
+            j.cancelled_by_person = true;
+            keep_left_out(&app.jobs, j, true);
+            match &j.hooks {
+                Some(h) => h.cancel(),
+                None => j.cancel_requested = true,
+            }
+        }
         _ => {}
     }
     drop(jobs);
@@ -997,17 +1073,8 @@ pub fn again(app: &App, id: u64) -> Result<Value> {
     Ok(r)
 }
 
-/// Takes the jobs that are over off the list. Those waiting for their output folder are not
-/// over: they stay saved for when the drive is back, until they are removed one by one.
 pub fn clear_finished(app: &App) -> Result<Value> {
-    app.jobs.jobs.lock().unwrap().retain_mut(|j| {
-        let stays = matches!(j.status.as_str(), "queued" | "running") || j.out_dir_missing;
-        if !stays {
-            let stopped = j.status == "cancelled";
-            keep_left_out(&app.jobs, j, stopped);
-        }
-        stays
-    });
+    app.jobs.clear_finished();
     persist(app);
     app.broadcast(json!({ "kind": "jobs" }));
     Ok(json!({ "ok": true }))
@@ -1112,13 +1179,19 @@ pub fn start_worker(app: Arc<App>) {
             if let Some(j) = jobs.iter_mut().find(|j| j.id == id) {
                 j.hooks = None;
                 j.current = None;
+                let stopping = app.jobs.shutting_down.load(Ordering::SeqCst);
+                j.ended_while_stopping = stopping;
                 match result {
                     Ok(s) if s.cancelled => {
                         j.status = "cancelled".into();
                         for f in j.files.iter_mut().filter(|f| f.status == "pending") {
                             f.status = "cancelled".into();
                         }
-                        keep_left_out(&app.jobs, j, true);
+                        // Stopped by the server stopping, nobody decided against what it left
+                        // out: that stays with the job, which comes back.
+                        if !stopping {
+                            keep_left_out(&app.jobs, j, true);
+                        }
                     }
                     Ok(_) => {
                         j.status = "done".into();
@@ -1221,6 +1294,82 @@ fn outcome_of_run(mut summary: batch::Summary, out_dir: &Path, place: Option<&Ou
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn job(id: u64, status: &str, dropped: &[&str]) -> Job {
+        Job {
+            id,
+            created: 0,
+            inputs: vec![PathBuf::from(format!("/videos/{id}.mkv"))],
+            roots: Vec::new(),
+            out_dir: PathBuf::from("/out"),
+            options: serde_json::from_value(json!({})).unwrap(),
+            watch: None,
+            status: status.into(),
+            error: None,
+            current: None,
+            files: Vec::new(),
+            time: crate::estimate::TimeModel::fit(&[], 6),
+            batch: Vec::new(),
+            hooks: None,
+            cancel_requested: false,
+            cancelled_by_person: false,
+            ended_while_stopping: false,
+            dropped: dropped.iter().map(PathBuf::from).collect(),
+            out_dir_place: None,
+            out_dir_missing: false,
+            out_dir_to_confirm: false,
+            out_dir_made: true,
+            folders_queued: 1,
+            not_text: 0,
+        }
+    }
+
+    fn inputs_saved_in(path: &Path) -> Vec<String> {
+        let saved: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        saved["jobs"].as_array().unwrap().iter().flat_map(|j| j["inputs"].as_array().unwrap().iter().map(|i| i.as_str().unwrap().to_string())).collect()
+    }
+
+    #[test]
+    fn clearing_the_list_keeps_what_a_cancelled_job_left_out_for_a_person_to_ask_for() {
+        let queue = Queue::default();
+        queue.jobs.lock().unwrap().extend([job(1, "cancelled", &["/videos/a.mkv"]), job(2, "failed", &["/videos/b.mkv"]), job(3, "queued", &["/videos/c.mkv"])]);
+        queue.clear_finished();
+        assert_eq!(queue.jobs.lock().unwrap().iter().map(|j| j.id).collect::<Vec<_>>(), [3]);
+        let kept = queue.unrestored.lock().unwrap();
+        let by_input = |input: &str| kept.iter().find(|(entry, _)| entry["inputs"] == json!([input])).map(|(entry, why)| (entry.clone(), why.clone())).unwrap();
+        let (cancelled, why) = by_input("/videos/a.mkv");
+        assert_eq!(cancelled["only_by_hand"], true);
+        assert_eq!(cancelled["left_out_of"], 1);
+        assert_eq!(why, ONLY_BY_HAND);
+        assert!(by_input("/videos/b.mkv").0.get("only_by_hand").is_none(), "that job ran its course");
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn the_last_save_holds_interrupted_jobs_and_not_those_someone_cancelled() {
+        let dir = std::env::temp_dir().join(format!("av1opt-queue-last-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ui-queue.json");
+        let queue = Queue::default();
+        queue.shutting_down.store(true, Ordering::SeqCst);
+        let mut cancelled_while_stopping = job(1, "running", &[]);
+        cancelled_while_stopping.cancelled_by_person = true;
+        let mut interrupted = job(2, "cancelled", &["/videos/left.mkv"]);
+        interrupted.ended_while_stopping = true;
+        let mut ended_after_a_cancel = job(3, "cancelled", &[]);
+        ended_after_a_cancel.cancelled_by_person = true;
+        ended_after_a_cancel.ended_while_stopping = true;
+        queue.jobs.lock().unwrap().extend([cancelled_while_stopping, interrupted, ended_after_a_cancel, job(4, "queued", &[]), job(5, "done", &[])]);
+        // A stop before the file was read must not replace it with what little is known.
+        std::fs::write(&path, b"what the file held").unwrap();
+        queue.save_while_stopping(&path);
+        assert_eq!(std::fs::read(&path).unwrap(), b"what the file held");
+        queue.saved_queue_read.store(true, Ordering::SeqCst);
+        queue.save_while_stopping(&path);
+        assert_eq!(inputs_saved_in(&path), ["/videos/2.mkv", "/videos/4.mkv"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_section_can_run_to_an_end_not_known_yet() {

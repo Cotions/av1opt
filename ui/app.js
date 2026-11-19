@@ -2205,24 +2205,30 @@ views.queue = (root) => {
   };
   const drawMissing = (un) => {
     if (!un || !un.length) { missing.replaceChildren(); return; }
-    const act = (what) => async () => {
+    const act = (what, key) => async () => {
       try {
-        const r = await api(`/api/jobs/unrestored/${what}`, {});
+        const r = await api(`/api/jobs/unrestored/${what}`, key ? { key } : {});
         if (what === "retry") toast(r.restored ? `Re-queued ${r.restored} job${r.restored === 1 ? "" : "s"}` : "Files still missing", !r.restored);
         load();
       } catch (e) { toast(e.message, true); }
     };
-    const forget = async () => {
-      const sure = await confirmDialog({ title: `Forget ${plural(un.length, "saved job")}?`, action: "Forget",
-        body: [h("p", {}, `${un.length === 1 ? "It leaves" : "They leave"} the saved queue for good and will not come back when the files do. No video is touched.`)] });
-      if (sure) act("forget")();
+    // One job by its key, or all of them. Forgetting is final, so it asks first.
+    const forget = (key) => async () => {
+      const count = key === undefined ? un.length : 1;
+      const sure = await confirmDialog({ title: `Forget ${plural(count, "saved job")}?`, action: "Forget",
+        body: [h("p", {}, `${count === 1 ? "It leaves" : "They leave"} the saved queue for good and will not come back when the files do. No video is touched.`)] });
+      if (sure) act("forget", key)();
     };
+    // Videos left out of a job someone stopped start only from their own row.
+    const ordinary = un.some((u) => !u.only_by_hand);
     missing.replaceChildren(h("div", { class: "panel" },
       h("div", { class: "row" }, h("strong", { class: "warn grow" }, `${un.length} saved job${un.length === 1 ? "" : "s"} not in the queue, kept for when ${un.length === 1 ? "its files are" : "their files are"} back`),
-        h("button", { onclick: act("retry") }, "Try again"), h("button", { class: "danger", onclick: forget }, "Forget")),
+        ordinary && h("button", { title: "Queue those whose files are back. Videos left out of a job you stopped wait for the button on their own row", onclick: act("retry") }, "Try again"),
+        h("button", { class: "danger", onclick: forget() }, un.length === 1 ? "Forget" : "Forget all")),
       cutList(un, UNRESTORED_SHOWN, (u) => {
         const inputs = Array.isArray(u.inputs) ? cutList(u.inputs, UNRESTORED_INPUTS_SHOWN, (p) => p, (n) => `and ${n} more`).join(", ") : "(its list of videos cannot be read)";
-        return h("div", { class: "dim mono long-text" }, `${inputs} → ${u.out_dir ?? "(no output folder)"}: ${u.error}`);
+        return h("div", { class: "row" }, h("div", { class: "dim mono long-text grow" }, `${inputs} → ${u.out_dir ?? "(no output folder)"}: ${u.error}`),
+          h("button", { class: "small", onclick: act("retry", u.key) }, "Try again"), h("button", { class: "small danger", onclick: forget(u.key) }, "Forget"));
       }, (n) => h("div", { class: "dim" }, `and ${plural(n, "more job")}`))));
   };
   const fileEls = new Map(); // "job:file" -> { el, update(progress) } for running files

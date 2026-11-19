@@ -261,8 +261,8 @@ fn api(app: &Arc<App>, m: &Method, path: &str, q: &[(String, String)], body: &Va
         (Method::Post, ["bench", "tuning"]) => bench::tune(app, body),
         (Method::Get, ["jobs"]) => Ok(jobs::list(app)),
         (Method::Get, ["jobs", "heads"]) => Ok(jobs::heads(app)),
-        (Method::Post, ["jobs", "unrestored", "retry"]) => jobs::unrestored_action(app, true),
-        (Method::Post, ["jobs", "unrestored", "forget"]) => jobs::unrestored_action(app, false),
+        (Method::Post, ["jobs", "unrestored", "retry"]) => jobs::unrestored_action(app, true, body),
+        (Method::Post, ["jobs", "unrestored", "forget"]) => jobs::unrestored_action(app, false, body),
         (Method::Get, ["jobs", id]) => jobs::get(app, id.parse()?),
         (Method::Get, ["jobs", id, "files", i]) => jobs::get_file(app, id.parse()?, i.parse()?),
         // Here and not in `jobs::add`: a watch queues through that with the options it saved.

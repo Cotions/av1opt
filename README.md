@@ -732,7 +732,9 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
   queues its files once more with the same settings. Inputs of a saved or requeued job that
   are gone are left out and named on the job. They stay saved when the job finishes, fails or
   is taken off the list, and are queued once they are back at a later start; a saved job with
-  no input left is listed apart, with **Try again** and **Forget**.
+  no input left is listed apart, with **Try again** and **Forget** on each entry and for the
+  whole list. The **Try again** of the list leaves out videos of jobs you cancelled or removed:
+  those start only from their own entry.
   A job queued by hand makes its output folder when it is queued. One that comes back from
   the saved queue, is queued again or comes from a watch needs that folder to exist, so that
   nothing is written under the mount point of a drive that is away: without it the job fails

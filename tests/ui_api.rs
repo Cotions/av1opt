@@ -2043,8 +2043,12 @@ fn inputs_left_out_of_a_job_outlive_it() {
         assert_eq!(list["unrestored"][0]["inputs"], left_out, "{name}");
         assert!(list["unrestored"][0]["error"].as_str().unwrap().contains("Try again"), "{name}: {list}");
 
-        // Try again queues the one that is back. The other goes on waiting to be asked for.
+        // Trying everything again does not start them: that takes asking for this entry.
         let r = s.post("/api/jobs/unrestored/retry", &json!({})).json();
+        assert_eq!(r["restored"], 0, "{name}: {r}");
+        assert_eq!(r["unrestored"][0]["only_by_hand"], true, "{name}: {r}");
+        // Asked for, the one that is back is queued. The other goes on waiting to be asked for.
+        let r = s.post("/api/jobs/unrestored/retry", &json!({ "key": r["unrestored"][0]["key"] })).json();
         assert_eq!(r["restored"], 1, "{name}: {r}");
         assert_eq!(heads(&s).last().unwrap()["total"], 1, "{name}");
         assert_eq!(r["unrestored"][0]["inputs"], json!([s.dir.join("videos/e.mkv")]), "{name}: {r}");
@@ -2081,6 +2085,102 @@ fn inputs_left_out_of_a_job_outlive_it() {
     soon("the job has stopped", || heads(&s)[0]["status"] == "cancelled");
     soon("what it left out is saved", || saved_queue(&s)["jobs"][0]["only_by_hand"] == true);
     assert_eq!(saved_queue(&s)["jobs"][0]["inputs"], json!([s.dir.join("videos/b.mkv")]));
+}
+
+#[test]
+fn each_saved_job_outside_the_queue_can_be_tried_or_forgotten_by_itself() {
+    let (ffmpeg, ffprobe) = stand_in_tools("entries", "exit 1");
+    let s = Server::start_with_tools("entries", &ffmpeg, &ffprobe, |d| {
+        paused(d);
+        for name in ["stopped.mkv", "second.mkv", "third.mkv"] {
+            std::fs::write(d.join("videos").join(name), b"x").unwrap();
+        }
+        folder_in_use(&d.join("out"));
+        let entry = |name: &str, by_hand: bool| {
+            let mut job = json!({ "inputs": [d.join("videos").join(name)], "roots": [], "out_dir": d.join("out"), "options": {}, "out_dir_made": true });
+            if by_hand {
+                job["only_by_hand"] = json!(true);
+            }
+            job
+        };
+        write_saved_queue(d, json!([entry("stopped.mkv", true), entry("second.mkv", true), entry("third.mkv", true), entry("away.mkv", false)]));
+    });
+    soon("the saved queue is read", || s.get("/api/jobs").json()["restoring"] == 0);
+    let videos = s.dir.join("videos");
+    let entries = || s.get("/api/jobs").json()["unrestored"].as_array().unwrap().clone();
+    let of = |name: &str| entries().into_iter().find(|e| e["inputs"] == json!([videos.join(name)])).unwrap_or_else(|| panic!("{name} is not listed"));
+    assert_eq!(entries().len(), 4);
+    assert_eq!(of("stopped.mkv")["only_by_hand"], true);
+    assert_eq!(of("away.mkv")["only_by_hand"], false);
+
+    // A drive comes back: Try again starts what was waiting for it, and nothing someone stopped.
+    std::fs::write(videos.join("away.mkv"), b"x").unwrap();
+    let r = s.post("/api/jobs/unrestored/retry", &json!({})).json();
+    assert_eq!(r["restored"], 1, "{r}");
+    assert_eq!(r["unrestored"].as_array().unwrap().len(), 3, "{r}");
+    assert_eq!(heads(&s).len(), 1);
+
+    // One entry asked for by name starts, and only that one.
+    let r = s.post("/api/jobs/unrestored/retry", &json!({ "key": of("stopped.mkv")["key"] })).json();
+    assert_eq!(r["restored"], 1, "{r}");
+    assert_eq!(r["unrestored"].as_array().unwrap().len(), 2, "{r}");
+    assert_eq!(heads(&s).len(), 2);
+
+    // One forgotten goes, and the others stay.
+    let key = of("second.mkv")["key"].clone();
+    let r = s.post("/api/jobs/unrestored/forget", &json!({ "key": key })).json();
+    assert_eq!(r["unrestored"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(of("third.mkv")["only_by_hand"], true);
+    assert_eq!(saved_queue(&s)["jobs"].as_array().unwrap().len(), 3, "two jobs and one entry");
+
+    // Named again, it is gone, and the page is told so and nothing else changes.
+    let r = s.post("/api/jobs/unrestored/forget", &json!({ "key": key }));
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert!(r.body.contains("not in the list any more"), "{}", r.body);
+    assert_eq!(entries().len(), 1);
+
+    // Forget without a name is for all of them.
+    let r = s.post("/api/jobs/unrestored/forget", &json!({})).json();
+    assert!(r["unrestored"].as_array().unwrap().is_empty(), "{r}");
+}
+
+#[test]
+fn a_job_cancelled_just_before_the_server_stops_does_not_come_back() {
+    let (ffmpeg, ffprobe) = stand_in_tools("cancel-stop", "sleep 30\nexit 1");
+    let launch = |name: &str| {
+        Server::start_with_tools(name, &ffmpeg, &ffprobe, |d| {
+            for video in ["a.mkv", "c.mkv"] {
+                std::fs::write(d.join("videos").join(video), b"x").unwrap();
+            }
+            folder_in_use(&d.join("out"));
+            write_saved_queue(d, json!([{ "inputs": [d.join("videos/a.mkv"), d.join("videos/b.mkv"), d.join("videos/c.mkv")], "roots": [], "out_dir": d.join("out"), "options": {}, "out_dir_made": true }]));
+        })
+    };
+    let mut s = launch("cancel-stop");
+    soon("the job runs", || heads(&s).first().is_some_and(|j| j["status"] == "running"));
+    let id = heads(&s)[0]["id"].as_u64().unwrap();
+    assert_eq!(s.post(&format!("/api/jobs/{id}/cancel"), &json!({})).status, 200);
+    // At once: the run has not had the time to end.
+    assert!(s.terminate());
+    let saved = saved_queue(&s)["jobs"].as_array().unwrap().clone();
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    assert_eq!(saved[0]["inputs"], json!([s.dir.join("videos/b.mkv")]), "{saved:?}");
+    assert_eq!(saved[0]["only_by_hand"], true, "{saved:?}");
+    let s = Server::start_in(&s.dir, &ffmpeg, &ffprobe);
+    soon("the saved queue is read", || s.get("/api/jobs").json()["restoring"] == 0);
+    assert!(heads(&s).is_empty(), "{:?}", heads(&s));
+    assert_eq!(s.get("/api/jobs").json()["unrestored"].as_array().unwrap().len(), 1);
+    drop(s);
+
+    // Interrupted by the stop and not by anyone, the same job comes back whole.
+    let mut s = launch("stop-only");
+    soon("the job runs", || heads(&s).first().is_some_and(|j| j["status"] == "running"));
+    assert!(s.terminate());
+    let saved = saved_queue(&s)["jobs"].as_array().unwrap().clone();
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    assert_eq!(saved[0]["inputs"].as_array().unwrap().len(), 2, "{saved:?}");
+    assert_eq!(saved[0]["dropped"], json!([s.dir.join("videos/b.mkv")]), "{saved:?}");
+    assert!(saved[0].get("only_by_hand").is_none(), "{saved:?}");
 }
 
 #[test]

@@ -124,6 +124,101 @@ pub struct MediaInfo {
     /// Global container tags. Not cached by scans (descriptions can be long); encodes probe fresh.
     #[serde(skip)]
     pub tags: BTreeMap<String, String>,
+    /// The shape of a pixel as (width, height), for the picture as shown (turned with it when
+    /// the video is turned); (0, 0) for square or not said. A DVD's 720x576 shown 16:9 has
+    /// pixels of 64:45.
+    #[serde(default)]
+    pub sample_aspect: (u32, u32),
+    /// What players show of the video track: its name and language.
+    #[serde(default)]
+    pub video_track: Track,
+    /// What the video track is marked as (see [`AudioInfo::disposition`]).
+    #[serde(default)]
+    pub video_disposition: String,
+    /// Closed captions carried inside the picture (ATSC A/53, as US television sends them).
+    #[serde(default)]
+    pub closed_captions: bool,
+    /// How the picture is to be shown that a player reads beside it: ffprobe's side data
+    /// types "Stereo 3D" and "Spherical Mapping" (360 degree video).
+    #[serde(default)]
+    pub view_marks: Vec<String>,
+    /// The layout of a 3D picture as ffprobe says it ("top and bottom"); empty for none.
+    #[serde(default)]
+    pub stereo3d: String,
+    /// ffprobe's color_space and color_primaries ("bt709", "gbr" for RGB).
+    #[serde(default)]
+    pub color_space: String,
+    #[serde(default)]
+    pub color_primaries: String,
+    /// A picture with transparency beside it that the pixel format does not show (VP9 in WebM).
+    #[serde(default)]
+    pub alpha: bool,
+    /// Name and language of each subtitle track.
+    #[serde(default)]
+    pub subtitle_tracks: Vec<Track>,
+    /// File names of the attachments (fonts and the like), as many as `attachments`.
+    #[serde(default)]
+    pub attachment_names: Vec<String>,
+}
+
+/// What a player shows of a track besides its contents.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Track {
+    /// Empty for none.
+    #[serde(default)]
+    pub title: String,
+    /// ISO 639-2 code; empty for none or "und".
+    #[serde(default)]
+    pub language: String,
+}
+
+/// Names MP4 writers give a track's handler when they are not told one: they name the kind
+/// of track, not the track.
+const PLAIN_HANDLERS: &[&str] = &[
+    "VideoHandler", "SoundHandler", "SubtitleHandler", "TextHandler", "DataHandler", "TimeCodeHandler", "Core Media Video", "Core Media Audio",
+    "Core Media Text", "Apple Video Media Handler", "Apple Sound Media Handler", "Apple Alias Data Handler", "GPAC ISO Video Handler", "GPAC ISO Audio Handler",
+    "ISO Media file produced by Google Inc.", "L-SMASH Video Handler", "L-SMASH Audio Handler", "Mainconcept Video Media Handler", "Mainconcept MP4 Sound Media Handler",
+];
+
+impl Track {
+    /// From a stream's tags. Matroska keeps a track's name as its title; ffmpeg reads an MP4
+    /// track's name as `name`, and many MP4 writers put it in the handler name instead.
+    pub fn from_tags(tags: &Value) -> Track {
+        let text = |key: &str| tags[key].as_str().map(str::trim).filter(|t| !t.is_empty());
+        let handler = text("handler_name").filter(|h| !PLAIN_HANDLERS.iter().any(|p| p.eq_ignore_ascii_case(h)));
+        let title = text("title").or(text("name")).or(handler).unwrap_or("").to_string();
+        let language = text("language").filter(|l| *l != "und").map(same_language).unwrap_or_default();
+        Track { title, language }
+    }
+}
+
+/// ISO 639-2 has two codes for some twenty languages (French: "fre" and "fra"); containers and
+/// the programs that write them pick either. The one of each pair used for comparing.
+fn same_language(code: &str) -> String {
+    const PAIRS: &[(&str, &str)] = &[
+        ("fre", "fra"), ("ger", "deu"), ("chi", "zho"), ("cze", "ces"), ("dut", "nld"), ("gre", "ell"), ("per", "fas"), ("rum", "ron"), ("slo", "slk"),
+        ("alb", "sqi"), ("arm", "hye"), ("baq", "eus"), ("bur", "mya"), ("geo", "kat"), ("ice", "isl"), ("mac", "mkd"), ("mao", "mri"), ("may", "msa"),
+        ("tib", "bod"), ("wel", "cym"),
+    ];
+    let code = code.to_ascii_lowercase();
+    PAIRS.iter().find(|(b, _)| *b == code).map_or(code, |(_, t)| t.to_string())
+}
+
+/// The rate of a video's frames from ffprobe's average and declared rates. The average is
+/// what a stream of uneven frame times really has, but some demuxers state it from their
+/// clock instead: raw DV reads as 60000 fps, its declared rate 25. An average above 1000
+/// frames a second, or more than twice the declared rate, is not believed. (A stream of
+/// uneven times averages below its declared rate, never far above it.)
+pub fn believable_rate(average: Option<f64>, declared: Option<f64>) -> Option<f64> {
+    let believed = average.filter(|a| *a <= 1000.0 && declared.is_none_or(|d| *a <= 2.0 * d));
+    believed.or(declared.filter(|d| *d <= 1000.0)).or(average)
+}
+
+/// A pixel's shape from ffprobe's "16:15"; None for square, unknown ("0:1") or unreadable.
+pub fn pixel_shape(text: Option<&str>) -> Option<(u32, u32)> {
+    let (w, h) = text?.split_once(':')?;
+    let (w, h): (u32, u32) = (w.parse().ok()?, h.parse().ok()?);
+    (w > 0 && h > 0 && w != h).then_some((w, h))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,7 +246,7 @@ impl MediaInfo {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AudioInfo {
     pub codec: String,
     pub channels: u32,
@@ -162,6 +257,11 @@ pub struct AudioInfo {
     /// ("default+forced"); empty for no mark.
     #[serde(default)]
     pub disposition: String,
+    /// ffprobe's channel_layout ("5.1(side)"); empty when it does not say.
+    #[serde(default)]
+    pub layout: String,
+    #[serde(default)]
+    pub track: Track,
 }
 
 /// Why a file in a format outside `tools::VIDEO_FORMATS` is not read.
@@ -498,7 +598,8 @@ fn probe_within(ffprobe: &str, path: &Path, file_size: u64, limit: Duration) -> 
     let start_time = num(&j["format"]["start_time"]).unwrap_or(0.0);
     let avg_rate = parse_rate(video["avg_frame_rate"].as_str());
     let nominal_rate = parse_rate(video["r_frame_rate"].as_str());
-    let fps = avg_rate.or(nominal_rate).unwrap_or(0.0);
+    let fps = believable_rate(avg_rate, nominal_rate).unwrap_or(0.0);
+    let avg_rate = avg_rate.filter(|a| *a == fps);
     let vfr = matches!((avg_rate, nominal_rate), (Some(a), Some(r)) if (a - r).abs() / r > 0.005);
     let mut video_start = num(&video["start_time"]).unwrap_or(start_time);
 
@@ -553,9 +654,19 @@ fn probe_within(ffprobe: &str, path: &Path, file_size: u64, limit: Duration) -> 
         .and_then(|l| l.iter().find_map(|d| d["rotation"].as_f64()))
         .unwrap_or(0.0);
     let (mut width, mut height) = (video["width"].as_u64().unwrap_or(0) as u32, video["height"].as_u64().unwrap_or(0) as u32);
+    let mut sample_aspect = pixel_shape(video["sample_aspect_ratio"].as_str()).unwrap_or((0, 0));
     if (rotation.abs() - 90.0).abs() < 1.0 || (rotation.abs() - 270.0).abs() < 1.0 {
         std::mem::swap(&mut width, &mut height);
+        sample_aspect = (sample_aspect.1, sample_aspect.0);
     }
+    let side_data: Vec<&str> = video["side_data_list"].as_array().into_iter().flatten().filter_map(|d| d["side_data_type"].as_str()).collect();
+    let view_marks = side_data.iter().filter(|t| matches!(**t, "Stereo 3D" | "Spherical Mapping")).map(|t| t.to_string()).collect();
+    let stereo3d = video["side_data_list"]
+        .as_array()
+        .and_then(|l| l.iter().find(|d| d["side_data_type"] == "Stereo 3D"))
+        .and_then(|d| d["type"].as_str())
+        .unwrap_or("")
+        .to_string();
 
     let main_index = video["index"].as_u64().unwrap_or(0);
     let covers: Vec<Cover> = streams
@@ -618,6 +729,8 @@ fn probe_within(ffprobe: &str, path: &Path, file_size: u64, limit: Duration) -> 
                 // Matroska has no per-stream bitrate field; mkvmerge writes it as a tag.
                 bitrate: num(&s["bit_rate"]).or_else(|| num(&s["tags"]["BPS"])).unwrap_or(0.0),
                 disposition: marks(s),
+                layout: s["channel_layout"].as_str().filter(|l| *l != "unknown").unwrap_or("").to_string(),
+                track: Track::from_tags(&s["tags"]),
             })
             .collect(),
         subtitle_codecs: streams
@@ -633,6 +746,21 @@ fn probe_within(ffprobe: &str, path: &Path, file_size: u64, limit: Duration) -> 
             .as_object()
             .map(|t| t.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect())
             .unwrap_or_default(),
+        sample_aspect,
+        video_track: Track::from_tags(&video["tags"]),
+        video_disposition: marks(video),
+        closed_captions: video["closed_captions"].as_i64() == Some(1),
+        view_marks,
+        stereo3d,
+        color_space: video["color_space"].as_str().unwrap_or("").to_string(),
+        color_primaries: video["color_primaries"].as_str().unwrap_or("").to_string(),
+        alpha: video["tags"]["alpha_mode"].as_str().or(video["tags"]["ALPHA_MODE"].as_str()) == Some("1"),
+        subtitle_tracks: streams.iter().filter(|s| s["codec_type"] == "subtitle").map(|s| Track::from_tags(&s["tags"])).collect(),
+        attachment_names: streams
+            .iter()
+            .filter(|s| s["codec_type"] == "attachment")
+            .map(|s| s["tags"]["filename"].as_str().unwrap_or("").to_string())
+            .collect(),
     })
 }
 
@@ -787,6 +915,38 @@ mod tests {
 
     fn close(a: f64, b: f64, what: &str) {
         assert!((a - b).abs() < 0.05, "{what}: {a} where {b} was expected");
+    }
+
+    #[test]
+    fn a_frame_rate_read_from_a_clock_is_not_believed() {
+        // Raw DV: 25 frames a second, an average of 60000 from its clock (ffmpeg's dv demuxer).
+        assert_eq!(believable_rate(Some(60000.0), Some(25.0)), Some(25.0));
+        // More than twice the declared rate, or above 1000, is not a rate either.
+        assert_eq!(believable_rate(Some(61.0), Some(30.0)), Some(30.0));
+        assert_eq!(believable_rate(Some(1500.0), None), Some(1500.0), "nothing better to go by");
+        assert_eq!(believable_rate(Some(1500.0), Some(1200.0)), Some(1500.0));
+        // An average below the declared rate is a stream of uneven times, as it was.
+        assert_eq!(believable_rate(Some(29.96), Some(30.0)), Some(29.96));
+        assert_eq!(believable_rate(Some(24.5), Some(60.0)), Some(24.5));
+        assert_eq!(believable_rate(Some(59.0), Some(30.0)), Some(59.0));
+        assert_eq!(believable_rate(None, Some(25.0)), Some(25.0));
+        assert_eq!(believable_rate(None, None), None);
+    }
+
+    #[test]
+    fn pixel_shapes_and_track_names_are_read_as_players_read_them() {
+        assert_eq!(pixel_shape(Some("16:15")), Some((16, 15)));
+        assert_eq!([pixel_shape(Some("1:1")), pixel_shape(Some("0:1")), pixel_shape(None), pixel_shape(Some("N/A"))], [None; 4]);
+        let track = |tags: Value| Track::from_tags(&tags);
+        let t = |title: &str, language: &str| Track { title: title.into(), language: language.into() };
+        // Matroska's title, MP4's name as ffmpeg reads it, a handler that names the track.
+        assert_eq!(track(serde_json::json!({"title": "Main picture", "language": "eng"})), t("Main picture", "eng"));
+        assert_eq!(track(serde_json::json!({"name": "English title", "handler_name": "English handler", "language": "eng"})), t("English title", "eng"));
+        assert_eq!(track(serde_json::json!({"handler_name": "German commentary", "language": "ger"})), t("German commentary", "deu"));
+        // A handler that only names the kind of track is no name; "und" is no language.
+        assert_eq!(track(serde_json::json!({"handler_name": "SoundHandler", "language": "und"})), Track::default());
+        assert_eq!(track(serde_json::json!({"title": "  "})), Track::default());
+        assert_eq!(track(Value::Null), Track::default());
     }
 
     #[test]

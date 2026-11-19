@@ -2356,8 +2356,9 @@ mod tests {
             video_bitrate: 5e6, pix_fmt: "yuv420p".into(), hdr: false, dolby_vision: false, color_transfer: String::new(), interlaced: false, vfr: false,
             start_time: 0.0, video_start: 0.0, covers: vec![], attachments: 0, tags: Default::default(), video_s: 0.0, nominal_fps: 0.0, time_base: (0, 0),
             audio_streams: audio.len() as u32, subtitle_streams: 0,
-            audio: audio.iter().map(|&(codec, channels, bitrate)| AudioInfo { codec: codec.into(), channels, bitrate, disposition: String::new() }).collect(),
+            audio: audio.iter().map(|&(codec, channels, bitrate)| AudioInfo { codec: codec.into(), channels, bitrate, ..Default::default() }).collect(),
             subtitle_codecs: vec![], subtitle_dispositions: vec![], other_streams: vec![],
+            ..Default::default()
         }
     }
 

@@ -985,6 +985,23 @@ fn other_containers_codecs_and_frame_rates_go_in() {
 
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn raw_dv_is_encoded_at_its_own_frame_rate() {
+    let c = Case::new("dv");
+    // ffprobe reads its average rate as 60000 a second, from the demuxer's clock.
+    c.ffmpeg(&[
+        "-f", "lavfi", "-i", "testsrc2=s=720x576:r=25:d=4", "-f", "lavfi", "-i", "sine=f=440:d=4:r=48000",
+        "-c:v", "dvvideo", "-pix_fmt", "yuv420p", "-c:a", "pcm_s16le", "-ac", "2", "-f", "dv", "tape.dv",
+    ]);
+    let src = c.videos().join("tape.dv");
+    assert_eq!(video(&src)["avg_frame_rate"], "60000/1", "the case this is about");
+    c.encode(&[&src], &[]).ok().has("720x576 25.00 fps").has("encoded 1, skipped 0, failed 0");
+    let out = c.out().join("tape.mp4");
+    assert_eq!(video(&out)["r_frame_rate"], "25/1");
+    assert_eq!(frames(&out), frames(&src));
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn very_short_videos_are_encoded_or_refused_cleanly() {
     let c = Case::new("short");
     for (name, n) in [("one-second.mp4", "24"), ("half.mp4", "12"), ("three-frames.mp4", "3"), ("one-frame.mp4", "1")] {

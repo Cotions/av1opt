@@ -2,7 +2,7 @@
 //! SVT-AV1 parameters) and every video, find the CRF that gives the target VMAF on a few sample
 //! clips, and compare the settings by file size and encode time at that equal quality.
 //!
-//! Every sample encode is remembered in `$XDG_CACHE_HOME/av1opt/bench-v2.jsonl`, so a stopped
+//! Every sample encode is remembered in `$XDG_CACHE_HOME/av1opt/bench-v3.jsonl`, so a stopped
 //! run resumes, and adding a setting or changing the target only measures what is new.
 
 pub mod stats;
@@ -23,7 +23,9 @@ use std::time::Instant;
 /// changes meaning or is removed.
 pub const REPORT_FORMAT: u32 = 1;
 
-pub const DEFAULT_PRESETS: [u8; 3] = [4, 6, 8];
+/// Presets tried by default: the one `encode` uses and one either side of it, so that every
+/// parameter set is also measured at the preset it would be used at.
+pub const DEFAULT_PRESETS: [u8; 3] = [4, search::DEFAULT_PRESET, 8];
 
 /// Parameter sets tried by default: the three tunes that suit video, and two additions to the
 /// default tune that cost no encode time.
@@ -202,6 +204,20 @@ pub fn cache_dir() -> Result<PathBuf> {
 
 const WORK_PREFIX: &str = "bench-work-";
 
+/// The remembered sample encodes. Raise the version when what they hold stops being comparable:
+/// version 3 came with sample clips cut another way.
+const CACHE_FILE: &str = "bench-v3.jsonl";
+const OLD_CACHE_FILES: [&str; 1] = ["bench-v2.jsonl"];
+
+/// Where sample encodes are remembered; those of earlier versions are of no more use.
+fn cache_file() -> Result<PathBuf> {
+    let dir = cache_dir()?;
+    for old in OLD_CACHE_FILES {
+        let _ = std::fs::remove_file(dir.join(old));
+    }
+    Ok(dir.join(CACHE_FILE))
+}
+
 /// Lossless sample clips are big; the folder goes away with the run, and ones left by runs
 /// that were killed (their process is gone) are removed by the next run.
 struct WorkDir(PathBuf);
@@ -302,7 +318,7 @@ pub fn run(paths: &[PathBuf], tools: &Tools, o: &Options, progress: &(dyn Fn(Pro
     }
     progress(Progress::Plan { videos: chosen.len(), configs: o.configs.len() });
 
-    let cache_path = cache_dir()?.join("bench-v2.jsonl");
+    let cache_path = cache_file()?;
     let lines = if o.refresh { Vec::new() } else { read_lines(&cache_path) };
     let work = WorkDir::new(&match &o.work_dir {
         Some(d) => d.clone(),
@@ -651,9 +667,25 @@ mod tests {
     fn the_default_settings_are_the_ones_encode_uses() {
         let b = Config::baseline();
         assert_eq!((b.preset, b.params.as_str()), (search::DEFAULT_PRESET, search::DEFAULT_PARAMS));
-        // Everything tried by default is different from each other.
+        // What is tried by default is all different, the baseline being one of them.
         let sets: Vec<String> = DEFAULT_PARAM_SETS.map(String::from).to_vec();
-        assert_eq!(matrix(&DEFAULT_PRESETS, &sets).len(), 1 + DEFAULT_PRESETS.len() * DEFAULT_PARAM_SETS.len());
+        let tried = matrix(&DEFAULT_PRESETS, &sets);
+        assert_eq!(tried.len(), DEFAULT_PRESETS.len() * DEFAULT_PARAM_SETS.len());
+        // Every parameter set is measured at the preset `encode` would use it at.
+        assert!(DEFAULT_PRESETS.contains(&search::DEFAULT_PRESET));
+        for params in DEFAULT_PARAM_SETS {
+            assert!(tried.iter().any(|c| c.preset == search::DEFAULT_PRESET && c.params == params), "{params}");
+        }
+    }
+
+    #[test]
+    fn a_remembered_encode_of_an_earlier_version_can_still_be_read() {
+        let line = br#"{"path":"/v/a.mkv","size":1,"mtime":2,"samples":2,"sample_secs":6.0,"encoder":"e","preset":6,"params":"tune=0","crf":30,"vmaf":93.0,"vmaf_min":92.0,"bytes":1000,"clip_secs":12.0,"encode_secs":3.0}"#;
+        let path = std::env::temp_dir().join(format!("av1opt-bench-old-{}.jsonl", std::process::id()));
+        std::fs::write(&path, line).unwrap();
+        let lines = read_lines(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!((lines.len(), lines[0].m.encode_secs), (1, 3.0));
     }
 
     #[test]

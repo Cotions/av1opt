@@ -182,7 +182,7 @@ enum Cmd {
         /// Videos and/or folders to take the test videos from.
         #[arg(required = true)]
         paths: Vec<PathBuf>,
-        /// Presets to try, e.g. 4,6,8.
+        /// Presets to try, e.g. 4,5,8.
         #[arg(long, value_delimiter = ',', default_values_t = bench::DEFAULT_PRESETS, value_parser = clap::value_parser!(u8).range(0..=13))]
         presets: Vec<u8>,
         /// An SVT-AV1 parameter set to try with every preset, as key=value:key=value.

@@ -403,7 +403,7 @@ folder), the file is refused before any sample is cut, with a message to rename 
 ## bench
 
 ```
-av1opt bench /videos [--presets 4,6,8] [--params tune=0 --params tune=2:enable-qm=1] [--save]
+av1opt bench /videos [--presets 4,5,8] [--params tune=0 --params tune=2:enable-qm=1] [--save]
 ```
 
 Answers "would another preset or SVT-AV1 parameter give me smaller files, and what would it
@@ -436,7 +436,7 @@ there by the video's size (classes without an entry use `--preset` and `--svt-pa
 `av1opt tuning` shows what is stored, `av1opt tuning --clear` forgets it. Without `--tuned`
 nothing changes: `encode --svt-params key=value:key=value` sets parameters by hand.
 
-Sample encodes are remembered in `~/.cache/av1opt/bench-v2.jsonl` (by file, clip layout,
+Sample encodes are remembered in `~/.cache/av1opt/bench-v3.jsonl` (by file, clip layout,
 encoder build, preset, parameters and CRF), so a stopped run carries on where it was and adding
 a setting later only measures the new one. `--refresh` measures again.
 

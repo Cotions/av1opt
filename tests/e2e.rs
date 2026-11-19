@@ -1327,6 +1327,38 @@ const SLOW: [&str; 6] = ["--preset", "6", "--samples", "2", "--sample-secs", "2"
 
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_finished_chunk_swapped_for_another_stream_is_encoded_again_on_resuming() {
+    let c = Case::new("swapped-chunk");
+    let src = c.scenes_clip("s.mp4");
+    let args = || {
+        let mut a: Vec<std::ffi::OsString> = vec!["encode".into(), "-o".into(), c.out().into(), "--scenes".into()];
+        a.extend(SLOW.iter().map(Into::into));
+        a.push(src.clone().into());
+        a
+    };
+    let mut child = c.command().args(args()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    wait_until("the first finished chunk", 180, || entries(&c.out(), ".av1opt-work-").iter().any(|w| w.join("chunk00000.obu").exists()));
+    child.kill().unwrap();
+    child.wait().unwrap();
+    wait_until("ffmpeg to end with av1opt", 5, || ffmpegs_under(&c.dir).is_empty());
+    // A valid AV1 stream of as many frames, all red, where the first chunk's encode was: what
+    // anybody who could write into the work folder could leave there.
+    let work = entries(&c.out(), ".av1opt-work-").remove(0);
+    let record: serde_json::Value = serde_json::from_slice(&std::fs::read(work.join("chunk00000.json")).unwrap()).unwrap();
+    let count = record["frames"].as_u64().unwrap().to_string();
+    let swapped = work.join("chunk00000.obu");
+    c.ffmpeg(&["-f", "lavfi", "-i", "color=c=red:s=640x360:r=24", "-frames:v", &count, "-pix_fmt", "yuv420p10le", "-c:v", "libsvtav1", "-preset", "12", "-crf", "50", "-f", "obu", swapped.to_str().unwrap()]);
+
+    let r = c.av1opt(&args());
+    r.ok().has("note: chunk 1 is encoded again: its encode").has("encoded 1, skipped 0, failed 0");
+    let out = c.out().join("s.mp4");
+    assert_eq!(frames(&out), 576);
+    // Had the red chunk been taken over, the first scene would be red and out of step.
+    assert_in_step(&out, &src, "1");
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn scenes_get_their_own_crf_and_a_killed_run_goes_on_where_it_stopped() {
     let c = Case::new("resume");
     let src = c.scenes_clip("s.mp4");

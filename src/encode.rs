@@ -536,6 +536,10 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
         skip!("already AV1 (use --force to re-encode anyway)");
     }
     let out_duration = cut.as_ref().map_or(info.duration_s, Sections::kept);
+    // A track that cannot be kept is found before the search, not when the encode fails.
+    if let Err(why) = plan_sound(&info, o.container, o.audio, cut.is_some()) {
+        bail!("{why}; {NOT_WRITTEN}");
+    }
 
     let stem = input.file_stem().context("input has no file name")?.to_string_lossy();
     let output = out_dir.join(format!("{stem}.{}", o.container.ext()));
@@ -1293,7 +1297,14 @@ fn full_encode_args(
             a.extend(["-f".into(), "ffmetadata".into(), "-i".into(), path_arg(p)]);
             chapters = n;
         }
-        a.extend(["-filter_complex".into(), c.sections.filter_graph(info.video_index, info.audio.len(), &vf, info.duration_s)]);
+        let mut graph = c.sections.filter_graph(info.video_index, info.audio.len(), &vf, info.duration_s);
+        // Sound libopus would refuse is put into a layout it takes on its way out of the cut.
+        for (i, (way, _)) in plan_sound(info, container, audio, true).unwrap_or_default().into_iter().enumerate() {
+            if let Sound::Opus { layout: Some(OpusLayout { filter: Some(filter), .. }), .. } = way {
+                graph = graph.replacen(&format!("[ao{i}]"), &format!("[ap{i}]"), 1) + &format!(";[ap{i}]{filter}[ao{i}]");
+            }
+        }
+        a.extend(["-filter_complex".into(), graph]);
         a.extend(["-map".into(), "[vout]".into()]);
     } else {
         a.extend(["-map".into(), format!("0:{}", info.video_index)]);
@@ -1364,6 +1375,181 @@ fn mux_args(
     (a, streams)
 }
 
+/// Channel layouts libopus takes as they are, with their channels in ffmpeg's order, fewest
+/// channels first. It refuses any other: "Invalid channel layout 5.1(side) for specified
+/// mapping family -1", which is what ffmpeg's AC-3, E-AC-3 and DTS decoders call ordinary 5.1.
+const OPUS_LAYOUTS: &[(&str, &[&str])] = &[
+    ("mono", &["FC"]),
+    ("stereo", &["FL", "FR"]),
+    ("3.0", &["FL", "FR", "FC"]),
+    ("quad", &["FL", "FR", "BL", "BR"]),
+    ("5.0", &["FL", "FR", "FC", "BL", "BR"]),
+    ("5.1", &["FL", "FR", "FC", "LFE", "BL", "BR"]),
+    ("6.1", &["FL", "FR", "FC", "LFE", "BC", "SL", "SR"]),
+    ("7.1", &["FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR"]),
+];
+
+/// ffmpeg's other named layouts of up to eight channels, by their channels.
+const OTHER_LAYOUTS: &[(&str, &[&str])] = &[
+    ("downmix", &["DL", "DR"]),
+    ("2.1", &["FL", "FR", "LFE"]),
+    ("3.0(back)", &["FL", "FR", "BC"]),
+    ("4.0", &["FL", "FR", "FC", "BC"]),
+    ("quad(side)", &["FL", "FR", "SL", "SR"]),
+    ("3.1", &["FL", "FR", "FC", "LFE"]),
+    ("5.0(side)", &["FL", "FR", "FC", "SL", "SR"]),
+    ("4.1", &["FL", "FR", "FC", "LFE", "BC"]),
+    ("5.1(side)", &["FL", "FR", "FC", "LFE", "SL", "SR"]),
+    ("6.0", &["FL", "FR", "FC", "BC", "SL", "SR"]),
+    ("6.0(front)", &["FL", "FR", "FLC", "FRC", "SL", "SR"]),
+    ("3.1.2", &["FL", "FR", "FC", "LFE", "TFL", "TFR"]),
+    ("hexagonal", &["FL", "FR", "FC", "BL", "BR", "BC"]),
+    ("6.1(back)", &["FL", "FR", "FC", "LFE", "BL", "BR", "BC"]),
+    ("6.1(front)", &["FL", "FR", "LFE", "FLC", "FRC", "SL", "SR"]),
+    ("7.0", &["FL", "FR", "FC", "BL", "BR", "SL", "SR"]),
+    ("7.0(front)", &["FL", "FR", "FC", "FLC", "FRC", "SL", "SR"]),
+    ("7.1(wide)", &["FL", "FR", "FC", "LFE", "BL", "BR", "FLC", "FRC"]),
+    ("7.1(wide-side)", &["FL", "FR", "FC", "LFE", "FLC", "FRC", "SL", "SR"]),
+    ("5.1.2", &["FL", "FR", "FC", "LFE", "BL", "BR", "TFL", "TFR"]),
+    ("octagonal", &["FL", "FR", "FC", "BL", "BR", "BC", "SL", "SR"]),
+];
+
+/// The channels of a layout as ffprobe names it: a named one, or one written out
+/// ("FL+FR+LFE", "3 channels (FL+FR+LFE)"). None where it does not say.
+fn layout_channels(layout: &str) -> Option<Vec<&str>> {
+    if let Some((_, channels)) = OPUS_LAYOUTS.iter().chain(OTHER_LAYOUTS).find(|(name, _)| *name == layout) {
+        return Some(channels.to_vec());
+    }
+    let listed = layout.rsplit_once('(').map_or(layout, |(_, rest)| rest.trim_end_matches(')'));
+    let channels: Vec<&str> = listed.split('+').map(str::trim).collect();
+    (channels.len() > 1 && channels.iter().all(|c| !c.is_empty() && c.chars().all(|ch| ch.is_ascii_alphanumeric()))).then_some(channels)
+}
+
+/// How a sound track is made into one libopus takes, every channel where it was.
+#[derive(Debug, PartialEq)]
+struct OpusLayout {
+    /// The layout the track is given.
+    name: &'static str,
+    /// The `pan` filter that puts each channel in its place there; None where libopus takes
+    /// the track as it is.
+    filter: Option<String>,
+    /// Channels of `name` the source has nothing for, which stay silent.
+    silent: usize,
+}
+
+/// The fewest-channel layout libopus takes that has a place for every channel of the source.
+/// A surround channel can take the other surround pair's place: ffmpeg's decoders call the
+/// same two speakers side (AC-3, DTS) or back (AAC) surrounds, and 5.1 is the one layout Opus
+/// has for either. A source with a channel no Opus layout has (more than eight, front centre
+/// pairs, heights) has none: it is copied or refused (see [`plan_sound`]).
+fn opus_layout(layout: &str, channels: u32) -> Option<OpusLayout> {
+    let named = OPUS_LAYOUTS.iter().find(|(name, _)| *name == layout);
+    if let Some((name, _)) = named {
+        return Some(OpusLayout { name, filter: None, silent: 0 });
+    }
+    if layout.is_empty() {
+        // Unsaid: the decoder hands the track on in the layout of its number of channels,
+        // as it always did.
+        return OPUS_LAYOUTS.iter().find(|(_, places)| places.len() == channels as usize).map(|(name, _)| OpusLayout { name, filter: None, silent: 0 });
+    }
+    // A layout named that is none of these has channels Opus has no place for (heights, 22.2).
+    let source = layout_channels(layout)?;
+    let stands_for = |channel: &str| -> &'static [&'static str] {
+        match channel {
+            "SL" => &["BL"],
+            "SR" => &["BR"],
+            "BL" => &["SL"],
+            "BR" => &["SR"],
+            "DL" => &["FL"],
+            "DR" => &["FR"],
+            _ => &[],
+        }
+    };
+    OPUS_LAYOUTS.iter().filter(|(_, places)| places.len() >= source.len()).find_map(|(name, places)| {
+        let mut taken = vec![false; places.len()];
+        let mut to = Vec::new();
+        for channel in &source {
+            let place = std::iter::once(*channel).chain(stands_for(channel).iter().copied()).find_map(|c| places.iter().position(|p| *p == c).filter(|&i| !taken[i]))?;
+            taken[place] = true;
+            to.push(place);
+        }
+        let map: Vec<String> = to.iter().enumerate().map(|(from, place)| format!("c{place}=c{from}")).collect();
+        Some(OpusLayout { name, filter: Some(format!("pan={name}|{}", map.join("|"))), silent: places.len() - source.len() })
+    })
+}
+
+/// Sound formats each container holds as they are, for a track Opus has no layout for.
+const MKV_AUDIO: &[&str] = &[
+    "aac", "ac3", "eac3", "dts", "truehd", "mlp", "flac", "opus", "vorbis", "mp3", "mp2", "alac", "wavpack", "tta",
+    "pcm_s16le", "pcm_s24le", "pcm_s32le", "pcm_f32le", "pcm_f64le", "pcm_s16be", "pcm_s24be", "pcm_s32be", "pcm_u8",
+];
+const MP4_AUDIO: &[&str] = &["aac", "ac3", "eac3", "flac", "opus", "mp3", "alac"];
+
+/// What becomes of one sound track.
+#[derive(Debug, PartialEq)]
+enum Sound {
+    Copy,
+    Opus { kbps: u32, layout: Option<OpusLayout> },
+}
+
+/// What becomes of each sound track, with what the report says of it, or why the video cannot
+/// be encoded at all. Decided before any encoding time is spent: a track libopus refuses used
+/// to fail the encode once the whole search was done. `cut`: the sound comes out of a cut,
+/// which has to encode it again.
+fn plan_sound(info: &MediaInfo, container: Container, audio: Audio, cut: bool) -> std::result::Result<Vec<(Sound, Option<String>)>, String> {
+    let mut plan = Vec::new();
+    for (i, s) in info.audio.iter().enumerate() {
+        let kbps = (s.channels.max(1) * 64).clamp(64, 384);
+        let lean = lean_opus_kbps(s.channels);
+        let wants = if cut {
+            Some((kbps, " (cut audio is re-encoded)"))
+        } else if COPY_AUDIO.contains(&s.codec.as_str()) {
+            (audio == Audio::Shrink && s.bitrate > lean as f64 * 1000.0 * SHRINK_ABOVE).then_some((lean, ""))
+        } else {
+            Some((kbps, ""))
+        };
+        let Some((kbps, why)) = wants else {
+            plan.push((Sound::Copy, None));
+            continue;
+        };
+        let layout = if s.layout.is_empty() { format!("{} channels", s.channels) } else { format!("{}, {} channels", s.layout, s.channels) };
+        let from = if COPY_AUDIO.contains(&s.codec.as_str()) && !cut && audio == Audio::Shrink { format!("{} {:.0} kbps", s.codec, s.bitrate / 1000.0) } else { s.codec.clone() };
+        match opus_layout(&s.layout, s.channels) {
+            Some(l) => {
+                let placed = match (&l.filter, l.silent) {
+                    (None, _) => String::new(),
+                    (Some(_), 0) => format!(", {} as {}", s.layout, l.name),
+                    (Some(_), n) => format!(", {} as {}: its channels where they were, {n} silent", s.layout, l.name),
+                };
+                plan.push((Sound::Opus { kbps, layout: Some(l).filter(|l| l.filter.is_some()) }, Some(format!("audio {i}: {from} -> Opus {kbps} kbps{placed}{why}"))));
+            }
+            None if cut => {
+                return Err(format!(
+                    "audio {i} ({}, {layout}) cannot be cut: sound out of a cut is encoded again, and Opus has no layout for these channels; remove the sections with another tool, or convert the track to 5.1 or 7.1 first",
+                    s.codec
+                ));
+            }
+            // Copyable formats are only made Opus to save room: kept as they are instead.
+            None if COPY_AUDIO.contains(&s.codec.as_str()) => plan.push((Sound::Copy, None)),
+            None => {
+                let holds = match container {
+                    Container::Mkv => MKV_AUDIO,
+                    Container::Mp4 => MP4_AUDIO,
+                };
+                if !holds.contains(&s.codec.as_str()) {
+                    let instead = if container == Container::Mp4 && MKV_AUDIO.contains(&s.codec.as_str()) { "--container mkv keeps it as it is" } else { "convert the track to 5.1 or 7.1 first" };
+                    return Err(format!(
+                        "audio {i} ({}, {layout}) cannot be kept: Opus has no layout for these channels and {} does not hold {} as it is; {instead}",
+                        s.codec, container.ext().to_uppercase(), s.codec
+                    ));
+                }
+                plan.push((Sound::Copy, Some(format!("audio {i}: {} kept as it is: Opus has no layout for its channels ({layout})", s.codec))));
+            }
+        }
+    }
+    Ok(plan)
+}
+
 /// Audio, subtitle, cover and attachment arguments for source input number `src`.
 struct Streams {
     args: Vec<String>,
@@ -1426,28 +1612,27 @@ fn stream_args(
     // What a track is marked as (the default one, forced subtitles) comes along with a track
     // that is mapped from the source; one that comes out of the cut has to be told.
     let marked = |marks: Option<&String>| marks.filter(|m| !m.is_empty()).map_or("0".to_string(), String::clone);
-    for (i, s) in info.audio.iter().enumerate() {
-        let kbps = (s.channels.max(1) * 64).clamp(64, 384);
+    // (`optimize` refused what cannot be planned before the search; what is left is kept.)
+    let sound = plan_sound(info, container, audio, cut_subs.is_some()).unwrap_or_default();
+    for (i, (s, (way, note))) in info.audio.iter().zip(sound).enumerate() {
         if cut_subs.is_some() {
             a.extend(["-map".into(), format!("[ao{i}]")]);
-            a.extend([format!("-c:a:{i}"), "libopus".into(), format!("-b:a:{i}"), format!("{kbps}k")]);
             a.extend([format!("-disposition:a:{i}"), marked(Some(&s.disposition))]);
-            notes.push(format!("audio {i}: {} -> Opus {kbps} kbps (cut audio is re-encoded)", s.codec));
             meta_from.push((format!("a:{i}"), format!("a:{i}")));
-        } else if COPY_AUDIO.contains(&s.codec.as_str()) {
-            a.extend(["-map".into(), format!("{src}:a:{i}")]);
-            let lean = lean_opus_kbps(s.channels);
-            if audio == Audio::Shrink && s.bitrate > lean as f64 * 1000.0 * SHRINK_ABOVE {
-                a.extend([format!("-c:a:{i}"), "libopus".into(), format!("-b:a:{i}"), format!("{lean}k")]);
-                notes.push(format!("audio {i}: {} {:.0} kbps -> Opus {lean} kbps", s.codec, s.bitrate / 1000.0));
-            } else {
-                a.extend([format!("-c:a:{i}"), "copy".into()]);
-            }
         } else {
             a.extend(["-map".into(), format!("{src}:a:{i}")]);
-            a.extend([format!("-c:a:{i}"), "libopus".into(), format!("-b:a:{i}"), format!("{kbps}k")]);
-            notes.push(format!("audio {i}: {} -> Opus {kbps} kbps", s.codec));
         }
+        match way {
+            Sound::Copy => a.extend([format!("-c:a:{i}"), "copy".into()]),
+            Sound::Opus { kbps, layout } => {
+                a.extend([format!("-c:a:{i}"), "libopus".into(), format!("-b:a:{i}"), format!("{kbps}k")]);
+                // Out of a cut, the filter goes into the cut's graph (see `full_encode_args`).
+                if let Some(filter) = layout.and_then(|l| l.filter).filter(|_| cut_subs.is_none()) {
+                    a.extend([format!("-filter:a:{i}"), filter]);
+                }
+            }
+        }
+        notes.extend(note);
     }
 
     let mut kept_subs = 0;
@@ -2405,6 +2590,81 @@ mod tests {
         let (plan, notes) = audio_plan(&i, Audio::Shrink);
         assert_eq!(plan, ["libopus 96k", "libopus 96k", "libopus 256k", "libopus 128k"]);
         assert!(notes[0].contains("aac 256 kbps -> Opus 96 kbps"), "{notes:?}");
+    }
+
+    #[test]
+    fn every_layout_reaches_opus_with_its_channels_in_place_or_is_kept_or_refused_before_the_search() {
+        let pan = |l: &str, ch: u32| opus_layout(l, ch).map(|o| (o.name, o.filter.unwrap_or_default(), o.silent));
+        // What libopus takes goes in as it is, and so does a layout not said.
+        for l in ["mono", "stereo", "3.0", "quad", "5.0", "5.1", "6.1", "7.1"] {
+            assert_eq!(pan(l, 0), Some((l, String::new(), 0)));
+        }
+        assert_eq!(pan("", 2), Some(("stereo", String::new(), 0)));
+        assert_eq!(pan("", 6), Some(("5.1", String::new(), 0)));
+        assert_eq!(pan("", 9), None);
+        // AC-3's 5.1 has side surrounds where AAC's has back ones: the same speakers.
+        assert_eq!(pan("5.1(side)", 6), Some(("5.1", "pan=5.1|c0=c0|c1=c1|c2=c2|c3=c3|c4=c4|c5=c5".into(), 0)));
+        assert_eq!(pan("5.0(side)", 5), Some(("5.0", "pan=5.0|c0=c0|c1=c1|c2=c2|c3=c3|c4=c4".into(), 0)));
+        assert_eq!(pan("quad(side)", 4), Some(("quad", "pan=quad|c0=c0|c1=c1|c2=c2|c3=c3".into(), 0)));
+        // A layout Opus has no same-sized place for goes into the smallest that holds each of
+        // its channels, the rest silent: 2.1's low frequencies stay low frequencies.
+        assert_eq!(pan("2.1", 3), Some(("5.1", "pan=5.1|c0=c0|c1=c1|c3=c2".into(), 3)));
+        assert_eq!(pan("4.0", 4), Some(("6.1", "pan=6.1|c0=c0|c1=c1|c2=c2|c4=c3".into(), 3)));
+        assert_eq!(pan("FL+FR+LFE", 3), pan("2.1", 3));
+        assert_eq!(pan("3 channels (FL+FR+LFE)", 3), pan("2.1", 3));
+        assert_eq!(pan("hexagonal", 6), Some(("6.1", "pan=6.1|c0=c0|c1=c1|c2=c2|c5=c3|c6=c4|c4=c5".into(), 1)));
+        assert_eq!(pan("downmix", 2), Some(("stereo", "pan=stereo|c0=c0|c1=c1".into(), 0)));
+        // Channels Opus has no place for.
+        for l in ["7.1(wide)", "7.1(wide-side)", "6.0(front)", "5.1.2", "hexadecagonal", "22.2"] {
+            assert_eq!(pan(l, 8), None, "{l}");
+        }
+
+        let track = |codec: &str, layout: &str, channels: u32| AudioInfo { codec: codec.into(), layout: layout.into(), channels, ..Default::default() };
+        let with = |tracks: Vec<AudioInfo>| MediaInfo { audio: tracks, ..info(&[]) };
+        let plan = |i: &MediaInfo, c: Container, cut: bool| plan_sound(i, c, Audio::Keep, cut);
+        let surround = with(vec![track("ac3", "5.1(side)", 6), track("aac", "5.1", 6)]);
+        let p = plan(&surround, Container::Mp4, false).unwrap();
+        assert!(matches!(&p[0].0, Sound::Opus { kbps: 384, layout: Some(OpusLayout { name: "5.1", .. }) }), "{p:?}");
+        assert_eq!(p[0].1.as_deref(), Some("audio 0: ac3 -> Opus 384 kbps, 5.1(side) as 5.1"));
+        assert_eq!(p[1], (Sound::Copy, None));
+        let args = stream_args(&surround, 1, Container::Mp4, Audio::Keep, &[], None, &mut Vec::new()).args;
+        let at = args.iter().position(|a| a == "-filter:a:0").expect("a filter");
+        assert_eq!(args[at + 1], "pan=5.1|c0=c0|c1=c1|c2=c2|c3=c3|c4=c4|c5=c5");
+        assert!(!args.iter().any(|a| a == "-filter:a:1"));
+        let p = plan(&with(vec![track("eac3", "2.1", 3)]), Container::Mkv, false).unwrap();
+        assert_eq!(p[0].1.as_deref(), Some("audio 0: eac3 -> Opus 192 kbps, 2.1 as 5.1: its channels where they were, 3 silent"));
+        // No Opus layout: kept as it is where the container holds it; refused before any
+        // encoding where it does not, saying which track and what to do.
+        let wide = with(vec![track("eac3", "7.1(wide)", 8)]);
+        let p = plan(&wide, Container::Mp4, false).unwrap();
+        assert_eq!(p[0], (Sound::Copy, Some("audio 0: eac3 kept as it is: Opus has no layout for its channels (7.1(wide), 8 channels)".into())));
+        let pcm = with(vec![track("aac", "stereo", 2), track("pcm_s24le", "7.1(wide)", 8)]);
+        assert!(plan(&pcm, Container::Mkv, false).is_ok());
+        let e = plan(&pcm, Container::Mp4, false).unwrap_err();
+        assert!(e.starts_with("audio 1 (pcm_s24le, 7.1(wide), 8 channels) cannot be kept") && e.ends_with("--container mkv keeps it as it is"), "{e}");
+        let e = plan(&with(vec![track("wmapro", "7.1(wide)", 8)]), Container::Mkv, false).unwrap_err();
+        assert!(e.ends_with("convert the track to 5.1 or 7.1 first"), "{e}");
+        // Sound out of a cut is encoded again, so it has to have a layout.
+        assert!(plan(&wide, Container::Mkv, true).unwrap_err().contains("cannot be cut"));
+        let p = plan(&surround, Container::Mkv, true).unwrap();
+        assert!(matches!(&p[1].0, Sound::Opus { layout: None, .. }), "{p:?}");
+        // An AAC track that would only be made smaller stays as it is where Opus has no layout.
+        let big = with(vec![AudioInfo { bitrate: 900_000.0, ..track("aac", "7.1(wide)", 8) }]);
+        assert_eq!(plan_sound(&big, Container::Mp4, Audio::Shrink, false).unwrap()[0], (Sound::Copy, None));
+    }
+
+    #[test]
+    fn a_cut_puts_its_sound_into_a_layout_opus_takes() {
+        let i = MediaInfo { audio: vec![AudioInfo { codec: "ac3".into(), layout: "5.1(side)".into(), channels: 6, ..Default::default() }], audio_streams: 1, ..info(&[]) };
+        let sections = Sections::new(&[(10.0, 20.0)], 60.0).unwrap();
+        let cut = Cut { sections: &sections, subs: Vec::new(), chapters: None };
+        let (a, _) = full_encode_args(
+            Path::new("in.mkv"), &i, &EncodeSettings { preset: 10, pix_fmt_out: "yuv420p10le", params: String::new() }, 30.0, Container::Mkv, Audio::Keep,
+            &[], &metadata::Resolved::default(), &MetaOptions::default(), Some(&cut), Path::new("out.mkv"), &mut Vec::new(),
+        );
+        let graph = &a[a.iter().position(|x| x == "-filter_complex").unwrap() + 1];
+        assert!(graph.contains("concat=n=2:v=1:a=1[vout][ap0];[ap0]pan=5.1|c0=c0|c1=c1|c2=c2|c3=c3|c4=c4|c5=c5[ao0]"), "{graph}");
+        assert!(a.windows(2).any(|w| w == ["-map", "[ao0]"]));
     }
 
     #[test]

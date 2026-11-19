@@ -528,6 +528,79 @@ fn sound_tracks_are_copied_converted_or_shrunk() {
     }
 }
 
+/// Energy of each channel of audio track `track`, second by second: `[second][channel]`.
+fn channel_energy(path: &Path, track: usize, channels: usize) -> Vec<Vec<f64>> {
+    let o = Command::new(ffmpeg_bin())
+        .args(["-v", "error", "-nostdin", "-i"])
+        .arg(path)
+        .args(["-map", &format!("0:a:{track}"), "-ar", "48000", "-f", "f32le", "-"])
+        .output()
+        .expect("run ffmpeg");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let samples: Vec<f32> = o.stdout.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+    samples.chunks(48000 * channels).map(|second| (0..channels).map(|ch| second.iter().skip(ch).step_by(channels).map(|x| f64::from(*x).powi(2)).sum()).collect()).collect()
+}
+
+/// Second `k` of the clip sounds in channel `k` alone: one tone per channel, one after the other.
+fn tone_per_channel(channels: usize, layout: &str, secs: u32) -> String {
+    let tone = |k: usize| format!("if(between(t\\,{k}.1\\,{k}.9)\\,0.5*sin(2*PI*{}*t)\\,0)", if k == 3 && layout.contains("5.1") { 80 } else { 440 + 110 * k });
+    format!("aevalsrc={}:c={layout}:s=48000:d={secs}", (0..channels).map(tone).collect::<Vec<_>>().join("|"))
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn surround_sound_libopus_would_refuse_keeps_every_channel_in_its_place() {
+    let c = Case::new("surround");
+    // ffmpeg's AC-3 decoder calls ordinary 5.1 "5.1(side)", which libopus refuses; 2.1 has
+    // no Opus layout of three channels at all. (The low frequencies are a low tone.)
+    let side = tone_per_channel(6, "5.1(side)", 8);
+    let low = "aevalsrc=if(between(t\\,0.1\\,0.9)\\,0.5*sin(2*PI*440*t)\\,0)|if(between(t\\,1.1\\,1.9)\\,0.5*sin(2*PI*550*t)\\,0)|if(between(t\\,2.1\\,2.9)\\,0.5*sin(2*PI*60*t)\\,0):c=2.1:s=48000:d=8";
+    c.ffmpeg(&[
+        "-f", "lavfi", "-i", "testsrc2=s=320x180:r=24:d=8", "-f", "lavfi", "-i", &side, "-f", "lavfi", "-i", low,
+        "-map", "0:v", "-map", "1:a", "-map", "2:a", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "16", "-pix_fmt", "yuv420p",
+        "-c:a:0", "ac3", "-b:a:0", "384k", "-c:a:1", "ac3", "src.mkv",
+    ]);
+    let src = c.videos().join("src.mkv");
+    let layouts = |p: &Path| streams(&probe(p), "audio").iter().map(|a| a["channel_layout"].as_str().unwrap_or("").to_string()).collect::<Vec<_>>();
+    assert_eq!(layouts(&src), ["5.1(side)", "2.1"]);
+    for container in ["mp4", "mkv"] {
+        let out_dir = c.dir.join(format!("out-{container}"));
+        c.encode_into(&out_dir, &[&src], &["--container", container]).ok();
+        let out = out_dir.join(format!("src.{container}"));
+        assert_eq!(layouts(&out), ["5.1", "5.1"], "{container}");
+        let rep = c.report_in(&out_dir, "src");
+        assert!(rep["notes"].to_string().contains("audio 0: ac3 -> Opus 384 kbps, 5.1(side) as 5.1"), "{rep}");
+        assert!(rep["notes"].to_string().contains("audio 1: ac3 -> Opus 192 kbps, 2.1 as 5.1: its channels where they were, 3 silent"), "{rep}");
+        // Each second's tone is in the channel it was in, and nowhere else to speak of.
+        let (before, after) = (channel_energy(&src, 0, 6), channel_energy(&out, 0, 6));
+        for k in 0..6 {
+            let loudest = (0..6).max_by(|&a, &b| after[k][a].total_cmp(&after[k][b])).unwrap();
+            assert_eq!(loudest, k, "{container}: second {k}: {:?}", after[k]);
+            assert!((after[k][k] / before[k][k] - 1.0).abs() < 0.3, "{container}: channel {k} went from {} to {}", before[k][k], after[k][k]);
+            assert!((0..6).filter(|&j| j != k).all(|j| after[k][j] < after[k][k] / 100.0), "{container}: second {k}: {:?}", after[k]);
+        }
+        // 2.1 in 5.1: left, right and low frequencies in theirs; centre and surrounds silent.
+        let after = channel_energy(&out, 1, 6);
+        for (k, place) in [(0, 0), (1, 1), (2, 3)] {
+            let loudest = (0..6).max_by(|&a, &b| after[k][a].total_cmp(&after[k][b])).unwrap();
+            assert_eq!(loudest, place, "{container}: second {k}: {:?}", after[k]);
+        }
+        assert!(after.iter().all(|second| [2, 4, 5].iter().all(|&j| second[j] < 1e-3)), "{container}: {after:?}");
+    }
+    // Channels Opus has no place for: kept as they are where the container holds them, and
+    // refused before any encoding where it does not.
+    c.ffmpeg(&["-f", "lavfi", "-i", "testsrc2=s=320x180:r=24:d=4", "-f", "lavfi", "-i", "sine=d=4,aformat=channel_layouts=7.1(wide)",
+        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "pcm_s24le", "wide.mov"]);
+    let wide = c.videos().join("wide.mov");
+    let r = c.encode_into(&c.dir.join("wide-mp4"), &[&wide], &[]);
+    r.has("audio 0 (pcm_s24le, 7.1(wide), 8 channels) cannot be kept").has("--container mkv keeps it as it is").has("failed 1");
+    assert!(!r.err.contains("searching CRF"), "refused after the search:\n{}", r.err);
+    c.encode_into(&c.dir.join("wide-mkv"), &[&wide], &["--container", "mkv"]).ok();
+    let out = c.dir.join("wide-mkv/wide.mkv");
+    assert_eq!(streams(&probe(&out), "audio")[0]["codec_name"], "pcm_s24le");
+    assert_eq!(packets_md5(&out, "0:a:0"), packets_md5(&wide, "0:a:0"));
+}
+
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn removed_sections_are_gone_to_the_frame() {

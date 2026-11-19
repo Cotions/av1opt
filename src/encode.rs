@@ -1368,6 +1368,11 @@ fn mux_args(
     // A bare stream says nothing about fields and the header would say "unknown"; what an
     // encode in one pass says of itself holds here too.
     a.extend(["-field_order:v:0", "progressive"].map(String::from));
+    // Nor about the shape of its pixels, which the one pass takes along with its frames: a
+    // DVD's 720x576 shown 4:3 came out square-pixelled at 5:4.
+    if let Some(aspect) = display_aspect(info) {
+        a.extend(["-aspect:v:0".into(), aspect]);
+    }
     let streams = stream_args(info, 1, container, audio, covers, None, notes);
     a.extend(metadata::ffmpeg_args(mo, tags, 1));
     a.extend(streams.args.iter().cloned());
@@ -1548,6 +1553,37 @@ fn plan_sound(info: &MediaInfo, container: Container, audio: Audio, cut: bool) -
         }
     }
     Ok(plan)
+}
+
+/// Width and height of the picture an encode of this source makes: even, as 4:2:0 needs
+/// (see [`search::source_filters`]).
+fn encoded_size(info: &MediaInfo) -> (u32, u32) {
+    (info.width & !1, info.height & !1)
+}
+
+/// How wide the encoded picture is shown against its height, as `-aspect` takes it ("4:3"),
+/// for a source whose pixels are not square; None for square ones.
+fn display_aspect(info: &MediaInfo) -> Option<String> {
+    let (w, h) = info.sample_aspect;
+    let (width, height) = encoded_size(info);
+    if w == 0 || h == 0 || width == 0 || height == 0 {
+        return None;
+    }
+    let (n, d) = (u64::from(w) * u64::from(width), u64::from(h) * u64::from(height));
+    let gcd = |mut a: u64, mut b: u64| {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a
+    };
+    let g = gcd(n, d);
+    Some(format!("{}:{}", n / g, d / g))
+}
+
+/// How wide a picture of `width` by `height` pixels of this shape is shown against its height.
+fn shown_ratio((w, h): (u32, u32), width: u32, height: u32) -> f64 {
+    let pixel = if w == 0 || h == 0 { 1.0 } else { f64::from(w) / f64::from(h) };
+    pixel * f64::from(width) / f64::from(height.max(1))
 }
 
 /// Audio, subtitle, cover and attachment arguments for source input number `src`.
@@ -1830,6 +1866,13 @@ fn check_layout(tools: &Tools, info: &MediaInfo, out: &Path, streams: &Streams, 
             "the finished file has {} audio and {} subtitle streams where it should have {} and {}; {NOT_WRITTEN}",
             out_info.audio_streams, out_info.subtitle_streams, streams.audio, streams.subs
         );
+    }
+    // The shape the picture is shown at: the same, but for the column or row an odd size
+    // loses to 4:2:0 (see `encoded_size`).
+    let (width, height) = encoded_size(info);
+    let (shown, should) = (shown_ratio(out_info.sample_aspect, out_info.width, out_info.height), shown_ratio(info.sample_aspect, width, height));
+    if (shown / should - 1.0).abs() > 0.005 {
+        bail!("the finished video is shown {shown:.4} times as wide as it is high where its source is shown {should:.4} times; {NOT_WRITTEN}");
     }
     if out_info.color_transfer != info.color_transfer && info.hdr {
         bail!("the finished video lost its HDR signalling (its transfer is '{}', the source's is '{}'); {NOT_WRITTEN}", out_info.color_transfer, info.color_transfer);
@@ -2665,6 +2708,24 @@ mod tests {
         let graph = &a[a.iter().position(|x| x == "-filter_complex").unwrap() + 1];
         assert!(graph.contains("concat=n=2:v=1:a=1[vout][ap0];[ap0]pan=5.1|c0=c0|c1=c1|c2=c2|c3=c3|c4=c4|c5=c5[ao0]"), "{graph}");
         assert!(a.windows(2).any(|w| w == ["-map", "[ao0]"]));
+    }
+
+    #[test]
+    fn a_video_joined_from_bare_streams_is_given_the_shape_of_its_pixels() {
+        let shaped = |sample_aspect, width, height| MediaInfo { sample_aspect, width, height, ..info(&[]) };
+        // A PAL DVD shown 4:3 and 16:9, and one an odd size loses a column of.
+        assert_eq!(display_aspect(&shaped((16, 15), 720, 576)).as_deref(), Some("4:3"));
+        assert_eq!(display_aspect(&shaped((64, 45), 720, 576)).as_deref(), Some("16:9"));
+        assert_eq!(display_aspect(&shaped((964, 963), 321, 241)).as_deref(), Some("3856:2889"));
+        assert_eq!(display_aspect(&shaped((0, 0), 720, 576)), None);
+        let mut notes = Vec::new();
+        let (args, _) = mux_args(Path::new("v.ivf"), false, Path::new("in.mkv"), &shaped((16, 15), 720, 576), Container::Mkv, Audio::Keep, &[], &Resolved::default(), &MetaOptions::default(), Path::new("o.mkv"), &mut notes);
+        assert!(args.windows(2).any(|w| w == ["-aspect:v:0", "4:3"]), "{args:?}");
+        let (args, _) = mux_args(Path::new("v.ivf"), false, Path::new("in.mkv"), &shaped((0, 0), 720, 576), Container::Mkv, Audio::Keep, &[], &Resolved::default(), &MetaOptions::default(), Path::new("o.mkv"), &mut notes);
+        assert!(!args.iter().any(|a| a.starts_with("-aspect")), "{args:?}");
+        // What the check compares: 4:3 against the 5:4 square pixels would show.
+        assert!((shown_ratio((16, 15), 720, 576) - 4.0 / 3.0).abs() < 1e-9);
+        assert!((shown_ratio((0, 0), 720, 576) - 1.25).abs() < 1e-9);
     }
 
     #[test]

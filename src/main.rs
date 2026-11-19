@@ -51,13 +51,13 @@ enum Cmd {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
         /// ffprobe binary to use.
-        #[arg(long, env = "AV1OPT_FFPROBE", default_value = "ffprobe")]
+        #[arg(long, env = "AV1OPT_FFPROBE", default_value = "ffprobe", value_parser = tool_path)]
         ffprobe: String,
-        /// Parallel ffprobe processes. Keep low on slow or FUSE-mounted drives.
-        #[arg(short, long, default_value_t = 6)]
+        /// Parallel ffprobe processes (1-64). Keep low on slow or FUSE-mounted drives.
+        #[arg(short, long, default_value_t = 6, value_parser = whole::<1, 64>)]
         jobs: usize,
-        /// Minimum expected savings (0-1) for a file to count as a candidate.
-        #[arg(long, default_value_t = 0.2)]
+        /// Minimum expected savings (0-0.95) for a file to count as a candidate.
+        #[arg(long, default_value_t = 0.2, value_parser = parse_min_savings)]
         min_savings: f64,
         /// Write one row per file to this CSV.
         #[arg(long)]
@@ -89,8 +89,8 @@ enum Cmd {
     Dups {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
-        /// Videos read at once. Keep low on slow or FUSE-mounted drives.
-        #[arg(short, long, default_value_t = 6)]
+        /// Videos read at once (1-64). Keep low on slow or FUSE-mounted drives.
+        #[arg(short, long, default_value_t = 6, value_parser = whole::<1, 64>)]
         jobs: usize,
         /// Between equally good copies, keep the one under this folder. Repeatable; first wins.
         #[arg(long, value_name = "DIR")]
@@ -115,9 +115,9 @@ enum Cmd {
         /// Write the full result to this JSON file.
         #[arg(long)]
         json: Option<PathBuf>,
-        #[arg(long, env = "AV1OPT_FFMPEG", default_value = "ffmpeg")]
+        #[arg(long, env = "AV1OPT_FFMPEG", default_value = "ffmpeg", value_parser = tool_path)]
         ffmpeg: String,
-        #[arg(long, env = "AV1OPT_FFPROBE", default_value = "ffprobe")]
+        #[arg(long, env = "AV1OPT_FFPROBE", default_value = "ffprobe", value_parser = tool_path)]
         ffprobe: String,
         /// Memory cap shared by the ffmpeg runs, as for `encode`.
         #[arg(long, default_value = "auto", value_parser = parse_memory)]
@@ -175,15 +175,16 @@ enum Cmd {
         param_sets: Vec<String>,
         #[arg(long, default_value_t = 93.0, value_parser = parse_target)]
         target_vmaf: f64,
-        /// Use at most this many videos, spread over the folders and resolution classes.
-        #[arg(long, default_value_t = 6)]
+        /// Use at most this many videos (1 or more), spread over the folders and resolution classes.
+        #[arg(long, default_value_t = 6, value_parser = at_least_one)]
         max_videos: usize,
-        /// Sample clips per video.
-        #[arg(long, default_value_t = 2)]
+        /// Sample clips per video (1-8).
+        #[arg(long, default_value_t = 2, value_parser = whole::<1, 8>)]
         samples: usize,
-        #[arg(long, default_value_t = 6.0)]
+        /// Length of a sample clip in seconds (2-30).
+        #[arg(long, default_value_t = 6.0, value_parser = parse_bench_sample_secs)]
         sample_secs: f64,
-        #[arg(long, default_value_t = 20)]
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u8).range(1..=63))]
         min_crf: u8,
         #[arg(long, default_value_t = 55, value_parser = clap::value_parser!(u8).range(1..=63))]
         max_crf: u8,
@@ -204,12 +205,12 @@ enum Cmd {
         /// Write the full result to this JSON file.
         #[arg(long)]
         json: Option<PathBuf>,
-        /// Parallel ffprobe processes while collecting the videos.
-        #[arg(short, long, default_value_t = 6)]
+        /// Parallel ffprobe processes while collecting the videos (1-64).
+        #[arg(short, long, default_value_t = 6, value_parser = whole::<1, 64>)]
         jobs: usize,
-        #[arg(long, env = "AV1OPT_FFMPEG", default_value = "ffmpeg")]
+        #[arg(long, env = "AV1OPT_FFMPEG", default_value = "ffmpeg", value_parser = tool_path)]
         ffmpeg: String,
-        #[arg(long, env = "AV1OPT_FFPROBE", default_value = "ffprobe")]
+        #[arg(long, env = "AV1OPT_FFPROBE", default_value = "ffprobe", value_parser = tool_path)]
         ffprobe: String,
         /// Memory cap for each ffmpeg run, as for `encode`.
         #[arg(long, default_value = "auto", value_parser = parse_memory)]
@@ -249,7 +250,7 @@ enum Cmd {
         /// resolution class; --preset and --svt-params apply to classes without a pick.
         #[arg(long)]
         tuned: bool,
-        #[arg(long, default_value_t = 20)]
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u8).range(1..=63))]
         min_crf: u8,
         #[arg(long, default_value_t = 55, value_parser = clap::value_parser!(u8).range(1..=63))]
         max_crf: u8,
@@ -259,11 +260,11 @@ enum Cmd {
         /// (8 to 32) where it is not (--scenes, removed sections, HDR).
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..=200))]
         samples: Option<u64>,
-        /// Length of a sample clip in seconds (4 with --samples alone).
-        #[arg(long)]
+        /// Length of a sample clip in seconds, 1 to 60 (4 with --samples alone).
+        #[arg(long, value_parser = parse_sample_secs)]
         sample_secs: Option<f64>,
-        /// Skip the full encode if predicted video savings are below this (0-1).
-        #[arg(long, default_value_t = 0.15)]
+        /// Skip the full encode if predicted video savings are below this (0-0.95).
+        #[arg(long, default_value_t = 0.15, value_parser = parse_min_savings)]
         min_savings: f64,
         /// Encode even if already AV1 or below --min-savings.
         #[arg(long)]
@@ -286,9 +287,9 @@ enum Cmd {
         /// Allow writing output to ZFS.
         #[arg(long)]
         allow_zfs: bool,
-        #[arg(long, env = "AV1OPT_FFMPEG", default_value = "ffmpeg")]
+        #[arg(long, env = "AV1OPT_FFMPEG", default_value = "ffmpeg", value_parser = tool_path)]
         ffmpeg: String,
-        #[arg(long, env = "AV1OPT_FFPROBE", default_value = "ffprobe")]
+        #[arg(long, env = "AV1OPT_FFPROBE", default_value = "ffprobe", value_parser = tool_path)]
         ffprobe: String,
         /// Choose the CRF per scene: split at scene changes, target VMAF for each chunk, then join.
         /// Evens out quality across the video; slower than one CRF for the whole file.
@@ -348,18 +349,18 @@ enum Cmd {
         /// Folder for the sample clips (removed afterwards).
         #[arg(long)]
         tmp: PathBuf,
-        #[arg(long, default_value_t = search::DEFAULT_PRESET)]
+        #[arg(long, default_value_t = search::DEFAULT_PRESET, value_parser = clap::value_parser!(u8).range(0..=13))]
         preset: u8,
         #[arg(long, default_value = search::DEFAULT_PARAMS, value_parser = search::parse_params)]
         svt_params: String,
-        /// Number of sample clips. Without it: as many as `encode` would take.
-        #[arg(long)]
+        /// Number of sample clips (1-200). Without it: as many as `encode` would take.
+        #[arg(long, value_parser = whole::<1, 200>)]
         samples: Option<usize>,
-        #[arg(long, default_value_t = search::SAMPLE_SECS)]
+        #[arg(long, default_value_t = search::SAMPLE_SECS, value_parser = parse_sample_secs)]
         sample_secs: f64,
-        #[arg(long, env = "AV1OPT_FFMPEG", default_value = "ffmpeg")]
+        #[arg(long, env = "AV1OPT_FFMPEG", default_value = "ffmpeg", value_parser = tool_path)]
         ffmpeg: String,
-        #[arg(long, env = "AV1OPT_FFPROBE", default_value = "ffprobe")]
+        #[arg(long, env = "AV1OPT_FFPROBE", default_value = "ffprobe", value_parser = tool_path)]
         ffprobe: String,
         #[arg(long, default_value = "auto", value_parser = parse_memory)]
         memory_limit: String,
@@ -374,9 +375,9 @@ enum Cmd {
         /// Don't open a browser; just print the sign-in link.
         #[arg(long)]
         no_open: bool,
-        #[arg(long, env = "AV1OPT_FFMPEG", default_value = "ffmpeg")]
+        #[arg(long, env = "AV1OPT_FFMPEG", default_value = "ffmpeg", value_parser = tool_path)]
         ffmpeg: String,
-        #[arg(long, env = "AV1OPT_FFPROBE", default_value = "ffprobe")]
+        #[arg(long, env = "AV1OPT_FFPROBE", default_value = "ffprobe", value_parser = tool_path)]
         ffprobe: String,
         /// Memory cap for each ffmpeg run, as for `encode`.
         #[arg(long, default_value = "auto", value_parser = parse_memory)]
@@ -384,8 +385,8 @@ enum Cmd {
         /// CPU priority for encodes (0-19).
         #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(i32).range(0..=19))]
         nice: i32,
-        /// Parallel ffprobe processes for scans.
-        #[arg(short, long, default_value_t = 6)]
+        /// Parallel ffprobe processes for scans (1-64).
+        #[arg(short, long, default_value_t = 6, value_parser = whole::<1, 64>)]
         jobs: usize,
     },
 }
@@ -397,6 +398,50 @@ fn parse_target(s: &str) -> Result<f64, String> {
         Ok(v) if v > 0.0 && v <= 100.0 => Ok(v),
         _ => Err("a VMAF target is a number above 0 and up to 100".into()),
     }
+}
+
+/// A number within limits. `nan` and the infinities are numbers to Rust and fall outside any.
+fn number_in(s: &str, low: f64, high: f64, what: &str) -> Result<f64, String> {
+    match s.parse::<f64>() {
+        Ok(v) if v >= low && v <= high => Ok(v),
+        _ => Err(format!("{what} is a number from {low} to {high}")),
+    }
+}
+
+/// A clip of no length measures nothing, and a very long one is a lossless copy of the video.
+fn parse_sample_secs(s: &str) -> Result<f64, String> {
+    number_in(s, 1.0, 60.0, "the length of a sample clip in seconds")
+}
+
+fn parse_bench_sample_secs(s: &str) -> Result<f64, String> {
+    number_in(s, 2.0, 30.0, "the length of a sample clip in seconds")
+}
+
+/// Below nothing would keep outputs larger than their source, and near 1 no encode could pass.
+fn parse_min_savings(s: &str) -> Result<f64, String> {
+    number_in(s, 0.0, 0.95, "the share of the size to save")
+}
+
+fn whole<const LOW: usize, const HIGH: usize>(s: &str) -> Result<usize, String> {
+    match s.parse::<usize>() {
+        Ok(n) if (LOW..=HIGH).contains(&n) => Ok(n),
+        _ => Err(format!("a whole number from {LOW} to {HIGH}")),
+    }
+}
+
+fn at_least_one(s: &str) -> Result<usize, String> {
+    s.parse::<usize>().ok().filter(|n| *n >= 1).ok_or_else(|| "a whole number, 1 or more".to_string())
+}
+
+/// A tool named by a path is made absolute here. It is started from other folders later (VMAF
+/// runs in the temporary folder, for the sake of its log's name), where a relative path leads
+/// nowhere. A bare name is left to be looked up in the PATH.
+fn tool_path(s: &str) -> Result<String, String> {
+    if !s.contains('/') {
+        return Ok(s.to_string());
+    }
+    let absolute = std::path::absolute(s).map_err(|e| format!("cannot tell where this is: {e}"))?;
+    absolute.into_os_string().into_string().map_err(|_| "the working folder's path is not valid UTF-8, so a tool cannot be named relative to it".to_string())
 }
 
 /// A memory amount cut in two: its number and what follows it.
@@ -442,7 +487,6 @@ fn main() -> Result<()> {
             check_reports(&[(csv.as_deref(), dups::CSV), (json.as_deref(), Kind::Json)], &paths)?;
             // SAFETY: plain syscall on our own process; children inherit the priority.
             unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) };
-            let jobs = jobs.clamp(1, 64);
             let tools = tools::Tools::new(ffmpeg, ffprobe, memory_cap(&memory_limit, jobs as u8));
             let opts = dups::Options { jobs, max_dist: tolerance, prefs: dups::matching::Prefs { prefer: prefer.iter().map(abs).collect(), avoid }, refresh };
             let start = std::time::Instant::now();
@@ -489,8 +533,8 @@ fn main() -> Result<()> {
             unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) };
             let tools = tools::Tools::new(ffmpeg, ffprobe, memory_cap(&memory_limit, 1));
             let opts = bench::Options {
-                configs: configs.clone(), target_vmaf, min_crf, max_crf, samples: samples.clamp(1, 8), sample_secs: sample_secs.clamp(2.0, 30.0),
-                max_videos, jobs: jobs.clamp(1, 64), refresh, work_dir,
+                configs: configs.clone(), target_vmaf, min_crf, max_crf, samples, sample_secs,
+                max_videos, jobs, refresh, work_dir,
             };
             let start = std::time::Instant::now();
             let plan = std::sync::Mutex::new((0usize, 0usize, 0usize));
@@ -774,7 +818,7 @@ fn check_reports(named: &[(Option<&Path>, Kind)], given: &[PathBuf]) -> Result<(
 fn positive_hours(s: &str) -> Result<f64, String> {
     match s.parse::<f64>() {
         Ok(h) if h > 0.0 && h <= 10_000.0 => Ok(h),
-        _ => Err("a number of hours above 0, like 8 or 2.5".into()),
+        _ => Err("a number of hours above 0 and up to 10000, like 8 or 2.5".into()),
     }
 }
 
@@ -846,6 +890,69 @@ fn scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the command line says to `words`, as text: empty when it is accepted.
+    fn refusal(words: &str) -> String {
+        Cli::try_parse_from(words.split_whitespace()).err().map_or(String::new(), |e| e.to_string())
+    }
+
+    #[test]
+    fn numbers_are_refused_by_their_real_range() {
+        let encode = "av1opt encode v.mkv -o o";
+        let scan = "av1opt scan v";
+        let dups = "av1opt dups v";
+        let bench = "av1opt bench v";
+        let curve = "av1opt curve v.mkv --tmp t";
+        // (command, option, range as said, accepted values, refused values)
+        let cases: &[(&str, &str, &str, &[&str], &[&str])] = &[
+            (encode, "--sample-secs", "from 1 to 60", &["1", "4.5", "60"], &["nan", "inf", "-inf", "0", "0.99", "-1", "60.5", "1e9", "x"]),
+            (curve, "--sample-secs", "from 1 to 60", &["1", "60"], &["nan", "0", "61"]),
+            (bench, "--sample-secs", "from 2 to 30", &["2", "30"], &["nan", "inf", "1.9", "31"]),
+            (encode, "--min-savings", "from 0 to 0.95", &["0", "0.5", "0.95"], &["nan", "inf", "-0.1", "0.96", "5"]),
+            (scan, "--min-savings", "from 0 to 0.95", &["0", "0.95"], &["nan", "-1", "5"]),
+            (scan, "--jobs", "from 1 to 64", &["1", "64"], &["0", "65", "-1", "x"]),
+            (dups, "--jobs", "from 1 to 64", &["1", "64"], &["0", "65"]),
+            (bench, "--jobs", "from 1 to 64", &["1", "64"], &["0", "65"]),
+            (bench, "--samples", "from 1 to 8", &["1", "8"], &["0", "9"]),
+            (bench, "--max-videos", "1 or more", &["1", "500"], &["0", "-1"]),
+            (curve, "--samples", "from 1 to 200", &["1", "200"], &["0", "201"]),
+            (scan, "--hours", "up to 10000", &["0.5", "10000"], &["0", "nan", "inf", "20000"]),
+        ];
+        for (command, option, range, good, bad) in cases {
+            for value in *good {
+                assert_eq!(refusal(&format!("{command} {option}={value}")), "", "{option} {value}");
+            }
+            for value in *bad {
+                let said = refusal(&format!("{command} {option}={value}"));
+                assert!(said.contains(option) && said.contains(range), "{option} {value}: {said}");
+            }
+        }
+        for command in [encode, bench] {
+            assert_eq!(refusal(&format!("{command} --min-crf=1")), "");
+            let said = refusal(&format!("{command} --min-crf=0"));
+            assert!(said.contains("--min-crf") && said.contains("1..=63"), "{said}");
+        }
+        assert!(refusal(&format!("{curve} --preset=14")).contains("--preset"));
+    }
+
+    #[test]
+    fn the_defaults_pass_their_own_limits() {
+        for words in ["av1opt encode v.mkv -o o", "av1opt scan v", "av1opt dups v", "av1opt bench v", "av1opt curve v.mkv --tmp t"] {
+            assert_eq!(refusal(words), "", "{words}");
+        }
+    }
+
+    #[test]
+    fn a_tool_named_by_a_path_stays_itself_from_any_folder() {
+        let here = std::env::current_dir().unwrap();
+        assert_eq!(tool_path("./bin/ffmpeg").unwrap(), here.join("bin/ffmpeg").to_str().unwrap());
+        assert_eq!(tool_path("bin/ffprobe").unwrap(), here.join("bin/ffprobe").to_str().unwrap());
+        assert_eq!(tool_path("/opt/ffmpeg").unwrap(), "/opt/ffmpeg");
+        // A bare name is the system's to find.
+        assert_eq!(tool_path("ffmpeg").unwrap(), "ffmpeg");
+        let Cmd::Encode { ffmpeg, .. } = Cli::try_parse_from(["av1opt", "encode", "v.mkv", "-o", "o", "--ffmpeg", "./bin/ffmpeg"]).unwrap().cmd else { panic!() };
+        assert_eq!(ffmpeg, here.join("bin/ffmpeg").to_str().unwrap());
+    }
 
     #[test]
     fn a_memory_cap_is_written_as_systemd_takes_it() {

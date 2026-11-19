@@ -169,3 +169,16 @@ fn a_report_takes_the_place_of_its_own_earlier_self_only() {
     assert_eq!(text(&list), "my notes\n");
     assert!(!csv.exists(), "refused as a whole, before anything is written");
 }
+
+#[test]
+fn tools_named_by_a_relative_path_are_found_from_every_folder() {
+    let c = Case::with_ffmpeg("relative-tools", "echo \"$0\" >> \"$(dirname \"$0\")/../started\"\nexit 1");
+    c.video("a.mkv");
+    let started = c.path("started");
+    // On the command line, and from the environment (where the Case's own tools are replaced).
+    c.run(&["encode", "videos/a.mkv", "-o", "out", "--ffmpeg", "./bin/ffmpeg", "--ffprobe", "./bin/ffprobe"]).lacks("cannot run");
+    assert_eq!(text(&started).lines().next(), c.path("bin/ffmpeg").to_str());
+    std::fs::remove_file(&started).unwrap();
+    let from_env = c.command(&["encode", "videos/a.mkv", "-o", "out2"]).env("AV1OPT_FFMPEG", "bin/ffmpeg").env("AV1OPT_FFPROBE", "bin/ffprobe").output().unwrap();
+    assert_eq!(text(&started).lines().next(), c.path("bin/ffmpeg").to_str(), "{}", Run::of(from_env).said);
+}

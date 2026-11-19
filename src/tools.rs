@@ -27,6 +27,30 @@ pub struct Capabilities {
 /// something else may, is given up on.
 const QUESTION_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// What [`Tools::encoder_version`] asks `ffmpeg`, each question given `limit`, and whether a
+/// question went unanswered for that long, which leaves the version short of a part.
+fn encoder_version_within(ffmpeg: &str, limit: std::time::Duration) -> (String, bool) {
+    let late = std::cell::Cell::new(false);
+    let ask = |args: &[&str]| {
+        let mut command = Command::new(ffmpeg);
+        command.args(args);
+        let asked = Instant::now();
+        let answer = answer_within(command, limit);
+        late.set(late.get() || answer.is_none() && asked.elapsed() >= limit);
+        answer
+    };
+    let version = ask(&["-hide_banner", "-version"]).and_then(|(_, out, _)| out.lines().next().map(str::to_owned)).unwrap_or_default();
+    // An ffmpeg that loads the encoder from the system stays the same ffmpeg when
+    // the encoder is updated; the encoder names itself when it is started.
+    let one_frame = ["-hide_banner", "-f", "lavfi", "-i", "color=black:s=64x64:r=1", "-frames:v", "1", "-c:v", "libsvtav1", "-preset", "13", "-f", "null", "-"];
+    let svt = ask(&one_frame).and_then(|(_, _, errors)| svt_version(&errors));
+    let version = match svt {
+        Some(v) => format!("{version} | {v}"),
+        None => version,
+    };
+    (version, late.get())
+}
+
 /// What `command` printed, its output and its errors, if it ended within `limit`. One still
 /// going then is killed, and there is no answer.
 fn answer_within(mut command: Command, limit: std::time::Duration) -> Option<(std::process::ExitStatus, String, String)> {
@@ -443,20 +467,14 @@ impl Tools {
     /// say). Measurements kept between runs only count for the build that made them.
     pub fn encoder_version(&self) -> &str {
         self.version.get_or_init(|| {
-            let ask = |args: &[&str]| {
-                let mut command = Command::new(&self.ffmpeg);
-                command.args(args);
-                answer_within(command, QUESTION_LIMIT)
-            };
-            let ffmpeg = ask(&["-hide_banner", "-version"]).and_then(|(_, out, _)| out.lines().next().map(str::to_owned)).unwrap_or_default();
-            // An ffmpeg that loads the encoder from the system stays the same ffmpeg when
-            // the encoder is updated; the encoder names itself when it is started.
-            let one_frame = ["-hide_banner", "-f", "lavfi", "-i", "color=black:s=64x64:r=1", "-frames:v", "1", "-c:v", "libsvtav1", "-preset", "13", "-f", "null", "-"];
-            let svt = ask(&one_frame).and_then(|(_, _, errors)| svt_version(&errors));
-            match svt {
-                Some(v) => format!("{ffmpeg} | {v}"),
-                None => ffmpeg,
+            let (version, late) = encoder_version_within(&self.ffmpeg, QUESTION_LIMIT);
+            if late {
+                eprintln!(
+                    "warning: ffmpeg did not say within {} s which build it is or which SVT-AV1 it encodes with, so the trials kept from earlier runs are not used in this run (they are again once it answers in time)",
+                    QUESTION_LIMIT.as_secs()
+                );
             }
+            version
         })
     }
 
@@ -1016,6 +1034,22 @@ mod tests {
         assert!(e.contains("stopped making progress") && e.contains("1 seconds") && e.contains("not been touched"), "{e}");
         let pid = std::fs::read_to_string(dir.join("pid")).unwrap();
         assert!(!Path::new("/proc").join(pid.trim()).exists(), "the stopped ffmpeg is gone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_encoder_that_hangs_on_its_one_frame_gives_a_short_version_in_time() {
+        let dir = room("version-hangs");
+        let ffmpeg = dir.join("ffmpeg");
+        crate::files::write_script(&ffmpeg, "case \"$*\" in *-version*) echo 'ffmpeg version test'; exit 0;; esac\nexec sleep 600\n");
+        let (tell, told) = std::sync::mpsc::channel();
+        let asked = ffmpeg.to_string_lossy().into_owned();
+        std::thread::spawn(move || drop(tell.send(encoder_version_within(&asked, Duration::from_millis(500)))));
+        let (version, late) = told.recv_timeout(Duration::from_secs(20)).expect("the one frame was waited on without a limit");
+        assert_eq!((version.as_str(), late), ("ffmpeg version test", true));
+        // One that answers both in time is not late.
+        crate::files::write_script(&ffmpeg, "echo 'ffmpeg version test'; echo 'Svt[info]: SVT [version]:\tSVT-AV1 Encoder Lib v3.0.0' >&2\n");
+        assert!(!encoder_version_within(&ffmpeg.to_string_lossy(), Duration::from_secs(10)).1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

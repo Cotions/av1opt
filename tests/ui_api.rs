@@ -3268,3 +3268,100 @@ fn a_scan_says_which_folders_it_could_not_read() {
     assert_eq!(paths.len(), 5, "{r}");
     assert!(paths.iter().all(|p| p.as_str().unwrap().starts_with(videos.to_str().unwrap())), "{r}");
 }
+
+/// What the page remembers is kept in ui.json: the port, and with it the browser's storage for
+/// the page, is new at every start.
+#[test]
+fn what_the_page_remembers_is_kept_by_the_server_and_survives_a_restart() {
+    let mut s = Server::start("prefs", |_| {});
+    let page = |s: &Server| s.get("/api/state").json()["settings"].clone();
+    // Nothing remembered yet: ui.json leaves the map out.
+    assert!(page(&s).get("page").is_none(), "{}", page(&s));
+    for (key, value) in [("scanVmaf", json!(91)), ("benchForm", json!({ "videos": 4, "secs": 6 })), ("noticesRead", json!(["ui.json was damaged"]))] {
+        let r = s.post("/api/prefs", &json!({ "key": key, "value": value }));
+        assert_eq!((r.status, r.json()), (200, json!({})), "{key}: {}", r.body);
+    }
+    // One key at a time: what another tab remembered stays.
+    assert_eq!(s.post("/api/prefs", &json!({ "key": "scanVmaf", "value": 95 })).status, 200);
+    assert_eq!(page(&s)["page"], json!({ "scanVmaf": 95, "benchForm": { "videos": 4, "secs": 6 }, "noticesRead": ["ui.json was damaged"] }));
+    // Null forgets.
+    assert_eq!(s.post("/api/prefs", &json!({ "key": "noticesRead", "value": null })).status, 200);
+    assert!(page(&s)["page"].get("noticesRead").is_none());
+
+    // The folder lists are the server's own settings, which a scan fills too: one list each.
+    let folder = s.dir.join("videos");
+    assert_eq!(s.post("/api/prefs", &json!({ "key": "scanRoots", "value": [folder] })).status, 200);
+    assert_eq!(page(&s)["scan_paths"], json!([folder]));
+    assert!(page(&s)["page"].get("scanRoots").is_none());
+    for (body, said) in [
+        (json!({ "key": "scanRoots", "value": ["relative"] }), "absolute paths"),
+        (json!({ "key": "dupRoots", "value": "/videos" }), "has to be a list"),
+        (json!({ "value": 1 }), "needs a key"),
+        (json!({ "key": "a b", "value": 1 }), "letters, digits"),
+        (json!({ "key": "big", "value": "x".repeat(20_000) }), "16384 bytes"),
+    ] {
+        let r = s.post("/api/prefs", &body);
+        assert_eq!(r.status, 400, "{body}: {}", r.body);
+        assert!(r.json()["error"].as_str().unwrap_or("").contains(said), "{said}: {}", r.body);
+    }
+    // Two are kept already: 62 more make the 64 allowed.
+    for i in 0..62 {
+        s.post("/api/prefs", &json!({ "key": format!("k{i}"), "value": i }));
+    }
+    let r = s.post("/api/prefs", &json!({ "key": "one_more", "value": 1 }));
+    assert!(r.status == 400 && r.body.contains("64 values"), "{}", r.body);
+
+    // Writing needs the session, from this page, as JSON, as every other change does.
+    let body = r#"{"key":"x","value":1}"#;
+    assert_eq!(s.request("POST", "/api/prefs", &[("Content-Type", "application/json")], Some(body)).status, 401);
+    let p = s.port;
+    let foreign = s.request("POST", "/api/prefs", &[("Cookie", &s.cookie()), ("Content-Type", "application/json"), ("Origin", "http://evil.example")], Some(body));
+    assert_eq!(foreign.status, 403);
+    let cross = s.request("POST", "/api/prefs", &[("Cookie", &s.cookie()), ("Content-Type", "application/json"), ("Sec-Fetch-Site", "cross-site")], Some(body));
+    assert_eq!(cross.status, 403);
+    let plain = s.request("POST", "/api/prefs", &[("Cookie", &s.cookie()), ("Content-Type", "text/plain"), ("Origin", &format!("http://127.0.0.1:{p}"))], Some(body));
+    assert_eq!(plain.status, 415);
+    assert!(page(&s)["page"].get("x").is_none());
+
+    // A restart, which here starts on another port as it always does.
+    assert!(s.terminate());
+    let s2 = Server::start_in(&s.dir, "false", "false");
+    let st = page(&s2);
+    assert_eq!((&st["page"]["scanVmaf"], &st["page"]["benchForm"]["videos"], &st["scan_paths"]), (&json!(95), &json!(4), &json!([folder])), "{st}");
+}
+
+/// A settings file edited by hand is read for what the page could have sent, no more.
+#[test]
+fn remembered_values_in_a_settings_file_are_kept_within_the_same_limits() {
+    let s = Server::start("prefs-file", |d| {
+        let page = json!({ "scanVmaf": 90, "bad key": 1, "huge": "x".repeat(20_000), "scanRoots": ["/elsewhere"] });
+        std::fs::write(d.join("data/av1opt/ui.json"), json!({ "format": 1, "page": page }).to_string()).unwrap();
+    });
+    let st = s.get("/api/state").json();
+    assert_eq!(st["settings"]["page"], json!({ "scanVmaf": 90 }), "{}", st["settings"]);
+    assert!(st["notices"].as_array().is_none_or(|n| n.is_empty()), "{}", st["notices"]);
+
+    // Something else than a map there costs the page's values, not the other settings.
+    let s = Server::start("prefs-not-a-map", |d| {
+        std::fs::write(d.join("data/av1opt/ui.json"), json!({ "format": 1, "page": 5, "scan_paths": ["/videos"] }).to_string()).unwrap();
+    });
+    let st = s.get("/api/state").json();
+    assert_eq!((st["settings"].get("page"), &st["settings"]["scan_paths"]), (None, &json!(["/videos"])), "{}", st["settings"]);
+    assert!(st["notices"].as_array().is_none_or(|n| n.is_empty()), "{}", st["notices"]);
+}
+
+/// The output folder of the last encode asked for is kept when it is queued, so a server that
+/// is killed rather than stopped still has it.
+#[test]
+fn the_output_folder_of_the_last_encode_is_kept_through_a_kill() {
+    let (ffmpeg, ffprobe) = stand_in_tools("out-dir-kept", A_VIDEO);
+    let mut s = Server::start_with_tools("out-dir-kept", &ffmpeg, &ffprobe, |d| std::fs::write(d.join("videos/a.mp4"), b"xx").unwrap());
+    s.post("/api/queue/pause", &json!({ "paused": true }));
+    let out = s.dir.join("chosen-out");
+    let r = s.post("/api/jobs", &json!({ "inputs": [s.dir.join("videos/a.mp4")], "out_dir": out }));
+    assert_eq!(r.status, 200, "{}", r.body);
+    unsafe { libc::kill(s.child.id() as i32, libc::SIGKILL) };
+    s.child.wait().unwrap();
+    let s2 = Server::start_in(&s.dir, &ffmpeg, &ffprobe);
+    assert_eq!(s2.get("/api/state").json()["default_out_dir"], json!(out));
+}

@@ -1,6 +1,6 @@
 //! Request handling: session check, routing, static files, the event stream and media ranges.
 
-use super::{App, bench, dups, err_json, fields, hold, jobs, library, watch};
+use super::{App, bench, dups, err_json, fields, hold, jobs, library, memory, watch};
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -293,6 +293,7 @@ fn api(app: &Arc<App>, m: &Method, path: &str, q: &[(String, String)], body: &Va
         (Method::Post, ["watch", id, "use-output-folder"]) => watch::use_output_folder(app, id.parse()?),
         (Method::Get, ["history"]) => Ok(library::history(app)),
         (Method::Post, ["settings", "tools"]) => library::set_tools(app, body),
+        (Method::Post, ["prefs"]) => memory::set(app, body),
         (Method::Post, ["history", "dirs"]) => library::add_history_dir(app, body),
         (Method::Post, ["history", "dirs", "remove"]) => library::remove_history_dir(app, body),
         (Method::Post, ["replace"]) => library::replace_original(app, body),

@@ -17,6 +17,7 @@ mod hold;
 mod http;
 mod jobs;
 mod library;
+mod memory;
 mod turns;
 mod watch;
 
@@ -84,6 +85,10 @@ pub struct Settings {
     /// Folders whose new videos are queued by themselves.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub watches: Vec<watch::Watch>,
+    /// What the page remembers of its forms and views (see `memory`): only ever read back into
+    /// its fields.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty", deserialize_with = "memory::read")]
+    pub page: std::collections::BTreeMap<String, Value>,
 }
 
 pub struct App {

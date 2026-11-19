@@ -1184,6 +1184,20 @@ fn splice(source: &Path, head: &[u8; 32], index: &[IvfFrame], fixed: &[Fixed], o
         let start = new.first().map(|x| read(&file, x)).transpose()?.unwrap_or_default();
         let joined = sequence_header::first_in(&start).ok_or_else(|| "it starts without a sequence header".to_string()).and_then(|h| sequence_header::joinable(&header, h));
         match joined {
+            // A piece that differs in what does not change how its own frames decode still
+            // leaves its header in force until the next one: the GOP after it decodes right
+            // only if its key frame carries the stream's header again. SVT-AV1 writes one at
+            // every key frame, and ffmpeg keeps them through MP4 and Matroska; that is held
+            // here rather than trusted, as a frame that is another piece's has one of its own.
+            Ok(found) if !found.is_empty() && f.run.end < index.len() && !fixed.iter().any(|g| g.run.start == f.run.end) && sequence_header::first_in(&read(&src, &index[f.run.end])?).is_none() => {
+                let what: Vec<&str> = found.iter().map(|d| d.what).collect();
+                bail!(
+                    "the stretch encoded again from frame {} cannot be put into the video: its {} differs, and frame {}, the first after it, carries no sequence header of its own to set the stream's back",
+                    f.run.start,
+                    what.join(" and "),
+                    f.run.end
+                );
+            }
             Ok(found) => {
                 for d in found {
                     if !differences.iter().any(|e| e.what == d.what) {
@@ -2075,6 +2089,28 @@ mod tests {
         let d = splice(&dir.join("src.ivf"), &head, &index, &fx, &dir.join("out.ivf")).unwrap();
         assert_eq!(d, [sequence_header::Difference { what: "level", stream: "2.1".into(), piece: "3.0".into() }]);
         assert_eq!(ivf_index(&dir.join("out.ivf")).unwrap().1.len(), 3);
+        // Past a piece of another level, the frame after it has to set the stream's header
+        // back: a key frame that holds none leaves the piece's in force.
+        write_ivf(&dir.join("bare-after.ivf"), &[(0, key(vec![1])), (1, vec![2]), (2, vec![3]), (3, vec![0x12, 0x00, 0x32, 0x01, 4]), (4, vec![5])]);
+        let (head, index) = ivf_index(&dir.join("bare-after.ivf")).unwrap();
+        let e = splice(&dir.join("bare-after.ivf"), &head, &index, &fx, &dir.join("bare-after.out")).unwrap_err().to_string();
+        assert_eq!(
+            e,
+            "the stretch encoded again from frame 2 cannot be put into the video: its level differs, and frame 3, the first after it, carries no sequence header of its own to set the stream's back"
+        );
+        assert!(!dir.join("bare-after.out").exists());
+        // One that holds it, or another piece starting there, or the end of the video: it goes in.
+        write_ivf(&dir.join("keyed-after.ivf"), &[(0, key(vec![1])), (1, vec![2]), (2, vec![3]), (3, key(vec![4])), (4, vec![5])]);
+        let (head, index) = ivf_index(&dir.join("keyed-after.ivf")).unwrap();
+        assert_eq!(splice(&dir.join("keyed-after.ivf"), &head, &index, &fx, &dir.join("keyed-after.out")).unwrap().len(), 1);
+        let (head, index) = ivf_index(&dir.join("bare-after.ivf")).unwrap();
+        write_ivf(&dir.join("next.ivf"), &[(0, key(vec![9])), (1, vec![9])]);
+        let both = [fixed(Run { start: 2, end: 3 }, dir.join("level.ivf")), fixed(Run { start: 3, end: 5 }, dir.join("next.ivf"))];
+        assert_eq!(splice(&dir.join("bare-after.ivf"), &head, &index, &both, &dir.join("both.out")).unwrap().len(), 1);
+        // A piece that differs in nothing needs nothing of the frame after it.
+        write_ivf(&dir.join("same.ivf"), &[(0, key(vec![7]))]);
+        let same = [fixed(Run { start: 2, end: 3 }, dir.join("same.ivf"))];
+        assert_eq!(splice(&dir.join("bare-after.ivf"), &head, &index, &same, &dir.join("same.out")).unwrap(), []);
         // A video whose own first frame holds none is not spliced into.
         write_ivf(&dir.join("plain.ivf"), &[(0, vec![1]), (1, vec![2]), (2, vec![3])]);
         let (head, index) = ivf_index(&dir.join("plain.ivf")).unwrap();

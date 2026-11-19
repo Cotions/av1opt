@@ -169,23 +169,20 @@ struct TrashRequest {
     allow_zfs: bool,
 }
 
-/// Whether `paths` may go to the trash: only files of the result that are still as the search
-/// saw them, and never the last copy of a video. `gone` are the files trashed earlier;
-/// `present` says whether a file is still there unchanged.
-fn check_trash(report: &Report, gone: &HashSet<PathBuf>, paths: &[PathBuf], present: &dyn Fn(&File) -> bool) -> Result<()> {
+/// Whether `paths` may go to the trash at all: only files of the result, not moved yet, and
+/// never every copy of a video. `gone` are the files trashed earlier. Whether each file is still
+/// what the search saw is asked when its turn comes, in [`move_marked`].
+fn check_trash(report: &Report, gone: &HashSet<PathBuf>, paths: &[PathBuf]) -> Result<()> {
     if paths.is_empty() {
         bail!("nothing is marked");
     }
     let marked: HashSet<&Path> = paths.iter().map(|p| p.as_path()).collect();
     for p in paths {
-        let Some(f) = report.files.iter().find(|f| f.path == *p) else {
+        if !report.files.iter().any(|f| f.path == *p) {
             bail!("{} is not a file of this result", p.display());
-        };
+        }
         if gone.contains(p) {
             bail!("{} is in the trash already", p.display());
-        }
-        if !present(f) {
-            bail!("{} is gone or has changed since the search; search again", p.display());
         }
     }
     for g in &report.groups {
@@ -198,14 +195,68 @@ fn check_trash(report: &Report, gone: &HashSet<PathBuf>, paths: &[PathBuf], pres
             bail!("the copy to keep of {} ({}) lies in a trash folder, so nothing would stay of that video; search again", one.path.display(), keeper.path.display());
         }
         let left: Vec<&&File> = members.iter().filter(|f| !marked.contains(f.path.as_path()) && !gone.contains(&f.path)).collect();
-        if left.is_empty() {
+        let Some(first) = left.first() else {
             bail!("every copy of {} is marked: nothing would be left of that video. Untick one", one.path.display());
-        }
-        if !left.iter().any(|f| !crate::trash::in_a_trash(&f.path) && present(f)) {
-            bail!("the copy to keep of {} ({}) is gone or has changed since the search; search again", one.path.display(), left[0].path.display());
+        };
+        if left.iter().all(|f| crate::trash::in_a_trash(&f.path)) {
+            bail!("the copy to keep of {} ({}) lies in a trash folder, so nothing would stay of that video; search again", one.path.display(), first.path.display());
         }
     }
     Ok(())
+}
+
+/// The copies that stay when `file` goes, one for each group it is in, all of them still what
+/// the search saw. The copy a group keeps comes first, so it is the one relied on while it
+/// is fit for that.
+fn copies_that_stay<'a>(report: &'a Report, gone: &HashSet<PathBuf>, marked: &HashSet<&Path>, file: &File, unchanged: &dyn Fn(&File) -> bool) -> Result<Vec<&'a File>> {
+    let mut stay = Vec::new();
+    for g in &report.groups {
+        let members: Vec<&File> = g.members.iter().filter_map(|&i| report.files.get(i)).collect();
+        if !members.iter().any(|f| f.path == file.path) {
+            continue;
+        }
+        let left: Vec<&File> = members.into_iter().filter(|f| !marked.contains(f.path.as_path()) && !gone.contains(&f.path) && !crate::trash::in_a_trash(&f.path)).collect();
+        match left.iter().find(|f| unchanged(f)) {
+            Some(copy) => stay.push(*copy),
+            None => bail!("the copy to keep ({}) is gone or has changed since the search, so {} was left where it is; search again", left.first().map_or(file.path.as_path(), |f| f.path.as_path()).display(), file.path.display()),
+        }
+    }
+    Ok(stay)
+}
+
+/// What became of the files of one request.
+#[derive(Default)]
+struct Moved {
+    trashed: Vec<PathBuf>,
+    failed: Vec<Value>,
+    bytes: u64,
+}
+
+/// Moves the marked files one at a time with `to_trash`. Each is looked at again right before
+/// its move, with the copy that is to stay: what changed since the search stays where it is,
+/// with a message, and the others still go.
+fn move_marked(report: &Report, gone: &HashSet<PathBuf>, paths: &[PathBuf], unchanged: &dyn Fn(&File) -> bool, to_trash: &dyn Fn(&Path) -> Result<PathBuf>) -> Moved {
+    let marked: HashSet<&Path> = paths.iter().map(|p| p.as_path()).collect();
+    let mut moved = Moved::default();
+    for p in paths {
+        let Some(file) = report.files.iter().find(|f| f.path == *p) else { continue };
+        let one = || -> Result<()> {
+            if !unchanged(file) {
+                bail!("{} is gone or has changed since the search, so it was left alone; search again", p.display());
+            }
+            copies_that_stay(report, gone, &marked, file, unchanged)?;
+            to_trash(p)?;
+            Ok(())
+        };
+        match one() {
+            Ok(()) => {
+                moved.bytes += file.size;
+                moved.trashed.push(p.clone());
+            }
+            Err(e) => moved.failed.push(json!({ "path": p, "error": format!("{e:#}") })),
+        }
+    }
+    moved
 }
 
 /// Moves marked files of a result to the trash of the drive each is on. Nothing is deleted:
@@ -224,8 +275,7 @@ pub fn trash(app: &App, id: u64, body: &Value) -> Result<Value> {
     let mut paths = r.paths;
     paths.sort();
     paths.dedup();
-    let present = |f: &File| std::fs::symlink_metadata(&f.path).is_ok_and(|m| m.is_file() && m.len() == f.size);
-    check_trash(&report, &gone, &paths, &present)?;
+    check_trash(&report, &gone, &paths)?;
     // A trash on ZFS is a write to the pool like any other: asked about first, and nothing
     // is moved before the answer.
     if !r.allow_zfs {
@@ -235,16 +285,7 @@ pub fn trash(app: &App, id: u64, body: &Value) -> Result<Value> {
         }
     }
 
-    let (mut trashed, mut failed, mut bytes) = (Vec::new(), Vec::new(), 0u64);
-    for p in &paths {
-        match crate::trash::trash(p) {
-            Ok(_) => {
-                bytes += report.files.iter().find(|f| f.path == *p).map_or(0, |f| f.size);
-                trashed.push(p.clone());
-            }
-            Err(e) => failed.push(json!({ "path": p, "error": format!("{e:#}") })),
-        }
-    }
+    let Moved { trashed, failed, bytes } = move_marked(&report, &gone, &paths, &File::unchanged, &crate::trash::trash);
     if let Some(run) = app.dups.lock().unwrap().iter_mut().find(|x| x.id == id) {
         run.trashed.extend(trashed.iter().cloned());
     }
@@ -359,7 +400,122 @@ mod tests {
     use crate::dups::matching::{Group, Kind};
 
     fn file(name: &str) -> File {
-        File { path: PathBuf::from(name), root: PathBuf::from("/"), size: 10, codec: "h264".into(), width: 1280, height: 720, fps: 30.0, duration_s: 60.0, video_mbps: 2.0, identical: None }
+        File { path: PathBuf::from(name), root: PathBuf::from("/"), size: 10, codec: "h264".into(), width: 1280, height: 720, fps: 30.0, duration_s: 60.0, video_mbps: 2.0, identical: None, modified: 0, digest: None }
+    }
+
+    /// A file on disk, as a search that ended now would describe it.
+    fn seen(path: &Path) -> File {
+        let meta = std::fs::metadata(path).unwrap();
+        let modified = meta.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        File { size: meta.len(), modified, digest: crate::files::sample_digest(path, meta.len(), 64 * 1024).ok(), ..file(path.to_str().unwrap()) }
+    }
+
+    /// A folder with the videos `names` in it, all of one size, and a private trash for them.
+    fn library(tag: &str, names: &[&str]) -> (PathBuf, Vec<PathBuf>) {
+        let dir = std::env::temp_dir().join(format!("av1opt-ui-dups-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        crate::trash::TEST_HOME_TRASH.with(|h| *h.borrow_mut() = Some(dir.join("Trash")));
+        let paths: Vec<PathBuf> = names.iter().map(|n| dir.join("lib").join(n)).collect();
+        for (i, p) in paths.iter().enumerate() {
+            std::fs::write(p, format!("contents of copy {i}")).unwrap();
+        }
+        (dir, paths)
+    }
+
+    fn pair_report(paths: &[PathBuf]) -> Report {
+        Report {
+            files: paths.iter().map(|p| seen(p)).collect(),
+            groups: vec![Group { kind: Kind::Same, score: 1.0, members: (0..paths.len()).collect(), reason: String::new() }],
+            ..Default::default()
+        }
+    }
+
+    fn move_all(report: &Report, paths: &[PathBuf]) -> Moved {
+        move_marked(report, &HashSet::new(), paths, &File::unchanged, &crate::trash::trash)
+    }
+
+    fn only_error(moved: &Moved) -> String {
+        assert_eq!(moved.failed.len(), 1, "{:?}", moved.failed);
+        moved.failed[0]["error"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn a_file_that_changed_since_the_search_stays_where_it_is() {
+        let (dir, p) = library("stale", &["keep.mkv", "spare.mkv"]);
+        let (keep, spare) = (&p[0], &p[1]);
+        let report = pair_report(&p);
+        let when = std::fs::metadata(keep).unwrap().modified().unwrap();
+        let set_time = |path: &Path| std::fs::File::options().write(true).open(path).unwrap().set_modified(when).unwrap();
+
+        // The two have changed places: same sizes, same dates, other contents.
+        let parked = dir.join("parked");
+        std::fs::rename(keep, &parked).unwrap();
+        std::fs::rename(spare, keep).unwrap();
+        std::fs::rename(&parked, spare).unwrap();
+        set_time(keep);
+        set_time(spare);
+        let moved = move_all(&report, std::slice::from_ref(spare));
+        assert!(moved.trashed.is_empty());
+        assert!(only_error(&moved).contains("changed since the search"), "{:?}", moved.failed);
+        assert!(spare.exists());
+        std::fs::rename(keep, &parked).unwrap();
+        std::fs::rename(spare, keep).unwrap();
+        std::fs::rename(&parked, spare).unwrap();
+
+        // The copy to keep was overwritten with zeros of its size, at the same second.
+        let original = std::fs::read(keep).unwrap();
+        std::fs::write(keep, vec![0; original.len()]).unwrap();
+        set_time(keep);
+        let moved = move_all(&report, std::slice::from_ref(spare));
+        let error = only_error(&moved);
+        assert!(error.contains("copy to keep") && error.contains("changed since the search"), "{error}");
+        assert!(spare.exists());
+        std::fs::write(keep, &original).unwrap();
+        set_time(keep);
+
+        // Only touched: the date is part of what the search saw.
+        std::fs::File::options().write(true).open(spare).unwrap().set_modified(when + std::time::Duration::from_secs(5)).unwrap();
+        assert!(only_error(&move_all(&report, std::slice::from_ref(spare))).contains("changed since the search"));
+        set_time(spare);
+
+        // As the search saw them, it goes.
+        let moved = move_all(&report, std::slice::from_ref(spare));
+        assert_eq!((moved.trashed.as_slice(), moved.failed.len(), moved.bytes), (std::slice::from_ref(spare), 0, report.files[1].size));
+        assert!(!spare.exists() && keep.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn one_changed_file_does_not_stop_the_others() {
+        let (dir, p) = library("some", &["a.mkv", "b.mkv", "c.mkv", "d.mkv"]);
+        let mut report = pair_report(&p);
+        report.groups = vec![Group { kind: Kind::Same, score: 1.0, members: vec![0, 1], reason: String::new() }, Group { kind: Kind::Same, score: 1.0, members: vec![2, 3], reason: String::new() }];
+        std::fs::write(&p[1], "another file altogether").unwrap();
+        let moved = move_all(&report, &[p[1].clone(), p[3].clone()]);
+        assert_eq!(moved.trashed, [p[3].clone()]);
+        assert!(only_error(&moved).contains("b.mkv"));
+        assert!(p[1].exists() && !p[3].exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_second_copy_stands_in_for_a_keeper_that_changed() {
+        let (dir, p) = library("stand-in", &["keep.mkv", "other.mkv", "spare.mkv"]);
+        let report = pair_report(&p);
+        std::fs::remove_file(&p[0]).unwrap();
+        let moved = move_all(&report, std::slice::from_ref(&p[2]));
+        assert_eq!((moved.trashed.len(), moved.failed.len()), (1, 0));
+        // With that one marked as well, nothing is left to rely on.
+        let (dir2, q) = library("stand-in-2", &["keep.mkv", "other.mkv", "spare.mkv"]);
+        let report = pair_report(&q);
+        std::fs::remove_file(&q[0]).unwrap();
+        let moved = move_all(&report, &q[1..]);
+        assert!(moved.trashed.is_empty() && moved.failed.len() == 2, "{:?}", moved.failed);
+        assert!(q[1].exists() && q[2].exists());
+        for d in [dir, dir2] {
+            std::fs::remove_dir_all(d).unwrap();
+        }
     }
 
     #[test]
@@ -372,13 +528,13 @@ mod tests {
         };
         let live = PathBuf::from("/lib/only.mkv");
         for keeper in ["/data/Trash/files/a.mkv", "/drive/.Trash-1000/files/a.mkv", "/drive/.Trash/1000/files/a.mkv"] {
-            let e = check_trash(&report(&[keeper, "/lib/only.mkv"]), &HashSet::new(), std::slice::from_ref(&live), &|_| true).unwrap_err().to_string();
+            let e = check_trash(&report(&[keeper, "/lib/only.mkv"]), &HashSet::new(), std::slice::from_ref(&live)).unwrap_err().to_string();
             assert!(e.contains("lies in a trash folder") && e.contains(keeper), "{e}");
         }
         // Another copy in a trash does not count as what stays either.
-        let e = check_trash(&report(&["/lib/only.mkv", "/lib/b.mkv", "/data/Trash/files/a.mkv"]), &HashSet::new(), &[live.clone(), "/lib/b.mkv".into()], &|_| true).unwrap_err().to_string();
+        let e = check_trash(&report(&["/lib/only.mkv", "/lib/b.mkv", "/data/Trash/files/a.mkv"]), &HashSet::new(), &[live.clone(), "/lib/b.mkv".into()]).unwrap_err().to_string();
         assert!(e.contains("copy to keep"), "{e}");
-        assert!(check_trash(&report(&["/lib/b.mkv", "/lib/only.mkv", "/data/Trash/files/a.mkv"]), &HashSet::new(), &[live], &|_| true).is_ok());
+        assert!(check_trash(&report(&["/lib/b.mkv", "/lib/only.mkv", "/data/Trash/files/a.mkv"]), &HashSet::new(), &[live]).is_ok());
         crate::trash::TEST_HOME_TRASH.with(|h| *h.borrow_mut() = None);
     }
 
@@ -393,27 +549,19 @@ mod tests {
             ..Default::default()
         };
         let paths = |names: &[&str]| names.iter().map(PathBuf::from).collect::<Vec<_>>();
-        let all = |_: &File| true;
         let none = HashSet::new();
-        let check = |gone: &HashSet<PathBuf>, names: &[&str], present: &dyn Fn(&File) -> bool| check_trash(&report, gone, &paths(names), present).map_err(|e| e.to_string());
+        let check = |gone: &HashSet<PathBuf>, names: &[&str]| check_trash(&report, gone, &paths(names)).map_err(|e| e.to_string());
 
-        assert!(check(&none, &["/b/1.mp4", "/c/1.webm", "/b/2.mkv"], &all).is_ok());
-        assert!(check(&none, &[], &all).unwrap_err().contains("nothing is marked"));
-        assert!(check(&none, &["/etc/passwd"], &all).unwrap_err().contains("not a file of this result"));
-        assert!(check(&none, &["/a/1.mkv", "/b/1.mp4", "/c/1.webm"], &all).unwrap_err().contains("every copy"));
-        assert!(check(&none, &["/a/2.mkv", "/b/2.mkv"], &all).unwrap_err().contains("every copy"));
+        assert!(check(&none, &["/b/1.mp4", "/c/1.webm", "/b/2.mkv"]).is_ok());
+        assert!(check(&none, &[]).unwrap_err().contains("nothing is marked"));
+        assert!(check(&none, &["/etc/passwd"]).unwrap_err().contains("not a file of this result"));
+        assert!(check(&none, &["/a/1.mkv", "/b/1.mp4", "/c/1.webm"]).unwrap_err().contains("every copy"));
+        assert!(check(&none, &["/a/2.mkv", "/b/2.mkv"]).unwrap_err().contains("every copy"));
 
         // Copies trashed earlier don't count as kept, and can't be trashed twice.
         let gone: HashSet<PathBuf> = paths(&["/a/1.mkv"]).into_iter().collect();
-        assert!(check(&gone, &["/b/1.mp4"], &all).is_ok());
-        assert!(check(&gone, &["/b/1.mp4", "/c/1.webm"], &all).unwrap_err().contains("every copy"));
-        assert!(check(&gone, &["/a/1.mkv"], &all).unwrap_err().contains("in the trash already"));
-
-        // A marked file that changed, or a keeper that is no longer there, stops everything.
-        let without = |missing: &'static str| move |f: &File| f.path != Path::new(missing);
-        assert!(check(&none, &["/b/1.mp4"], &without("/b/1.mp4")).unwrap_err().contains("gone or has changed"));
-        assert!(check(&none, &["/b/2.mkv"], &without("/a/2.mkv")).unwrap_err().contains("copy to keep"));
-        // One keeper missing is fine while another is there.
-        assert!(check(&none, &["/b/1.mp4"], &without("/a/1.mkv")).is_ok());
+        assert!(check(&gone, &["/b/1.mp4"]).is_ok());
+        assert!(check(&gone, &["/b/1.mp4", "/c/1.webm"]).unwrap_err().contains("every copy"));
+        assert!(check(&gone, &["/a/1.mkv"]).unwrap_err().contains("in the trash already"));
     }
 }

@@ -55,6 +55,26 @@ pub struct File {
     pub video_mbps: f64,
     /// Files of a group with the same number here have the same bytes (sampled, not read in full).
     pub identical: Option<u32>,
+    /// Modification time (seconds since 1970) the search saw, for [`File::unchanged`].
+    #[serde(skip)]
+    #[cfg_attr(not(feature = "ui"), allow(dead_code))]
+    pub modified: u64,
+    /// Sampled digest of the contents at the end of the search, None if they could not be read.
+    #[serde(skip)]
+    #[cfg_attr(not(feature = "ui"), allow(dead_code))]
+    pub digest: Option<u64>,
+}
+
+impl File {
+    /// Whether this is still the file the search saw: its size, its date and the bytes sampled
+    /// at its start, middle and end. The size alone does not tell: two copies of one size can
+    /// have changed places, or one been overwritten.
+    #[cfg(feature = "ui")]
+    pub fn unchanged(&self) -> bool {
+        let Ok(meta) = std::fs::symlink_metadata(&self.path) else { return false };
+        let modified = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+        meta.is_file() && meta.len() == self.size && modified == self.modified && self.digest.is_some() && crate::files::sample_digest(&self.path, self.size, IDENTICAL_SAMPLE).ok() == self.digest
+    }
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -339,11 +359,15 @@ pub fn find(paths: &[PathBuf], tools: &Tools, o: &Options, progress: &(dyn Fn(Pr
                     duration_s: info.duration_s,
                     video_mbps: info.video_bitrate / 1e6,
                     identical: media[*m].identical,
+                    modified: f.mtime,
+                    digest: None,
                 });
                 files.len() - 1
             });
         }
     }
+    // What the page checks again before it moves anything; only files in a group are read.
+    pool.install(|| files.par_iter_mut().for_each(|f| f.digest = crate::files::sample_digest(&f.path, f.size, IDENTICAL_SAMPLE).ok()));
     let same: Vec<&Group> = groups.iter().filter(|g| g.kind == Kind::Same).collect();
     let stats = Stats {
         videos: found.len(),
@@ -509,6 +533,8 @@ mod tests {
             duration_s: d,
             video_mbps: 1.5,
             identical: (i == 0).then_some(4),
+            modified: 0,
+            digest: None,
         };
         let g = Group { kind, score: 0.875, members: (0..secs.len()).collect(), reason: "largest file".into() };
         let r = Report { files: secs.iter().enumerate().map(|(i, &d)| file(i, d)).collect(), groups: vec![g.clone()], ..Default::default() };

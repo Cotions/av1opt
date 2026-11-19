@@ -1609,6 +1609,10 @@ fn scenes_are_encoded_apart_only_where_the_samples_disagree() {
     assert!(w["lowest_vmaf"].as_f64().unwrap() > w["lowest_before"].as_f64().unwrap(), "{rep}");
     assert!(stretches.iter().any(|st| st["out_of_reach"] == true) || w["lowest_vmaf"].as_f64().unwrap() >= 89.0, "{rep}");
     assert_eq!(rep["mean_vmaf"], w["mean_vmaf"]);
+    // Encoded once, then repaired: no first CRF, and the length the stretches are part of.
+    assert!(rep.get("first_crf").is_none(), "{rep}");
+    let secs = rep["video_secs"].as_f64().unwrap();
+    assert!(stretches.iter().map(|st| st["secs"].as_f64().unwrap()).sum::<f64>() < secs + 0.1, "{rep}");
     let out = whole.join("uneven.mp4");
     let (got, want) = (frame_times(&out), frame_times(&uneven));
     assert_eq!(got.len(), want.len());
@@ -1691,6 +1695,8 @@ fn scenes_are_encoded_apart_only_where_the_samples_disagree() {
     let chosen = rep["crf"].as_f64().unwrap();
     let first: f64 = r.err.split("chose crf ").nth(1).and_then(|t| t.split_whitespace().next()?.parse().ok()).unwrap();
     assert!(chosen < first, "CRF {chosen} after {first}");
+    // And the report says the first too, for the page to tell both.
+    assert!(rep["first_crf"].as_f64().is_some_and(|f| (f - first).abs() < 0.01), "{rep}");
     assert_eq!(c.outputs_in(&again), ["av1opt-log.tsv", "hidden.av1opt.json", "hidden.mp4"]);
 }
 

@@ -201,7 +201,13 @@ struct Report<'a> {
     savings: f64,
     /// "whole" (one CRF) or "scenes" (CRF per chunk; `crf` is then the whole-file starting point).
     mode: &'a str,
+    /// The CRF of the whole video as kept. Stretches encoded again (`whole`) have their own.
     crf: f64,
+    /// The CRF of the first encode, where the video was encoded a second time at another.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_crf: Option<f64>,
+    /// Length of the output in seconds, for what share of it `whole.stretches` cover.
+    video_secs: f64,
     preset: u8,
     /// SVT-AV1 parameters besides the CRF.
     svt_params: &'a str,
@@ -939,6 +945,8 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     }
 
     let mut lifted_crf = repaired_after.then_some(best.crf);
+    // Set where the video is encoded a second time at another CRF.
+    let mut first_crf = None;
     // (A search aimed low and rounded to the nearest step says little about what the video can
     // reach: its target stands.)
     let goal_for = |best: &search::Trial| if repaired_after { o.target_vmaf } else { o.target_vmaf.min(best.mean_vmaf) };
@@ -988,6 +996,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
         eprintln!("note: {n}");
         tools.emit(Event::Note { text: n.clone() });
         notes.push(n);
+        first_crf.get_or_insert(best.crf);
         best = search::Trial { crf, ..best };
         lifted_crf = lifted_crf.map(|_| crf);
         tools.emit(Event::Chosen { crf, vmaf: goal_for(&best), predicted_savings: 1.0 - best.size_ratio });
@@ -1037,6 +1046,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
                 eprintln!("note: {n}");
                 tools.emit(Event::Note { text: n.clone() });
                 notes.push(n);
+                first_crf.get_or_insert(best.crf);
                 best = b;
                 trials = all;
                 search_secs += t2.secs(tools);
@@ -1162,6 +1172,8 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
         savings: 1.0 - output_bytes as f64 / size as f64,
         mode: if chunks.is_some() { "scenes" } else { "whole" },
         crf: best.crf,
+        first_crf,
+        video_secs: out_duration,
         preset,
         svt_params,
         target_vmaf: o.target_vmaf,

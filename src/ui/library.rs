@@ -565,6 +565,10 @@ pub fn history(app: &App) -> Value {
                 "savings": r["savings"],
                 "mode": r["mode"],
                 "crf": r["crf"],
+                "first_crf": r["first_crf"],
+                "video_secs": r["video_secs"],
+                // What of a one-pass encode was encoded again after the whole-video check.
+                "stretches": r["whole"]["stretches"].as_array().map(|list| list.iter().map(|x| json!({ "crf": x["crf"], "secs": x["secs"] })).collect::<Vec<_>>()),
                 "preset": r["preset"],
                 "target_vmaf": r["target_vmaf"],
                 "mean_vmaf": r["mean_vmaf"],
@@ -577,7 +581,8 @@ pub fn history(app: &App) -> Value {
         })
         .collect();
     rows.sort_by_key(|r| std::cmp::Reverse(r["time"].as_u64().unwrap_or(0)));
-    json!({ "dirs": dirs, "reports": rows })
+    // Asked again here: an encode since the state was read may count among them.
+    json!({ "dirs": dirs, "reports": rows, "history_encodes": Model::fit(&history::load(), 93.0).samples })
 }
 
 #[derive(Deserialize)]

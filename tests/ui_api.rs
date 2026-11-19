@@ -3389,3 +3389,28 @@ fn sections_that_leave_too_little_of_the_video_are_refused_when_queued() {
     let r = s.post("/api/jobs", &job(json!([[1.0, null]])));
     assert_eq!(r.status, 200, "{}", r.body);
 }
+
+/// History tells what of a one-CRF encode the whole-video check had encoded again, and an
+/// older report, which says none of it, still reads.
+#[test]
+fn history_says_what_the_whole_video_check_encoded_again() {
+    let s = Server::start("history-again", |d| {
+        let report = |name: &str, extra: Value| {
+            let mut r = json!({ "format": 1, "input": d.join(format!("videos/{name}.mp4")), "output": d.join(format!("out/{name}.mp4")), "source_bytes": 3000, "output_bytes": 1000, "mode": "whole", "crf": 45.25 });
+            r.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            write_report(&d.join(format!("out/{name}.av1opt.json")), r);
+        };
+        report("old", json!({}));
+        report("repaired", json!({ "video_secs": 20.0, "whole": { "stretches": [{ "start_secs": 0.0, "secs": 20.0, "frames": 500, "crf": 38.25, "vmaf_before": 87.0, "vmaf": 93.1, "bytes_before": 1, "bytes": 2 }] } }));
+        report("second", json!({ "crf": 41.0, "first_crf": 45.25, "video_secs": 20.0 }));
+    });
+    add_history_folder(&s, "out");
+    let rows = s.get("/api/history").json()["reports"].as_array().unwrap().clone();
+    let row = |name: &str| rows.iter().find(|r| r["input"].as_str().unwrap().ends_with(&format!("{name}.mp4"))).unwrap().clone();
+    let old = row("old");
+    assert_eq!((&old["crf"], &old["first_crf"], &old["stretches"], &old["video_secs"]), (&json!(45.25), &Value::Null, &Value::Null, &Value::Null), "{old}");
+    let repaired = row("repaired");
+    assert_eq!((&repaired["stretches"], &repaired["video_secs"]), (&json!([{ "crf": 38.25, "secs": 20.0 }]), &json!(20.0)), "{repaired}");
+    let second = row("second");
+    assert_eq!((&second["crf"], &second["first_crf"]), (&json!(41.0), &json!(45.25)), "{second}");
+}

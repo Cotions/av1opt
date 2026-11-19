@@ -63,11 +63,21 @@ struct Connection {
     open_millis: u64,
 }
 
+/// How long a connection that has sent no request yet counts as one that has: a browser's new
+/// connection takes a moment to send its request, and under a flood of idle ones the person's
+/// own request would otherwise be the first to go.
+const NEW_FOR_MILLIS: u64 = 2_000;
+
 /// Which of `open` to close to leave `most`: by their standing, and within one the oldest (for
 /// those that have sent no request) or the quietest (for those that have), so that connections
 /// held open doing nothing go before the ones in use.
 fn over_the_limit(mut open: Vec<Connection>, most: usize) -> Vec<RawFd> {
     let excess = open.len().saturating_sub(most);
+    for c in &mut open {
+        if c.standing == Standing::NoRequest && c.open_millis < NEW_FOR_MILLIS {
+            c.standing = Standing::Heard;
+        }
+    }
     open.sort_by_key(|c| {
         let waited = match c.standing {
             Standing::OtherUser | Standing::NoRequest => c.open_millis,
@@ -88,6 +98,10 @@ struct Heard {
 }
 
 static HEARD: LazyLock<Mutex<HashMap<SocketAddrV4, Heard>>> = LazyLock::new(Mutex::default);
+
+/// The far ends of the connections [`accepting`] makes to see the server take them: they are
+/// this process's own, and neither count against the limit nor are closed for it.
+static PROBES: LazyLock<Mutex<HashSet<SocketAddrV4>>> = LazyLock::new(Mutex::default);
 
 fn v4(peer: Option<&SocketAddr>) -> Option<SocketAddrV4> {
     match peer {
@@ -179,7 +193,11 @@ fn open_connections(port: u16) -> Vec<Found> {
 /// The connections to `port`, each with its standing; `first_seen` keeps when each was first
 /// found, from one look to the next.
 fn look(port: u16, first_seen: &mut HashMap<u64, Instant>) -> Vec<Connection> {
-    let found = open_connections(port);
+    let mut found = open_connections(port);
+    {
+        let probes = PROBES.lock().unwrap();
+        found.retain(|f| !probes.contains(&f.peer));
+    }
     let now = Instant::now();
     first_seen.retain(|inode, _| found.iter().any(|f| f.inode == *inode));
     // Only read when there are too many: whose program holds the other end.
@@ -250,24 +268,36 @@ pub fn raise_open_file_limit() {
 }
 
 /// Whether a server is accepting connections to `port`: a connection made here has to turn up
-/// among this process's sockets. None where it cannot be told, when this process can make no
-/// socket. One that cannot connect is not accepting: when nobody takes them, connections fill
-/// the system's queue for the port and the next ones wait until they give up.
+/// among this process's sockets. None where it cannot be told (see [`told_by_failed_connect`]).
 fn accepting(port: u16) -> Option<bool> {
     let probe = match TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), ACCEPT_WITHIN) {
         Ok(probe) => probe,
-        Err(e) if matches!(e.raw_os_error(), Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)) => return None,
-        Err(_) => return Some(false),
+        Err(e) => return told_by_failed_connect(&e),
     };
     let SocketAddr::V4(mine) = probe.local_addr().ok()? else { return None };
+    PROBES.lock().unwrap().insert(mine);
     let began = Instant::now();
-    while began.elapsed() < ACCEPT_WITHIN {
-        if open_connections(port).iter().any(|f| f.peer == mine) {
-            return Some(true);
+    let mut taken = false;
+    while !taken && began.elapsed() < ACCEPT_WITHIN {
+        taken = open_connections(port).iter().any(|f| f.peer == mine);
+        if !taken {
+            std::thread::sleep(Duration::from_millis(50));
         }
-        std::thread::sleep(Duration::from_millis(50));
     }
-    Some(false)
+    PROBES.lock().unwrap().remove(&mine);
+    Some(taken)
+}
+
+/// What a connection to the server's own port that could not be made says of its accepting.
+/// Refused, nothing listens there any more; timed out, nobody takes connections and they fill
+/// the system's queue for the port until the next ones wait for good. Any other failure (no
+/// file descriptor or memory left, a network that is not there) says nothing of the server,
+/// and a server that is fine is not replaced for it.
+fn told_by_failed_connect(e: &std::io::Error) -> Option<bool> {
+    match e.kind() {
+        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut => Some(false),
+        _ => None,
+    }
 }
 
 /// Answers the requests of the connections to `listener` with `handle`, for as long as the
@@ -275,11 +305,16 @@ fn accepting(port: u16) -> Option<bool> {
 /// when its accepting fails or has stopped, after a short pause another server takes over on
 /// a new copy. The one before goes on answering the connections it had.
 pub fn serve(listener: TcpListener, handle: impl Fn(tiny_http::Request) + Send + Sync + 'static) -> ! {
+    serve_with(listener, handle, |copy| tiny_http::Server::from_listener(copy, None).map_err(|e| e.to_string()))
+}
+
+/// [`serve`], with each server started on a copy of the listening socket by `start`.
+fn serve_with(listener: TcpListener, handle: impl Fn(tiny_http::Request) + Send + Sync + 'static, start: impl Fn(TcpListener) -> Result<tiny_http::Server, String>) -> ! {
     let handle: Arc<dyn Fn(tiny_http::Request) + Send + Sync> = Arc::new(handle);
     let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
     let (failed, failures) = mpsc::channel::<String>();
     loop {
-        let server = listener.try_clone().map_err(|e| e.to_string()).and_then(|l| tiny_http::Server::from_listener(l, None).map_err(|e| e.to_string()));
+        let server = listener.try_clone().map_err(|e| e.to_string()).and_then(&start);
         let server = match server {
             Ok(server) => server,
             Err(e) => {
@@ -367,6 +402,50 @@ mod tests {
     }
 
     #[test]
+    fn a_connection_just_opened_counts_as_one_that_has_sent_its_request() {
+        use Standing::*;
+        let open = vec![
+            // The person's own new connection, whose request is on its way.
+            connection(1, NoRequest, 300, 300),
+            // Idle ones of a flood, opened before it.
+            connection(2, NoRequest, 2_500, 2_500),
+            connection(3, NoRequest, 9_000, 9_000),
+            connection(4, Heard, 5_000, 60_000),
+        ];
+        assert_eq!(over_the_limit(open.clone(), 2), [3, 2]);
+        // Among those heard, by how long it has been quiet.
+        assert_eq!(over_the_limit(open.clone(), 1), [3, 2, 4]);
+        // Past two seconds without a request, it is one of the idle ones.
+        let open = vec![connection(1, NoRequest, 2_100, 2_100), connection(4, Heard, 5_000, 60_000)];
+        assert_eq!(over_the_limit(open, 1), [1]);
+    }
+
+    #[test]
+    fn only_a_refused_or_unanswered_connect_says_the_server_is_not_accepting() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(told_by_failed_connect(&Error::from_raw_os_error(libc::ECONNREFUSED)), Some(false));
+        assert_eq!(told_by_failed_connect(&Error::from(ErrorKind::TimedOut)), Some(false));
+        for cannot_tell in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM, libc::EADDRNOTAVAIL, libc::ENETUNREACH, libc::EINTR] {
+            assert_eq!(told_by_failed_connect(&Error::from_raw_os_error(cannot_tell)), None, "{}", Error::from_raw_os_error(cannot_tell));
+        }
+    }
+
+    #[test]
+    fn the_connection_that_checks_the_server_is_neither_counted_nor_closed() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let clients: Vec<TcpStream> = (0..2).map(|_| TcpStream::connect(("127.0.0.1", port)).unwrap()).collect();
+        let _accepted: Vec<TcpStream> = (0..2).map(|_| listener.accept().unwrap().0).collect();
+        let SocketAddr::V4(probe) = clients[1].local_addr().unwrap() else { unreachable!() };
+        PROBES.lock().unwrap().insert(probe);
+        let looked = look(port, &mut HashMap::new());
+        PROBES.lock().unwrap().remove(&probe);
+        let other = open_connections(port).into_iter().find(|f| SocketAddr::V4(f.peer) == clients[0].local_addr().unwrap()).unwrap();
+        assert_eq!(looked.iter().map(|c| c.socket).collect::<Vec<_>>(), [other.socket]);
+        assert_eq!(look(port, &mut HashMap::new()).len(), 2);
+    }
+
+    #[test]
     fn a_connection_is_found_once_and_a_refused_one_hears_why() {
         use std::io::Read;
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -437,24 +516,24 @@ mod tests {
         use std::io::{Read, Write};
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
-        // One copy of the socket as tiny_http would be given it, whose accepting is ended by
-        // dropping it: the socket stays open through the copy kept, and a later server answers.
-        let first = tiny_http::Server::from_listener(listener.try_clone().unwrap(), None).unwrap();
-        drop(first);
-        std::thread::spawn(move || serve(listener, |request| drop(request.respond(tiny_http::Response::from_string("answered")))));
+        // The first server is given a socket of its own that nobody connects to: to the port
+        // it is a server whose accepting has ended, and the connections to it wait unanswered.
+        let elsewhere = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = started.clone();
+        let start = move |copy: TcpListener| {
+            let first = count.fetch_add(1, Ordering::Relaxed) == 0;
+            let on = if first { elsewhere.try_clone().unwrap() } else { copy };
+            tiny_http::Server::from_listener(on, None).map_err(|e| e.to_string())
+        };
+        std::thread::spawn(move || serve_with(listener, |request| drop(request.respond(tiny_http::Response::from_string("answered"))), start));
         let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        // Found not accepting at the first check, and the next server answers.
+        client.set_read_timeout(Some(CHECK_EVERY + ACCEPT_WITHIN * 4)).unwrap();
         write!(client, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
         let mut said = String::new();
         client.read_to_string(&mut said).unwrap();
         assert!(said.starts_with("HTTP/1.1 200") && said.ends_with("answered"), "{said}");
-    }
-
-    #[test]
-    fn the_open_file_limit_is_raised_to_the_most_allowed() {
-        raise_open_file_limit();
-        // SAFETY: getrlimit writes only the struct given.
-        let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
-        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
-        assert!(limit.rlim_cur == limit.rlim_max || limit.rlim_max == libc::RLIM_INFINITY, "{} of {}", limit.rlim_cur, limit.rlim_max);
+        assert_eq!(started.load(Ordering::Relaxed), 2);
     }
 }

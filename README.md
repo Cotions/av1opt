@@ -219,7 +219,10 @@ For each file:
    point, about where such a stretch ends up, and the search aims at the mean the video will
    have when it is done, 0.2 short of the target because step 5 measures that mean and makes
    up what is missing. The answer is the step of SVT-AV1's quarter-step CRF nearest the
-   crossing. In the other cases nothing makes up for a miss, so it is rounded toward quality,
+   crossing. That holds only where the frames of the source are shown about as long as each
+   other, which is looked up in its packets before the search: elsewhere step 5 can only
+   spot check, and the search aims at the target itself. In the other cases nothing makes
+   up for a miss, so it is rounded toward quality,
    and is never more than 0.05 VMAF short of the target. 4K uses the
    `vmaf_4k` model. Clips of 1 second are too short to speak for a stretch; in the 4-second
    scheme a sample 4 or more below the samples' mean gets a note that quality differs along

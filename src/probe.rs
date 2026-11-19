@@ -170,6 +170,10 @@ pub struct Track {
     /// ISO 639-2 code; empty for none or "und".
     #[serde(default)]
     pub language: String,
+    /// The title is what ffmpeg reads of an MP4 track's name, as a tag `name`, which it
+    /// writes into Matroska as a tag NAME no player shows.
+    #[serde(default)]
+    pub from_name: bool,
 }
 
 /// Names MP4 writers give a track's handler when they are not told one: they name the kind
@@ -188,7 +192,8 @@ impl Track {
         let handler = text("handler_name").filter(|h| !PLAIN_HANDLERS.iter().any(|p| p.eq_ignore_ascii_case(h)));
         let title = text("title").or(text("name")).or(handler).unwrap_or("").to_string();
         let language = text("language").filter(|l| *l != "und").map(same_language).unwrap_or_default();
-        Track { title, language }
+        let from_name = text("title").is_none() && text("name").is_some();
+        Track { title, language, from_name }
     }
 }
 
@@ -942,10 +947,10 @@ mod tests {
         assert_eq!(pixel_shape(Some("16:15")), Some((16, 15)));
         assert_eq!([pixel_shape(Some("1:1")), pixel_shape(Some("0:1")), pixel_shape(None), pixel_shape(Some("N/A"))], [None; 4]);
         let track = |tags: Value| Track::from_tags(&tags);
-        let t = |title: &str, language: &str| Track { title: title.into(), language: language.into() };
+        let t = |title: &str, language: &str| Track { title: title.into(), language: language.into(), from_name: false };
         // Matroska's title, MP4's name as ffmpeg reads it, a handler that names the track.
         assert_eq!(track(serde_json::json!({"title": "Main picture", "language": "eng"})), t("Main picture", "eng"));
-        assert_eq!(track(serde_json::json!({"name": "English title", "handler_name": "English handler", "language": "eng"})), t("English title", "eng"));
+        assert_eq!(track(serde_json::json!({"name": "English title", "handler_name": "English handler", "language": "eng"})), Track { from_name: true, ..t("English title", "eng") });
         assert_eq!(track(serde_json::json!({"handler_name": "German commentary", "language": "ger"})), t("German commentary", "deu"));
         // A handler that only names the kind of track is no name; "und" is no language.
         assert_eq!(track(serde_json::json!({"handler_name": "SoundHandler", "language": "und"})), Track::default());

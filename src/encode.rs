@@ -1385,6 +1385,14 @@ fn mux_args(
     }
     let streams = stream_args(info, 1, container, audio, covers, None, notes);
     a.extend(metadata::ffmpeg_args(mo, tags, 1));
+    // The video's language and marks are the source's video's, not the bare stream's (which
+    // has none): a repaired Matroska lost "Main picture", its language and its default mark.
+    // Naming one stream's source turns off ffmpeg's copying for all of them.
+    a.extend(["-map_metadata:s:v:0".into(), format!("1:s:{}", info.video_index)]);
+    a.extend(streams.meta_from.iter().flat_map(|(o, i)| [format!("-map_metadata:s:{o}"), format!("1:s:{i}")]));
+    if !info.video_disposition.is_empty() {
+        a.extend(["-disposition:v:0".into(), info.video_disposition.clone()]);
+    }
     a.extend(streams.args.iter().cloned());
     a.push(path_arg(out));
     (a, streams)
@@ -1617,7 +1625,24 @@ struct Streams {
     meta_from: Vec<(String, String)>,
     audio: usize,
     subs: usize,
+    /// The source subtitle stream each kept one comes from.
+    sub_sources: Vec<usize>,
     covers: usize,
+}
+
+/// Names a kept track the way its source does, as `-metadata` arguments for output stream
+/// `spec` ("a:1"). Copied tags alone lose it: ffmpeg reads an MP4 track's name as a tag
+/// `name` and writes a title, so MP4 to MP4 lost every name and MP4 to Matroska put it in a
+/// tag NAME, where players do not look.
+fn title_args(spec: &str, track: &probe::Track, container: Container) -> Vec<String> {
+    if track.title.is_empty() {
+        return Vec::new();
+    }
+    let mut a = vec![format!("-metadata:s:{spec}"), format!("title={}", track.title)];
+    if track.from_name && container == Container::Mkv {
+        a.extend([format!("-metadata:s:{spec}"), "name=".into()]);
+    }
+    a
 }
 
 /// A cover image extracted for Matroska output, which stores covers as file attachments.
@@ -1674,14 +1699,16 @@ fn stream_args(
     let marked = |marks: Option<&String>| marks.filter(|m| !m.is_empty()).map_or("0".to_string(), String::clone);
     // (`optimize` refused what cannot be planned before the search; what is left is kept.)
     let sound = plan_sound(info, container, audio, cut_subs.is_some()).unwrap_or_default();
+    a.extend(title_args("v:0", &info.video_track, container));
     for (i, (s, (way, note))) in info.audio.iter().zip(sound).enumerate() {
         if cut_subs.is_some() {
             a.extend(["-map".into(), format!("[ao{i}]")]);
             a.extend([format!("-disposition:a:{i}"), marked(Some(&s.disposition))]);
-            meta_from.push((format!("a:{i}"), format!("a:{i}")));
         } else {
             a.extend(["-map".into(), format!("{src}:a:{i}")]);
         }
+        meta_from.push((format!("a:{i}"), format!("a:{i}")));
+        a.extend(title_args(&format!("a:{i}"), &s.track, container));
         match way {
             Sound::Copy => a.extend([format!("-c:a:{i}"), "copy".into()]),
             Sound::Opus { kbps, layout } => {
@@ -1696,6 +1723,7 @@ fn stream_args(
     }
 
     let mut kept_subs = 0;
+    let mut sub_sources = Vec::new();
     for (i, codec) in info.subtitle_codecs.iter().enumerate() {
         let text = TEXT_SUBS.contains(&codec.as_str());
         if container == Container::Mp4 && !text {
@@ -1721,6 +1749,8 @@ fn stream_args(
             a.extend([format!("-disposition:s:{kept_subs}"), marked(info.subtitle_dispositions.get(i))]);
         }
         meta_from.push((format!("s:{kept_subs}"), format!("s:{i}")));
+        a.extend(title_args(&format!("s:{kept_subs}"), &info.subtitle_tracks.get(i).cloned().unwrap_or_default(), container));
+        sub_sources.push(i);
         kept_subs += 1;
     }
 
@@ -1755,7 +1785,7 @@ fn stream_args(
     if container == Container::Mp4 {
         a.extend(["-movflags", "+faststart"].map(String::from));
     }
-    Streams { args: a, meta_from, audio: info.audio.len(), subs: kept_subs, covers }
+    Streams { args: a, meta_from, audio: info.audio.len(), subs: kept_subs, sub_sources, covers }
 }
 
 /// Inputs for an encode that leaves sections out: retimed copies of the text subtitles and
@@ -1898,6 +1928,9 @@ fn check_layout(tools: &Tools, info: &MediaInfo, out: &Path, streams: &Streams, 
     if (shown / should - 1.0).abs() > 0.005 {
         bail!("the finished video is shown {shown:.4} times as wide as it is high where its source is shown {should:.4} times; {NOT_WRITTEN}");
     }
+    if let Some(what) = track_lost(info, &out_info, streams) {
+        bail!("the finished file's {what}; {NOT_WRITTEN}");
+    }
     if let Some(off) = sound_moved(info, &out_info, streams, cut) {
         bail!(
             "the sound of the finished video starts {:.3} s {} the picture than in its source; {NOT_WRITTEN}",
@@ -1937,6 +1970,29 @@ fn check_hdr_data(tools: &Tools, input: &Path, info: &MediaInfo, out: &Path, out
         bail!("the finished video {what} of its source; {NOT_WRITTEN}");
     }
     Ok(())
+}
+
+/// The first kept track whose name or language the output does not have as its source does,
+/// said as what was lost ("audio track 2 has no name where its source's is \"Commentary\"").
+fn track_lost(info: &MediaInfo, out: &MediaInfo, streams: &Streams) -> Option<String> {
+    let mut pairs = vec![("video track".to_string(), &info.video_track, &out.video_track)];
+    if out.audio.len() == info.audio.len() {
+        pairs.extend(info.audio.iter().zip(&out.audio).enumerate().map(|(i, (s, o))| (format!("audio track {}", i + 1), &s.track, &o.track)));
+    }
+    let none = probe::Track::default();
+    for (k, &i) in streams.sub_sources.iter().enumerate() {
+        pairs.push((format!("subtitle track {}", k + 1), info.subtitle_tracks.get(i).unwrap_or(&none), out.subtitle_tracks.get(k).unwrap_or(&none)));
+    }
+    let said = |t: &str| if t.is_empty() { "none".to_string() } else { format!("\"{t}\"") };
+    pairs.into_iter().find_map(|(what, source, kept)| {
+        if !source.title.is_empty() && source.title != kept.title {
+            Some(format!("{what} is named {} where its source's is named \"{}\"", said(&kept.title), source.title))
+        } else if !source.language.is_empty() && source.language != kept.language {
+            Some(format!("{what} has language {} where its source's has \"{}\"", said(&kept.language), source.language))
+        } else {
+            None
+        }
+    })
 }
 
 /// How much later against the picture the first sound track starts in the output than in the
@@ -2791,6 +2847,47 @@ mod tests {
     }
 
     #[test]
+    fn every_track_keeps_its_name_and_language() {
+        let named = |title: &str, from_name| probe::Track { title: title.into(), language: "eng".into(), from_name };
+        let mut source = info(&[("aac", 2, 128_000.0), ("aac", 2, 128_000.0)]);
+        source.video_track = named("Main picture", false);
+        source.audio[1].track = named("English title", true);
+        source.subtitle_codecs = vec!["hdmv_pgs_subtitle".into(), "subrip".into()];
+        source.subtitle_tracks = vec![named("Signs", false), named("Full", true)];
+        source.subtitle_streams = 2;
+        source.video_disposition = "default".into();
+        let mut notes = Vec::new();
+        // An MP4 track's name reaches MP4 as a title, which its muxer writes as the name, and
+        // Matroska as a title with the tag NAME taken off. The image subtitle stays out of MP4.
+        let streams = stream_args(&source, 1, Container::Mp4, Audio::Keep, &[], None, &mut notes);
+        let pairs: Vec<_> = streams.args.windows(2).filter(|w| w[0].starts_with("-metadata:s:")).map(|w| format!("{} {}", w[0], w[1])).collect();
+        assert_eq!(pairs, ["-metadata:s:v:0 title=Main picture", "-metadata:s:a:1 title=English title", "-metadata:s:s:0 title=Full"]);
+        assert_eq!(streams.sub_sources, [1]);
+        let streams = stream_args(&source, 1, Container::Mkv, Audio::Keep, &[], None, &mut notes);
+        let pairs: Vec<_> = streams.args.windows(2).filter(|w| w[0].starts_with("-metadata:s:")).map(|w| format!("{} {}", w[0], w[1])).collect();
+        assert_eq!(pairs, ["-metadata:s:v:0 title=Main picture", "-metadata:s:a:1 title=English title", "-metadata:s:a:1 name=", "-metadata:s:s:0 title=Signs", "-metadata:s:s:1 title=Full", "-metadata:s:s:1 name="]);
+        // A bare video stream takes the source video's tags and marks, and every other stream
+        // its own, since naming one turns off ffmpeg's copying for all.
+        let (args, _) = mux_args(Path::new("v.ivf"), false, 0.0, Path::new("in.mkv"), &source, Container::Mkv, Audio::Keep, &[], &Resolved::default(), &MetaOptions::default(), Path::new("o.mkv"), &mut notes);
+        for pair in [["-map_metadata:s:v:0", "1:s:0"], ["-map_metadata:s:a:1", "1:s:a:1"], ["-map_metadata:s:s:1", "1:s:s:1"], ["-disposition:v:0", "default"]] {
+            assert!(args.windows(2).any(|w| w == pair), "{pair:?} in {args:?}");
+        }
+        // The check: a name or language lost or changed is refused, one the source lacks is not.
+        let streams = stream_args(&source, 0, Container::Mkv, Audio::Keep, &[], None, &mut notes);
+        let mut out = source.clone();
+        assert_eq!(track_lost(&source, &out, &streams), None);
+        out.video_track.title.clear();
+        assert_eq!(track_lost(&source, &out, &streams).as_deref(), Some("video track is named none where its source's is named \"Main picture\""));
+        out = source.clone();
+        out.subtitle_tracks[1].language = "fre".into();
+        assert_eq!(track_lost(&source, &out, &streams).as_deref(), Some("subtitle track 2 has language \"fre\" where its source's has \"eng\""));
+        out = source.clone();
+        source.audio[0].track = probe::Track::default();
+        out.audio[0].track = named("Added", false);
+        assert_eq!(track_lost(&source, &out, &streams), None);
+    }
+
+    #[test]
     fn sound_moved_against_the_picture_is_found() {
         let sound_at = |video_start: f64, audio: f64| MediaInfo {
             video_start,
@@ -2798,7 +2895,7 @@ mod tests {
             audio_streams: 1,
             ..info(&[])
         };
-        let streams = |audio| Streams { args: Vec::new(), meta_from: Vec::new(), audio, subs: 0, covers: 0 };
+        let streams = |audio| Streams { args: Vec::new(), meta_from: Vec::new(), audio, subs: 0, sub_sources: Vec::new(), covers: 0 };
         // The 0.28 s a joined TS lost, both ways; what Opus and AAC delays differ by is not.
         let source = sound_at(1.4, 1.6787);
         assert!(sound_moved(&source, &sound_at(0.0, 0.0), &streams(1), None).is_some_and(|m| (m + 0.2787).abs() < 1e-6));

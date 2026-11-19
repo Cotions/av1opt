@@ -79,20 +79,31 @@ pub fn save_name(path: &Path) -> PathBuf {
 /// name is gone through (a file of the user's own, which they may keep elsewhere) or
 /// refused (a file in a folder others can write to).
 pub fn append_line(path: &Path, line: &str, follow: bool) -> std::io::Result<()> {
-    use std::os::unix::fs::{FileExt, OpenOptionsExt};
-    let mut o = std::fs::OpenOptions::new();
-    o.read(true).create(true).append(true);
-    if !follow {
-        o.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut file = o.open(path)?;
-    let size = file.metadata()?.len();
-    let mut last = *b"\n";
-    if size > 0 {
-        file.read_exact_at(&mut last, size - 1)?;
-    }
-    let start = if last[0] == b'\n' { "" } else { "\n" };
+    use std::os::unix::fs::OpenOptionsExt;
+    let open = |read: bool| {
+        let mut o = std::fs::OpenOptions::new();
+        o.read(read).create(true).append(true);
+        if !follow {
+            o.custom_flags(libc::O_NOFOLLOW);
+        }
+        o.open(path)
+    };
+    // Reading is only for the last byte: a log that may only be written to still gets its line.
+    let mut file = match open(true) {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => open(false)?,
+        opened => opened?,
+    };
+    let start = if needs_line_end_first(&file) { "\n" } else { "" };
     file.write_all(format!("{start}{line}\n").as_bytes())
+}
+
+/// Whether the file ends in the middle of a line. When that cannot be found out it is taken to:
+/// every reader of these files passes over a blank line, and none can part two joined ones.
+fn needs_line_end_first(file: &std::fs::File) -> bool {
+    use std::os::unix::fs::FileExt;
+    let Ok(size) = file.metadata().map(|m| m.len()) else { return true };
+    let mut last = [b'\n'];
+    size > 0 && file.read_exact_at(&mut last, size - 1).map_or(true, |()| last[0] != b'\n')
 }
 
 /// A hash (FNV-1a, the same in every build) of a file's size and of `chunk` bytes at its start,
@@ -221,6 +232,34 @@ mod tests {
         append_line(&log, "{\"next\":2}", true).unwrap();
         append_line(&log, "{\"last\":3}", true).unwrap();
         assert_eq!(std::fs::read_to_string(&log).unwrap(), "{\"whole\":1}\n{\"cut sh\n{\"next\":2}\n{\"last\":3}\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_log_that_cannot_be_read_still_gets_its_line() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("av1opt-files-writeonly-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("log.jsonl");
+        std::fs::write(&log, b"{\"cut sh").unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o200)).unwrap();
+        append_line(&log, "{\"next\":2}", true).unwrap();
+        append_line(&log, "{\"last\":3}", true).unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // Whatever the last byte was, the new line stands alone. (A blank line is what it costs
+        // where the file did end in a line end, and for someone allowed to read it there is none.)
+        let text = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines, ["{\"cut sh", "{\"next\":2}", "{\"last\":3}"], "{text:?}");
+
+        // A last byte that cannot be read counts as a line left open.
+        let write_only = std::fs::File::options().append(true).open(&log).unwrap();
+        assert!(needs_line_end_first(&write_only));
+        let readable = std::fs::File::open(&log).unwrap();
+        assert!(!needs_line_end_first(&readable));
+        std::fs::write(&log, b"").unwrap();
+        assert!(!needs_line_end_first(&std::fs::File::options().append(true).open(&log).unwrap()), "an empty file has no line to end");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

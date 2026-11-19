@@ -76,6 +76,8 @@ mod tests {
     fn what_a_passing_test_prints_is_not_shown() {
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "output::tests::prints_a_line", "--ignored"])
+            // Set by whoever runs these tests with --nocapture, which would show the line.
+            .env_remove("RUST_TEST_NOCAPTURE")
             .output()
             .unwrap();
         let shown = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));

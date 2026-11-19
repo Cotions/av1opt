@@ -293,6 +293,9 @@ fn differences(members: &[usize], media: &[Media]) -> (Vec<String>, bool) {
             said.push(format!("{} shows {}x{} inside any black bars, the suggested copy {}x{}", name(other), other.picture_width, other.picture_height, keep.picture_width, keep.picture_height));
         }
     }
+    // Copies of one name in several folders would each repeat the same line.
+    let mut seen = std::collections::HashSet::new();
+    said.retain(|line| seen.insert(line.clone()));
     (said, look)
 }
 
@@ -788,6 +791,14 @@ mod tests {
         let g = groups(&[link(0, 1, Kind::Same, 1.0)], &m, &Prefs::default());
         assert_eq!((g[0].members[0], g[0].look_first), (1, false));
         assert_eq!(g[0].differences, ["0.mp4 is damaged or incomplete"]);
+    }
+
+    #[test]
+    fn copies_of_one_name_are_described_once() {
+        let mut m = vec![media("/a/film.mkv", 1920, 1080, "h264", 8.0, 900), media("/b/film.mkv", 640, 360, "h264", 2.0, 300), media("/c/film.mkv", 640, 360, "h264", 2.0, 200)];
+        m[0].sound_tracks = 1;
+        let g = groups(&[link(0, 1, Kind::Same, 1.0), link(0, 2, Kind::Same, 1.0)], &m, &Prefs::default());
+        assert_eq!(g[0].differences.iter().filter(|d| d.contains("640x360")).count(), 1, "{:?}", g[0].differences);
     }
 
     #[test]

@@ -3,14 +3,15 @@
 
 use super::turns::Turns;
 use super::{App, library, now};
-use crate::dups::{self, File, Progress, Report, matching::Prefs};
+use crate::dups::matching::{Group, Kind, Prefs};
+use crate::dups::{self, File, Progress, Report};
 use crate::events::Hooks;
 use crate::scan::is_video;
 use crate::tools::path_arg;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -169,6 +170,23 @@ struct TrashRequest {
     allow_zfs: bool,
 }
 
+/// The whole-video group each file is in. A file is in one at most.
+fn whole_video_groups(report: &Report) -> HashMap<usize, &Group> {
+    report.groups.iter().filter(|g| g.kind == Kind::Same).flat_map(|g| g.members.iter().map(move |&i| (i, g))).collect()
+}
+
+/// The copies of `group` that stay when the marked files go, its own members first. A pair that
+/// shares only a start or an ending is two videos, and either can be listed through a spare
+/// copy: such a video also stays through the other copies of its whole-video group.
+fn copies_left<'a>(report: &'a Report, whole: &HashMap<usize, &Group>, group: &Group, gone: &HashSet<PathBuf>, marked: &HashSet<&Path>) -> Vec<&'a File> {
+    let stays = |i: &usize| report.files.get(*i).filter(|f| !marked.contains(f.path.as_path()) && !gone.contains(&f.path));
+    let mut left: Vec<&File> = group.members.iter().filter_map(stays).collect();
+    if group.kind != Kind::Same {
+        left.extend(group.members.iter().filter_map(|i| whole.get(i)).flat_map(|w| w.members.iter().filter_map(stays)));
+    }
+    left
+}
+
 /// Whether `paths` may go to the trash at all: only files of the result, not moved yet, and
 /// never every copy of a video. `gone` are the files trashed earlier. Whether each file is still
 /// what the search saw is asked when its turn comes, in [`move_marked`].
@@ -185,6 +203,7 @@ fn check_trash(report: &Report, gone: &HashSet<PathBuf>, paths: &[PathBuf]) -> R
             bail!("{} is in the trash already", p.display());
         }
     }
+    let whole = whole_video_groups(report);
     for g in &report.groups {
         let members: Vec<&File> = g.members.iter().filter_map(|&i| report.files.get(i)).collect();
         let Some(one) = members.iter().find(|f| marked.contains(f.path.as_path())) else { continue };
@@ -194,7 +213,7 @@ fn check_trash(report: &Report, gone: &HashSet<PathBuf>, paths: &[PathBuf]) -> R
         if let Some(keeper) = members.first().filter(|keeper| crate::trash::in_a_trash(&keeper.path)) {
             bail!("the copy to keep of {} ({}) lies in a trash folder, so nothing would stay of that video; search again", one.path.display(), keeper.path.display());
         }
-        let left: Vec<&&File> = members.iter().filter(|f| !marked.contains(f.path.as_path()) && !gone.contains(&f.path)).collect();
+        let left = copies_left(report, &whole, g, gone, &marked);
         let Some(first) = left.first() else {
             bail!("every copy of {} is marked: nothing would be left of that video. Untick one", one.path.display());
         };
@@ -208,14 +227,13 @@ fn check_trash(report: &Report, gone: &HashSet<PathBuf>, paths: &[PathBuf]) -> R
 /// The copies that stay when `file` goes, one for each group it is in, all of them still what
 /// the search saw. The copy a group keeps comes first, so it is the one relied on while it
 /// is fit for that.
-fn copies_that_stay<'a>(report: &'a Report, gone: &HashSet<PathBuf>, marked: &HashSet<&Path>, file: &File, unchanged: &dyn Fn(&File) -> bool) -> Result<Vec<&'a File>> {
+fn copies_that_stay<'a>(report: &'a Report, whole: &HashMap<usize, &Group>, gone: &HashSet<PathBuf>, marked: &HashSet<&Path>, file: &File, unchanged: &dyn Fn(&File) -> bool) -> Result<Vec<&'a File>> {
     let mut stay = Vec::new();
     for g in &report.groups {
-        let members: Vec<&File> = g.members.iter().filter_map(|&i| report.files.get(i)).collect();
-        if !members.iter().any(|f| f.path == file.path) {
+        if !g.members.iter().filter_map(|&i| report.files.get(i)).any(|f| f.path == file.path) {
             continue;
         }
-        let left: Vec<&File> = members.into_iter().filter(|f| !marked.contains(f.path.as_path()) && !gone.contains(&f.path) && !crate::trash::in_a_trash(&f.path)).collect();
+        let left: Vec<&File> = copies_left(report, whole, g, gone, marked).into_iter().filter(|f| !crate::trash::in_a_trash(&f.path)).collect();
         match left.iter().find(|f| unchanged(f)) {
             Some(copy) => stay.push(*copy),
             None => bail!("the copy to keep ({}) is gone or has changed since the search, so {} was left where it is; search again", left.first().map_or(file.path.as_path(), |f| f.path.as_path()).display(), file.path.display()),
@@ -237,6 +255,7 @@ struct Moved {
 /// with a message, and the others still go.
 fn move_marked(report: &Report, gone: &HashSet<PathBuf>, paths: &[PathBuf], unchanged: &dyn Fn(&File) -> bool, to_trash: &dyn Fn(&Path) -> Result<PathBuf>) -> Moved {
     let marked: HashSet<&Path> = paths.iter().map(|p| p.as_path()).collect();
+    let whole = whole_video_groups(report);
     let mut moved = Moved::default();
     for p in paths {
         let Some(file) = report.files.iter().find(|f| f.path == *p) else { continue };
@@ -244,7 +263,7 @@ fn move_marked(report: &Report, gone: &HashSet<PathBuf>, paths: &[PathBuf], unch
             if !unchanged(file) {
                 bail!("{} is gone or has changed since the search, so it was left alone; search again", p.display());
             }
-            let stay = copies_that_stay(report, gone, &marked, file, unchanged)?;
+            let stay = copies_that_stay(report, &whole, gone, &marked, file, unchanged)?;
             let dest = to_trash(p)?;
             // Device and inode cannot tell a network mount's view of a folder from a second
             // copy. If the copy that stays went with this one, they were the same file.
@@ -408,7 +427,6 @@ pub fn thumb(app: &App, path: &Path, t: f64) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dups::matching::{Group, Kind};
 
     fn file(name: &str) -> File {
         File { path: PathBuf::from(name), root: PathBuf::from("/"), size: 10, codec: "h264".into(), width: 1280, height: 720, fps: 30.0, duration_s: 60.0, video_mbps: 2.0, identical: None, damaged: false, sound_tracks: 1, subtitle_tracks: 0, picture_width: 1280, picture_height: 720, modified: 0, digest: None }
@@ -609,5 +627,44 @@ mod tests {
         assert!(check(&gone, &["/b/1.mp4"]).is_ok());
         assert!(check(&gone, &["/b/1.mp4", "/c/1.webm"]).unwrap_err().contains("every copy"));
         assert!(check(&gone, &["/a/1.mkv"]).unwrap_err().contains("in the trash already"));
+    }
+
+    fn group(kind: Kind, members: &[usize]) -> Group {
+        Group { kind, score: 1.0, members: members.to_vec(), reason: String::new(), differences: Vec::new(), look_first: false }
+    }
+
+    #[test]
+    fn a_pair_of_spare_copies_can_go_while_their_videos_keep_a_copy() {
+        // Two videos stored twice, whose spare copies happen to share a start, and a third
+        // video on its own that shares an ending with the first one's spare.
+        let report = Report {
+            files: ["/keep/a.mkv", "/spare/a.mkv", "/keep/b.mkv", "/spare/b.mkv", "/alone/c.mkv"].map(file).to_vec(),
+            groups: vec![group(Kind::Same, &[0, 1]), group(Kind::Same, &[2, 3]), group(Kind::SameStart, &[1, 3]), group(Kind::SameEnd, &[1, 4])],
+            ..Default::default()
+        };
+        let paths = |names: &[&str]| names.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let check = |gone: &[&str], names: &[&str]| check_trash(&report, &paths(gone).into_iter().collect(), &paths(names)).map_err(|e| e.to_string());
+
+        assert!(check(&[], &["/spare/a.mkv", "/spare/b.mkv"]).is_ok(), "each video keeps its copy");
+        assert!(check(&[], &["/spare/a.mkv", "/alone/c.mkv"]).is_ok(), "the first video stays through its group");
+        // Without what the groups keep, nothing is left after all.
+        assert!(check(&[], &["/keep/a.mkv", "/spare/a.mkv", "/keep/b.mkv", "/spare/b.mkv"]).unwrap_err().contains("every copy"));
+        assert!(check(&["/keep/a.mkv", "/keep/b.mkv"], &["/spare/a.mkv", "/spare/b.mkv"]).unwrap_err().contains("every copy"));
+    }
+
+    #[test]
+    fn spare_copies_that_share_a_start_really_move_and_rely_on_their_groups() {
+        let (dir, p) = library("pair", &["keep-a.mkv", "spare-a.mkv", "keep-b.mkv", "spare-b.mkv"]);
+        let mut report = pair_report(&p);
+        report.groups = vec![group(Kind::Same, &[0, 1]), group(Kind::Same, &[2, 3]), group(Kind::SameStart, &[1, 3])];
+        let spares = [p[1].clone(), p[3].clone()];
+        check_trash(&report, &HashSet::new(), &spares).unwrap();
+        // The copy one of them relies on has changed: that one stays, the other goes.
+        std::fs::write(&p[0], "another file altogether").unwrap();
+        let moved = move_all(&report, &spares);
+        assert_eq!(moved.trashed, [p[3].clone()]);
+        assert!(only_error(&moved).contains("changed since the search"), "{:?}", moved.failed);
+        assert!(p[1].exists() && !p[3].exists() && p[2].exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

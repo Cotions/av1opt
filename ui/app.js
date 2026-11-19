@@ -97,6 +97,44 @@ function times(x) {
 }
 function plural(n, word) { return `${n} ${word}${n === 1 ? "" : "s"}`; }
 
+// A list of paths holds one per line, so a name with a line break in it would read as a
+// second file. Such a name cannot be in one: it is left out, and counted.
+const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+function pathList(paths) {
+  const listed = paths.filter((p) => !CONTROL_CHARACTER.test(p));
+  return { text: listed.length ? listed.join("\n") + "\n" : "", listed: listed.length, left: paths.length - listed.length };
+}
+function leftOutOfList(n) {
+  return `${plural(n, "file")} with line breaks or control characters in ${n === 1 ? "its name is" : "their names are"} not in this list`;
+}
+// A path as text on the page: what would break the line or move the text is drawn as a symbol.
+function shownPath(p) {
+  return String(p).replace(new RegExp(CONTROL_CHARACTER.source, "g"), (c) => {
+    const code = c.charCodeAt(0);
+    return code < 0x20 ? String.fromCharCode(0x2400 + code) : code === 0x7f ? "\u2421" : "\ufffd";
+  });
+}
+
+// What stays of the videos of a duplicate search once the marked files go. `gone` are the
+// files trashed earlier. A pair sharing only a start or an ending is two videos, and each of
+// them also stays while its own whole-video group keeps a copy. The server applies the same
+// rule when asked to trash.
+function copiesLeft(groups, files, marked, gone) {
+  const whole = new Map();
+  for (const g of groups) if (g.kind === "same") for (const i of g.members) whole.set(i, g);
+  const stays = (i) => !marked.has(files[i].path) && !gone.has(files[i].path);
+  const survives = (g) => g.members.some(stays) || (g.kind !== "same" && g.members.some((i) => whole.has(i) && whole.get(i).members.some(stays)));
+  const emptied = () => groups.filter((g) => g.members.some((i) => marked.has(files[i].path)) && !survives(g));
+  return { survives, emptied };
+}
+
+// For answers that can come back in another order than they were asked: each call to the
+// function this returns starts a request and gives what says whether it is still the latest.
+function newestOnly() {
+  let last = 0;
+  return () => { const mine = ++last; return () => mine === last; };
+}
+
 // ---------- end of the part that runs alone ----------
 
 function savedClass(x) { return x < 0 ? "warn" : "ok"; }
@@ -791,7 +829,8 @@ function encodeDialog(inputs, roots = [], watch = false, files = null) {
         location.hash = "#/queue";
       } catch (e) { toast(e.message, true); } finally { go.disabled = busy = false; }
     } }, watch ? "Watch folder" : "Add to queue");
-    const list = inputs.length <= 6 ? inputs.map((p) => h("div", { class: "mono" }, p)) : [h("div", { class: "mono" }, inputs.slice(0, 4).join("\n")), h("div", { class: "dim" }, `… and ${inputs.length - 4} more`)];
+    const inputLine = (p) => h("div", { class: "mono" }, shownPath(p));
+    const list = inputs.length <= 6 ? inputs.map(inputLine) : [...inputs.slice(0, 4).map(inputLine), h("div", { class: "dim" }, `… and ${inputs.length - 4} more`)];
     // While the request is on its way the dialog stays: what it asked for is being queued.
     const dismiss = () => { if (!busy) close(false); };
     const bg = h("div", { class: "modal-bg", onclick: (e) => { if (e.target === bg) dismiss(); } },
@@ -834,6 +873,18 @@ function encodeDialog(inputs, roots = [], watch = false, files = null) {
 }
 
 // ---------- views ----------
+
+// Paths in a dialog, one element each, the first few at once and the others on request.
+function pathLines(paths) { return paths.map((p) => h("div", {}, shownPath(p))); }
+function pathBlock(paths, first = 12) {
+  const box = h("div", { class: "mono trash-list" }, pathLines(paths.slice(0, first)));
+  if (paths.length <= first) return box;
+  // Built when opened: the list can run to thousands.
+  const rest = h("div", { class: "mono trash-list" });
+  const more = h("details", { class: "more", ontoggle: () => { if (more.open && !rest.firstChild) rest.append(...pathLines(paths.slice(first))); } },
+    h("summary", {}, `Show the other ${paths.length - first}`), rest);
+  return [box, more];
+}
 
 const views = {};
 let cleanup = null;
@@ -1059,6 +1110,7 @@ const dupMarks = new Set();
 // Files a trash request could not move, shown once with the next drawing of the result.
 let pendingTrashFailures = null;
 const DUP_KIND = { same: ["Same video", "ok"], same_start: ["Same start", "warn"], same_end: ["Same ending", "warn"] };
+const DUP_GROUPS_SHOWN = 60;
 
 views.dups = (root) => {
   const st = (STATE && STATE.settings) || {};
@@ -1078,6 +1130,10 @@ views.dups = (root) => {
   let dupStatus = null; // of the search shown, as last read; null until then
   // For the time-left estimate of the slow step.
   let fpStart = null;
+  // What is kept when a result is drawn again after a move to the trash.
+  const shownPart = { limit: DUP_GROUPS_SHOWN, keepScroll: false };
+  const askResult = newestOnly();
+  let left = false;
 
   const drawChips = () => {
     chips.replaceChildren(...[...roots].map((r) => h("span", { class: "chip" }, h("code", {}, r), h("button", { title: "Remove", onclick: () => { roots.delete(r); prefs.set("dupRoots", [...roots]); drawChips(); } }, "×"))));
@@ -1120,6 +1176,7 @@ views.dups = (root) => {
       prefs.set("dupTolerance", tolerance);
       runId = lastDupId = r.id;
       dupStatus = null;
+      shownPart.limit = DUP_GROUPS_SHOWN;
       dupMarks.clear();
       fpStart = null;
       refresh.checked = false;
@@ -1156,8 +1213,16 @@ views.dups = (root) => {
     out);
 
   async function showResult(id) {
+    const isNewest = askResult();
     let r;
-    try { r = await api("/api/dups/" + id); } catch (e) { if (id === lastDupId) { runId = null; setRunning(false); } return; }
+    try { r = await api("/api/dups/" + id); } catch (e) {
+      if (left || !isNewest() || id !== lastDupId) return;
+      toast(`Could not read the duplicate search: ${e.message}`, true);
+      runId = null; setRunning(false);
+      return;
+    }
+    // After the view was left nothing is drawn, and what is to be shown once stays to be shown.
+    if (left || !isNewest()) return;
     if (id !== lastDupId) return; // another search was started meanwhile
     dupStatus = r.status;
     if (r.status === "running") { runId = id; setRunning(true); showProgress(r); return; }
@@ -1168,7 +1233,7 @@ views.dups = (root) => {
     if (r.status === "cancelled") { progText.textContent = "stopped (frames read so far are remembered)"; out.replaceChildren(); return; }
     const s = r.report.stats;
     progText.textContent = `${s.compared} of ${s.videos} videos compared · ${s.fresh} read now, the rest remembered${s.not_text ? ` · ${plural(s.not_text, "video")} left out: the path is not valid UTF-8` : ""}`;
-    renderDups(out, r, () => showResult(id));
+    renderDups(out, r, () => showResult(id), shownPart);
   }
 
   const off = onEvent((m) => {
@@ -1180,11 +1245,11 @@ views.dups = (root) => {
   (async () => {
     // After a reload the page has forgotten the run; the server hasn't.
     if (lastDupId == null) {
-      try { const { runs } = await api("/api/dups"); if (runs.length) lastDupId = runs[runs.length - 1].id; } catch { /* offline */ }
+      try { const { runs } = await api("/api/dups"); if (runs.length) lastDupId = runs[runs.length - 1].id; } catch (e) { toast(`Could not read the duplicate searches: ${e.message}`, true); }
     }
-    if (lastDupId != null) showResult(lastDupId);
+    if (lastDupId != null && !left) showResult(lastDupId);
   })();
-  return off;
+  return () => { left = true; off(); };
 };
 
 // Browsers play some codecs and not others; the comparison player needs its right-hand
@@ -1207,10 +1272,12 @@ function confirmDialog({ title, body, action }) {
   });
 }
 
-function renderDups(out, run, reload) {
+// `shownPart` outlives one drawing: how many groups are shown, and whether to stay at the same
+// place on the page.
+function renderDups(out, run, reload, shownPart) {
   const rep = run.report, files = rep.files;
   let filter = prefs.get("dupFilter", "same");
-  let limit = 60;
+  const scrolledTo = window.scrollY;
   // Files moved to the trash since the search are out of the picture; a group needs two copies.
   const gone = new Set(run.trashed || []);
   for (const p of gone) dupMarks.delete(p);
@@ -1225,31 +1292,48 @@ function renderDups(out, run, reload) {
   const sizeOf = new Map(files.filter((f) => !gone.has(f.path)).map((f) => [f.path, f.size]));
   const list = h("div");
   const markInfo = h("span", { class: "dim" });
+  const listNote = h("p", { class: "warn", hidden: true });
+  // The files of the groups drawn right now; marks can lie outside them.
+  let onScreen = new Set();
   const marked = () => [...dupMarks].filter((p) => sizeOf.has(p)).sort();
+  const offScreen = (m) => m.filter((p) => !onScreen.has(p)).length;
+  // Null when no marked file can be listed, which is then said.
+  const listOfMarks = () => {
+    const l = pathList(marked());
+    if (!l.listed) { toast(leftOutOfList(l.left), true); return null; }
+    return l;
+  };
   const copyBtn = h("button", { onclick: async () => {
-    try { await navigator.clipboard.writeText(marked().join("\n") + "\n"); toast(`Copied ${marked().length} paths`); }
-    catch (e) { toast("Could not copy: " + e.message, true); }
+    const l = listOfMarks();
+    if (!l) return;
+    try {
+      await navigator.clipboard.writeText(l.text);
+      toast(`Copied ${plural(l.listed, "path")}${l.left ? ". " + leftOutOfList(l.left) : ""}`, l.left > 0);
+    } catch (e) { toast("Could not copy: " + e.message, true); }
   } }, "Copy paths");
   const saveBtn = h("button", { onclick: () => {
-    const url = URL.createObjectURL(new Blob([marked().join("\n") + "\n"], { type: "text/plain" }));
+    const l = listOfMarks();
+    if (!l) return;
+    if (l.left) toast(leftOutOfList(l.left), true);
+    const url = URL.createObjectURL(new Blob([l.text], { type: "text/plain" }));
     const a = h("a", { href: url, download: "av1opt-duplicates.txt" });
     document.body.append(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 10000);
   } }, "Save list…");
   const clearBtn = h("button", { onclick: () => { dupMarks.clear(); draw(); } }, "Clear marks");
-  // Groups where every copy left is marked: the server refuses those too.
-  const emptied = () => groups.filter((g) => g.members.every((i) => dupMarks.has(files[i].path)));
+  // Groups that would have nothing left: the server refuses those too.
+  const copies = copiesLeft(rep.groups, files, dupMarks, gone);
   const failures = h("div");
   let trashing = false;
   const trashBtn = h("button", { class: "danger", onclick: async () => {
-    const m = marked(), total = m.reduce((a, p) => a + sizeOf.get(p), 0);
+    const m = marked(), total = m.reduce((a, p) => a + sizeOf.get(p), 0), hidden = offScreen(m);
     const ok = await confirmDialog({
       title: `Move ${plural(m.length, "file")} to the trash?`,
       action: "Move to trash",
       body: [
         h("p", {}, `${bytes(total)} in ${plural(m.length, "file")}. Each goes to the trash of the drive it is on, where your file manager can put it back; the space is freed when you empty the trash. Another copy of every video stays where it is.`),
-        h("div", { class: "mono trash-list" }, m.slice(0, 12).join("\n")),
-        m.length > 12 ? h("p", { class: "dim" }, `… and ${m.length - 12} more`) : null],
+        hidden ? h("p", { class: "warn" }, `${plural(hidden, "marked file")} ${hidden === 1 ? "is" : "are"} not on screen: hidden by the filter or further down the list. ${hidden === 1 ? "It goes" : "They go"} too.`) : null,
+        pathBlock(m)],
     });
     if (!ok) return;
     trashBtn.disabled = trashing = true;
@@ -1262,28 +1346,32 @@ function renderDups(out, run, reload) {
           action: "Move to trash on ZFS too",
           body: [
             h("p", { class: "warn" }, `${plural(z.length, "file")} of these ${z.length === 1 ? "is" : "are"} stored on ZFS, which av1opt writes to only when asked. The trash of that drive is on it too. Nothing has been moved yet.`),
-            h("div", { class: "mono trash-list" }, z.slice(0, 12).join("\n")),
-            z.length > 12 ? h("p", { class: "dim" }, `… and ${z.length - 12} more`) : null],
+            pathBlock(z)],
         });
         if (!yes) return;
         r = await api(`/api/dups/${run.id}/trash`, { paths: m, allow_zfs: true });
       }
       for (const p of r.trashed) dupMarks.delete(p);
-      toast(`${plural(r.trashed.length, "file")} moved to the trash (${bytes(r.bytes)})`, r.failed.length > 0);
+      // Said here as well as in the result: the view may have been left by now.
+      const moved = `${plural(r.trashed.length, "file")} moved to the trash (${bytes(r.bytes)})`;
+      toast(r.failed.length ? `${moved}; ${plural(r.failed.length, "file")} could not be moved: ${r.failed[0].error}` : moved, r.failed.length > 0);
       if (r.failed.length) pendingTrashFailures = r.failed;
+      shownPart.keepScroll = true;
       reload();
     } catch (e) { toast(e.message, true); } finally { trashing = false; updateMarks(); }
   } }, "Move to trash…");
   if (pendingTrashFailures) {
     failures.append(h("div", { class: "panel" }, h("strong", { class: "bad" }, `${plural(pendingTrashFailures.length, "file")} could not be moved to the trash and are still where they were`),
-      pendingTrashFailures.slice(0, 50).map((f) => h("div", { class: "dim mono" }, `${f.path}: ${f.error}`))));
+      pendingTrashFailures.slice(0, 50).map((f) => h("div", { class: "dim mono" }, `${shownPath(f.path)}: ${f.error}`))));
     pendingTrashFailures = null;
   }
   const shown = () => groups.filter((g) => filter === "all" || (filter === "same" ? g.kind === "same" : g.kind !== "same"));
   const updateMarks = () => {
     const m = marked();
-    const e = emptied().length;
-    markInfo.textContent = m.length ? `${m.length} file${m.length === 1 ? "" : "s"} marked · ${bytes(m.reduce((a, p) => a + sizeOf.get(p), 0))}` : "Nothing marked";
+    const e = copies.emptied().length, hidden = offScreen(m), unlisted = pathList(m).left;
+    markInfo.textContent = m.length ? `${m.length} file${m.length === 1 ? "" : "s"} marked · ${bytes(m.reduce((a, p) => a + sizeOf.get(p), 0))}${hidden ? ` · ${hidden} not on screen` : ""}` : "Nothing marked";
+    listNote.hidden = !unlisted;
+    listNote.textContent = unlisted ? `${leftOutOfList(unlisted)}: a list has one path per line and cannot hold such a name.` : "";
     copyBtn.disabled = saveBtn.disabled = clearBtn.disabled = !m.length;
     trashBtn.disabled = trashing || !m.length || e > 0;
     trashBtn.title = e ? `${plural(e, "video")} would have no copy left: untick one copy first` : "";
@@ -1298,7 +1386,7 @@ function renderDups(out, run, reload) {
     const thumbAt = (m) => (g.kind === "same_end" ? Math.max(0, m.duration_s - at) : at);
     const spare = g.kind === "same" && !g.look_first ? members.slice(1).reduce((a, m) => a + m.size, 0) : 0;
     const allMarked = h("span", { class: "bad", hidden: true }, "Every copy is marked: nothing would be left");
-    const sync = () => { allMarked.hidden = !members.every((m) => dupMarks.has(m.path)); };
+    const sync = () => { allMarked.hidden = copies.survives(g); };
     const rows = members.map((m, k) => {
       const row = h("div", { class: "dup-file" + (dupMarks.has(m.path) ? " marked" : "") });
       const cb = h("input", { type: "checkbox", checked: dupMarks.has(m.path), title: "Mark this file for removal", onchange: () => {
@@ -1317,7 +1405,7 @@ function renderDups(out, run, reload) {
       img.addEventListener("error", () => img.classList.add("missing"));
       row.append(...[cb, img,
         h("div", { class: "dup-info" },
-          h("div", { class: "name", title: m.path }, h("span", { class: "dim" }, dirname(m.path) + "/"), basename(m.path)),
+          h("div", { class: "name", title: m.path }, h("span", { class: "dim" }, shownPath(dirname(m.path)) + "/"), shownPath(basename(m.path))),
           h("div", { class: "dim" }, `${m.codec} · ${m.width}×${m.height}${m.picture_width !== m.width || m.picture_height !== m.height ? ` (picture ${m.picture_width}×${m.picture_height})` : ""} · ${num(m.video_mbps, 1)} Mbps · ${hms(m.duration_s)} · ${bytes(m.size)} · ${plural(m.sound_tracks, "sound track")}${m.subtitle_tracks ? ` · ${plural(m.subtitle_tracks, "subtitle track")}` : ""}`)),
         g.kind === "same" && k === 0 && !g.keepGone ? h("span", { class: "pill ok", title: g.reason }, "Suggested keep") : null,
         longer ? h("span", { class: "pill ok", title: k === 0 ? g.reason : "The longest of these copies" }, "Longer") : null,
@@ -1336,13 +1424,14 @@ function renderDups(out, run, reload) {
       rows);
   };
   const draw = () => {
-    const v = shown();
+    const v = shown(), limit = shownPart.limit;
+    onScreen = new Set(v.slice(0, limit).flatMap((g) => g.members.map((i) => files[i].path)));
     list.replaceChildren(...v.slice(0, limit).map(card));
-    if (v.length > limit) list.append(h("div", { class: "panel dim" }, `${v.length - limit} more groups not shown. `, h("button", { class: "small", onclick: () => { limit += 200; draw(); } }, "Show more")));
+    if (v.length > limit) list.append(h("div", { class: "panel dim" }, `${v.length - limit} more groups not shown. `, h("button", { class: "small", onclick: () => { shownPart.limit += 200; draw(); } }, "Show more")));
     if (!v.length) list.append(h("div", { class: "panel empty" }, groups.length ? "Nothing in this view." : gone.size ? "No duplicates left." : "No duplicates found."));
     updateMarks();
   };
-  const filt = h("select", { onchange: (e) => { filter = e.target.value; prefs.set("dupFilter", filter); limit = 60; draw(); } },
+  const filt = h("select", { onchange: (e) => { filter = e.target.value; prefs.set("dupFilter", filter); shownPart.limit = DUP_GROUPS_SHOWN; draw(); } },
     h("option", { value: "same" }, `Same video (${s.same_groups})`), h("option", { value: "partial" }, `Same start or ending (${s.partial_groups})`), h("option", { value: "all" }, "All groups"));
   filt.value = filter;
   const markSpares = h("button", { title: "Marks every copy except the suggested one, in the groups of the same video", onclick: () => {
@@ -1358,6 +1447,7 @@ function renderDups(out, run, reload) {
       h("div", { class: "stat" }, h("div", { class: "v" }, s.partial_groups), h("div", { class: "l" }, "pairs sharing only a start or an ending"))),
     h("div", { class: "panel" },
       h("div", { class: "row" }, filt, markSpares, h("span", { class: "spacer" }), markInfo, clearBtn, copyBtn, saveBtn, trashBtn),
+      listNote,
       h("p", { class: "dim" }, "Tick the files you want gone, then move them to the trash, or copy or save the list of their paths. av1opt deletes nothing: trashed files can be put back from your file manager until you empty the trash, and the last copy of a video is never trashed. “Same start / ending” pairs have different lengths: one is cut, or two videos share an intro or credits, so look before you tick."),
       gone.size ? h("p", {}, `${plural(gone.size, "file")} of this result ${gone.size === 1 ? "is" : "are"} in the trash now (${bytes(files.filter((f) => gone.has(f.path)).reduce((a, f) => a + f.size, 0))}).`) : null),
     failures,
@@ -1365,6 +1455,7 @@ function renderDups(out, run, reload) {
     rep.unreadable.length ? h("details", { class: "panel more" }, h("summary", {}, `${rep.unreadable.length} video${rep.unreadable.length === 1 ? "" : "s"} could not be compared`),
       h("div", { class: "tablewrap" }, h("table", {}, h("tbody", {}, rep.unreadable.slice(0, 500).map((u) => h("tr", {}, h("td", { class: "path" }, u.path), h("td", { class: "dim" }, u.error))))))) : null].filter(Boolean));
   draw();
+  if (shownPart.keepScroll) { shownPart.keepScroll = false; window.scrollTo(0, scrolledTo); }
 }
 
 // ----- benchmark -----

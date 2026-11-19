@@ -312,6 +312,30 @@ checks["scan: folders that could not be read are counted and the first few named
   noElementFromText(root);
 };
 
+checks["duplicates: the trash dialog says which marks are not on screen and lists every path apart"] = async () => {
+  const page = openPage(() => ({}));
+  await settled();
+  const file = (path) => ({ path, size: 1000, codec: "h264", width: 1280, height: 720, picture_width: 1280, picture_height: 720, duration_s: 60, video_mbps: 1, sound_tracks: 1, subtitle_tracks: 0 });
+  const forged = "/v/a\n/home/me/keep.mp4";
+  page.context.__run = { id: 1, trashed: [], report: {
+    stats: { same_groups: 2, partial_groups: 0, spare_files: 2, spare_bytes: 2000 }, unreadable: [],
+    files: [file("/v/k1.mp4"), file(forged), file("/v/k2.mp4"), file("/v/s2.mp4")],
+    groups: [{ kind: "same", score: 1, members: [0, 1] }, { kind: "same", score: 1, members: [2, 3] }],
+  } };
+  page.context.__out = page.document.createElement("div");
+  page.document.body.append(page.context.__out);
+  page.run(`window.scrollY = 0; dupMarks.add(__run.report.files[1].path); dupMarks.add("/v/s2.mp4"); renderDups(__out, __run, () => {}, { limit: 1, keepScroll: false })`);
+  const out = page.context.__out;
+  assert(out.textContent.includes("1 not on screen"), out.textContent.slice(0, 300));
+  assert(out.textContent.includes("1 file with line breaks or control characters in its name is not in this list"), out.textContent.slice(0, 500));
+  out.named("button", "Move to trash…").click();
+  await settled();
+  const dialog = page.document.body.all().find((e) => e.classList.contains("modal-bg"));
+  assert(dialog.textContent.includes("1 marked file is not on screen"), dialog.textContent);
+  const lines = dialog.all().filter((e) => e.classList.contains("trash-list")).flatMap((e) => e.children.map((k) => k.textContent));
+  assert.deepStrictEqual(lines, ["/v/a\u240a/home/me/keep.mp4", "/v/s2.mp4"]);
+};
+
 (async () => {
   let failed = 0;
   for (const [name, check] of Object.entries(checks)) {

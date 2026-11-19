@@ -267,6 +267,9 @@ tr.hi td { background: var(--panel2); }
 td .pill { margin-left: 6px; }
 td .pill:first-child { margin-left: 0; }
 .modal.narrow { width: min(560px, 94vw); }
+/* One path per element: a long one wraps with its later lines set in, so it reads as one. */
+.trash-list > div { padding-left: 1em; text-indent: -1em; }
+.modal details.more > .trash-list { margin-top: 6px; }
 .trash-list { white-space: pre-wrap; word-break: break-all; max-height: 220px; overflow: auto; background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius); padding: 6px 8px; }
 
 /* replace originals */

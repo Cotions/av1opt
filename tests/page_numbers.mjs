@@ -9,7 +9,7 @@ const source = readFileSync(new URL("../ui/app.js", import.meta.url), "utf8");
 const from = source.indexOf("// ---------- numbers and names ----------");
 const to = source.indexOf("// ---------- end of the part that runs alone ----------");
 assert.ok(from >= 0 && to > from, "the markers of the part that runs alone are in ui/app.js");
-const names = ["bytes", "pct", "floorPct", "sizeChange", "savedPct", "num", "rel", "times", "plural"];
+const names = ["bytes", "pct", "floorPct", "sizeChange", "savedPct", "num", "rel", "times", "plural", "pathList", "leftOutOfList", "shownPath", "copiesLeft", "newestOnly"];
 const page = new Function(`"use strict";\n${source.slice(from, to)}\nreturn { ${names.join(", ")} };`)();
 
 // Each case is [argument, what is shown]; arguments in an array are spread.
@@ -112,6 +112,41 @@ test("a ratio with a base of zero is a dash", () => {
     [Infinity, "–"],
     [null, "–"],
   ]);
+});
+
+test("a list of paths cannot be given a line that is not a file", () => {
+  const forged = "/videos/a\n/home/me/keep.mp4";
+  const l = page.pathList(["/videos/b.mp4", forged, "/videos/c\td.mp4", "/videos/e\u2028f.mp4", "/videos/g.mp4"]);
+  assert.equal(l.text, "/videos/b.mp4\n/videos/g.mp4\n");
+  assert.deepEqual([l.listed, l.left], [2, 3]);
+  assert.deepEqual({ ...page.pathList([forged]) }, { text: "", listed: 0, left: 1 });
+  assert.equal(page.leftOutOfList(2), "2 files with line breaks or control characters in their names are not in this list");
+  assert.equal(page.leftOutOfList(1), "1 file with line breaks or control characters in its name is not in this list");
+  assert.equal(page.shownPath(forged), "/videos/a\u240a/home/me/keep.mp4");
+  assert.equal(page.shownPath("/a\u007fb\u0085c\u2029d é"), "/a\u2421b\ufffdc\ufffdd é");
+});
+
+test("a pair of spare copies leaves its videos their copies", () => {
+  const files = ["/keep/a", "/spare/a", "/keep/b", "/spare/b", "/alone/c"].map((path) => ({ path }));
+  const groups = [
+    { kind: "same", members: [0, 1] },
+    { kind: "same", members: [2, 3] },
+    { kind: "same_start", members: [1, 3] },
+    { kind: "same_end", members: [1, 4] },
+  ];
+  const emptied = (marked, gone = []) => page.copiesLeft(groups, files, new Set(marked), new Set(gone)).emptied().length;
+  assert.equal(emptied(["/spare/a", "/spare/b"]), 0);
+  assert.equal(emptied(["/spare/a", "/alone/c"]), 0);
+  assert.equal(emptied(["/keep/a", "/spare/a"]), 1, "its group; both pairs still have their other video");
+  assert.equal(emptied(["/keep/a", "/spare/a", "/keep/b", "/spare/b"]), 3, "both groups and the pair between them");
+  assert.equal(emptied(["/spare/a", "/spare/b"], ["/keep/a", "/keep/b"]), 3, "copies trashed earlier do not count");
+});
+
+test("only the answer to the latest question counts", () => {
+  const ask = page.newestOnly();
+  const first = ask(), second = ask();
+  assert.equal(first(), false);
+  assert.equal(second(), true);
 });
 
 test("counts name one thing or several", () => {

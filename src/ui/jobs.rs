@@ -574,6 +574,16 @@ fn prepare(app: &App, body: &Value, origin: Origin, known: &Known) -> Result<Job
     if !opts.remove.is_empty() && batch_jobs.len() > 1 {
         bail!("sections can only be removed when encoding a single video");
     }
+    // What the sections leave is judged as the encode judges it, when they are asked for and
+    // not when the job comes to run.
+    if origin == Origin::Asked
+        && !opts.remove.is_empty()
+        && let [j] = batch_jobs.as_slice()
+    {
+        let size = std::fs::metadata(&j.input).with_context(|| format!("cannot read {}", j.input.display()))?.len();
+        let info = crate::probe::probe(&app.ffprobe(), &j.input, size).with_context(|| format!("cannot read {}", j.input.display()))?;
+        crate::sections::Sections::new(&opts.remove, info.duration_s)?;
+    }
     for j in &batch_jobs {
         if !j.out_dir.starts_with(&r.out_dir) {
             bail!("{} would be written outside the output folder", j.input.display());

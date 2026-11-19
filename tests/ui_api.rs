@@ -3365,3 +3365,27 @@ fn the_output_folder_of_the_last_encode_is_kept_through_a_kill() {
     let s2 = Server::start_in(&s.dir, &ffmpeg, &ffprobe);
     assert_eq!(s2.get("/api/state").json()["default_out_dir"], json!(out));
 }
+
+/// Sections that leave nothing, or less than a second, are refused when they are asked for,
+/// not when the job comes to run.
+#[test]
+fn sections_that_leave_too_little_of_the_video_are_refused_when_queued() {
+    // The stand-in video is 9 s long.
+    let (ffmpeg, ffprobe) = stand_in_tools("too-little", A_VIDEO);
+    let s = Server::start_with_tools("too-little", &ffmpeg, &ffprobe, |d| std::fs::write(d.join("videos/a.mp4"), b"xx").unwrap());
+    s.post("/api/queue/pause", &json!({ "paused": true }));
+    let job = |remove: Value| json!({ "inputs": [s.dir.join("videos/a.mp4")], "out_dir": s.dir.join("out"), "options": { "remove": remove } });
+    for (remove, said) in [
+        (json!([[0.0, null]]), "nothing would be left"),
+        (json!([[0.0, 4.0], [4.0, 9.0]]), "nothing would be left"),
+        (json!([[0.5, null]]), "at least 1 s has to stay"),
+        (json!([[0.0, 3.0], [3.5, null]]), "at least 1 s has to stay"),
+    ] {
+        let r = s.post("/api/jobs", &job(remove.clone()));
+        assert_eq!(r.status, 400, "{remove}: {}", r.body);
+        assert!(r.json()["error"].as_str().unwrap_or("").contains(said), "{remove}: {}", r.body);
+    }
+    assert!(s.get("/api/jobs/heads").json()["jobs"].as_array().unwrap().is_empty());
+    let r = s.post("/api/jobs", &job(json!([[1.0, null]])));
+    assert_eq!(r.status, 200, "{}", r.body);
+}

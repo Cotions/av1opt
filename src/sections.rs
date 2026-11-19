@@ -11,6 +11,10 @@ use std::fmt::Write as _;
 /// whole frame in it would break the join.
 const MIN_KEEP: f64 = 0.25;
 
+/// What has to stay of a video in all: a source with less picture than this is skipped as
+/// having no usable duration, and an output cut down to less would be no better.
+pub const MIN_OUTPUT: f64 = 1.0;
+
 /// The parts of a source that stay, in source seconds, plus what was removed.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sections {
@@ -109,6 +113,10 @@ impl Sections {
         }
         if keep.is_empty() {
             bail!("the sections cover the whole video; nothing would be left");
+        }
+        let kept: f64 = keep.iter().map(|(a, b)| b - a).sum();
+        if kept < MIN_OUTPUT {
+            bail!("the sections leave {} of the video; at least {MIN_OUTPUT} s has to stay", fmt_time(kept));
         }
         Ok(Sections { keep, removed: merged })
     }
@@ -550,6 +558,16 @@ mod tests {
         // At the end.
         assert_eq!(Sections::new(&[(10.0, 19.75)], 20.0).unwrap().keep(), &[(0.0, 10.0), (19.75, 20.0)]);
         assert_eq!(Sections::new(&[(10.0, 19.8)], 20.0).unwrap().keep(), &[(0.0, 10.0)]);
+    }
+
+    #[test]
+    fn at_least_a_second_of_the_video_has_to_stay() {
+        assert_eq!(Sections::new(&[(1.0, f64::INFINITY)], 3.0).unwrap().kept(), 1.0);
+        assert_eq!(Sections::new(&[(0.0, 1.0), (1.5, 2.0), (2.5, f64::INFINITY)], 3.0).unwrap().kept(), 1.0);
+        for remove in [vec![(0.5, f64::INFINITY)], vec![(0.0, 2.5)], vec![(0.0, 1.0), (1.5, 2.0), (2.4, f64::INFINITY)]] {
+            let e = Sections::new(&remove, 3.0).unwrap_err().to_string();
+            assert!(e.contains("at least 1 s has to stay") && e.contains("leave 0:00."), "{remove:?}: {e}");
+        }
     }
 
     #[test]

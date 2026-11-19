@@ -3,7 +3,7 @@
 Shrink video libraries by re-encoding to AV1 at a target perceptual quality (VMAF),
 instead of one fixed setting for everything. Built on stock FFmpeg with SVT-AV1 and libvmaf.
 
-Seven commands:
+Eight commands:
 
 - `scan` — read-only survey of a library: what each file is, what re-encoding would roughly save.
 - `dups` — read-only search for videos that are kept more than once.
@@ -12,6 +12,8 @@ Seven commands:
 - `tuning` — shows the settings `bench --save` stored for `encode --tuned`, or forgets them.
 - `replace` — once you are happy with the outputs: each takes its original's place, the
   original goes to the trash.
+- `adopt` — takes outputs that are not on av1opt's record (made before it kept one) onto it,
+  so that the page can replace them too.
 - `ui` — all of this in a local web app (built with `--features ui`).
 
 ## Requirements
@@ -504,7 +506,7 @@ folder), the file is refused before any sample is cut, with a message to rename 
 |---|---|---|
 | `-o`, `--out-dir` | required | Folder for the finished files and their `.av1opt.json` reports; not on ZFS. |
 | `--container` | `mp4` | `mp4` (plays in browsers; image subtitles dropped) or `mkv` (keeps every subtitle but TTML, and attachments). |
-| `--target-vmaf` | 93 | Mean VMAF the samples must reach. |
+| `--target-vmaf` | 93 | Mean VMAF the output must reach: over the whole video where it is scored whole, over the samples where not. |
 | `--preset` | 4 | SVT-AV1 preset: lower is slower and smaller. |
 | `--svt-params` | `tune=0` | SVT-AV1 parameters besides the CRF, as `key=value:key=value`. |
 | `--tuned` | off | Use the preset and parameters `bench --save` picked for each resolution class. |
@@ -738,6 +740,7 @@ output and original pass the checks `replace` makes.
 | Option | Default | What it does |
 |---|---|---|
 | `--apply` | off | Write to the record; without it the command only lists. |
+| `--anywhere` | off | Follow reports to originals wherever they are, not only in the folders named. |
 
 ## ui (optional)
 

@@ -272,7 +272,8 @@ enum Cmd {
         /// Container of the outputs
         #[arg(long, value_enum, default_value_t = encode::Container::Mp4)]
         container: encode::Container,
-        /// Mean VMAF the samples must reach. 93 is hard to tell apart from an already-lossy source.
+        /// Mean VMAF the output must reach: over the whole video where it is scored whole, over
+        /// the samples where not. 93 is hard to tell apart from an already-lossy source.
         #[arg(long, default_value_t = 93.0, value_parser = parse_target)]
         target_vmaf: f64,
         /// SVT-AV1 preset: lower is slower and smaller (5 is about 4% larger than 4 for a fifth less processor time, 6 about 10% larger for two fifths less).
@@ -293,10 +294,10 @@ enum Cmd {
         #[arg(long, default_value_t = 55, value_parser = clap::value_parser!(u8).range(1..=63))]
         max_crf: u8,
         /// Number of sample clips the CRF search goes by. Without it and --sample-secs: 1 s
-        /// clips, one for about every 8 seconds of video (64 at most, and 8 at least where the
-        /// video is 16 seconds or longer; a shorter one gets one for every 2 seconds), where the
-        /// whole video is checked after its encode; one 4 s clip for about every two minutes
-        /// (8 to 32) where it is not (--scenes, removed sections, HDR).
+        /// clips, one for about every 8 seconds of video (8 to 64; a video under 64 seconds is
+        /// sampled whole, as 1 s clips side by side), where the whole video is checked after
+        /// its encode; one 4 s clip for about every two minutes (8 to 32) where it is not
+        /// (--scenes, removed sections, HDR).
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..=200))]
         samples: Option<u64>,
         /// Length of a sample clip in seconds, 1 to 60 (4 with --samples alone).

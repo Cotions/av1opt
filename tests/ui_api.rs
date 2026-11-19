@@ -753,6 +753,29 @@ fn a_recorded_output_swapped_for_another_file_does_not_take_the_originals_place(
 }
 
 #[test]
+fn a_report_rewritten_to_fit_a_changed_original_is_not_believed() {
+    let modified = |p: &Path| std::fs::metadata(p).unwrap().modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let s = Server::start("planted-facts", |d| {
+        std::fs::write(d.join("videos/movie.mp4"), vec![b's'; 3000]).unwrap();
+        std::fs::create_dir_all(d.join("out")).unwrap();
+        std::fs::write(d.join("out/movie.mkv"), vec![b'o'; 1000]).unwrap();
+        let mut line = encoded_line(&d.join("videos/movie.mp4"), &d.join("out/movie.mkv"));
+        line["source_mtime"] = json!(1_000_000);
+        write_record(d, &[line]);
+        // The time the file has now, so that by the report alone it is the file encoded.
+        let now = modified(&d.join("videos/movie.mp4"));
+        let r = json!({ "format": 1, "input": d.join("videos/movie.mp4"), "output": d.join("out/movie.mkv"), "source_bytes": 3000, "output_bytes": 1000, "source_mtime": now });
+        write_report(&d.join("out/movie.av1opt.json"), r);
+    });
+    add_history_folder(&s, "out");
+    let row = s.get("/api/history").json()["reports"][0].clone();
+    assert_eq!(row["replace"]["state"], "no", "{row}");
+    let r = s.post("/api/replace", &json!({ "report": s.dir.join("out/movie.av1opt.json") }));
+    assert!(r.status == 400 && r.body.contains("does not say what av1opt recorded"), "{}", r.body);
+    assert!(s.dir.join("videos/movie.mp4").exists() && s.dir.join("out/movie.mkv").exists() && nothing_in_the_trash(&s));
+}
+
+#[test]
 fn a_planted_report_cannot_pull_a_file_out_through_undo() {
     let plant = |d: &Path| {
         let (original, placed) = (d.join("videos/movie.mp4"), d.join("videos/movie.mkv"));

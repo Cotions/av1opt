@@ -963,7 +963,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     let report_at = output.with_extension("av1opt.json");
     // A report that says where an original went (it is in the trash, and can be put back) is
     // the only record of that: it is set aside, not written over.
-    let records_original = std::fs::read(&report_at).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).is_some_and(|r| r.get("replaced").is_some_and(|v| !v.is_null()));
+    let records_original = crate::files::read_regular(&report_at, crate::replace::REPORT_LIMIT).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).is_some_and(|r| r.get("replaced").is_some_and(|v| !v.is_null()));
     if records_original {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         match crate::replace::set_aside(&report_at, &output, now) {

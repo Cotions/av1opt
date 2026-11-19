@@ -209,7 +209,7 @@ fn collect_with_cache(
                 progress(done.fetch_add(1, Ordering::Relaxed) + 1, total);
                 let (verdict, estimate) = match &entry.info {
                     Some(i) => estimate::judge(i, *size, min_savings, model),
-                    None => (Verdict::Unreadable, SizeRange { low: *size as f64, likely: *size as f64, high: *size as f64 }),
+                    None => (Verdict::Unreadable, SizeRange { low: *size as f64, likely: *size as f64, high: *size as f64, chance: 0.0 }),
                 };
                 FileResult { path: path.clone(), root: root.clone(), size: *size, mtime: *mtime, info: entry.info, error: entry.error, verdict, estimate, unjudged }
             })
@@ -313,10 +313,11 @@ pub fn best_within(items: &[(f64, f64)], budget_secs: f64) -> Vec<usize> {
     if saved(&plain) > saved(&chosen) { plain } else { by_rate(chosen) }
 }
 
-/// The candidates of a scan to encode in `budget_secs`: see [`best_within`].
+/// The files of a scan to encode in `budget_secs`, each counted for what it is likely to save
+/// given its chance of being kept: see [`best_within`].
 pub fn pick_for_time<'a>(results: &'a [FileResult], time: &estimate::TimeModel, budget_secs: f64) -> Vec<&'a FileResult> {
-    let cands: Vec<&FileResult> = results.iter().filter(|r| r.verdict == Verdict::Candidate).collect();
-    let items: Vec<(f64, f64)> = cands.iter().map(|r| (r.size as f64 - r.estimate.likely, r.info.as_ref().map_or(0.0, |i| time.secs(i)))).collect();
+    let cands: Vec<&FileResult> = results.iter().filter(|r| r.verdict.will_be_tried()).collect();
+    let items: Vec<(f64, f64)> = cands.iter().map(|r| (r.estimate.weighted_saving(r.size), r.info.as_ref().map_or(0.0, |i| time.secs(i)))).collect();
     best_within(&items, budget_secs).into_iter().map(|i| cands[i]).collect()
 }
 
@@ -509,6 +510,23 @@ mod tests {
         let back: HashMap<PathBuf, CacheEntry> = serde_json::from_slice(&std::fs::read(&at).unwrap()).unwrap();
         assert_eq!(back.keys().collect::<Vec<_>>(), [Path::new("/v/b.mkv")]);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_time_goes_to_the_file_likelier_to_be_kept() {
+        let info = crate::probe::MediaInfo { codec: "h264".into(), width: 1920, height: 1080, fps: 30.0, duration_s: 600.0, ..Default::default() };
+        let file = |name: &str, verdict, likely: f64, chance| FileResult {
+            path: name.into(), root: "/".into(), size: 1000, mtime: 0, info: Some(info.clone()), error: None, verdict, unjudged: false,
+            estimate: SizeRange { low: likely, likely, high: likely, chance },
+        };
+        let time = estimate::TimeModel::fit(&[], 5);
+        let one_video = time.secs(&info) * 1.5;
+        // The doubtful one promises more, 600 bytes against 500, and may well not be kept.
+        let results = [file("doubtful", Verdict::Maybe, 400.0, 0.15), file("sure", Verdict::Candidate, 500.0, 0.99), file("no", Verdict::LowGain, 100.0, 0.01)];
+        let names = |budget| pick_for_time(&results, &time, budget).iter().map(|r| r.path.to_str().unwrap().to_string()).collect::<Vec<_>>();
+        assert_eq!(names(one_video), ["sure"]);
+        // Given the time it is tried too, after the sure one.
+        assert_eq!(names(one_video * 2.0), ["sure", "doubtful"]);
     }
 
     #[test]

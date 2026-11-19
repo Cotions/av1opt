@@ -813,7 +813,7 @@ views.scan = (root) => {
   const saved = (STATE && STATE.settings.scan_paths) || [];
   const roots = new Set(prefs.get("scanRoots", saved));
   const chips = h("div", { class: "chips" });
-  const minSav = h("input", { type: "number", min: "0", max: "95", value: prefs.get("scanMinSavings", 20) });
+  const minSav = h("input", { type: "number", min: "0", max: "95", value: prefs.get("scanMinSavings", 15) });
   const vmaf = h("input", { type: "number", step: "0.5", value: prefs.get("scanVmaf", 93) });
   const start = h("button", { class: "primary" }, "Scan");
   const progress = h("div", { class: "bar grow" }, h("div"));
@@ -906,8 +906,9 @@ function renderScan(out, r) {
   let sortKey = "saved", sortDir = -1;
   const selected = new Set();
   const savedOf = (row) => row.size - row.estimate.likely;
+  const tried = (row) => row.verdict === "Candidate" || row.verdict === "Maybe";
   // Bytes saved per hour of encoding: what to start with when time is short.
-  const rateOf = (row) => row.verdict === "Candidate" && row.est_secs ? savedOf(row) / row.est_secs * 3600 : 0;
+  const rateOf = (row) => tried(row) && row.est_secs ? savedOf(row) / row.est_secs * 3600 : 0;
   const timeBasis = `Search and encode at preset ${r.preset}, ${r.time_samples ? "going by " + plural(r.time_samples, "past encode") + " on this machine" : "a rough guess until a few files are encoded on this machine"}. A CRF per scene takes about ${num(r.scenes_factor || 3, 1)} times as long${r.scene_samples ? " (" + plural(r.scene_samples, "such encode") + ")" : ""}; one only where quality is uneven about ${num(r.auto_factor || 1.7, 1)} times on average${r.auto_samples ? " (" + Math.round((r.auto_share || 0) * 100) + "% of " + plural(r.auto_samples, "encode") + " made that way went per scene)" : ""}`;
   const rows = r.rows;
   const body = h("tbody");
@@ -918,8 +919,8 @@ function renderScan(out, r) {
   const allBox = h("input", { type: "checkbox", title: "Select all shown" });
 
   const shown = () => {
-    let v = rows.filter((x) => filter === "all" || (filter === "candidate" ? x.verdict === "Candidate" : x.verdict !== "Candidate"));
-    const key = { saved: savedOf, size: (x) => x.size, name: (x) => x.rel, mbps: (x) => x.video_mbps || 0, dur: (x) => x.duration_s || 0, time: (x) => x.est_secs || 0, rate: rateOf }[sortKey];
+    let v = rows.filter((x) => filter === "all" || (filter === "candidate" ? tried(x) : !tried(x)));
+    const key = { saved: savedOf, size: (x) => x.size, name: (x) => x.rel, mbps: (x) => x.video_mbps || 0, dur: (x) => x.duration_s || 0, time: (x) => x.est_secs || 0, rate: (x) => rateOf(x) * (x.order_weight ?? 1) }[sortKey];
     v.sort((a, b) => { const ka = key(a), kb = key(b); return (ka < kb ? -1 : ka > kb ? 1 : 0) * sortDir; });
     return v;
   };
@@ -962,7 +963,7 @@ function renderScan(out, r) {
     const v = shown();
     body.replaceChildren(...v.slice(0, limit).map((x) => {
       const cb = h("input", { type: "checkbox", checked: selected.has(x.path), onchange: () => { if (cb.checked) selected.add(x.path); else selected.delete(x.path); updateSel(); } });
-      const cls = x.verdict === "Candidate" ? "ok" : x.verdict === "Unreadable" ? "bad" : "";
+      const cls = x.verdict === "Candidate" ? "ok" : x.verdict === "Maybe" ? "warn" : x.verdict === "Unreadable" ? "bad" : "";
       return h("tr", {},
         h("td", {}, cb),
         h("td", { class: "path", title: x.path }, x.rel),
@@ -971,9 +972,9 @@ function renderScan(out, r) {
         h("td", { class: "num" }, hms(x.duration_s)),
         h("td", { class: "num" }, num(x.video_mbps, 1)),
         h("td", { class: "num" }, bytes(x.size)),
-        h("td", { class: "num" }, x.verdict === "Candidate" ? `~${bytes(x.estimate.likely)}` : "–"),
-        h("td", { class: "num" }, x.verdict === "Candidate" ? h("span", { title: `range ${bytes(x.size - x.estimate.high)} – ${bytes(x.size - x.estimate.low)}` }, `${bytes(savedOf(x))} (${pct(savedOf(x) / x.size)})`) : "–"),
-        h("td", { class: "num" }, x.verdict === "Candidate" ? span(x.est_secs) : "–"),
+        h("td", { class: "num" }, tried(x) ? `~${bytes(x.estimate.likely)}` : "–"),
+        h("td", { class: "num" }, tried(x) ? h("span", { title: `range ${bytes(x.size - x.estimate.high)} – ${bytes(x.size - x.estimate.low)}` }, `${bytes(savedOf(x))} (${pct(savedOf(x) / x.size)})`) : "–"),
+        h("td", { class: "num" }, tried(x) ? span(x.est_secs) : "–"),
         h("td", { class: "num" }, rateOf(x) ? bytes(rateOf(x)) + "/h" : "–"),
         h("td", {}, h("span", { class: "pill " + cls, title: x.error || "" }, x.verdict_label)));
     }));

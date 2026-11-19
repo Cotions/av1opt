@@ -328,7 +328,7 @@ fn d_preset() -> u8 {
 }
 
 fn d_savings() -> f64 {
-    0.2
+    crate::estimate::MIN_SAVINGS
 }
 fn d_vmaf() -> f64 {
     93.0
@@ -463,6 +463,7 @@ pub fn scan_result(app: &App, id: u64) -> Result<Value> {
                 "verdict": r.verdict,
                 "verdict_label": r.verdict.label(),
                 "estimate": r.estimate,
+                "order_weight": r.estimate.order_weight(),
                 "est_secs": est_secs,
                 "codec": i.map(|i| i.codec.as_str()),
                 "width": i.map(|i| i.width),

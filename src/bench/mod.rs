@@ -272,7 +272,7 @@ pub fn run(paths: &[PathBuf], tools: &Tools, o: &Options, progress: &(dyn Fn(Pro
 
     // The verdicts of `scan` aren't used here, so the built-in size model will do.
     let model = crate::estimate::Model::fit(&[], 93.0);
-    let (mut found, _) = scan::collect(paths, &tools.ffprobe, o.jobs.max(1), 0.2, &model, &|done, total| progress(Progress::Probing { done, total }))?;
+    let (mut found, _) = scan::collect(paths, &tools.ffprobe, o.jobs.max(1), crate::estimate::MIN_SAVINGS, &model, &|done, total| progress(Progress::Probing { done, total }))?;
     tools.check_cancel()?;
     let not_text = scan::drop_unnamed(&mut found);
     if not_text > 0 {

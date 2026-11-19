@@ -101,11 +101,16 @@ pub fn print(results: &[FileResult], top: usize, time: &TimeModel, by: TopBy) {
     println!("{} videos, {}", all.files, gb(all.size));
     println!("{} candidates, estimated savings {}", all.candidates, all.savings());
     println!("(likely, with pessimistic - optimistic range in brackets)");
+    let maybe = results.iter().filter(|r| r.verdict == Verdict::Maybe).count();
+    if maybe > 0 {
+        println!("{maybe} more may save too little: not counted here, and worth trying after the candidates");
+    }
     let secs_of = |r: &FileResult| r.info.as_ref().map_or(0.0, |i| time.secs(i));
     let saved_of = |r: &FileResult| r.size as f64 - r.estimate.likely;
-    // Bytes saved per second of encoding; a time that isn't known sorts last.
+    // Bytes saved per second of encoding, by the chance of being kept; a time that isn't known
+    // sorts last.
     let rate_of = |r: &FileResult| match secs_of(r) {
-        s if s > 0.0 => saved_of(r) / s,
+        s if s > 0.0 => r.estimate.weighted_saving(r.size) / s,
         _ => 0.0,
     };
     if all.candidates > 0 {
@@ -188,7 +193,7 @@ pub fn print_pick(picked: &[&FileResult], hours: f64, results: &[FileResult], ti
     println!("\n== Most saved in {} of encoding ==", span(hours * 3600.0));
     let secs_of = |r: &FileResult| r.info.as_ref().map_or(0.0, |i| time.secs(i));
     if picked.is_empty() {
-        let shortest = results.iter().filter(|r| r.verdict == Verdict::Candidate).map(secs_of).filter(|s| *s > 0.0).fold(f64::INFINITY, f64::min);
+        let shortest = results.iter().filter(|r| r.verdict.will_be_tried()).map(secs_of).filter(|s| *s > 0.0).fold(f64::INFINITY, f64::min);
         match shortest.is_finite() {
             true => println!("no candidate fits: the shortest takes about {}", span(shortest)),
             false => println!("no candidates"),

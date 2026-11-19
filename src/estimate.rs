@@ -11,6 +11,15 @@ use crate::history::{Record, TIMING_VERSION};
 use crate::probe::MediaInfo;
 use serde::Serialize;
 
+/// The share of its video stream a file has to be expected to save to be worth encoding: the
+/// line `encode` itself holds a video to, so that a scan does not turn away what an encode
+/// would keep. At 20% a library of 34,578 files had 5,259 turned away, about one in three of
+/// which would have saved 15% or more.
+pub const MIN_SAVINGS: f64 = 0.15;
+/// What a video that turns out not worth encoding costs, as a share of encoding it: it stops
+/// after the search, which takes 5 to 13% of an encode.
+const COST_OF_A_SKIP: f64 = 0.1;
+
 const BPP_1080P: f64 = 0.035;
 /// The preset of the pilot the first guess comes from.
 const PILOT_PRESET: u8 = 6;
@@ -148,6 +157,11 @@ impl Model {
             (distance / FAR_FROM_HISTORY).min(1.0)
         };
         (self.sigma.powi(2) + UNKNOWN_CONTENT_SIGMA.powi(2) * unlike).sqrt()
+    }
+
+    /// The spread to expect around the prediction for this video (log units).
+    fn sigma_at(&self, source_bpp: f64, pixels: f64) -> f64 {
+        self.sigma_for(&features(source_bpp.max(1e-4), pixels))
     }
 
     /// Predicted AV1 bits per pixel: (low, likely, high), the outer two an 80% interval.
@@ -434,6 +448,9 @@ fn solve3(mut a: [[f64; 3]; 3], mut b: [f64; 3]) -> Option<[f64; 3]> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub enum Verdict {
     Candidate,
+    /// Expected to save too little, but the kind end of the estimate would be enough: the
+    /// search will tell, and it comes after the sure ones.
+    Maybe,
     AlreadyAv1,
     LowGain,
     DolbyVision,
@@ -445,12 +462,18 @@ impl Verdict {
     pub fn label(self) -> &'static str {
         match self {
             Verdict::Candidate => "candidate",
+            Verdict::Maybe => "may save too little: tried last",
             Verdict::AlreadyAv1 => "skip: already AV1",
             Verdict::LowGain => "skip: low expected gain",
             Verdict::DolbyVision => "skip: Dolby Vision",
             Verdict::TooShort => "skip: too short or no duration",
             Verdict::Unreadable => "skip: unreadable",
         }
+    }
+
+    /// Whether a file with this verdict is worth the search that settles it.
+    pub fn will_be_tried(self) -> bool {
+        matches!(self, Verdict::Candidate | Verdict::Maybe)
     }
 }
 
@@ -460,6 +483,38 @@ pub struct SizeRange {
     pub low: f64,
     pub likely: f64,
     pub high: f64,
+    /// The chance that the video saves enough to be kept, 0 to 1; 0 when it was not judged.
+    pub chance: f64,
+}
+
+impl SizeRange {
+    fn unchanged(file_size: u64) -> SizeRange {
+        let size = file_size as f64;
+        SizeRange { low: size, likely: size, high: size, chance: 0.0 }
+    }
+
+    /// How much of its expected saving counts when files are put in order. A file that fails
+    /// the line still cost its search, so per hour spent it brings
+    /// `P / (P + COST_OF_A_SKIP * (1 - P))` of what a sure one would.
+    pub fn order_weight(&self) -> f64 {
+        let p = self.chance;
+        if p > 0.0 { p / (p + COST_OF_A_SKIP * (1.0 - p)) } else { 0.0 }
+    }
+
+    /// The bytes this file is expected to save, weighted by its chance of being kept.
+    pub fn weighted_saving(&self, file_size: u64) -> f64 {
+        (file_size as f64 - self.likely) * self.order_weight()
+    }
+}
+
+/// The share of a normal distribution below `z`, from the complementary error function
+/// (Numerical Recipes' fit, good to about one part in ten million).
+fn normal_share_below(z: f64) -> f64 {
+    let x = z.abs() / std::f64::consts::SQRT_2;
+    let t = 1.0 / (1.0 + 0.5 * x);
+    let fit = [0.17087277, -0.82215223, 1.48851587, -1.13520398, 0.27886807, -0.18628806, 0.09678418, 0.37409196, 1.00002368, -1.26551223];
+    let beyond = t * (fit.iter().fold(0.0, |sum, c| sum * t + c) - x * x).exp() / 2.0;
+    if z > 0.0 { 1.0 - beyond } else { beyond }
 }
 
 pub fn bits_per_pixel(m: &MediaInfo) -> f64 {
@@ -468,7 +523,7 @@ pub fn bits_per_pixel(m: &MediaInfo) -> f64 {
 
 /// Returns the verdict and the estimated new size of the *whole file* in bytes.
 pub fn judge(m: &MediaInfo, file_size: u64, min_savings: f64, model: &Model) -> (Verdict, SizeRange) {
-    let keep = SizeRange { low: file_size as f64, likely: file_size as f64, high: file_size as f64 };
+    let keep = SizeRange::unchanged(file_size);
     if m.codec == "av1" {
         return (Verdict::AlreadyAv1, keep);
     }
@@ -483,14 +538,26 @@ pub fn judge(m: &MediaInfo, file_size: u64, min_savings: f64, model: &Model) -> 
     let (low, likely, high) = model.predict_bpp(bits_per_pixel(m), pixels);
     let video_bytes = m.video_bitrate * m.picture_secs() / 8.0;
     let other_bytes = (file_size as f64 - video_bytes).max(0.0);
-    let new_size = |bpp: f64| {
-        let av1 = bpp * pixels * m.fps * m.picture_secs() / 8.0;
-        other_bytes + av1.min(video_bytes)
-    };
-    let est = SizeRange { low: new_size(low), likely: new_size(likely), high: new_size(high) };
+    let av1_bytes = |bpp: f64| bpp * pixels * m.fps * m.picture_secs() / 8.0;
+    let new_size = |bpp: f64| other_bytes + av1_bytes(bpp).min(video_bytes);
+    let mut est = SizeRange { low: new_size(low), likely: new_size(likely), high: new_size(high), chance: 0.0 };
 
-    let savings = 1.0 - est.likely / file_size as f64;
-    let verdict = if savings >= min_savings { Verdict::Candidate } else { Verdict::LowGain };
+    // The line is about the video stream, as it is in `encode`. A bitrate that claims more
+    // than the file holds says nothing about the stream, so the file's size caps it.
+    let ratio = av1_bytes(likely) / video_bytes.min(file_size as f64);
+    if !(ratio.is_finite() && ratio > 0.0) {
+        return (Verdict::LowGain, est);
+    }
+    let sigma = model.sigma_at(bits_per_pixel(m), pixels);
+    let enough = 1.0 - min_savings;
+    est.chance = normal_share_below((enough.ln() - ratio.ln()) / sigma.max(1e-9));
+    let verdict = if ratio <= enough {
+        Verdict::Candidate
+    } else if ratio * (-Z80 * sigma).exp() <= enough {
+        Verdict::Maybe
+    } else {
+        Verdict::LowGain
+    };
     (verdict, est)
 }
 
@@ -841,7 +908,61 @@ mod tests {
         let saved = 1.0 - r.likely / size as f64;
         assert!(near(saved, 0.5), "{saved}");
         assert_eq!(judge(&m, size, saved, &model).0, Verdict::Candidate);
-        assert_eq!(judge(&m, size, saved + 1e-9, &model).0, Verdict::LowGain);
+        assert_eq!(judge(&m, size, saved + 1e-9, &model).0, Verdict::Maybe);
+    }
+
+    /// The spread `says` gives a video: its own 0.1 and all of what unknown content adds.
+    fn spread_of_says() -> f64 {
+        (0.1f64.powi(2) + UNKNOWN_CONTENT_SIGMA.powi(2)).sqrt()
+    }
+
+    #[test]
+    fn the_likely_size_makes_a_candidate_and_the_kind_end_of_the_range_a_maybe() {
+        // The source spends 0.1 bits per pixel, so what the model says over 0.1 is the ratio.
+        let verdict = |ratio: f64| judge(&video(100.0, 1e6), 12_500_000, MIN_SAVINGS, &says(ratio * 0.1)).0;
+        let last_maybe = (1.0 - MIN_SAVINGS) * (Z80 * spread_of_says()).exp();
+        assert_eq!(verdict(0.5), Verdict::Candidate);
+        assert_eq!(verdict(0.849_99), Verdict::Candidate);
+        assert_eq!(verdict(0.850_01), Verdict::Maybe);
+        assert_eq!(verdict(last_maybe * 0.999_99), Verdict::Maybe);
+        assert_eq!(verdict(last_maybe * 1.000_01), Verdict::LowGain);
+    }
+
+    #[test]
+    fn the_line_is_about_the_video_stream_and_not_the_whole_file() {
+        // Half the file is sound: the picture shrinks by 20%, the file by 10%.
+        let (m, model) = (video(100.0, 1e6), says(0.08));
+        assert_eq!(judge(&m, 25_000_000, MIN_SAVINGS, &model).0, Verdict::Candidate);
+        // A bitrate claiming twice what the file holds: half of the claim is no saving at all.
+        assert_eq!(judge(&m, 6_250_000, MIN_SAVINGS, &says(0.05)).0, Verdict::Maybe);
+    }
+
+    #[test]
+    fn the_share_below_a_normal_value_is_the_known_one() {
+        for (z, share) in [(0.0, 0.5), (1.0, 0.841_345), (1.28, 0.899_727), (1.96, 0.975_002), (-1.28, 0.100_273), (-3.0, 0.001_350)] {
+            assert!((normal_share_below(z) - share).abs() < 1e-5, "{z}: {}", normal_share_below(z));
+        }
+        assert_eq!(normal_share_below(f64::NEG_INFINITY), 0.0);
+        assert_eq!(normal_share_below(f64::INFINITY), 1.0);
+    }
+
+    #[test]
+    fn the_chance_of_being_kept_puts_a_likely_file_before_a_doubtful_one() {
+        let judged = |ratio: f64| judge(&video(100.0, 1e6), 12_500_000, MIN_SAVINGS, &says(ratio * 0.1));
+        // On the line it is one chance in two, and at the kind end of the range one in ten.
+        assert!((judged(0.85).1.chance - 0.5).abs() < 1e-3);
+        let (verdict, at_the_end) = judged((1.0 - MIN_SAVINGS) * (Z80 * spread_of_says()).exp() * 0.999);
+        assert_eq!(verdict, Verdict::Maybe);
+        assert!((at_the_end.chance - 0.1).abs() < 2e-3, "{}", at_the_end.chance);
+        assert!((at_the_end.order_weight() - 0.526).abs() < 0.01, "{}", at_the_end.order_weight());
+        assert!(judged(0.2).1.order_weight() > 0.999);
+        // A file saving more than another comes after it when its saving is unlikely to hold.
+        let sure = SizeRange { likely: 500.0, chance: 0.99, ..Default::default() };
+        let doubtful = SizeRange { likely: 400.0, chance: 0.2, ..Default::default() };
+        assert!(1000.0 - doubtful.likely > 1000.0 - sure.likely);
+        assert!(doubtful.weighted_saving(1000) < sure.weighted_saving(1000));
+        // What was not judged counts for nothing.
+        assert_eq!(SizeRange::unchanged(1000).order_weight(), 0.0);
     }
 
     #[test]
@@ -1092,10 +1213,12 @@ mod tests {
     }
 
     #[test]
-    fn every_verdict_but_candidate_reads_as_a_skip() {
+    fn every_verdict_but_the_two_tried_reads_as_a_skip() {
         assert_eq!(Verdict::Candidate.label(), "candidate");
+        assert_eq!(Verdict::Maybe.label(), "may save too little: tried last");
+        assert!(Verdict::Candidate.will_be_tried() && Verdict::Maybe.will_be_tried());
         for v in [Verdict::AlreadyAv1, Verdict::LowGain, Verdict::DolbyVision, Verdict::TooShort, Verdict::Unreadable] {
-            assert!(v.label().starts_with("skip: "), "{v:?}");
+            assert!(v.label().starts_with("skip: ") && !v.will_be_tried(), "{v:?}");
         }
     }
 }

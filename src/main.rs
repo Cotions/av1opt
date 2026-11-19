@@ -57,8 +57,9 @@ enum Cmd {
         /// Parallel ffprobe processes (1-64). Keep low on slow or FUSE-mounted drives.
         #[arg(short, long, default_value_t = 6, value_parser = whole::<1, 64>)]
         jobs: usize,
-        /// Minimum expected savings (0-0.95) for a file to count as a candidate.
-        #[arg(long, default_value_t = 0.2, value_parser = parse_min_savings)]
+        /// Share of its video stream (0-0.95) a file must be expected to save to be a candidate.
+        /// Files that could reach it if the estimate is too high are listed as maybe.
+        #[arg(long, default_value_t = estimate::MIN_SAVINGS, value_parser = parse_min_savings)]
         min_savings: f64,
         /// Write one row per file to this CSV.
         #[arg(long)]
@@ -281,7 +282,7 @@ enum Cmd {
         #[arg(long, value_parser = parse_sample_secs)]
         sample_secs: Option<f64>,
         /// Skip the full encode if predicted video savings are below this (0-0.95).
-        #[arg(long, default_value_t = 0.15, value_parser = parse_min_savings)]
+        #[arg(long, default_value_t = estimate::MIN_SAVINGS, value_parser = parse_min_savings)]
         min_savings: f64,
         /// Encode even if already AV1 or below --min-savings.
         #[arg(long)]
@@ -837,12 +838,13 @@ fn order_jobs(jobs: &mut [batch::Job], inputs: &[PathBuf], ffprobe: &str, o: &en
     let roots: Vec<PathBuf> = inputs.iter().map(|p| abs(p)).collect();
     eprintln!("probing {} files to order them", jobs.len());
     let (found, _) = scan::collect(&roots, ffprobe, 6, o.min_savings, &model, &|_, _| {})?;
-    // Files that would be skipped anyway are worth nothing and go last.
+    // Files that would be skipped anyway are worth nothing and go last, and those that may
+    // save too little count for their chance of being kept.
     let worth: std::collections::HashMap<PathBuf, f64> = found
         .iter()
-        .filter(|r| r.verdict == estimate::Verdict::Candidate)
+        .filter(|r| r.verdict.will_be_tried())
         .map(|r| {
-            let saved = r.size as f64 - r.estimate.likely;
+            let saved = r.estimate.weighted_saving(r.size);
             let secs = r.info.as_ref().map_or(0.0, |i| time.secs(i));
             let w = match order {
                 batch::Order::PerHour if secs > 0.0 => saved / secs,

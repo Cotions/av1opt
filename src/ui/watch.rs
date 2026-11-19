@@ -374,7 +374,7 @@ fn judge(app: &App, w: &Watch, ready: Vec<PathBuf>) -> Result<Judged> {
     let (results, _) = crate::scan::collect(&ready, &app.ffprobe(), app.cfg.jobs, w.options.min_savings, &model, &|_, _| {})?;
     // "Encode anyway" is about the gain expected. AV1 is left even so: an output that took
     // its original's place in this folder would be encoded again, and again after that.
-    let worth = |v: Verdict| v == Verdict::Candidate || (w.options.force && !matches!(v, Verdict::AlreadyAv1 | Verdict::Unreadable));
+    let worth = |v: Verdict| v.will_be_tried() || (w.options.force && !matches!(v, Verdict::AlreadyAv1 | Verdict::Unreadable));
     let mut judged = Judged::default();
     for r in results {
         if r.unjudged {

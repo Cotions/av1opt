@@ -28,11 +28,14 @@ av1opt scan /videos /more/videos --csv report.csv
 ```
 
 Probes every video in parallel (results cached in `~/.cache/av1opt/`), sorts each file into
-*candidate* or a skip reason (already AV1, Dolby Vision, too short, low expected gain), and prints totals
-by codec and folder plus the biggest wins. Savings are a rough metadata-based estimate shown as a
-range; `encode` measures the real numbers. Low expected gain means under 20% here
-(`--min-savings`); `encode` has a `--min-savings` of its own, 15%, for what it measures. Never
-writes to the scanned folders.
+*candidate*, *may save too little: tried last*, or a skip reason (already AV1, Dolby Vision, too
+short, low expected gain), and prints totals by codec and folder plus the biggest wins. Savings
+are a rough metadata-based estimate shown as a range; `encode` measures the real numbers. A
+candidate is expected to save 15% of its video stream (`--min-savings`, the line `encode` holds
+it to as well). A file expected to save less whose range still reaches 15% is worth a search
+but comes after the others: orders by saving weigh every file by its chance of being kept. Low
+expected gain means even the kind end of the range falls short. Never writes to the scanned
+folders.
 
 Every run of ffprobe on a video, here and in the other commands, has a time limit that only
 a stalled drive should reach: at most two minutes, and for a run that reads every packet of a
@@ -571,8 +574,9 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
   often when walking it takes long: a look never takes a tenth of the time), not through
   file-change notifications, which network and FUSE mounts don't send. A video is queued
   once two looks found it unchanged and it has not been written to for two minutes, so a
-  download still running is left alone, and only if a scan would call it a candidate: AV1,
-  Dolby Vision, too short, too little to gain and unreadable files are left. A watch with
+  download still running is left alone, and only if a scan would call it a candidate or say it
+  may save too little: AV1, Dolby Vision, too short, too little to gain and unreadable files
+  are left. A watch with
   **Force** ticked leaves only AV1 and unreadable files. A video whose probe could not
   finish, or that the system could not read, is not called unreadable at once: it gets three
   looks and is then tried at growing intervals, up to once a day. Until a probe gets through

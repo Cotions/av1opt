@@ -419,7 +419,7 @@ to tell, and the check of the whole video finds the weak stretches instead.
 Finished chunks are kept in `.av1opt-work-*` in the output folder, so an interrupted run resumes
 where it stopped (including the search). A chunk is taken over only if its encode has the
 size and SHA-256 its record kept; any other is encoded again, and the run says how many of
-each (chunks of versions that kept no hash are encoded again too). Chunks are cut and compared at a constant frame
+each (chunks of versions that kept no hash are taken over by their size alone, and the run says how many). Chunks are cut and compared at a constant frame
 rate, and a file's header is not taken at its word for having one: the scene pass counts how
 many frames that rate would drop or show twice. Past one in 10,000 the chunks are cut at the
 frames' own timestamps instead, each frame is encoded once, and the joined video is stamped

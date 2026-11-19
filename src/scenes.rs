@@ -585,19 +585,26 @@ fn encode_chunk(c: &Ctx, plan: &Plan, i: usize) -> Result<ChunkResult> {
     let sha256 = crate::ledger::sha256_of_file(&part).with_context(|| format!("cannot read back the encode of chunk {}", i + 1))?;
     // The JSON is written first and the encode renamed last: a chunk counts as done only when
     // its .obu exists, which can't happen half-written.
-    crate::files::write_new(&chunk_path(c.work, i, "json"), &serde_json::to_vec(&Done { result: r.clone(), sha256 })?)?;
+    let done = Done { result: r.clone(), sha256: Some(sha256), plan: Some(plan.key.clone()) };
+    crate::files::write_new(&chunk_path(c.work, i, "json"), &serde_json::to_vec(&done)?)?;
     std::fs::rename(&part, chunk_path(c.work, i, "obu"))?;
     let _ = std::fs::remove_file(&reference);
     Ok(r)
 }
 
-/// What is kept of a finished chunk beside its encode: its result, and the SHA-256 of the
-/// encode, which settles on resuming that the file there is the one that was measured.
+/// What is kept of a finished chunk beside its encode: its result, the SHA-256 of the encode,
+/// which settles on resuming that the file there is the one that was measured, and the key of
+/// the plan it was encoded for, so that a chunk of another plan (of another video, in a work
+/// folder put at this one's name) is not taken for one of this.
 #[derive(Serialize, Deserialize)]
 struct Done {
     #[serde(flatten)]
     result: ChunkResult,
-    sha256: String,
+    /// Absent from the records of versions before hashes were kept, as is `plan`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan: Option<String>,
 }
 
 /// More than the record of any chunk takes: a few numbers and a dozen probes.
@@ -610,6 +617,8 @@ enum Found {
     Nothing,
     /// A finished chunk whose encode is the one its record measured.
     Taken(ChunkResult),
+    /// A finished chunk of a version that kept no hash, whose encode has the size recorded.
+    TakenBySize(ChunkResult),
     /// Something that cannot be gone on from, and why: it is encoded again.
     Redo(String),
 }
@@ -618,8 +627,10 @@ enum Found {
 /// sensible size, and its encode a plain file of the size and SHA-256 that record holds. The
 /// encode is what goes into the output, and its score into the report: a file put there by
 /// anyone but this encode (another valid AV1 stream of other pictures, say) must not pass for
-/// it. Records of versions that kept no hash are encoded again too.
-fn load_done(work: &Path, i: usize) -> Found {
+/// it, nor a chunk encoded for another plan than `plan_key`. Records of versions that kept no
+/// hash are taken by the size alone: only this user can write in the work folder, which has
+/// passed the check for going on from it, and the chunks of a long video may be days of work.
+fn load_done(work: &Path, i: usize, plan_key: &str) -> Found {
     let encode = chunk_path(work, i, "obu");
     if std::fs::symlink_metadata(&encode).is_err() {
         return Found::Nothing;
@@ -628,7 +639,7 @@ fn load_done(work: &Path, i: usize) -> Found {
         Err(e) => return Found::Redo(format!("its record cannot be read ({e})")),
         Ok(bytes) => match serde_json::from_slice(&bytes) {
             Ok(done) => done,
-            Err(_) => return Found::Redo("its record holds no size and hash to check it by".into()),
+            Err(_) => return Found::Redo("its record cannot be understood".into()),
         },
     };
     let opened = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC).open(&encode);
@@ -642,8 +653,15 @@ fn load_done(work: &Path, i: usize) -> Found {
         Ok(_) => {}
         Err(e) => return Found::Redo(format!("its encode cannot be looked at ({e})")),
     }
+    if done.result.index != i {
+        return Found::Redo("its record is of another chunk".into());
+    }
+    let Some(recorded) = done.sha256 else { return Found::TakenBySize(done.result) };
+    if done.plan.as_deref() != Some(plan_key) {
+        return Found::Redo("it was encoded for another plan".into());
+    }
     match crate::ledger::sha256_of_open(&file) {
-        Ok(hash) if hash == done.sha256 && done.result.index == i => Found::Taken(done.result),
+        Ok(hash) if hash == recorded => Found::Taken(done.result),
         Ok(_) => Found::Redo("its encode is not the one recorded".into()),
         Err(e) => Found::Redo(format!("its encode cannot be read ({e})")),
     }
@@ -652,9 +670,13 @@ fn load_done(work: &Path, i: usize) -> Found {
 /// Encodes all chunks not already done, `workers` at a time. Returns results in chunk order.
 pub fn encode_all(c: &Ctx, plan: &Plan) -> Result<Vec<ChunkResult>> {
     let n = plan.chunks.len();
-    let mut redone = 0;
-    let found = (0..n).map(|i| match load_done(c.work, i) {
+    let (mut redone, mut by_size) = (0, 0);
+    let found = (0..n).map(|i| match load_done(c.work, i, &plan.key) {
         Found::Taken(r) => Some(r),
+        Found::TakenBySize(r) => {
+            by_size += 1;
+            Some(r)
+        }
         Found::Nothing => None,
         Found::Redo(why) => {
             eprintln!("note: chunk {} is encoded again: {why}", i + 1);
@@ -667,7 +689,8 @@ pub fn encode_all(c: &Ctx, plan: &Plan) -> Result<Vec<ChunkResult>> {
     let todo: Vec<usize> = results.lock().unwrap().iter().enumerate().filter(|(_, r)| r.is_none()).map(|(i, _)| i).collect();
     if todo.len() < n || redone > 0 {
         let again = if redone > 0 { format!(", {redone} found there encoded again as they did not match their records") } else { String::new() };
-        eprintln!("resuming: {} of {n} chunks taken over{again}", n - todo.len());
+        let unhashed = if by_size > 0 { format!(" ({by_size} made by an earlier version that kept no hash, checked by their size alone)") } else { String::new() };
+        eprintln!("resuming: {} of {n} chunks taken over{unhashed}{again}", n - todo.len());
     }
     c.tools.emit(Event::ChunkPlan { chunks: n, done: n - todo.len() });
     c.tools.emit(Event::Phase { phase: "chunks".into(), detail: format!("{} of {n} chunks to encode", todo.len()) });
@@ -826,43 +849,52 @@ mod tests {
         let keep = |bytes: &[u8], recorded: &[u8]| {
             std::fs::write(&encode, bytes).unwrap();
             let result = ChunkResult { bytes: recorded.len() as u64, ..chunk(48, 93.0) };
-            std::fs::write(&record, serde_json::to_vec(&Done { result, sha256: hash(recorded) }).unwrap()).unwrap();
+            std::fs::write(&record, serde_json::to_vec(&Done { result, sha256: Some(hash(recorded)), plan: Some("plan".into()) }).unwrap()).unwrap();
         };
-        assert!(matches!(load_done(&work, 0), Found::Nothing));
+        assert!(matches!(load_done(&work, 0, "plan"), Found::Nothing));
         keep(&made, &made);
-        assert!(matches!(load_done(&work, 0), Found::Taken(r) if r.frames == 48));
+        assert!(matches!(load_done(&work, 0, "plan"), Found::Taken(r) if r.frames == 48));
+        // The same chunk and record in the work folder of another plan (another video's, put at
+        // this one's name) are not this plan's.
+        assert!(matches!(load_done(&work, 0, "another plan"), Found::Redo(why) if why.contains("another plan")));
         // One byte changed, or another stream of the same size: the record does not vouch for it.
         let mut changed = made.clone();
         changed[500] ^= 1;
         keep(&changed, &made);
-        assert!(matches!(load_done(&work, 0), Found::Redo(why) if why == "its encode is not the one recorded"));
+        assert!(matches!(load_done(&work, 0, "plan"), Found::Redo(why) if why == "its encode is not the one recorded"));
         keep(&vec![9u8; 1000], &made);
-        assert!(matches!(load_done(&work, 0), Found::Redo(why) if why == "its encode is not the one recorded"));
+        assert!(matches!(load_done(&work, 0, "plan"), Found::Redo(why) if why == "its encode is not the one recorded"));
         keep(&made[..999], &made);
-        assert!(matches!(load_done(&work, 0), Found::Redo(why) if why.contains("has 999 bytes, not the 1000 recorded")));
+        assert!(matches!(load_done(&work, 0, "plan"), Found::Redo(why) if why.contains("has 999 bytes, not the 1000 recorded")));
         // A record of a chunk of another place in the video does not count for this one.
         keep(&made, &made);
-        assert!(matches!(load_done(&work, 1), Found::Nothing));
+        assert!(matches!(load_done(&work, 1, "plan"), Found::Nothing));
         std::fs::copy(&encode, chunk_path(&work, 1, "obu")).unwrap();
         std::fs::copy(&record, chunk_path(&work, 1, "json")).unwrap();
-        assert!(matches!(load_done(&work, 1), Found::Redo(_)));
-        // A record from before hashes were kept, one too large, or a pipe at its name.
+        assert!(matches!(load_done(&work, 1, "plan"), Found::Redo(_)));
+        // A record from before hashes were kept is taken by its size alone, for any plan (none
+        // was kept either); one too large, or a pipe at its name, is not.
         std::fs::write(&record, serde_json::to_vec(&ChunkResult { bytes: 1000, ..chunk(48, 93.0) }).unwrap()).unwrap();
-        assert!(matches!(load_done(&work, 0), Found::Redo(why) if why.contains("no size and hash")));
+        assert!(matches!(load_done(&work, 0, "plan"), Found::TakenBySize(r) if r.frames == 48));
+        std::fs::write(&encode, &made[..999]).unwrap();
+        assert!(matches!(load_done(&work, 0, "plan"), Found::Redo(why) if why.contains("has 999 bytes")));
+        std::fs::write(&encode, &made).unwrap();
+        std::fs::write(&record, b"{\"index\": 0}").unwrap();
+        assert!(matches!(load_done(&work, 0, "plan"), Found::Redo(why) if why.contains("cannot be understood")));
         std::fs::write(&record, vec![b' '; DONE_LIMIT as usize + 1]).unwrap();
-        assert!(matches!(load_done(&work, 0), Found::Redo(why) if why.contains("larger than")));
+        assert!(matches!(load_done(&work, 0, "plan"), Found::Redo(why) if why.contains("larger than")));
         std::fs::remove_file(&record).unwrap();
         crate::files::tests::make_pipe(&record);
         let (tell, told) = std::sync::mpsc::channel();
         let looked = work.clone();
-        std::thread::spawn(move || drop(tell.send(format!("{:?}", load_done(&looked, 0)))));
+        std::thread::spawn(move || drop(tell.send(format!("{:?}", load_done(&looked, 0, "plan")))));
         assert!(told.recv_timeout(std::time::Duration::from_secs(2)).expect("the record was waited on").contains("it is a pipe"));
         // An encode that is a link to a file that would pass is not followed.
         std::fs::remove_file(&record).unwrap();
         keep(&made, &made);
         std::fs::rename(&encode, work.join("elsewhere")).unwrap();
         std::os::unix::fs::symlink(work.join("elsewhere"), &encode).unwrap();
-        assert!(matches!(load_done(&work, 0), Found::Redo(why) if why.contains("cannot be opened")));
+        assert!(matches!(load_done(&work, 0, "plan"), Found::Redo(why) if why.contains("cannot be opened")));
         std::fs::remove_dir_all(&work).unwrap();
     }
 

@@ -1701,6 +1701,33 @@ fn bit_depth(pix_fmt: &str) -> u32 {
 }
 
 
+/// What subtitle track `i`, of `codec`, becomes in `container`: the codec it is written with
+/// ("copy" for as it is) or None for left out, and a note where something of it is lost.
+fn plan_subtitle(i: usize, codec: &str, container: Container) -> (Option<&'static str>, Option<String>) {
+    match (container, codec) {
+        // 608 captions are text, which ffmpeg's decoder reads as ASS lines. Neither container
+        // takes them as they are: MP4 "codec not currently supported in container", and
+        // Matroska failed at the end of the encode.
+        (Container::Mp4, "eia_608") => (
+            Some("mov_text"),
+            Some(format!("subtitle {i} (608 closed captions) became an MP4 text subtitle: MP4 has no place for 608 captions as they are, and where they stand on screen is lost")),
+        ),
+        (Container::Mkv, "eia_608") => (Some("ass"), Some(format!("subtitle {i} (608 closed captions) became an ASS subtitle: Matroska has no place for 608 captions as they are"))),
+        // MP4 holds TTML as it is; ffmpeg has no TTML decoder to convert it for Matroska.
+        (Container::Mp4, "ttml") => (Some("copy"), None),
+        (Container::Mkv, "ttml") => (
+            None,
+            Some(format!("subtitle {i} (ttml) dropped: Matroska has no place for TTML subtitles and ffmpeg cannot read them to convert them; --container mp4 keeps it")),
+        ),
+        (Container::Mp4, "ass" | "ssa") => (Some("mov_text"), Some(format!("subtitle {i} ({codec}) became plain MP4 text: its styles, positions and fonts are lost; --container mkv keeps it as it is"))),
+        (Container::Mp4, text) if TEXT_SUBS.contains(&text) => (Some("mov_text"), None),
+        (Container::Mp4, _) => (None, Some(format!("subtitle {i} ({codec}) dropped: image subtitles don't fit in MP4; use --container mkv"))),
+        // MP4-style text subtitles can't be stored in Matroska; convert them to SRT.
+        (Container::Mkv, "mov_text") => (Some("srt"), None),
+        (Container::Mkv, _) => (Some("copy"), None),
+    }
+}
+
 /// Names a kept track the way its source does, as `-metadata` arguments for output stream
 /// `spec` ("a:1"). Copied tags alone lose it: ffmpeg reads an MP4 track's name as a tag
 /// `name` and writes a title, so MP4 to MP4 lost every name and MP4 to Matroska put it in a
@@ -1796,23 +1823,15 @@ fn stream_args(
     let mut kept_subs = 0;
     let mut sub_sources = Vec::new();
     for (i, codec) in info.subtitle_codecs.iter().enumerate() {
-        let text = TEXT_SUBS.contains(&codec.as_str());
-        if container == Container::Mp4 && !text {
-            notes.push(format!("subtitle {i} ({codec}) dropped: image subtitles don't fit in MP4; use --container mkv"));
-            continue;
-        }
+        let (codec, note) = plan_subtitle(i, codec, container);
+        notes.extend(note);
+        let Some(codec) = codec else { continue };
         let from = match cut_subs {
             None => format!("{src}:s:{i}"),
             Some(inputs) => match inputs.get(i).copied().flatten() {
                 Some(n) => format!("{n}:s:0"),
                 None => continue,
             },
-        };
-        // MP4-style text subtitles can't be stored in Matroska; convert them to SRT.
-        let codec = match container {
-            Container::Mkv if codec == "mov_text" => "srt",
-            Container::Mkv => "copy",
-            Container::Mp4 => "mov_text",
         };
         a.extend(["-map".into(), from]);
         a.extend([format!("-c:s:{kept_subs}"), codec.into()]);
@@ -1837,6 +1856,9 @@ fn stream_args(
                 a.extend(["-map".into(), format!("{src}:{}", c.index), format!("-c:v:{covers}"), "copy".into()]);
                 meta_from.push((format!("v:{covers}"), c.index.to_string()));
                 a.extend([format!("-disposition:v:{covers}"), "attached_pic".into()]);
+            }
+            if !info.attachment_names.is_empty() {
+                notes.push(format!("attachments dropped: {}: MP4 has no place for them; --container mkv keeps them", info.attachment_names.join(", ")));
             }
         }
         Container::Mkv => {
@@ -1881,7 +1903,13 @@ fn prepare_cut<'a>(
 ) -> Result<Cut<'a>> {
     let mut subs = Vec::new();
     for (i, codec) in info.subtitle_codecs.iter().enumerate() {
-        if !TEXT_SUBS.contains(&codec.as_str()) {
+        if codec == "ttml" {
+            notes.push(format!("subtitle {i} (ttml) dropped: ffmpeg cannot read TTML subtitles, so their lines cannot be moved with the cut"));
+            subs.push(None);
+            continue;
+        }
+        // 608 captions are read as text like the others.
+        if !TEXT_SUBS.contains(&codec.as_str()) && codec != "eia_608" {
             // MP4 drops these anyway (stream_args says so).
             notes.push(format!("subtitle {i} ({codec}) dropped: image subtitles can't be cut"));
             subs.push(None);
@@ -2956,6 +2984,38 @@ mod tests {
         source.audio[0].track = probe::Track::default();
         out.audio[0].track = named("Added", false);
         assert_eq!(track_lost(&source, &out, &streams), None);
+    }
+
+    #[test]
+    fn subtitles_are_kept_as_each_container_can_hold_them_and_losses_are_said() {
+        let plan = |codec, container| plan_subtitle(3, codec, container);
+        // Captions and TTML are text, not images.
+        assert_eq!(plan("eia_608", Container::Mp4).0, Some("mov_text"));
+        assert_eq!(plan("eia_608", Container::Mkv).0, Some("ass"));
+        assert_eq!(plan("ttml", Container::Mp4), (Some("copy"), None));
+        let (kept, note) = plan("ttml", Container::Mkv);
+        assert_eq!(kept, None);
+        assert!(note.is_some_and(|n| n.contains("ffmpeg cannot read them") && n.contains("--container mp4")));
+        // Styled subtitles go flat into MP4, and that is said; plain text goes without a word.
+        let (kept, note) = plan("ass", Container::Mp4);
+        assert_eq!(kept, Some("mov_text"));
+        assert!(note.is_some_and(|n| n.contains("styles, positions and fonts are lost") && n.contains("--container mkv")));
+        assert_eq!(plan("subrip", Container::Mp4), (Some("mov_text"), None));
+        assert_eq!(plan("ass", Container::Mkv), (Some("copy"), None));
+        assert_eq!(plan("mov_text", Container::Mkv), (Some("srt"), None));
+        let (kept, note) = plan("hdmv_pgs_subtitle", Container::Mp4);
+        assert_eq!(kept, None);
+        assert_eq!(note.as_deref(), Some("subtitle 3 (hdmv_pgs_subtitle) dropped: image subtitles don't fit in MP4; use --container mkv"));
+        assert_eq!(plan("hdmv_pgs_subtitle", Container::Mkv), (Some("copy"), None));
+        // Fonts are said to be left out of MP4.
+        let mut source = info(&[]);
+        (source.attachments, source.attachment_names) = (1, vec!["MyFont.ttf".into()]);
+        let mut notes = Vec::new();
+        stream_args(&source, 0, Container::Mp4, Audio::Keep, &[], None, &mut notes);
+        assert_eq!(notes, ["attachments dropped: MyFont.ttf: MP4 has no place for them; --container mkv keeps them"]);
+        notes.clear();
+        stream_args(&source, 0, Container::Mkv, Audio::Keep, &[], None, &mut notes);
+        assert!(notes.is_empty(), "{notes:?}");
     }
 
     #[test]

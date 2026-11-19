@@ -2,7 +2,7 @@
 
 use super::turns::Turns;
 use super::{App, now, text_path};
-use crate::estimate::{Model, TimeModel, Verdict};
+use crate::estimate::{Model, SavingsTotal, TimeModel, Verdict};
 use crate::history;
 use crate::ledger::{Entry, Ledger};
 use crate::replace::{self, Check};
@@ -301,7 +301,8 @@ pub struct Scan {
     done: usize,
     total: usize,
     started: u64,
-    model_samples: usize,
+    /// What the sizes were estimated with.
+    model: Model,
     /// How long encodes take here, for the preset the scan was asked about.
     time: TimeModel,
     results: Vec<FileResult>,
@@ -365,7 +366,7 @@ pub fn start_scan(app: &Arc<App>, body: &Value) -> Result<Value> {
             done: 0,
             total: 0,
             started: now(),
-            model_samples: model.samples,
+            model,
             time,
             results: Vec::new(),
             not_listed: 0,
@@ -437,7 +438,8 @@ pub fn scan_result(app: &App, id: u64) -> Result<Value> {
     let scans = app.scans.lock().unwrap();
     let s = scans.iter().find(|s| s.id == id).ok_or_else(|| anyhow!("not found: scan {id}"))?;
     let mut totals = json!({ "files": 0, "bytes": 0.0, "candidates": 0, "candidate_bytes": 0.0, "saved_likely": 0.0, "saved_low": 0.0, "saved_high": 0.0 });
-    let (mut files, mut bytes, mut cands, mut cbytes, mut lk, mut lo, mut hi) = (0, 0.0, 0, 0.0, 0.0, 0.0, 0.0);
+    let (mut files, mut bytes, mut cands, mut cbytes) = (0, 0.0, 0, 0.0);
+    let mut saved = SavingsTotal::default();
     let mut encode_secs = 0.0;
     let rows: Vec<Value> = s
         .results
@@ -450,9 +452,7 @@ pub fn scan_result(app: &App, id: u64) -> Result<Value> {
                 cands += 1;
                 encode_secs += est_secs.unwrap_or(0.0);
                 cbytes += r.size as f64;
-                lk += r.size as f64 - r.estimate.likely;
-                lo += r.size as f64 - r.estimate.high;
-                hi += r.size as f64 - r.estimate.low;
+                saved.add(r.size, &r.estimate);
             }
             let i = r.info.as_ref();
             json!({
@@ -477,13 +477,14 @@ pub fn scan_result(app: &App, id: u64) -> Result<Value> {
         })
         .collect();
     if files > 0 {
-        totals = json!({ "files": files, "bytes": bytes, "candidates": cands, "candidate_bytes": cbytes, "saved_likely": lk, "saved_low": lo, "saved_high": hi, "encode_secs": encode_secs });
+        let (low, high) = saved.range(&s.model);
+        totals = json!({ "files": files, "bytes": bytes, "candidates": cands, "candidate_bytes": cbytes, "saved_likely": saved.likely, "saved_low": low, "saved_high": high, "encode_secs": encode_secs });
     }
     Ok(json!({
         "id": s.id, "paths": s.paths, "status": s.status, "error": s.error, "done": s.done, "total": s.total,
         "unreadable_folders": s.unreadable.len(),
         "unreadable_paths": s.unreadable.iter().take(scan::UNREADABLE_SHOWN).map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
-        "started": s.started, "model_samples": s.model_samples, "time_samples": s.time.samples, "scenes_factor": s.time.scenes, "scene_samples": s.time.scene_samples, "auto_factor": s.time.auto_factor(), "auto_share": s.time.auto_share, "auto_samples": s.time.auto_samples, "preset": s.time.preset, "totals": totals, "rows": rows, "not_listed": s.not_listed,
+        "started": s.started, "model_samples": s.model.samples, "time_samples": s.time.samples, "scenes_factor": s.time.scenes, "scene_samples": s.time.scene_samples, "auto_factor": s.time.auto_factor(), "auto_share": s.time.auto_share, "auto_samples": s.time.auto_samples, "preset": s.time.preset, "totals": totals, "rows": rows, "not_listed": s.not_listed,
     }))
 }
 

@@ -1,7 +1,7 @@
 //! Human-readable summary and per-file CSV for a scan.
 
 use crate::scan::FileResult;
-use crate::estimate::{TimeModel, Verdict, bits_per_pixel};
+use crate::estimate::{Model, SavingsTotal, TimeModel, Verdict, bits_per_pixel};
 use crate::report_file::{self, Kind};
 use anyhow::Result;
 use std::collections::BTreeMap;
@@ -48,9 +48,7 @@ struct Bucket {
     files: usize,
     size: f64,
     candidates: usize,
-    saved_low: f64,
-    saved_likely: f64,
-    saved_high: f64,
+    saved: SavingsTotal,
 }
 
 impl Bucket {
@@ -59,18 +57,16 @@ impl Bucket {
         self.size += r.size as f64;
         if r.verdict == Verdict::Candidate {
             self.candidates += 1;
-            // Optimistic estimate = smallest new file = most saved.
-            self.saved_high += r.size as f64 - r.estimate.low;
-            self.saved_likely += r.size as f64 - r.estimate.likely;
-            self.saved_low += r.size as f64 - r.estimate.high;
+            self.saved.add(r.size, &r.estimate);
         }
     }
 
-    fn savings(&self) -> String {
+    fn savings(&self, model: &Model) -> String {
         if self.candidates == 0 {
             return "-".into();
         }
-        format!("{} ({} - {})", gb(self.saved_likely), gb(self.saved_low), gb(self.saved_high))
+        let (low, high) = self.saved.range(model);
+        format!("{} ({} - {})", gb(self.saved.likely), gb(low), gb(high))
     }
 }
 
@@ -84,7 +80,7 @@ fn top_folder(r: &FileResult) -> String {
     }
 }
 
-pub fn print(results: &[FileResult], top: usize, time: &TimeModel, by: TopBy) {
+pub fn print(results: &[FileResult], top: usize, model: &Model, time: &TimeModel, by: TopBy) {
     let mut all = Bucket::default();
     let mut by_verdict: BTreeMap<Verdict, Bucket> = BTreeMap::new();
     let mut by_codec: BTreeMap<String, Bucket> = BTreeMap::new();
@@ -99,7 +95,7 @@ pub fn print(results: &[FileResult], top: usize, time: &TimeModel, by: TopBy) {
 
     println!("\n== Summary ==");
     println!("{} videos, {}", all.files, gb(all.size));
-    println!("{} candidates, estimated savings {}", all.candidates, all.savings());
+    println!("{} candidates, estimated savings {}", all.candidates, all.savings(model));
     println!("(likely, with pessimistic - optimistic range in brackets)");
     let maybe = results.iter().filter(|r| r.verdict == Verdict::Maybe).count();
     if maybe > 0 {
@@ -147,11 +143,11 @@ pub fn print(results: &[FileResult], top: usize, time: &TimeModel, by: TopBy) {
     let table = |title: &str, map: &BTreeMap<String, Bucket>| {
         println!("\n== {title} ==");
         let mut rows: Vec<_> = map.iter().collect();
-        rows.sort_by(|a, b| b.1.saved_likely.total_cmp(&a.1.saved_likely).then(b.1.size.total_cmp(&a.1.size)));
+        rows.sort_by(|a, b| b.1.saved.likely.total_cmp(&a.1.saved.likely).then(b.1.size.total_cmp(&a.1.size)));
         println!("{:40} {:>6} {:>10} {:>6}  savings", "", "files", "size", "cand.");
         for (k, b) in rows.iter().take(15) {
             let k: String = if k.chars().count() > 40 { k.chars().take(39).collect::<String>() + "…" } else { k.to_string() };
-            println!("{:40} {:>6} {:>10} {:>6}  {}", k, b.files, gb(b.size), b.candidates, b.savings());
+            println!("{:40} {:>6} {:>10} {:>6}  {}", k, b.files, gb(b.size), b.candidates, b.savings(model));
         }
     };
     table("By codec", &by_codec);

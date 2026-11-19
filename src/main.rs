@@ -834,7 +834,8 @@ fn order_jobs(jobs: &mut [batch::Job], inputs: &[PathBuf], ffprobe: &str, o: &en
     let abs = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
     let past = history::load();
     let model = estimate::Model::fit_at_preset(&past, o.target_vmaf, o.preset);
-    let time = estimate::TimeModel::fit(&past, o.preset);
+    // With tuned settings, each size of video takes the time of its own preset.
+    let mut times = std::collections::HashMap::new();
     let roots: Vec<PathBuf> = inputs.iter().map(|p| abs(p)).collect();
     eprintln!("probing {} files to order them", jobs.len());
     let (found, _) = scan::collect(&roots, ffprobe, 6, o.min_savings, &model, &|_, _| {})?;
@@ -845,7 +846,10 @@ fn order_jobs(jobs: &mut [batch::Job], inputs: &[PathBuf], ffprobe: &str, o: &en
         .filter(|r| r.verdict.will_be_tried())
         .map(|r| {
             let saved = r.estimate.weighted_saving(r.size);
-            let secs = r.info.as_ref().map_or(0.0, |i| time.secs(i));
+            let secs = r.info.as_ref().map_or(0.0, |i| {
+                let preset = o.tuning.as_ref().map_or(o.preset, |t| t.preset_for(i.width, i.height, o.preset));
+                times.entry(preset).or_insert_with(|| estimate::TimeModel::fit(&past, preset)).secs(i)
+            });
             let w = match order {
                 batch::Order::PerHour if secs > 0.0 => saved / secs,
                 batch::Order::PerHour => 0.0,
@@ -931,7 +935,7 @@ fn scan(
         }
         Ok(())
     })();
-    report::print(&results, top, time, sort);
+    report::print(&results, top, model, time, sort);
     if let (Some(picked), Some((hours, _))) = (&picked, &pick) {
         report::print_pick(picked, *hours, &results, time);
     }

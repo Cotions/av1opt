@@ -16,6 +16,8 @@ use serde::Serialize;
 /// would keep. At 20% a library of 34,578 files had 5,259 turned away, about one in three of
 /// which would have saved 15% or more.
 pub const MIN_SAVINGS: f64 = 0.15;
+/// The shortest picture worth judging, in seconds: `encode` refuses what is shorter.
+const MIN_PICTURE_SECS: f64 = 1.0;
 /// What a video that turns out not worth encoding costs, as a share of encoding it: it stops
 /// after the search, which takes 5 to 13% of an encode.
 const COST_OF_A_SKIP: f64 = 0.1;
@@ -507,6 +509,32 @@ impl SizeRange {
     }
 }
 
+/// What a number of files are expected to save together, with what can be said of its range.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SavingsTotal {
+    pub likely: f64,
+    /// The sum of each file's variance, in bytes squared.
+    variance: f64,
+}
+
+impl SavingsTotal {
+    pub fn add(&mut self, file_size: u64, estimate: &SizeRange) {
+        self.likely += file_size as f64 - estimate.likely;
+        // A file's range is 1.28 standard deviations either side.
+        self.variance += ((estimate.high - estimate.low) / 2.0 / Z80).powi(2);
+    }
+
+    /// The 80% range of the total, least first. The errors of single files mostly cancel out,
+    /// so adding up their ranges said "98.6 to 415.8 GB" of one library. What does not cancel
+    /// is the model being off for all of them at once, which it knows only as well as its
+    /// history lets it.
+    pub fn range(&self, model: &Model) -> (f64, f64) {
+        let shared = model.sigma / (model.samples as f64 + 3.0).sqrt() * self.likely;
+        let half = Z80 * (self.variance + shared.powi(2)).sqrt();
+        ((self.likely - half).max(0.0), self.likely + half)
+    }
+}
+
 /// The share of a normal distribution below `z`, from the complementary error function
 /// (Numerical Recipes' fit, good to about one part in ten million).
 fn normal_share_below(z: f64) -> f64 {
@@ -527,7 +555,7 @@ pub fn judge(m: &MediaInfo, file_size: u64, min_savings: f64, model: &Model) -> 
     if m.codec == "av1" {
         return (Verdict::AlreadyAv1, keep);
     }
-    if m.picture_secs() < 5.0 || m.width == 0 || m.fps <= 0.0 {
+    if m.picture_secs() < MIN_PICTURE_SECS || m.width == 0 || m.fps <= 0.0 {
         return (Verdict::TooShort, keep);
     }
     if m.dolby_vision {
@@ -880,7 +908,7 @@ mod tests {
         let verdict = |m: &MediaInfo| judge(m, size, 0.2, &says(0.01)).0;
         let av1 = MediaInfo { codec: "av1".into(), dolby_vision: true, duration_s: 1.0, ..video(100.0, 1e6) };
         assert_eq!(verdict(&av1), Verdict::AlreadyAv1);
-        let short_dolby = MediaInfo { dolby_vision: true, ..video(1.0, 1e6) };
+        let short_dolby = MediaInfo { dolby_vision: true, ..video(0.5, 1e6) };
         assert_eq!(verdict(&short_dolby), Verdict::TooShort);
         let dolby = MediaInfo { dolby_vision: true, ..video(100.0, 1e6) };
         assert_eq!(verdict(&dolby), Verdict::DolbyVision);
@@ -891,12 +919,12 @@ mod tests {
     }
 
     #[test]
-    fn a_video_is_too_short_below_five_seconds_of_picture() {
+    fn a_video_is_too_short_below_the_second_an_encode_asks_for() {
         let verdict = |m: &MediaInfo| judge(m, 625_000, 0.2, &says(0.001)).0;
-        assert_eq!(verdict(&video(5.0, 1e6)), Verdict::Candidate);
-        assert_eq!(verdict(&video(4.99, 1e6)), Verdict::TooShort);
+        assert_eq!(verdict(&video(1.0, 1e6)), Verdict::Candidate);
+        assert_eq!(verdict(&video(0.99, 1e6)), Verdict::TooShort);
         // Sound that runs on does not make the picture longer.
-        assert_eq!(verdict(&MediaInfo { video_s: 3.0, ..video(100.0, 1e6) }), Verdict::TooShort);
+        assert_eq!(verdict(&MediaInfo { video_s: 0.5, ..video(100.0, 1e6) }), Verdict::TooShort);
         assert_eq!(verdict(&MediaInfo { width: 0, ..video(100.0, 1e6) }), Verdict::TooShort);
         assert_eq!(verdict(&MediaInfo { fps: 0.0, ..video(100.0, 1e6) }), Verdict::TooShort);
     }
@@ -935,6 +963,34 @@ mod tests {
         assert_eq!(judge(&m, 25_000_000, MIN_SAVINGS, &model).0, Verdict::Candidate);
         // A bitrate claiming twice what the file holds: half of the claim is no saving at all.
         assert_eq!(judge(&m, 6_250_000, MIN_SAVINGS, &says(0.05)).0, Verdict::Maybe);
+    }
+
+    #[test]
+    fn the_range_of_a_total_is_narrower_than_the_ranges_added_up() {
+        // Files of 1000 expected to come out at 500, give or take 128.
+        let file = SizeRange { low: 372.0, likely: 500.0, high: 628.0, chance: 1.0 };
+        let total = |files: usize| {
+            let mut t = SavingsTotal::default();
+            (0..files).for_each(|_| t.add(1000, &file));
+            t
+        };
+        let settled = Model { sigma: 0.25, samples: 97, ..Model::prior() };
+        // sqrt(100 * 100^2 + (0.025 * 50000)^2) = 1600.8, times 1.28.
+        let t = total(100);
+        let (low, high) = t.range(&settled);
+        assert_eq!(t.likely, 50_000.0);
+        assert!((high - 50_000.0 - 2049.0).abs() < 1.0, "{high}");
+        assert!((50_000.0 - low - 2049.0).abs() < 1.0, "{low}");
+        assert!(high - 50_000.0 < 12_800.0 / 6.0, "the ranges added up would be 12800 either side");
+        // With little history the error all files share is most of it, and a range reaches
+        // no lower than nothing saved.
+        let (low, high) = t.range(&Model { sigma: 3.0, samples: 0, ..Model::prior() });
+        assert_eq!(low, 0.0);
+        assert!(high > 150_000.0, "{high}");
+        // Of one file with a well known model, the total's range is the file's own.
+        let (low, high) = total(1).range(&Model { sigma: 0.01, samples: 10_000, ..Model::prior() });
+        assert!((low - 372.0).abs() < 0.5 && (high - 628.0).abs() < 0.5, "{low} {high}");
+        assert_eq!(SavingsTotal::default().range(&settled), (0.0, 0.0));
     }
 
     #[test]

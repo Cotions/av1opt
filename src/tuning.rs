@@ -122,6 +122,11 @@ impl Tuning {
     pub fn pick(&self, width: u32, height: u32) -> Option<&Choice> {
         self.classes.get(&Class::of(width, height))
     }
+
+    /// The preset a video of this size is encoded at: that of its class, if it was tuned.
+    pub fn preset_for(&self, width: u32, height: u32, otherwise: u8) -> u8 {
+        self.pick(width, height).map_or(otherwise, |c| c.preset)
+    }
 }
 
 #[cfg(test)]
@@ -202,6 +207,7 @@ mod tests {
         assert_eq!(t.pick(720, 1280).unwrap().preset, 8);
         assert_eq!(t.pick(2160, 3840).unwrap().preset, 4);
         assert_eq!(t.pick(1920, 1080), None);
+        assert_eq!((t.preset_for(3840, 2160, 5), t.preset_for(1920, 1080, 5)), (4, 5));
     }
 
     #[test]

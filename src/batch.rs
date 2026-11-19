@@ -552,7 +552,8 @@ pub struct Summary {
 /// The folders a stopped run leaves in `out_dir`: per-scene work, which the next run resumes from,
 /// and its temporary folder if it was told to keep that.
 fn kept_when_stopped(out_dir: &Path, o: &Options) -> Vec<PathBuf> {
-    let temp = format!(".av1opt-tmp-{}", std::process::id());
+    // This run's own: the name goes on with when the process began and random text.
+    let temp = format!(".av1opt-tmp-{}-", std::process::id());
     let mut kept: Vec<PathBuf> = std::fs::read_dir(out_dir)
         .into_iter()
         .flatten()
@@ -560,7 +561,7 @@ fn kept_when_stopped(out_dir: &Path, o: &Options) -> Vec<PathBuf> {
         .filter(|e| {
             let name = e.file_name();
             let name = name.to_string_lossy();
-            name.starts_with(encode::WORK_PREFIX) || (o.keep_temp && *name == temp)
+            name.starts_with(encode::WORK_PREFIX) || (o.keep_temp && name.starts_with(&temp))
         })
         .map(|e| e.path())
         .collect();

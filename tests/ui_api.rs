@@ -335,8 +335,21 @@ fn a_settings_file_kept_elsewhere_stays_a_link() {
 #[test]
 fn idle_connections_beyond_the_limit_go_before_a_signed_in_event_stream() {
     use std::io::{BufRead, BufReader, Read, Write};
-    let s = Server::start("idle-flood", |_| {});
-    // Each connection holds two files: the server raised its own limit to the most allowed.
+    use std::os::unix::process::CommandExt;
+    // Started with the soft limit on open files most systems start programs with: each
+    // connection holds two files, and the server raises its own limit to the most allowed.
+    let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: getrlimit writes only the struct given.
+    assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
+    let low = libc::rlimit { rlim_cur: limit.rlim_max.min(1024), rlim_max: limit.rlim_max };
+    let lowered = |command: &mut std::process::Command| {
+        // SAFETY: setrlimit only, which is safe to call between fork and exec.
+        unsafe {
+            command.pre_exec(move || if libc::setrlimit(libc::RLIMIT_NOFILE, &low) == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) });
+        }
+    };
+    let s = Server::launch_adjusted("idle-flood", "false", "false", &[], lowered, |_| {});
+    s.wait_for_restored_jobs();
     let limits = std::fs::read_to_string(format!("/proc/{}/limits", s.child.id())).unwrap();
     let files: Vec<&str> = limits.lines().find(|l| l.starts_with("Max open files")).unwrap().split_whitespace().collect();
     assert_eq!(files[3], files[4], "{limits}");
@@ -353,17 +366,27 @@ fn idle_connections_beyond_the_limit_go_before_a_signed_in_event_stream() {
         }
     };
     assert!(next_data().contains("hello"));
+    // The stream is then the quietest of all: only its standing as a long answer to a
+    // signed-in page keeps it from going first.
+    std::thread::sleep(std::time::Duration::from_millis(1000));
 
-    // Seventy connections opened after it and left doing nothing.
-    let idle: Vec<std::net::TcpStream> = (0..70).map(|_| std::net::TcpStream::connect(("127.0.0.1", s.port)).unwrap()).collect();
+    // Seventy connections opened after it, each of which sends one signed-in request, kept
+    // alive, and is then left doing nothing.
+    let idle: Vec<std::net::TcpStream> = (0..70)
+        .map(|_| {
+            let c = std::net::TcpStream::connect(("127.0.0.1", s.port)).unwrap();
+            write!(&c, "GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nCookie: {}\r\n\r\n", s.port, s.cookie()).unwrap();
+            c
+        })
+        .collect();
     // Two looks at the connections, half a second apart, then one more for good measure.
     std::thread::sleep(std::time::Duration::from_millis(1800));
+    // A closed one ends: what it was sent is all there is. An open one has no end to read to.
     let closed = idle
         .iter()
         .filter(|c| {
             c.set_read_timeout(Some(std::time::Duration::from_millis(50))).unwrap();
-            let mut said = Vec::new();
-            (&**c).read_to_end(&mut said).is_ok() && (said.is_empty() || said.starts_with(b"HTTP/1.1 503"))
+            (&**c).read_to_end(&mut Vec::new()).is_ok()
         })
         .count();
     assert!(closed >= 7, "only {closed} of the idle connections were closed");

@@ -816,16 +816,21 @@ pub fn stamp(tools: &Tools, work: &Path, video: &Path, info: &MediaInfo) -> Resu
 /// Copies an IVF stream, its time base and frame timestamps replaced by `times`.
 fn restamp(from: &Path, to: &Path, times: &Times) -> Result<()> {
     use std::io::{BufRead, Read, Write};
-    let mut r = std::io::BufReader::new(std::fs::File::open(from)?);
+    // Every refusal names the file, as `repair::ivf_index` does: it is in the work folder,
+    // which is kept, so it can be looked at.
+    let joined = format!("the joined chunks in {}", from.display());
+    let mut r = std::io::BufReader::new(std::fs::File::open(from).with_context(|| format!("{joined} could not be opened; {FAILED_INSIDE}"))?);
     let mut w = std::io::BufWriter::new(crate::files::create_new(to)?);
     // 32 bytes: "DKIF", version, header length, codec, width, height, time base denominator
     // and numerator, number of frames, four unused. Little-endian throughout.
     let mut head = [0u8; 32];
-    r.read_exact(&mut head).with_context(|| format!("the joined chunks could not be read back; {FAILED_INSIDE}"))?;
+    r.read_exact(&mut head).with_context(|| format!("{joined} could not be read back; {FAILED_INSIDE}"))?;
     if &head[..4] != b"DKIF" || u16::from_le_bytes([head[6], head[7]]) != 32 {
-        bail!("the joined chunks could not be read back; {FAILED_INSIDE}");
+        bail!("{joined} could not be read back: they are not an IVF stream; {FAILED_INSIDE}");
     }
-    let (num, den) = (u32::try_from(times.tb.0)?, u32::try_from(times.tb.1)?);
+    let (Ok(num), Ok(den)) = (u32::try_from(times.tb.0), u32::try_from(times.tb.1)) else {
+        bail!("{joined} cannot be given the source's time base, {}/{}: an IVF stream holds 32 bits for each part; {FAILED_INSIDE}", times.tb.0, times.tb.1);
+    };
     let first = times.pts[0];
     head[16..20].copy_from_slice(&den.to_le_bytes());
     head[20..24].copy_from_slice(&num.to_le_bytes());
@@ -837,18 +842,18 @@ fn restamp(from: &Path, to: &Path, times: &Times) -> Result<()> {
     // Each frame: its size in 4 bytes, its timestamp in 8, the frame.
     while !r.fill_buf()?.is_empty() {
         let mut frame = [0u8; 12];
-        r.read_exact(&mut frame)?;
+        r.read_exact(&mut frame).with_context(|| format!("{joined} stop inside the header of frame {}; {FAILED_INSIDE}", n + 1))?;
         let size = u32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]) as u64;
-        let Some(&pts) = times.pts.get(n) else { bail!("the joined chunks have more frames than the source's {}; {FAILED_INSIDE}", times.pts.len()) };
+        let Some(&pts) = times.pts.get(n) else { bail!("{joined} have more frames than the source's {}; {FAILED_INSIDE}", times.pts.len()) };
         frame[4..].copy_from_slice(&((pts - first) as u64).to_le_bytes());
         w.write_all(&frame)?;
         if std::io::copy(&mut (&mut r).take(size), &mut w)? != size {
-            bail!("the joined chunks stop partway through frame {}; {FAILED_INSIDE}", n + 1);
+            bail!("{joined} stop partway through frame {}; {FAILED_INSIDE}", n + 1);
         }
         n += 1;
     }
     if n != times.pts.len() {
-        bail!("the joined chunks have {n} frames and the source has {}; {FAILED_INSIDE}", times.pts.len());
+        bail!("{joined} have {n} frames and the source has {}; {FAILED_INSIDE}", times.pts.len());
     }
     w.flush()?;
     Ok(())
@@ -1185,10 +1190,24 @@ mod tests {
             let e = restamp(&from, &to, &Times { pts, tb: (1, 90000) }).unwrap_err().to_string();
             assert!(e.contains("no output was written"), "{e}");
         }
+        // Each refusal names the file.
+        let joined = format!("the joined chunks in {} ", from.display());
+        let refusal = |times: &Times| {
+            let _ = std::fs::remove_file(&to);
+            format!("{:#}", restamp(&from, &to, times).unwrap_err())
+        };
         std::fs::write(&from, &plain[..plain.len() - 10]).unwrap();
-        assert!(restamp(&from, &to, &times).unwrap_err().to_string().contains("partway through frame 3"));
+        assert!(refusal(&times).starts_with(&format!("{joined}stop partway through frame 3;")), "{}", refusal(&times));
+        // Cut inside the 12 bytes in front of the second frame.
+        std::fs::write(&from, &plain[..32 + 12 + 5 + 4]).unwrap();
+        assert!(refusal(&times).starts_with(&format!("{joined}stop inside the header of frame 2;")), "{}", refusal(&times));
+        std::fs::write(&from, &plain).unwrap();
+        let e = refusal(&Times { pts: vec![0, 1, 2], tb: (1, 1 << 40) });
+        assert!(e.starts_with(&format!("{joined}cannot be given the source's time base, 1/1099511627776: ")), "{e}");
         std::fs::write(&from, b"not a video at all, though long enough").unwrap();
-        assert!(restamp(&from, &to, &times).unwrap_err().to_string().contains("could not be read back"));
+        assert!(refusal(&times).starts_with(&format!("{joined}could not be read back")), "{}", refusal(&times));
+        std::fs::write(&from, b"short").unwrap();
+        assert!(refusal(&times).starts_with(&format!("{joined}could not be read back")), "{}", refusal(&times));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -1466,8 +1466,8 @@ fn a_stopped_encode_leaves_nothing_half_done_and_its_trials_are_remembered() {
         a
     };
     let mut child = c.command().args(args(&[])).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
-    let tmp = c.out().join(format!(".av1opt-tmp-{}", child.id()));
-    wait_until("the encode to start writing", 180, || std::fs::metadata(tmp.join("partial.mp4")).is_ok_and(|m| m.len() > 0));
+    let this_run = format!(".av1opt-tmp-{}-", child.id());
+    wait_until("the encode to start writing", 180, || entries(&c.out(), &this_run).iter().any(|tmp| std::fs::metadata(tmp.join("partial.mp4")).is_ok_and(|m| m.len() > 0)));
     // Ctrl-C in a terminal reaches av1opt and ffmpeg alike; `kill` reaches av1opt only.
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     let status = child.wait().unwrap();

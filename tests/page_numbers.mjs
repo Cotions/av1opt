@@ -9,7 +9,7 @@ const source = readFileSync(new URL("../ui/app.js", import.meta.url), "utf8");
 const from = source.indexOf("// ---------- numbers and names ----------");
 const to = source.indexOf("// ---------- end of the part that runs alone ----------");
 assert.ok(from >= 0 && to > from, "the markers of the part that runs alone are in ui/app.js");
-const names = ["bytes", "pct", "floorPct", "sizeChange", "savedPct", "num", "rel", "times", "plural", "pathList", "leftOutOfList", "shownPath", "copiesLeft", "newestOnly", "refusalText", "presetFrom", "NAME_ORDER", "rowOrder", "numberProblem", "RANGES", "sameKind", "rememberedForm", "rememberedOptions", "oneCrfText", "searchShift"];
+const names = ["bytes", "pct", "floorPct", "sizeChange", "savedPct", "num", "rel", "times", "plural", "pathList", "leftOutOfList", "shownPath", "copiesLeft", "newestOnly", "refusalText", "presetFrom", "NAME_ORDER", "rowOrder", "numberProblem", "RANGES", "sameKind", "allowedValue", "rememberedForm", "rememberedOptions", "oneCrfText", "searchShift"];
 const page = new Function(`"use strict";\n${source.slice(from, to)}\nreturn { ${names.join(", ")} };`)();
 
 // Each case is [argument, what is shown]; arguments in an array are spread.
@@ -160,8 +160,23 @@ test("a refusal is told in the server's words", () => {
   assert.equal(said(404, "text/plain", ""), "404 Status");
 });
 
-test("a remembered preset of 0 stays 0, and what is no number gives the usual one", () => {
-  cases(page.presetFrom, [[0, 0], ["0", 0], [8, 8], ["8", 8], ["", 5], ["  ", 5], [null, 5], [undefined, 5], ["fast", 5], [2.5, 5]]);
+test("a remembered preset of 0 stays 0, and what is no preset gives the usual one", () => {
+  cases(page.presetFrom, [[0, 0], ["0", 0], [8, 8], ["8", 8], [13, 13], ["", 5], ["  ", 5], [null, 5], [undefined, 5], ["fast", 5], [2.5, 5], [99, 5], [-1, 5]]);
+});
+
+test("a remembered value is used only where its field takes it", () => {
+  const { allowedValue: ok, rememberedForm, RANGES } = page;
+  assert.equal(ok(93, RANGES.vmaf), true);
+  assert.equal(ok(1e308, RANGES.vmaf), false);
+  assert.equal(ok(0, RANGES.vmaf), false);
+  assert.equal(ok(0.5, RANGES.tolerance), false);
+  assert.equal(ok(0.95, RANGES.savingsShare), true);
+  assert.equal(ok(15, RANGES.savingsShare), false);
+  assert.equal(ok("93", RANGES.vmaf), false);
+  assert.equal(ok("mkv", ["mp4", "mkv"]), true);
+  assert.equal(ok("avi", ["mp4", "mkv"]), false);
+  assert.equal(ok("anything"), true);
+  assert.deepEqual(rememberedForm({ vmaf: 93, videos: 6 }, { vmaf: 101, videos: 4 }, { vmaf: RANGES.vmaf, videos: RANGES.videos }), { vmaf: 93, videos: 4 });
 });
 
 test("names sort as people count, and rows without a value come last both ways", () => {

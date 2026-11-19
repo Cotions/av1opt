@@ -910,8 +910,9 @@ and which start-up notices were dismissed (a notice about a file damaged again c
 Every browser and desktop window sees the same values. Two tabs that change the same value
 leave the later one, and neither takes the other's away. What is kept is a remembered form
 value and no more: the server keeps at most 64 values of 16 KiB each, 64 KiB in all, and
-folder lists of absolute paths; the page puts a value back only into a field of its kind and
-checks it from there as if it had been typed.
+folder lists of absolute paths; the page puts a value back only into a field of its kind that
+takes it (a number within the field's range, a choice among its options, a benchmark preset
+that has a box), and a field given none starts at its default.
 
 The server listens on 127.0.0.1 only, on a free port unless `--port` names one, and prints its
 address and a sign-in link with a random token (the browser

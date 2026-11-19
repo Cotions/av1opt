@@ -148,10 +148,10 @@ function refusalText(status, statusText, type, text, json) {
 }
 
 // The preset remembered from the encode dialog. 0 is a preset like the others: only what is
-// no whole number at all gives way to the usual one.
+// no whole number of the presets' range gives way to the usual one.
 function presetFrom(remembered, usual = 5) {
   const text = String(remembered ?? "").trim();
-  return text !== "" && Number.isInteger(Number(text)) ? Number(text) : usual;
+  return numberProblem(text, RANGES.preset) === null ? Number(text) : usual;
 }
 
 // Names as people count: "a9" before "a10", and capitals among the small letters.
@@ -172,6 +172,7 @@ const RANGES = {
   preset: { whole: true, min: 0, max: 13 },
   workers: { whole: true, min: 1, max: 8 },
   savingsPct: { min: 0, max: 95 },
+  savingsShare: { min: 0, max: 0.95 },
   tolerance: { whole: true, min: 0, max: 20 },
   videos: { whole: true, min: 1, max: 50 },
   clips: { whole: true, min: 1, max: 8 },
@@ -190,28 +191,38 @@ function numberProblem(text, range = {}) {
 }
 
 // Whether a remembered value can stand for `d`, the value used without one: of the same kind,
-// a list for a list and text for text. What it holds is for its field to check.
+// a list for a list and text for text.
 function sameKind(v, d) {
   if (v == null || d == null) return false;
   if (Array.isArray(d) || Array.isArray(v)) return Array.isArray(d) && Array.isArray(v);
   return typeof v === typeof d;
 }
+// Whether a remembered value is one its field takes: with `allowed` a range of RANGES, a number
+// in it; with a list, one of the list; with nothing, anything. A value written by an older page
+// or by hand into ui.json can be anything, and a field given one out of range would hold up
+// the form it is in (a preset of 99 kept Scan from starting).
+function allowedValue(v, allowed) {
+  if (allowed == null) return true;
+  if (Array.isArray(allowed)) return allowed.includes(v);
+  return typeof v === "number" && numberProblem(String(v), allowed) === null;
+}
 
-// A form's values as remembered, over `defaults`: those of the kind of their default.
-function rememberedForm(defaults, saved) {
+// A form's values as remembered, over `defaults`: those of the kind of their default and, where
+// `allowed` names what a value may be (as allowedValue takes it), allowed.
+function rememberedForm(defaults, saved, allowed = {}) {
   const o = { ...defaults };
   if (!saved || typeof saved !== "object" || Array.isArray(saved)) return o;
-  for (const k of Object.keys(defaults)) if (sameKind(saved[k], defaults[k])) o[k] = saved[k];
+  for (const k of Object.keys(defaults)) if (sameKind(saved[k], defaults[k]) && allowedValue(saved[k], allowed[k])) o[k] = saved[k];
   return o;
 }
 
-// The encode dialog's options as remembered, over `defaults`: each of the kind its default is,
-// and the tags as pairs of texts. Settings saved before "auto" existed hold true or false for
-// per-scene CRF.
+// The encode dialog's options as remembered, over `defaults`: each of the kind its default is
+// and within its field's range, and the tags as pairs of texts. Settings saved before "auto"
+// existed hold true or false for per-scene CRF.
 function rememberedOptions(defaults, saved) {
-  const o = rememberedForm(defaults, saved);
+  const o = rememberedForm(defaults, saved, { target_vmaf: RANGES.vmaf, preset: RANGES.preset, workers: RANGES.workers,
+    min_savings: RANGES.savingsShare, container: ["mp4", "mkv"], scenes: ["off", "auto", "always"] });
   if (saved && typeof saved.scenes === "boolean") o.scenes = saved.scenes;
-  if (!["mp4", "mkv"].includes(o.container)) o.container = defaults.container;
   o.meta_tags = o.meta_tags.filter((t) => Array.isArray(t) && t.length === 2 && t.every((x) => typeof x === "string"));
   return o;
 }
@@ -440,15 +451,15 @@ function isVideoFile(p, files) {
 // benchmark starts: one list each, not a second copy here.
 const FOLDER_PREFS = { scanRoots: "scan_paths", dupRoots: "dup_paths", dupPrefer: "dup_prefer", benchRoots: "bench_paths" };
 const prefs = {
-  // What comes back is a remembered form value and no more: one of another kind than `d`
-  // is not used, and what goes into a field is checked from there as typed input is.
-  get(k, d) {
+  // What comes back is a remembered form value and no more: one of another kind than `d`, or
+  // not `allowed` (see allowedValue), is not used.
+  get(k, d, allowed) {
     const s = STATE && STATE.settings;
     if (!s) return d;
     const own = Object.prototype.hasOwnProperty;
     if (own.call(FOLDER_PREFS, k)) { const v = s[FOLDER_PREFS[k]]; return Array.isArray(v) ? v.filter((p) => typeof p === "string") : d; }
     const v = s.page && own.call(s.page, k) ? s.page[k] : null;
-    return sameKind(v, d) ? v : d;
+    return sameKind(v, d) && allowedValue(v, allowed) ? v : d;
   },
   set(k, v) {
     if (STATE) {
@@ -1231,8 +1242,8 @@ let lastScanId = null;
 views.scan = (root) => {
   const roots = new Set(prefs.get("scanRoots", []));
   const chips = h("div", { class: "chips" });
-  const minSav = h("input", { type: "number", min: "0", max: "95", value: prefs.get("scanMinSavings", 15) });
-  const vmaf = h("input", { type: "number", step: "0.5", value: prefs.get("scanVmaf", 93) });
+  const minSav = h("input", { type: "number", min: "0", max: "95", value: prefs.get("scanMinSavings", 15, RANGES.savingsPct) });
+  const vmaf = h("input", { type: "number", step: "0.5", value: prefs.get("scanVmaf", 93, RANGES.vmaf) });
   const start = h("button", { class: "primary" }, "Scan");
   const progress = h("div", { class: "bar grow" }, h("div"));
   const progText = h("span", { class: "dim" });
@@ -1329,7 +1340,7 @@ views.scan = (root) => {
 
 function renderScan(out, r) {
   const t = r.totals;
-  let filter = [prefs.get("scanFilter", "candidate")].find((f) => ["candidate", "skip", "all"].includes(f)) || "candidate";
+  let filter = prefs.get("scanFilter", "candidate", ["candidate", "skip", "all"]);
   let sortKey = "saved", sortDir = -1;
   const selected = new Set();
   const savedOf = (row) => row.size - row.estimate.likely;
@@ -1360,7 +1371,7 @@ function renderScan(out, r) {
     encodeBtn.disabled = !selected.size;
   };
   // "What is worth encoding tonight": the candidates that save the most in so many hours.
-  const hoursIn = h("input", { type: "number", min: "0.5", max: "999", step: "0.5", value: prefs.get("pickHours", 8), title: "Hours of encoding to fill" });
+  const hoursIn = h("input", { type: "number", min: "0.5", max: "999", step: "0.5", value: prefs.get("pickHours", 8, RANGES.hours), title: "Hours of encoding to fill" });
   const pickBtn = h("button", { title: "Selects the candidates that save the most together in this many hours of encoding. Not simply the best per hour first: a long video can leave a gap that shorter ones fill better", onclick: async () => {
     const numbers = readNumbers([[hoursIn, "Hours", RANGES.hours]]);
     if (!numbers) return;
@@ -1379,7 +1390,7 @@ function renderScan(out, r) {
     } catch (e) { toast(e.message, true); } finally { pickBtn.disabled = false; }
   } }, "Pick");
   // With encoding hours set, a night is as long as they are.
-  if (prefs.get("pickHours", -1) < 0) {
+  if (prefs.get("pickHours", -1, RANGES.hours) < 0) {
     api("/api/jobs/heads").then(({ queue }) => {
       const sch = queue && queue.schedule;
       if (!sch || !sch.on) return;
@@ -1457,7 +1468,7 @@ views.dups = (root) => {
   const chips = h("div", { class: "chips" });
   const preferChips = h("div", { class: "chips" });
   const avoid = h("input", { type: "text", class: "grow", value: (Array.isArray(st.dup_avoid) ? st.dup_avoid.filter((x) => typeof x === "string") : []).join(", "), placeholder: "e.g. trash, tmp", spellcheck: "false" });
-  const tol = h("input", { type: "number", min: "0", max: "20", value: prefs.get("dupTolerance", 10) });
+  const tol = h("input", { type: "number", min: "0", max: "20", value: prefs.get("dupTolerance", 10, RANGES.tolerance) });
   const refresh = h("input", { type: "checkbox" });
   const start = h("button", { class: "primary" }, "Find duplicates");
   const cancel = h("button", { hidden: true }, "Stop");
@@ -1621,7 +1632,7 @@ function confirmDialog({ title, body, action }) {
 // place on the page.
 function renderDups(out, run, reload, shownPart) {
   const rep = run.report, files = rep.files;
-  let filter = [prefs.get("dupFilter", "same")].find((f) => ["same", "partial", "all"].includes(f)) || "same";
+  let filter = prefs.get("dupFilter", "same", ["same", "partial", "all"]);
   const scrolledTo = window.scrollY;
   // Files moved to the trash since the search are out of the picture; a group needs two copies.
   const gone = new Set(run.trashed || []);
@@ -1813,10 +1824,12 @@ views.bench = (root) => {
   const roots = new Set(own.length ? own : prefs.get("scanRoots", []));
   const saved = prefs.get("benchForm", {});
   // Presets and parameter sets left unset are the server's.
-  const f = { ...rememberedForm({ vmaf: 93, videos: 6, samples: 2, secs: 6 }, saved),
-    presets: Array.isArray(saved.presets) ? saved.presets.filter(Number.isInteger) : null, params: typeof saved.params === "string" ? saved.params : null };
-  const chips = h("div", { class: "chips" });
   const presetBoxes = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map((p) => [p, h("input", { type: "checkbox" })]);
+  // Remembered presets without a box are dropped, and with none left the server's are ticked.
+  const savedPresets = Array.isArray(saved.presets) ? saved.presets.filter((p) => presetBoxes.some(([q]) => q === p)) : [];
+  const f = { ...rememberedForm({ vmaf: 93, videos: 6, samples: 2, secs: 6 }, saved, { vmaf: RANGES.vmaf, videos: RANGES.videos, samples: RANGES.clips, secs: RANGES.clipSecs }),
+    presets: savedPresets.length ? savedPresets : null, params: typeof saved.params === "string" ? saved.params : null };
+  const chips = h("div", { class: "chips" });
   const params = h("textarea", { rows: "5", spellcheck: "false", class: "mono" });
   const vmaf = h("input", { type: "number", step: "0.5", min: "50", max: "99.5", value: f.vmaf });
   const videos = h("input", { type: "number", min: "1", max: "50", value: f.videos });

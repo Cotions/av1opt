@@ -632,6 +632,30 @@ checks["scan: a remembered preset of 0 is the one asked for"] = async () => {
   await settled();
   assert.strictEqual(posted(page, "/api/scans")[0].body.preset, 0);
 };
+checks["remembered values out of their field's range are not used: Scan starts with the defaults"] = async () => {
+  const stored = { scanRoots: ["/videos"], dupRoots: ["/videos"], encodeOptions: { preset: 99, target_vmaf: 1e308, min_savings: -500, workers: 0, container: "avi", scenes: "sometimes" },
+    scanVmaf: 1e308, scanMinSavings: -500, dupTolerance: 99999, scanFilter: "everything", benchForm: { vmaf: -1, videos: 1e9, samples: 0, secs: 1000, presets: [99, 4] } };
+  const page = openPage((path, body) => (body ? { id: 1 } : path === "/api/bench" ? { defaults: { presets: [5], param_sets: ["tune=0"], baseline: { preset: 5, params: "tune=0" } } } : { id: 1, status: "running" }), stored);
+  await settled();
+  const scan = page.show("scan");
+  await settled();
+  assert.strictEqual(scan.field("Min savings").value, "15");
+  assert.strictEqual(scan.field("Target VMAF").value, "93");
+  await scan.named("button", "Scan").click();
+  await settled();
+  const body = (posted(page, "/api/scans")[0] || {}).body;
+  assert(body, `no scan started: ${lastToast(page)}`);
+  assert.deepStrictEqual([body.preset, body.target_vmaf, body.min_savings], [5, 93, 0.15]);
+  assert.strictEqual(page.show("dups").field("Tolerance").value, "10");
+  page.run("var __o = defaultOptions()");
+  const o = page.context.__o;
+  assert.deepStrictEqual([o.preset, o.target_vmaf, o.min_savings, o.workers, o.container, o.scenes], [5, 93, 0.15, 1, "mp4", "off"]);
+  const bench = page.show("bench");
+  await settled();
+  assert.deepStrictEqual(["Target VMAF", "Videos", "Clips per video"].map((l) => bench.field(l).value), ["93", "6", "2"]);
+  const ticked = bench.all().filter((e) => e.tag === "input" && e.attrs.type === "checkbox" && e.checked);
+  assert.strictEqual(ticked.length, 1, "the remembered presets that have a box are not the ones ticked");
+};
 checks["scan table: dashes sort last, names as people count, and select all stops at what is drawn"] = async () => {
   const page = openPage(() => ({}), { scanFilter: "all" });
   await settled();

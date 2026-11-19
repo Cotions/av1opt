@@ -905,7 +905,8 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
 What the page remembers of its forms is kept by the server in `ui.json`, not in the browser:
 the browser keeps such things per address, and the port, so the address, is new at every
 start. That is the encode dialog's settings and output folder, the values of the scan,
-duplicate and benchmark forms, their folders, filters and tabs, the folder the picker was in,
+duplicate and benchmark forms (each number as soon as its field changes to one the field takes,
+not only when a run starts), their folders, filters and tabs, the folder the picker was in,
 and which start-up notices were dismissed (a notice about a file damaged again comes back).
 Every browser and desktop window sees the same values. Two tabs that change the same value
 leave the later one, and neither takes the other's away. What is kept is a remembered form

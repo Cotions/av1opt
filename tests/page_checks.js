@@ -656,6 +656,42 @@ checks["remembered values out of their field's range are not used: Scan starts w
   const ticked = bench.all().filter((e) => e.tag === "input" && e.attrs.type === "checkbox" && e.checked);
   assert.strictEqual(ticked.length, 1, "the remembered presets that have a box are not the ones ticked");
 };
+checks["form numbers are remembered when they change to one their field takes, and not otherwise"] = async () => {
+  const page = openPage((path) => (path === "/api/bench" ? { defaults: { presets: [5], param_sets: ["tune=0"], baseline: { preset: 5, params: "tune=0" } } } : {}), { scanRoots: ["/videos"] });
+  await settled();
+  const change = (input, value) => { input.value = value; input.dispatch("change"); };
+  const scan = page.show("scan");
+  await settled();
+  change(scan.field("Min savings"), "20");
+  change(scan.field("Target VMAF"), "95.5");
+  await settled();
+  assert.deepStrictEqual([page.remembered("scanMinSavings"), page.remembered("scanVmaf")], [20, 95.5]);
+  change(scan.field("Min savings"), "200");
+  change(scan.field("Target VMAF"), "");
+  await settled();
+  assert.deepStrictEqual([page.remembered("scanMinSavings"), page.remembered("scanVmaf")], [20, 95.5]);
+  const dups = page.show("dups");
+  change(dups.field("Tolerance"), "4");
+  await settled();
+  change(dups.field("Tolerance"), "4.5");
+  await settled();
+  assert.strictEqual(page.remembered("dupTolerance"), 4);
+  const bench = page.show("bench");
+  await settled();
+  change(bench.field("Target VMAF"), "90");
+  change(bench.field("Videos"), "0");
+  await settled();
+  assert.strictEqual(page.remembered("benchForm").vmaf, 90);
+  // The 6 the field held when the target changed stays: 0 is no number of videos.
+  assert.strictEqual(page.remembered("benchForm").videos, 6);
+  change(bench.field("Videos"), "3");
+  const box = bench.all().filter((e) => e.tag === "input" && e.attrs.type === "checkbox")[0];
+  box.checked = true;
+  box.dispatch("change");
+  await settled();
+  const kept = page.remembered("benchForm");
+  assert.deepStrictEqual([kept.vmaf, kept.videos, kept.presets, kept.params], [90, 3, [2, 5], "tune=0"]);
+};
 checks["scan table: dashes sort last, names as people count, and select all stops at what is drawn"] = async () => {
   const page = openPage(() => ({}), { scanFilter: "all" });
   await settled();

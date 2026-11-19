@@ -397,6 +397,15 @@ function readNumbers(fields) {
   return numbers;
 }
 
+// Remembers the number in `input` under `key` each time the field changes to one of `range`,
+// so that it is there at the next visit whether or not a run was started with it. A number the
+// field does not take is not remembered: the one before it stays.
+function rememberNumber(input, key, range) {
+  input.addEventListener("change", () => {
+    if (numberProblem(input.value, range) === null) prefs.set(key, Number(input.value.trim()));
+  });
+}
+
 // What cancels each open dialog, the oldest first. One that is waiting for an answer stays.
 const openDialogs = new Set();
 function closeDialogs() { for (const cancel of [...openDialogs].reverse()) cancel(); }
@@ -1250,6 +1259,8 @@ views.scan = (root) => {
   const out = h("div");
   const unreadable = h("div");
   let scanId = null;
+  rememberNumber(minSav, "scanMinSavings", RANGES.savingsPct);
+  rememberNumber(vmaf, "scanVmaf", RANGES.vmaf);
   let scanStatus = null; // as last read; null until then
   // A scan is being started or is running: the list of folders has no say in that.
   let scanBusy = false;
@@ -1272,7 +1283,7 @@ views.scan = (root) => {
     askResult(); // what is still on its way is about the scan before this one
     try {
       const r = await api("/api/scans", { paths: [...roots], min_savings: minSavings / 100, target_vmaf: targetVmaf, preset: presetFrom(defaultOptions().preset) });
-      // Only now: values the server refused would come back at the next visit.
+      // Also when they were typed and Scan pressed without the field's change going by.
       prefs.set("scanMinSavings", minSavings);
       prefs.set("scanVmaf", targetVmaf);
       scanId = lastScanId = r.id;
@@ -1469,6 +1480,7 @@ views.dups = (root) => {
   const preferChips = h("div", { class: "chips" });
   const avoid = h("input", { type: "text", class: "grow", value: (Array.isArray(st.dup_avoid) ? st.dup_avoid.filter((x) => typeof x === "string") : []).join(", "), placeholder: "e.g. trash, tmp", spellcheck: "false" });
   const tol = h("input", { type: "number", min: "0", max: "20", value: prefs.get("dupTolerance", 10, RANGES.tolerance) });
+  rememberNumber(tol, "dupTolerance", RANGES.tolerance);
   const refresh = h("input", { type: "checkbox" });
   const start = h("button", { class: "primary" }, "Find duplicates");
   const cancel = h("button", { hidden: true }, "Stop");
@@ -1878,6 +1890,19 @@ views.bench = (root) => {
     planText.textContent = `${plural(n, "setting")}: ${which} with ${plural(sets.length, "parameter set")}${presets.length > 1 ? " each" : ""}, and the default (preset ${base.preset} · ${base.params}), which is always one. With at most ${plural(v, "video")} that is up to around ${n * v * 4} sample encodes of ${samples.value} × ${secs.value} s. Slow presets and big videos take the longest.`;
   };
   for (const el of [params, videos, samples, secs, ...presetBoxes.map(([, b]) => b)]) el.addEventListener("input", plan);
+  // The form is remembered as it changes, each number only while its field takes it and the
+  // presets only while at least one is ticked; what is not taken stays as it was remembered.
+  const keepForm = () => {
+    const kept = { ...prefs.get("benchForm", {}) };
+    for (const [k, input, range] of [["vmaf", vmaf, RANGES.vmaf], ["videos", videos, RANGES.videos], ["samples", samples, RANGES.clips], ["secs", secs, RANGES.clipSecs]]) {
+      if (numberProblem(input.value, range) === null) kept[k] = Number(input.value.trim());
+    }
+    const { presets } = form();
+    if (presets.length) kept.presets = presets;
+    kept.params = params.value;
+    prefs.set("benchForm", kept);
+  };
+  for (const el of [params, vmaf, videos, samples, secs, ...presetBoxes.map(([, b]) => b)]) el.addEventListener("change", keepForm);
 
   const showRun = (run) => {
     running = !!run && run.status === "running";

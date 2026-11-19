@@ -509,10 +509,17 @@ impl PastSkip {
     }
 }
 
-/// Whether a run aims where the defaults do. Lines of older versions do not say what their
-/// skip was decided under, and those defaults are the likeliest answer.
+/// The preset that was the default while log lines did not yet say what a skip was decided
+/// under (until 2026-11-02).
+const PRESET_OF_UNMARKED_LINES: u8 = 6;
+
+/// Whether a run aims where the defaults of that time did. Lines of older versions do not say
+/// what their skip was decided under, and those defaults are the likeliest answer. Today's
+/// default preset is not the one of that time: a video skipped for too small a saving at
+/// preset 6 may be worth it at 4, which makes files a tenth smaller, so a run at today's
+/// default looks at it again.
 fn at_default_aims(o: &Options) -> bool {
-    o.target_vmaf == 93.0 && o.preset == crate::search::DEFAULT_PRESET && o.min_savings == crate::estimate::MIN_SAVINGS
+    o.target_vmaf == 93.0 && o.preset == PRESET_OF_UNMARKED_LINES && o.min_savings == crate::estimate::MIN_SAVINGS
 }
 
 /// The most of the log that is read: a line is about 200 bytes, so this is over half a million
@@ -1858,7 +1865,8 @@ mod tests {
         assert!(other.contains_key(&(PathBuf::from("/videos/b.mp4"), 20)));
         // A line that names no settings counts only for a run at the default aims.
         assert!(!same.contains_key(&(PathBuf::from("/videos/b.mp4"), 20)));
-        assert!(at_default_aims(&options()));
+        assert!(at_default_aims(&Options { preset: 6, ..options() }));
+        assert!(!at_default_aims(&options()), "the default preset of today is not that of the unmarked lines");
         for changed in [Options { target_vmaf: 50.0, ..options() }, Options { preset: 8, ..options() }, Options { min_savings: 0.3, ..options() }] {
             assert!(!at_default_aims(&changed));
         }
@@ -1910,11 +1918,13 @@ mod tests {
 
         // A line of the oldest kind: five fields, written long after the file last changed.
         let old = |input: &Path, size: u64, _: u128| format!("99999999999\tskip\t{}\t{size}\ttoo lean\n", input.display());
-        assert!(skipped_earlier(old, &options()));
-        assert!(!skipped_earlier(old, &Options { force: true, ..options() }));
-        assert!(!skipped_earlier(old, &Options { target_vmaf: 50.0, ..options() }));
-        assert!(!skipped_earlier(old, &Options { preset: 8, ..options() }));
-        assert!(!skipped_earlier(old, &Options { min_savings: 0.3, ..options() }));
+        let then = || Options { preset: PRESET_OF_UNMARKED_LINES, ..options() };
+        assert!(skipped_earlier(old, &then()));
+        assert!(!skipped_earlier(old, &options()), "today's default preset is another");
+        assert!(!skipped_earlier(old, &Options { force: true, ..then() }));
+        assert!(!skipped_earlier(old, &Options { target_vmaf: 50.0, ..then() }));
+        assert!(!skipped_earlier(old, &Options { preset: 8, ..then() }));
+        assert!(!skipped_earlier(old, &Options { min_savings: 0.3, ..then() }));
         // The same line written before the file last changed.
         assert!(!skipped_earlier(|i, s, _| format!("1\tskip\t{}\t{s}\ttoo lean\n", i.display()), &options()));
     }

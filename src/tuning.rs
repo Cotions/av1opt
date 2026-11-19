@@ -62,7 +62,7 @@ impl std::str::FromStr for Class {
 
 /// The default of the versions that saved no baseline, for telling their entries apart: before
 /// the default moved to preset 5, a benchmark won by the default saved these very settings. Kept
-/// now they would pin preset 6, 6.2% larger than the default.
+/// now they would pin preset 6, about a tenth larger than today's default.
 const OLD_DEFAULT_PRESET: u8 = 6;
 const OLD_DEFAULT_PARAMS: &str = "tune=0";
 /// How far an encode's VMAF target may be from the one a choice was measured at.

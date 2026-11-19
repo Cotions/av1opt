@@ -451,7 +451,8 @@ skipped for a reason (low savings, ...) are not searched again with the same set
 preset, CRF range, `--min-savings`, and `--scenes`, `--audio`, `--svt-params`,
 `--tuned`, `--remove` and the samples where set) while their size and modification time stay
 the same, unless `--retry-skipped` or `--force` is given. Lines from versions that did not note
-the settings count only for a run at the default target, preset and `--min-savings`. A finished file counts only for the source it was made from, as the
+the settings count only for a run at the default target and `--min-savings` and at preset 6,
+the default of that time: a run at today's default looks at those videos again. A finished file counts only for the source it was made from, as the
 report beside it says. A source of the same name with another size is reported, not passed
 over. At the same size and another modification time the fingerprint in the report decides
 (see Verify above): a source only touched, or copied without its dates, counts as done, and

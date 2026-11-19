@@ -372,9 +372,11 @@ fn an_old_skip_does_not_stand_against_force_or_another_target() {
     let line = format!("99999999999\tskip\t{}\t{size}\ttoo lean\n", std::fs::canonicalize(&video).unwrap().display());
     std::fs::write(c.path("out/av1opt-log.tsv"), line).unwrap();
     let encode = |extra: &[&str]| c.run(&[&["encode", "videos", "-o", "out", "--memory-limit", "none"], extra].concat());
-    encode(&[]).ended(0).has("skipped earlier: too lean");
-    encode(&["--force"]).ended(3).lacks("skipped earlier");
-    encode(&["--target-vmaf", "50"]).ended(3).lacks("skipped earlier");
+    // The line is of the time when the default preset was 6 and lines did not say so.
+    encode(&["--preset", "6"]).ended(0).has("skipped earlier: too lean");
+    encode(&[]).ended(3).lacks("skipped earlier");
+    encode(&["--preset", "6", "--force"]).ended(3).lacks("skipped earlier");
+    encode(&["--preset", "6", "--target-vmaf", "50"]).ended(3).lacks("skipped earlier");
 }
 
 #[test]

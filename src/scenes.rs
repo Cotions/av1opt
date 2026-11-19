@@ -819,7 +819,7 @@ fn restamp(from: &Path, to: &Path, times: &Times) -> Result<()> {
     let mut r = std::io::BufReader::new(std::fs::File::open(from)?);
     let mut w = std::io::BufWriter::new(crate::files::create_new(to)?);
     // 32 bytes: "DKIF", version, header length, codec, width, height, time base denominator
-    // and numerator, length of the stream, four unused. Little-endian throughout.
+    // and numerator, number of frames, four unused. Little-endian throughout.
     let mut head = [0u8; 32];
     r.read_exact(&mut head).with_context(|| format!("the joined chunks could not be read back; {FAILED_INSIDE}"))?;
     if &head[..4] != b"DKIF" || u16::from_le_bytes([head[6], head[7]]) != 32 {
@@ -829,7 +829,9 @@ fn restamp(from: &Path, to: &Path, times: &Times) -> Result<()> {
     let first = times.pts[0];
     head[16..20].copy_from_slice(&den.to_le_bytes());
     head[20..24].copy_from_slice(&num.to_le_bytes());
-    head[24..28].copy_from_slice(&u32::try_from(times.pts[times.pts.len() - 1] - first).unwrap_or(u32::MAX).to_le_bytes());
+    // The number of frames, as ffmpeg's own IVF muxer writes it. The span of the timestamps
+    // written here before made ffprobe read 294,400 frames from a stream of 576 at 1/12288.
+    head[24..28].copy_from_slice(&u32::try_from(times.pts.len()).unwrap_or(u32::MAX).to_le_bytes());
     w.write_all(&head)?;
     let mut n = 0;
     // Each frame: its size in 4 bytes, its timestamp in 8, the frame.
@@ -1177,7 +1179,7 @@ mod tests {
         std::fs::write(&from, &plain).unwrap();
         let times = Times { pts: vec![9000, 12750, 15750], tb: (1, 90000) };
         restamp(&from, &to, &times).unwrap();
-        assert_eq!(std::fs::read(&to).unwrap(), ivf(&[(0, 5), (3750, 0), (6750, 300)], 90000, 1, 6750));
+        assert_eq!(std::fs::read(&to).unwrap(), ivf(&[(0, 5), (3750, 0), (6750, 300)], 90000, 1, 3));
         // A frame too many or too few, or a stream that stops inside a frame: no video.
         for pts in [vec![0, 3000], vec![0, 3000, 6000, 9000]] {
             let e = restamp(&from, &to, &Times { pts, tb: (1, 90000) }).unwrap_err().to_string();

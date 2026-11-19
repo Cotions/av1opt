@@ -1135,18 +1135,25 @@ fn ivf_index(path: &Path) -> Result<([u8; 32], Vec<IvfFrame>)> {
     }
     let mut frames = Vec::new();
     let mut offset = 32u64;
+    // A read that fails says which file, and where in it: the bare error says neither.
+    let unread = |n: usize| format!("the video stream av1opt made in {} could not be read at frame {n}; {WENT_WRONG_INSIDE}", path.display());
     // Each frame: its size in 4 bytes, its timestamp in 8, the frame.
-    while !r.fill_buf()?.is_empty() {
+    while !r.fill_buf().with_context(|| unread(frames.len() + 1))?.is_empty() {
         let mut f = [0u8; 12];
-        r.read_exact(&mut f)?;
+        if let Err(e) = r.read_exact(&mut f) {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                bail!("the video stream av1opt made in {} stops inside the header of frame {}; {WENT_WRONG_INSIDE}", path.display(), frames.len() + 1);
+            }
+            return Err(e).with_context(|| unread(frames.len() + 1));
+        }
         let size = u32::from_le_bytes([f[0], f[1], f[2], f[3]]);
         let pts = u64::from_le_bytes(f[4..12].try_into().expect("eight bytes"));
         frames.push(IvfFrame { offset: offset + 12, size, pts });
-        r.seek_relative(size as i64)?;
+        r.seek_relative(size as i64).with_context(|| unread(frames.len()))?;
         offset += 12 + size as u64;
     }
-    if offset != std::fs::metadata(path)?.len() {
-        bail!("a video stream av1opt made stops partway through frame {}; {WENT_WRONG_INSIDE}", frames.len());
+    if offset != std::fs::metadata(path).with_context(|| unread(frames.len()))?.len() {
+        bail!("the video stream av1opt made in {} stops partway through frame {}; {WENT_WRONG_INSIDE}", path.display(), frames.len());
     }
     Ok((head, frames))
 }
@@ -1534,8 +1541,15 @@ mod tests {
         write_ivf(&dir.join("x.ivf"), &[(0, vec![1; 10]), (1, vec![2; 10])]);
         let mut b = std::fs::read(dir.join("x.ivf")).unwrap();
         b.truncate(b.len() - 4);
-        std::fs::write(dir.join("x.ivf"), b).unwrap();
-        assert!(ivf_index(&dir.join("x.ivf")).is_err());
+        std::fs::write(dir.join("x.ivf"), &b).unwrap();
+        let e = ivf_index(&dir.join("x.ivf")).err().unwrap().to_string();
+        assert!(e.contains("x.ivf stops partway through frame 2;"), "{e}");
+        // Cut inside the 12 bytes before the second frame: the bare error said "failed to
+        // fill whole buffer", with neither the file nor the frame.
+        b.truncate(32 + 12 + 10 + 5);
+        std::fs::write(dir.join("x.ivf"), &b).unwrap();
+        let e = ivf_index(&dir.join("x.ivf")).err().unwrap().to_string();
+        assert!(e.contains(&format!("{} stops inside the header of frame 2;", dir.join("x.ivf").display())), "{e}");
         std::fs::write(dir.join("y.ivf"), b"not an ivf file at all, just text that is long enough").unwrap();
         assert!(ivf_index(&dir.join("y.ivf")).is_err());
         std::fs::remove_dir_all(&dir).unwrap();

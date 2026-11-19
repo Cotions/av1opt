@@ -664,16 +664,29 @@ fn saved_form(j: &Job) -> Value {
     })
 }
 
+/// Why a saved entry of inputs left out of a job someone stopped is not queued by itself.
+const ONLY_BY_HAND: &str = "they were left out of a job you cancelled or removed; they start only if you choose Try again";
+
 /// Inputs left out of a job outlive it: when the job leaves the list or has nothing more to do,
-/// they become a saved entry of their own, with its settings, and come back at a later start.
-fn keep_left_out(queue: &Queue, j: &mut Job) {
+/// they become a saved entry of their own, with its settings. Those of a job that ran its course
+/// are queued at a later start, once they are back. Those of a job someone cancelled or removed
+/// (`stopped`) are kept and shown, and start only when asked to: that person did not want this
+/// job to go on, and it must not start by itself because a drive has come back.
+fn keep_left_out(queue: &Queue, j: &mut Job, stopped: bool) {
     if j.dropped.is_empty() {
         return;
     }
     let mut saved = saved_form(j);
     saved["inputs"] = json!(std::mem::take(&mut j.dropped));
     saved["dropped"] = json!([]);
-    queue.unrestored.lock().unwrap().push((saved, "they were not there when the rest of their job ran; they are queued when they are back".into()));
+    let why = if stopped {
+        saved["only_by_hand"] = json!(true);
+        saved["left_out_of"] = json!(j.id);
+        ONLY_BY_HAND
+    } else {
+        "they were not there when the rest of their job ran; they are queued when they are back"
+    };
+    queue.unrestored.lock().unwrap().push((saved, why.into()));
 }
 
 /// Saves unfinished jobs so the next `av1opt ui` picks them up again: those in the queue, those
@@ -763,7 +776,7 @@ pub fn restore(app: &Arc<App>) {
     std::thread::spawn(move || {
         {
             let _one = app.jobs.restoring.lock().unwrap_or_else(|e| e.into_inner());
-            let (_, all_read) = bring_back(&app);
+            let (_, all_read) = bring_back(&app, false);
             finish_bringing_back(&app, all_read);
         }
         // Once the pass is over, so that what the page then reads says so.
@@ -773,27 +786,40 @@ pub fn restore(app: &Arc<App>) {
 
 /// Moves the jobs of `to_restore` into the queue, or to the list of those that could not be
 /// restored. Returns how many got into the queue, and whether the list was gone through.
-fn bring_back(app: &App) -> (usize, bool) {
+/// `by_person` when someone asked for it now, which is what entries that wait for that need.
+fn bring_back(app: &App, by_person: bool) -> (usize, bool) {
     let known = Known::load();
     let (mut added, mut told) = (0, Instant::now());
     loop {
         if shutting_down(app) {
             return (added, false);
         }
-        let Some(saved) = app.jobs.to_restore.lock().unwrap().front().cloned() else { return (added, true) };
-        let prepared = prepare(app, &saved, Origin::Saved, &known);
+        let Some(mut saved) = app.jobs.to_restore.lock().unwrap().front().cloned() else { return (added, true) };
+        let only_by_hand = saved["only_by_hand"] == true;
+        let waits_for_person = only_by_hand && !by_person;
+        // The numbers of jobs start over with each run: it would name some other job now.
+        if waits_for_person && let Some(entry) = saved.as_object_mut() {
+            entry.remove("left_out_of");
+        }
+        let prepared = if waits_for_person { Err(anyhow::anyhow!(ONLY_BY_HAND)) } else { prepare(app, &saved, Origin::Saved, &known) };
         {
             // Not while a save is on its way: it would find this job in both places, or neither.
             let _saving = app.jobs.saves.hold();
             match prepared {
-                Ok(job) => {
+                Ok(mut job) => {
+                    // Those of its inputs still away stay as they were: waiting to be asked for.
+                    if only_by_hand {
+                        keep_left_out(&app.jobs, &mut job, true);
+                    }
                     // Not `add`: with broken tools the jobs wait in the queue rather than get dropped.
                     eprintln!("re-queued {} file(s) from the last session", job.files.len());
                     enqueue(app, job);
                     added += 1;
                 }
                 Err(e) => {
-                    eprintln!("could not re-queue a job from the last session (kept for later): {e:#}");
+                    if !waits_for_person {
+                        eprintln!("could not re-queue a job from the last session (kept for later): {e:#}");
+                    }
                     app.jobs.unrestored.lock().unwrap().push((saved, format!("{e:#}")));
                 }
             }
@@ -847,7 +873,7 @@ pub fn unrestored_action(app: &App, retry: bool) -> Result<Value> {
             app.jobs.to_restore.lock().unwrap().extend(list.into_iter().map(|(job, _)| job));
         }
     }
-    let (restored, all_read) = if retry { bring_back(app) } else { (0, true) };
+    let (restored, all_read) = if retry { bring_back(app, true) } else { (0, true) };
     finish_bringing_back(app, all_read);
     drop(one);
     app.broadcast(json!({ "kind": "jobs" }));
@@ -863,6 +889,8 @@ pub fn cancel(app: &App, id: u64) -> Result<Value> {
             for f in &mut j.files {
                 f.status = "cancelled".into();
             }
+            // A cancelled job is not saved: what it left out would go with it.
+            keep_left_out(&app.jobs, j, true);
         }
         "running" => match &j.hooks {
             Some(h) => h.cancel(),
@@ -882,7 +910,7 @@ pub fn remove(app: &App, id: u64) -> Result<Value> {
         bail!("cancel the job first");
     }
     if let Some(at) = jobs.iter().position(|j| j.id == id) {
-        keep_left_out(&app.jobs, &mut jobs[at]);
+        keep_left_out(&app.jobs, &mut jobs[at], true);
         jobs.remove(at);
     }
     drop(jobs);
@@ -918,11 +946,18 @@ pub fn again(app: &App, id: u64) -> Result<Value> {
         if !matches!(j.status.as_str(), "cancelled" | "failed") {
             bail!("only a cancelled or failed job can be queued again");
         }
-        saved_form(j)
+        let mut body = saved_form(j);
+        // What was set apart when it was cancelled is part of it again.
+        let set_apart = app.jobs.unrestored.lock().unwrap().iter().filter(|(entry, _)| entry["left_out_of"] == id).flat_map(|(entry, _)| entry["inputs"].as_array().cloned().unwrap_or_default()).collect::<Vec<_>>();
+        if let Some(dropped) = body["dropped"].as_array_mut() {
+            dropped.extend(set_apart);
+        }
+        body
     };
     let r = add_checked(app, &body, Origin::Saved)?;
     // Only once the new job exists: a refused request leaves the old entry on screen.
     app.jobs.jobs.lock().unwrap().retain(|j| j.id != id);
+    app.jobs.unrestored.lock().unwrap().retain(|(entry, _)| entry["left_out_of"] != id);
     persist(app);
     app.broadcast(json!({ "kind": "jobs" }));
     Ok(r)
@@ -934,7 +969,8 @@ pub fn clear_finished(app: &App) -> Result<Value> {
     app.jobs.jobs.lock().unwrap().retain_mut(|j| {
         let stays = matches!(j.status.as_str(), "queued" | "running") || j.out_dir_missing;
         if !stays {
-            keep_left_out(&app.jobs, j);
+            let stopped = j.status == "cancelled";
+            keep_left_out(&app.jobs, j, stopped);
         }
         stays
     });
@@ -1048,10 +1084,11 @@ pub fn start_worker(app: Arc<App>) {
                         for f in j.files.iter_mut().filter(|f| f.status == "pending") {
                             f.status = "cancelled".into();
                         }
+                        keep_left_out(&app.jobs, j, true);
                     }
                     Ok(_) => {
                         j.status = "done".into();
-                        keep_left_out(&app.jobs, j);
+                        keep_left_out(&app.jobs, j, false);
                     }
                     Err(e) => {
                         j.status = "failed".into();
@@ -1059,7 +1096,7 @@ pub fn start_worker(app: Arc<App>) {
                         j.out_dir_missing = batch::is_out_dir_problem(&e);
                         // A job that waits for its folder comes back whole.
                         if !j.out_dir_missing {
-                            keep_left_out(&app.jobs, j);
+                            keep_left_out(&app.jobs, j, false);
                         }
                     }
                 }

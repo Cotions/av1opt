@@ -1126,8 +1126,61 @@ fn inputs_left_out_of_a_job_outlive_it() {
     assert_eq!(heads(&s)[0]["total"], 1);
     assert!(s.get("/api/jobs").json()["unrestored"].as_array().unwrap().is_empty());
 
-    // A job cleared from the list before it ran keeps them too.
-    let s = Server::start_with_tools("outlive-cleared", &ffmpeg, &ffprobe, |d| {
+    // Cleared from the list once it has run its course, a job's left-out inputs still come back
+    // by themselves.
+    let mut s = Server::start_with_tools("outlive-done", &ffmpeg, &ffprobe, |d| {
+        std::fs::write(d.join("videos/a.mkv"), b"x").unwrap();
+        std::fs::create_dir_all(d.join("out")).unwrap();
+        write_saved_queue(d, json!([{ "inputs": [d.join("videos/a.mkv"), d.join("videos/b.mkv")], "roots": [], "out_dir": d.join("out"), "options": {}, "out_dir_made": true }]));
+    });
+    assert_eq!(first_job_ended(&s)["status"], "done");
+    assert_eq!(s.post("/api/jobs/clear", &json!({})).status, 200);
+    assert!(s.terminate());
+    std::fs::write(s.dir.join("videos/b.mkv"), b"x").unwrap();
+    let s = Server::start_in(&s.dir, &ffmpeg, &ffprobe);
+    assert_eq!(heads(&s).len(), 1);
+    drop(s);
+
+    // Those of a job someone stopped are kept apart, however it was stopped, and start only
+    // when that is asked for.
+    for (name, stop) in [("cancelled", &["cancel"][..]), ("cancelled-cleared", &["cancel", "clear"][..]), ("removed", &["remove"][..])] {
+        let name = format!("outlive-{name}");
+        let mut s = Server::start_with_tools(&name, &ffmpeg, &ffprobe, |d| {
+            paused(d);
+            std::fs::write(d.join("videos/a.mkv"), b"x").unwrap();
+            std::fs::create_dir_all(d.join("out")).unwrap();
+            write_saved_queue(d, json!([{ "inputs": [d.join("videos/a.mkv"), d.join("videos/b.mkv"), d.join("videos/e.mkv")], "roots": [], "out_dir": d.join("out"), "options": {}, "out_dir_made": true }]));
+        });
+        let id = heads(&s)[0]["id"].as_u64().unwrap();
+        for action in stop {
+            let path = if *action == "clear" { "/api/jobs/clear".to_string() } else { format!("/api/jobs/{id}/{action}") };
+            assert_eq!(s.post(&path, &json!({})).status, 200, "{name}: {action}");
+        }
+        let left_out = json!([s.dir.join("videos/b.mkv"), s.dir.join("videos/e.mkv")]);
+        assert_eq!(saved_queue(&s)["jobs"][0]["inputs"], left_out, "{name}");
+        assert_eq!(saved_queue(&s)["jobs"][0]["only_by_hand"], true, "{name}");
+        assert_eq!(s.get("/api/jobs").json()["unrestored"][0]["inputs"], left_out, "{name}");
+
+        // Back at the next start, they are shown and do not start.
+        assert!(s.terminate());
+        std::fs::write(s.dir.join("videos/b.mkv"), b"x").unwrap();
+        let s = Server::start_in(&s.dir, &ffmpeg, &ffprobe);
+        soon("the saved queue is read", || s.get("/api/jobs").json()["restoring"] == 0);
+        let list = s.get("/api/jobs").json();
+        assert!(heads(&s).iter().all(|j| j["status"] == "cancelled"), "{name}: {list}");
+        assert_eq!(list["unrestored"][0]["inputs"], left_out, "{name}");
+        assert!(list["unrestored"][0]["error"].as_str().unwrap().contains("Try again"), "{name}: {list}");
+
+        // Try again queues the one that is back. The other goes on waiting to be asked for.
+        let r = s.post("/api/jobs/unrestored/retry", &json!({})).json();
+        assert_eq!(r["restored"], 1, "{name}: {r}");
+        assert_eq!(heads(&s).last().unwrap()["total"], 1, "{name}");
+        assert_eq!(r["unrestored"][0]["inputs"], json!([s.dir.join("videos/e.mkv")]), "{name}: {r}");
+        assert!(r["unrestored"][0]["error"].as_str().unwrap().contains("Try again"), "{name}: {r}");
+    }
+
+    // Set apart by cancelling, they go back with the job when it is queued again.
+    let s = Server::start_with_tools("outlive-again", &ffmpeg, &ffprobe, |d| {
         paused(d);
         std::fs::write(d.join("videos/a.mkv"), b"x").unwrap();
         std::fs::create_dir_all(d.join("out")).unwrap();
@@ -1135,8 +1188,26 @@ fn inputs_left_out_of_a_job_outlive_it() {
     });
     let id = heads(&s)[0]["id"].as_u64().unwrap();
     assert_eq!(s.post(&format!("/api/jobs/{id}/cancel"), &json!({})).status, 200);
-    assert_eq!(s.post("/api/jobs/clear", &json!({})).status, 200);
-    assert!(heads(&s).is_empty());
+    std::fs::write(s.dir.join("videos/b.mkv"), b"x").unwrap();
+    assert_eq!(s.post(&format!("/api/jobs/{id}/again"), &json!({})).status, 200);
+    assert_eq!(heads(&s)[0]["total"], 2);
+    assert!(s.get("/api/jobs").json()["unrestored"].as_array().unwrap().is_empty());
+    drop(s);
+
+    // A job stopped while it runs counts the same.
+    let (slow_ffmpeg, slow_ffprobe) = stand_in_tools("outlive-slow", "sleep 1\nexit 1");
+    let s = Server::start_with_tools("outlive-running", &slow_ffmpeg, &slow_ffprobe, |d| {
+        for name in ["a.mkv", "c.mkv"] {
+            std::fs::write(d.join("videos").join(name), b"x").unwrap();
+        }
+        std::fs::create_dir_all(d.join("out")).unwrap();
+        write_saved_queue(d, json!([{ "inputs": [d.join("videos/a.mkv"), d.join("videos/b.mkv"), d.join("videos/c.mkv")], "roots": [], "out_dir": d.join("out"), "options": {}, "out_dir_made": true }]));
+    });
+    soon("the job runs", || heads(&s).first().is_some_and(|j| j["status"] == "running"));
+    let id = heads(&s)[0]["id"].as_u64().unwrap();
+    assert_eq!(s.post(&format!("/api/jobs/{id}/cancel"), &json!({})).status, 200);
+    soon("the job has stopped", || heads(&s)[0]["status"] == "cancelled");
+    soon("what it left out is saved", || saved_queue(&s)["jobs"][0]["only_by_hand"] == true);
     assert_eq!(saved_queue(&s)["jobs"][0]["inputs"], json!([s.dir.join("videos/b.mkv")]));
 }
 

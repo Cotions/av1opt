@@ -195,7 +195,7 @@ pub fn handle(app: &Arc<App>, mut req: Request) {
         };
         match serde_json::from_str(&s) {
             Ok(v) => v,
-            Err(e) => return reply_json(req, 400, &json!({ "error": format!("bad JSON: {e}") })),
+            Err(e) => return reply_json(req, 400, &json!({ "error": fields::shortened(&format!("bad JSON: {e}")) })),
         }
     } else {
         Value::Null
@@ -214,7 +214,7 @@ pub fn handle(app: &Arc<App>, mut req: Request) {
             let t = param(&q, "t").and_then(|t| t.parse().ok()).unwrap_or(0.0);
             match param(&q, "path").map(|p| dups::thumb(app, std::path::Path::new(p), t)) {
                 Some(Ok(jpeg)) => reply(req, 200, "image/jpeg", jpeg),
-                Some(Err(e)) => reply(req, 404, "text/plain", format!("{e:#}")),
+                Some(Err(e)) => reply(req, 404, "text/plain", fields::shortened(&format!("{e:#}"))),
                 None => reply(req, 400, "text/plain", "missing path"),
             }
         }

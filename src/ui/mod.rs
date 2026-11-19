@@ -595,7 +595,7 @@ pub fn now() -> u64 {
 
 /// Error reply for the API: `{ "error": "..." }`.
 pub fn err_json(e: &anyhow::Error) -> Value {
-    json!({ "error": format!("{e:#}") })
+    json!({ "error": fields::shortened(&format!("{e:#}")) })
 }
 
 #[cfg(test)]

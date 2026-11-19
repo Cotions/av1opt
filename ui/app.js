@@ -349,13 +349,20 @@ function dirname(p) { const a = String(p || "").split("/"); a.pop(); return a.jo
 function when(t) { return t ? new Date(t * 1000).toLocaleString() : "–"; }
 
 let toastTimer;
+// A message at the foot of the page. The text scrolls inside a box of bounded height beside a
+// Close button that stays on screen however long the message is (an error once quoted a
+// path of 12000 characters and filled the screen), and it stays while the pointer is on it.
 function toast(msg, err) {
   const t = document.getElementById("toast");
-  t.textContent = msg;
+  const hide = () => { clearTimeout(toastTimer); t.hidden = true; };
+  const later = () => { clearTimeout(toastTimer); toastTimer = setTimeout(hide, err ? 7000 : 3000); };
+  t.replaceChildren(h("div", { class: "toast-text" }, msg),
+    h("button", { class: "toast-close", title: "Close", "aria-label": "Close the message", onclick: hide }, "×"));
   t.className = "toast" + (err ? " err" : "");
+  t.onmouseenter = () => clearTimeout(toastTimer);
+  t.onmouseleave = later;
   t.hidden = false;
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => (t.hidden = true), err ? 7000 : 3000);
+  later();
 }
 
 // The numbers in `fields` ([input, label, range] each, a range of RANGES), or null after

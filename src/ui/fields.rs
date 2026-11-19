@@ -84,6 +84,50 @@ fn shown(value: &Value) -> String {
     if chars.next().is_some() { format!("{start}…") } else { start }
 }
 
+/// A run of text without a space longer than this is shortened in a message to the page.
+const LONG_WORD: usize = 100;
+/// What a message to the page holds at most.
+const LONG_MESSAGE: usize = 1000;
+
+/// A message as the page is sent it. Messages repeat what they refuse: a path, a parameter
+/// list, the value serde could not read. A value of 12 KB came back whole and the page's notice
+/// covered the dialog it was about. Each run of text without a space keeps its start and its
+/// end (where a path has its file name) and says how long it was; a message of many short
+/// words ends after `LONG_MESSAGE` characters.
+pub fn shortened(message: &str) -> String {
+    let mut out = String::with_capacity(message.len().min(LONG_MESSAGE * 4));
+    let mut word = String::new();
+    let flush = |word: &mut String, out: &mut String| {
+        let n = word.chars().count();
+        if n > LONG_WORD {
+            // What closes the value in the sentence stays after the count.
+            let value = word.trim_end_matches([':', ';', ',', ')', '\'', '"']);
+            let (closing, n) = (&word[value.len()..], value.chars().count());
+            let start: String = value.chars().take(SHOWN_CHARS).collect();
+            let end: String = value.chars().skip(n.saturating_sub(SHOWN_CHARS * 3 / 4)).collect();
+            out.push_str(&format!("{start}…{end} ({n} characters){closing}"));
+        } else {
+            out.push_str(word);
+        }
+        word.clear();
+    };
+    for c in message.chars() {
+        if c.is_whitespace() {
+            flush(&mut word, &mut out);
+            out.push(c);
+        } else {
+            word.push(c);
+        }
+    }
+    flush(&mut word, &mut out);
+    let n = out.chars().count();
+    if n > LONG_MESSAGE {
+        let start: String = out.chars().take(LONG_MESSAGE).collect();
+        return format!("{start}… ({n} characters in all)");
+    }
+    out
+}
+
 /// Refuses the first of `fields` that `body` has and that is out of its range or no number.
 pub fn check(body: &Value, fields: &[Field]) -> Result<()> {
     for field in fields {
@@ -133,6 +177,21 @@ mod tests {
         assert!(refusal(json!({ "workers": "two" }), JOB).ends_with("it was \"two\""));
         let long = refusal(json!({ "preset": "x".repeat(5000) }), JOB);
         assert!(long.len() < 120 && long.ends_with('…'), "{long}");
+    }
+
+    #[test]
+    fn a_message_quotes_a_long_value_by_its_ends_and_its_length() {
+        assert_eq!(shortened("cannot open /videos/a b.mkv"), "cannot open /videos/a b.mkv");
+        let path = format!("/videos/{}/last.mkv", "x".repeat(12_000));
+        let said = shortened(&format!("cannot open {path}: File name too long"));
+        assert!(said.starts_with("cannot open /videos/xxx") && said.ends_with("x/last.mkv (12017 characters): File name too long"), "{said}");
+        assert!(said.len() < 140, "{said}");
+        // A long value in short words.
+        let said = shortened(&format!("SVT-AV1 refuses '{}'", "a ".repeat(6000)));
+        assert!(said.chars().count() < LONG_MESSAGE + 40 && said.ends_with("characters in all)"), "{said}");
+        // Letters of more than one byte are cut between letters.
+        let said = shortened(&"é".repeat(500));
+        assert!(said.contains('…') && said.ends_with("(500 characters)"), "{said}");
     }
 
     #[test]

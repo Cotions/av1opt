@@ -190,7 +190,10 @@ tr.click:hover td { background: var(--panel2); }
 .checks { list-style: none; padding: 0; margin: 10px 0 0; }
 .checks li { padding: 2px 0; }
 
-.toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--panel2); border: 1px solid var(--line); padding: 8px 16px; border-radius: var(--radius); z-index: 60; max-width: 80vw; }
+.toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--panel2); border: 1px solid var(--line); padding: 8px 8px 8px 16px; border-radius: var(--radius); z-index: 60; width: max-content; max-width: 80vw; display: flex; gap: 8px; align-items: flex-start; }
+/* However long the message, it scrolls in here and the Close button stays in sight. */
+.toast-text { max-height: 30vh; overflow-y: auto; min-width: 0; padding: 2px 0; }
+.toast-close { flex: none; padding: 0 6px; line-height: 1.4; }
 .toast.err { border-color: var(--bad); color: var(--bad); }
 /* Paths have no spaces to break at. */
 .banner, .toast, .file.warn, .file.bad, .long-text { overflow-wrap: anywhere; }

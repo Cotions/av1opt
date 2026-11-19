@@ -61,6 +61,28 @@ fn sign_in_and_request_checks() {
 }
 
 #[test]
+fn a_refusal_repeats_a_long_value_only_in_part() {
+    let s = Server::start("longvalue", |_| {});
+    let long = "x".repeat(12_000);
+    let said = |r: common::Resp| {
+        assert_eq!(r.status, 400, "{}", &r.body[..r.body.len().min(300)]);
+        r.json()["error"].as_str().unwrap().to_string()
+    };
+    // A path the server cannot open, a value of the wrong kind that serde quotes, and a
+    // number of a form.
+    let path = format!("/{long}/last.mkv");
+    for e in [
+        said(s.post("/api/dups", &json!({ "paths": [path] }))),
+        said(s.post("/api/replace", &json!({ "report": "/r.json", "allow_zfs": long }))),
+        said(s.post("/api/dups", &json!({ "paths": ["/"], "tolerance": long }))),
+    ] {
+        assert!(e.chars().count() < 200 && (e.contains("characters") || e.ends_with('…')), "{} characters: {}", e.len(), &e[..e.len().min(300)]);
+    }
+    let e = said(s.post("/api/dups", &json!({ "paths": [path] })));
+    assert!(e.contains("x/last.mkv (12010 characters)"), "{e}");
+}
+
+#[test]
 fn state_reports_versions_and_tools() {
     let s = Server::start("state", |_| {});
     let st = s.get("/api/state").json();

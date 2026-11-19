@@ -147,7 +147,7 @@ function openPage(answer, stored = {}, extra = {}) {
   vm.runInContext(fs.readFileSync(process.argv[2], "utf8"), page.context, { filename: "app.js" });
   page.run = (code) => vm.runInContext(code, page.context);
   world.__told = (message, bad) => page.toasts.push({ message, bad });
-  page.run("toast = __told");
+  page.run("var realToast = toast; toast = __told");
   page.document = document;
   page.remembered = (k) => page.stored[k];
   page.show = (view) => {
@@ -722,6 +722,22 @@ checks["compare: Play is there as soon as both sides can play, while they are st
   play.click();
   assert(!vo.paused && !vs.paused);
   page.run("leave()");
+};
+
+checks["toast: a long message scrolls in its own box, beside a Close button"] = async () => {
+  const page = openPage(() => ({}));
+  await settled();
+  page.context.__long = "cannot open /" + "x/".repeat(6000) + "last.mkv";
+  page.run("realToast(__long, true)");
+  const t = page.document.getElementById("toast");
+  assert(!t.hidden);
+  const text = t.all().find((e) => e.className === "toast-text");
+  assert(text && text.textContent === page.context.__long, "the message is not in a box of its own");
+  const close = t.all().find((e) => e.tag === "button");
+  assert(close && close.attrs["aria-label"], "no Close button");
+  assert(!text.contains(close), "the Close button scrolls away with the text");
+  close.click();
+  assert(t.hidden, "Close leaves the message");
 };
 
 // Answers held back until the check lets them go, so that they can arrive in any order.

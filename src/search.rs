@@ -150,6 +150,29 @@ pub fn reference_pix_fmt(info: &MediaInfo) -> &'static str {
     if info.pix_fmt.contains("10") || info.pix_fmt.contains("12") { "yuv420p10le" } else { "yuv420p" }
 }
 
+/// Whether the source's picture uses every value (0 to 255 in 8 bits) rather than broadcast
+/// video's 16 to 235, by its tag. ffmpeg also takes the old `yuvj` formats as full range when
+/// a file has no tag. A picture stored as RGB is made limited range by [`source_filters`].
+pub fn full_range(info: &MediaInfo) -> bool {
+    let untagged = matches!(info.color_range.as_str(), "" | "unknown");
+    !is_rgb(info) && (info.color_range == "pc" || (untagged && info.pix_fmt.starts_with("yuvj")))
+}
+
+/// The output format of every lossless cut of this source: its bit depth in 4:2:0, and its
+/// range. Left to choose, ffmpeg turned a full-range source into limited range in the cut
+/// (luma mean 127.3 down to 125.3 on a phone-like clip), while the one pass kept it full: the
+/// stretches encoded again from such cuts said limited range in their sequence headers, the
+/// rest of the video full, and decoders that keep the first header's range for the whole file
+/// showed a jump in brightness at every joint. With the range named, the cut holds the
+/// source's very values (the decoded frames are byte for byte the same).
+pub fn reference_format(info: &MediaInfo) -> Vec<&'static str> {
+    let mut args = vec!["-pix_fmt", reference_pix_fmt(info)];
+    if full_range(info) {
+        args.extend(["-color_range", "pc"]);
+    }
+    args
+}
+
 pub fn vmaf_model(info: &MediaInfo) -> &'static str {
     if info.width.max(info.height) >= 3200 { "vmaf_4k_v0.6.1" } else { "vmaf_v0.6.1" }
 }
@@ -205,6 +228,17 @@ pub fn source_filters(info: &MediaInfo) -> Vec<String> {
     if is_rgb(info) {
         let matrix = if info.color_primaries == "bt2020" { "bt2020" } else { "bt709" };
         f.push(format!("scale=out_color_matrix={matrix}:out_range=tv"));
+    }
+    // A full-range picture made 10-bit is spread over the range one way when it comes as
+    // 4:2:0 and another when it comes as 4:2:2 or 4:4:4 (ffmpeg multiplies the second by 4,
+    // the first by 1023/255): the one pass, made from the source, and a stretch encoded again
+    // from a 4:2:0 cut differed by 1.45 in their 10-bit luma mean, on the same frames. Made
+    // 4:2:0 first, as the cut is, both take the same way (the frames came out byte for byte
+    // alike). Limited range takes the same way either way, and is left as it was.
+    let cut_as = reference_pix_fmt(info);
+    let same_layout = info.pix_fmt == cut_as || (info.pix_fmt == "yuvj420p" && cut_as == "yuv420p");
+    if full_range(info) && !same_layout {
+        f.push(format!("format={cut_as}"));
     }
     f
 }
@@ -322,10 +356,12 @@ pub fn extract_reference(
                 "-i", &path_arg(input),
                 "-t", &format!("{secs:.3}"),
                 "-map", &format!("0:{}", if is_source { info.video_index } else { 0 }), "-an", "-sn",
-                "-vf", &vf.join(","), "-c:v", REFERENCE_CODEC, "-pix_fmt", reference_pix_fmt(info), &path_arg(out),
+                "-vf", &vf.join(","), "-c:v", REFERENCE_CODEC,
             ]
             .map(String::from),
         );
+        args.extend(reference_format(info).into_iter().map(String::from));
+        args.push(path_arg(out));
         tools.run(&args)?;
         // ffmpeg ends without complaint when it has nothing to write.
         tools.count_frames(out)
@@ -530,12 +566,20 @@ impl TrialCache {
     /// Opens the cache for one video and its sample positions. `reuse` false starts empty
     /// (trials are measured again) but still records what is measured. `lift_to` is the mark
     /// of [`lifted_mean`]: a mean counted that way is another number, kept apart.
-    pub fn open(input: &Path, size: u64, positions: &[(f64, f64)], encoder: &str, reuse: bool, lift_to: Option<f64>) -> Self {
+    /// `full_range` is [`full_range`] of the source: its clips were cut in limited range
+    /// before (see [`reference_format`]) and scored otherwise, so what was measured on them
+    /// then is kept apart from what is measured now. A mark of their own leaves every
+    /// limited-range source's trials as they were, which a new [`MEASURING_VERSION`] would
+    /// have thrown away with them.
+    pub fn open(input: &Path, size: u64, positions: &[(f64, f64)], encoder: &str, reuse: bool, lift_to: Option<f64>, full_range: bool) -> Self {
         let Ok(dir) = crate::bench::cache_dir() else { return Self::off() };
-        let encoder = match lift_to {
+        let mut encoder = match lift_to {
             Some(mark) => format!("{encoder}|lifted to {mark}"),
             None => encoder.to_string(),
         };
+        if full_range {
+            encoder.push_str("|full range kept");
+        }
         // Version 1 was measured on clips cut by where the decoder started: for some files
         // (MPEG-TS most of all) they were not the frames their positions say.
         let _ = std::fs::remove_file(dir.join("trials-v1.jsonl"));
@@ -1765,6 +1809,41 @@ mod tests {
         assert_eq!(source_filters(&rgb("gbrp10le", "gbr", "bt2020")), ["scale=out_color_matrix=bt2020:out_range=tv"]);
         assert!(source_filters(&rgb("yuv444p", "bt709", "bt709")).is_empty());
         assert!(source_filters(&rgb("gray", "", "")).is_empty());
+    }
+
+    #[test]
+    fn full_range_sources_are_cut_in_their_own_range_and_limited_ones_as_before() {
+        let source = |pix_fmt: &str, color_range: &str| MediaInfo { pix_fmt: pix_fmt.into(), color_range: color_range.into(), ..info_with_fps(25.0) };
+        // Limited range, tagged or not: the cut's arguments and filters are what they were.
+        for (pix_fmt, range) in [("yuv420p", ""), ("yuv420p", "tv"), ("yuv420p", "unknown"), ("yuv422p", "tv"), ("yuv420p10le", "tv"), ("yuv444p10le", "")] {
+            let s = source(pix_fmt, range);
+            assert!(!full_range(&s), "{pix_fmt} {range}");
+            assert_eq!(reference_format(&s), ["-pix_fmt", reference_pix_fmt(&s)], "{pix_fmt} {range}");
+            assert!(source_filters(&s).is_empty(), "{pix_fmt} {range}");
+        }
+        // Full range by the tag, whatever the format's name, and by `yuvj` where there is no tag.
+        for (pix_fmt, range, cut_as) in [
+            ("yuvj420p", "pc", "yuv420p"),
+            ("yuvj420p", "", "yuv420p"),
+            ("yuv420p", "pc", "yuv420p"),
+            ("yuvj422p", "pc", "yuv420p"),
+            ("yuvj444p", "unknown", "yuv420p"),
+            ("yuv420p10le", "pc", "yuv420p10le"),
+            ("yuv422p10le", "pc", "yuv420p10le"),
+        ] {
+            let s = source(pix_fmt, range);
+            assert!(full_range(&s), "{pix_fmt} {range}");
+            assert_eq!(reference_format(&s), ["-pix_fmt", cut_as, "-color_range", "pc"], "{pix_fmt} {range}");
+            // Made 4:2:0 before the encoder sees it, as the cut is, unless it is already.
+            let made_as_the_cut = (pix_fmt != cut_as && pix_fmt != "yuvj420p").then(|| format!("format={cut_as}"));
+            assert_eq!(source_filters(&s), Vec::from_iter(made_as_the_cut), "{pix_fmt} {range}");
+        }
+        // A tag says what it says: yuvj marked limited is limited.
+        assert!(!full_range(&source("yuvj420p", "tv")));
+        // RGB is made limited range by its own filter, whatever its tag.
+        let rgb = MediaInfo { color_space: "gbr".into(), ..source("gbrp", "pc") };
+        assert!(!full_range(&rgb));
+        assert_eq!(source_filters(&rgb), ["scale=out_color_matrix=bt709:out_range=tv"]);
     }
 
     #[test]

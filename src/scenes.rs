@@ -475,13 +475,15 @@ pub(crate) fn extract_chunk(tools: &Tools, input: &Path, info: &MediaInfo, b: Bo
         if let (true, Some(start)) = (seek > 0.0, b.start) {
             filters.insert(before_trim, format!("select='if(eq(n,0),st(0,lte(pts,{start})),ld(0))'"));
         }
-        let args: Vec<String> = [
+        let mut args: Vec<String> = [
             "-y", "-v", "error", "-copyts", "-ss", &format!("{seek:.3}"), "-i", &path_arg(input),
             "-map", &format!("0:{}", info.video_index), "-an", "-sn", "-dn", "-vf", &filters.join(","),
-            "-c:v", search::REFERENCE_CODEC, "-pix_fmt", search::reference_pix_fmt(info), &path_arg(out),
+            "-c:v", search::REFERENCE_CODEC,
         ]
         .map(String::from)
         .to_vec();
+        args.extend(search::reference_format(info).into_iter().map(String::from));
+        args.push(path_arg(out));
         tools.run(&args)?;
         tools.count_frames(out)
     };

@@ -2592,6 +2592,75 @@ fn sound_keeps_its_place_against_the_picture_when_stretches_are_encoded_again() 
     }
 }
 
+/// Where each GOP of the first video stream starts, by frame number.
+fn key_frames(path: &Path) -> Vec<usize> {
+    let out = ffprobe(&["-select_streams", "v:0", "-show_entries", "packet=flags", "-of", "csv=p=0"], path);
+    out.lines().filter(|l| !l.trim().is_empty()).enumerate().filter(|(_, l)| l.contains('K')).map(|(i, _)| i).collect()
+}
+
+/// The values a field takes in the sequence headers of an AV1 stream, each time one is
+/// written (in the container's own header too), as ffmpeg's `trace_headers` reads them.
+fn sequence_header_field(path: &Path, field: &str) -> Vec<u64> {
+    let o = Command::new(ffmpeg_bin())
+        .args(["-v", "trace", "-nostdin", "-i"])
+        .arg(path)
+        .args(["-map", "0:v:0", "-c", "copy", "-bsf:v", "trace_headers", "-f", "null", "-"])
+        .output()
+        .expect("run ffmpeg");
+    let err = String::from_utf8_lossy(&o.stderr);
+    err.lines()
+        .filter(|l| l.contains("trace_headers") && l.split_whitespace().nth(4) == Some(field))
+        .filter_map(|l| l.rsplit("= ").next()?.trim().parse().ok())
+        .collect()
+}
+
+/// Mean luma of every frame of the first video stream, on a 10-bit scale whatever its own.
+fn luma_means(path: &Path) -> Vec<f64> {
+    let o = Command::new(ffmpeg_bin())
+        .args(["-v", "error", "-nostdin", "-i"])
+        .arg(path)
+        .args(["-map", "0:v:0", "-vf", "format=yuv420p10le,signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-", "-f", "null", "-"])
+        .output()
+        .expect("run ffmpeg");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| l.split("YAVG=").nth(1)?.trim().parse().ok()).collect()
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_full_range_video_stays_full_range_where_stretches_are_encoded_again() {
+    let c = Case::new("range-repair");
+    c.scenes_clip("hard.mp4");
+    // Full range, as phones and screen recorders write it, with an easy 12 s at the end that
+    // the whole-video check leaves as the one pass made it. The stretches encoded again were
+    // cut from the source in limited range: their sequence headers said so, the rest's said
+    // full, and their brightness moved by up to 16 steps of 1023 against the source while the
+    // one pass's moved by 0.1.
+    c.ffmpeg(&[
+        "-i", "hard.mp4", "-f", "lavfi", "-i", "testsrc=s=640x360:r=24:d=12", "-f", "lavfi", "-i", "sine=f=440:d=12",
+        "-filter_complex", "[0:v][0:a][1:v][2:a]concat=n=2:v=1:a=1[v][a];[v]scale=out_range=pc[w]", "-map", "[w]", "-map", "[a]",
+        "-color_range", "pc", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "16", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "64k", "full.mp4",
+    ]);
+    let src = c.videos().join("full.mp4");
+    assert_eq!(video(&src)["color_range"], "pc");
+    c.encode(&[&src], &[]).ok().has("encoding again:");
+    let out = c.out().join("full.mp4");
+    let keys = key_frames(&out);
+    assert!(keys.len() >= 3, "{keys:?}");
+    // Every GOP says full range in its own sequence header, and the container agrees.
+    let ranges = sequence_header_field(&out, "color_range");
+    assert!(ranges.len() >= keys.len() && ranges.iter().all(|r| *r == 1), "{ranges:?} for GOPs at {keys:?}");
+    assert_eq!(video(&out)["color_range"], "pc");
+    // Brightness against the source, GOP by GOP: what is encoded again sits where the one
+    // pass does. Two steps of 1023 are half a step of 8-bit video; encoding alone moved the
+    // darkest scene by 1.4.
+    let (got, want) = (luma_means(&out), luma_means(&src));
+    assert_eq!(got.len(), want.len());
+    let bounds: Vec<usize> = keys.iter().copied().chain([got.len()]).collect();
+    let offsets: Vec<f64> = bounds.windows(2).map(|w| (w[0]..w[1]).map(|i| got[i] - want[i]).sum::<f64>() / (w[1] - w[0]) as f64).collect();
+    assert!(offsets.windows(2).all(|o| (o[1] - o[0]).abs() < 2.0), "luma against the source, GOP by GOP from {keys:?}: {offsets:.2?}");
+}
+
 /// What a player shows as a track's name: Matroska's title, MP4's name as ffmpeg reads it.
 fn track_name(stream: &Value) -> Option<&str> {
     tag(stream, "title").or_else(|| tag(stream, "name"))

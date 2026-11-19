@@ -151,6 +151,11 @@ pub struct MediaInfo {
     pub color_space: String,
     #[serde(default)]
     pub color_primaries: String,
+    /// ffprobe's color_range: "pc" for a picture using every value (0 to 255 in 8 bits, as
+    /// phones and screen recorders write it), "tv" for broadcast video's 16 to 235, empty or
+    /// "unknown" when the file does not say.
+    #[serde(default)]
+    pub color_range: String,
     /// A picture with transparency beside it that the pixel format does not show (VP9 in WebM).
     #[serde(default)]
     pub alpha: bool,
@@ -796,6 +801,7 @@ fn probe_within(ffprobe: &str, path: &Path, file_size: u64, limit: Duration) -> 
         stereo3d,
         color_space: video["color_space"].as_str().unwrap_or("").to_string(),
         color_primaries: video["color_primaries"].as_str().unwrap_or("").to_string(),
+        color_range: video["color_range"].as_str().unwrap_or("").to_string(),
         alpha: video["tags"]["alpha_mode"].as_str().or(video["tags"]["ALPHA_MODE"].as_str()) == Some("1"),
         subtitle_tracks: streams.iter().filter(|s| s["codec_type"] == "subtitle").map(|s| Track::from_tags(&s["tags"])).collect(),
         attachment_names: streams

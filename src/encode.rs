@@ -728,7 +728,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
             // A stretch that fails after all is searched for among samples long enough to
             // score like it.
             let again = if mean_only { lasting() } else { pos.clone() };
-            let cache = search::TrialCache::open(input, size, &pos, tools.encoder_version(), !o.fresh_search, lift_to);
+            let cache = search::TrialCache::open(input, size, &pos, tools.encoder_version(), !o.fresh_search, lift_to, search::full_range(&info));
             let mut lab = search::Lab::new(tools, input, &info, &tmp.path, pos.clone(), vmaf_threads, cache).lifting(lift_to);
             let params = SearchParams { target_vmaf: o.target_vmaf, min_crf: o.min_crf, max_crf: o.max_crf, start_crf, max_size_ratio, worst_sample: None, landing: search::Landing::SafeSide };
             // Where the mean is measured and brought to the target afterwards, the answer need
@@ -1013,7 +1013,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
         tools.emit(Event::Phase { phase: "searching".into(), detail: format!("again, with the stretch at {} (VMAF {lowest:.2}) as a sample", hms(at)) });
         let mut pos = pos.clone();
         pos.extend(apart(&low.windows, AGAIN_SAMPLES).iter().map(|w| (w.0, w.1)));
-        let cache = search::TrialCache::open(input, size, &pos, tools.encoder_version(), !o.fresh_search, None);
+        let cache = search::TrialCache::open(input, size, &pos, tools.encoder_version(), !o.fresh_search, None, search::full_range(&info));
         let mut lab = search::Lab::new(tools, input, &info, &tmp.path, pos, vmaf_threads, cache);
         let start_crf = (best.crf - ((aim - lowest) / search::VMAF_PER_CRF).max(1.0)).floor().max(o.min_crf as f64) as u8;
         let (found, all) = search::search(&mut lab, &enc, &SearchParams { worst_sample: Some(aim), start_crf, ..params })?;

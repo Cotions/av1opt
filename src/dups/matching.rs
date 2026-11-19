@@ -267,14 +267,11 @@ pub fn groups(links: &[Link], media: &[Media], prefs: &Prefs) -> Vec<Group> {
     }
     out.extend(partial.values().map(|l| ordered(vec![l.a, l.b], l.kind, l.score)));
 
-    // Whole-video groups first, biggest win first; ties by path so runs list the same way.
+    // Whole-video groups first, biggest win first. Ties go by the paths of all the members:
+    // the groups come out of a hash map, and two can share the copy they keep.
     let spare = |g: &Group| g.members[1..].iter().map(|&i| media[i].size).sum::<u64>();
-    out.sort_by(|a, b| {
-        (a.kind != Kind::Same)
-            .cmp(&(b.kind != Kind::Same))
-            .then(spare(b).cmp(&spare(a)))
-            .then_with(|| media[a.members[0]].path.cmp(&media[b.members[0]].path))
-    });
+    let paths = |g: &'_ Group| g.members.iter().map(|&i| media[i].path.clone()).collect::<Vec<_>>();
+    out.sort_by(|a, b| (a.kind != Kind::Same).cmp(&(b.kind != Kind::Same)).then(spare(b).cmp(&spare(a))).then_with(|| paths(a).cmp(&paths(b))));
     out
 }
 
@@ -709,7 +706,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "defect: groups with the same copy first and as much to win come out in hash-map order, so runs differ"]
     fn pairs_that_tie_are_listed_the_same_way_every_run() {
         let m = numbered(&[9, 1, 1, 1, 1, 1]);
         let links: Vec<Link> = (1..6).map(|b| link(0, b, Kind::SameStart, 1.0)).collect();

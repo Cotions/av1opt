@@ -204,7 +204,9 @@ fn decode_path(s: &str) -> Option<PathBuf> {
     let (b, mut out, mut i) = (s.as_bytes(), Vec::new(), 0);
     while i < b.len() {
         if b[i] == b'%' {
-            out.push(u8::from_str_radix(s.get(i + 1..i + 3)?, 16).ok()?);
+            // Two digits exactly: `from_str_radix` alone would also take a sign for one.
+            let digits = b.get(i + 1..i + 3).filter(|d| d.iter().all(u8::is_ascii_hexdigit))?;
+            out.push(u8::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok()?);
             i += 3;
         } else {
             out.push(b[i]);
@@ -281,7 +283,8 @@ fn holds_with(trashed: &Path, original: &Path, is_top: &dyn Fn(&Path) -> bool) -
             shared if shared.file_name().is_some_and(|n| n == ".Trash") => shared.parent()?,
             top => top,
         };
-        let plain = recorded.components().all(|c| matches!(c, std::path::Component::Normal(_)));
+        // An empty path has no parts to object to, and would name the top of the drive.
+        let plain = recorded.components().next().is_some() && recorded.components().all(|c| matches!(c, std::path::Component::Normal(_)));
         Some(plain && is_top(top) && top.join(recorded) == original)
     };
     inner().unwrap_or(false)
@@ -641,7 +644,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "defect: decode_path takes a sign for a hex digit, so %+1 reads as byte 1"]
     fn a_sign_is_not_a_digit_of_an_encoded_byte() {
         assert_eq!(decode_path("a%+1"), None);
         assert_eq!(decode_path("%+f"), None);
@@ -688,7 +690,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "defect: an empty Path= is taken to say the file came from the top of the drive"]
     fn an_empty_path_names_no_file() {
         let dir = scratch("emptypath");
         let top = dir.join("drive");

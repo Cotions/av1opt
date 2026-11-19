@@ -377,14 +377,11 @@ fn percent_decode(s: &str) -> String {
     while i < b.len() {
         match b[i] {
             b'+' => out.push(b' '),
-            b'%' if i + 2 < b.len() => {
-                match u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("zz"), 16) {
-                    Ok(v) => {
-                        out.push(v);
-                        i += 2;
-                    }
-                    Err(_) => out.push(b'%'),
-                }
+            // Two digits exactly: `from_str_radix` alone would also take a sign for one.
+            b'%' if i + 2 < b.len() && b[i + 1].is_ascii_hexdigit() && b[i + 2].is_ascii_hexdigit() => {
+                let digit = |c: u8| (c as char).to_digit(16).unwrap_or(0) as u8;
+                out.push(digit(b[i + 1]) << 4 | digit(b[i + 2]));
+                i += 2;
             }
             c => out.push(c),
         }
@@ -548,10 +545,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "defect: percent_decode reads %+1 as the byte 0x01 because from_str_radix accepts a sign"]
     fn a_sign_is_not_a_hex_digit() {
-        assert_eq!(percent_decode("%+1"), "%+1");
-        assert_eq!(percent_decode("%+f.mkv"), "%+f.mkv");
+        // The percent sign stays as it is, and a plus is a space here as everywhere in a query.
+        assert_eq!(percent_decode("%+1"), "% 1");
+        assert_eq!(percent_decode("%+f.mkv"), "% f.mkv");
+        assert_eq!(percent_decode("%-1"), "%-1");
     }
 
     #[test]

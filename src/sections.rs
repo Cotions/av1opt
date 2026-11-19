@@ -43,11 +43,16 @@ pub fn parse_time(s: &str) -> Option<f64> {
     let (last, rest) = parts.split_last()?;
     let secs: f64 = last.parse().ok().filter(|v: &f64| v.is_finite() && *v >= 0.0)?;
     let mut t = 0.0;
-    for p in rest {
+    for (i, p) in rest.iter().enumerate() {
         if !p.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
-        t = t * 60.0 + p.parse::<f64>().ok()?;
+        let value = p.parse::<f64>().ok()?;
+        // Below the hours, minutes stop at 59: 1:75:00 is a typing mistake, not 2:15:00.
+        if i == 1 && value >= 60.0 {
+            return None;
+        }
+        t = t * 60.0 + value;
     }
     if !rest.is_empty() && secs >= 60.0 {
         return None;
@@ -443,7 +448,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "defect: parse_time takes 1:75:00 as 2:15:00 although it refuses 1:75 as m:ss"]
     fn the_minutes_of_a_time_with_hours_stop_at_sixty() {
         assert_eq!(parse_time("1:59:00"), Some(7140.0));
         assert_eq!(parse_time("1:60:00"), None);

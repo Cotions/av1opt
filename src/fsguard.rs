@@ -39,16 +39,32 @@ fn plain(path: &Path) -> std::io::Result<PathBuf> {
 }
 
 /// Where `path` leads as the system takes it, links included, whether or not all of it exists
-/// yet: the real place of the part that exists, followed by the rest.
+/// yet. Followed one name at a time, because a link can point at a folder still to be made:
+/// what is written through it will land there, not next to the link.
 #[cfg(feature = "ui")]
 pub fn resolved(path: &Path) -> std::io::Result<PathBuf> {
-    let abs = plain(path)?;
-    for above in abs.ancestors() {
-        if let Ok(real) = std::fs::canonicalize(above) {
-            return Ok(real.join(abs.strip_prefix(above).unwrap_or(Path::new(""))));
+    /// As many links as the system itself follows before it gives up on a path.
+    const MOST_LINKS: u32 = 40;
+    let names = |p: &Path| p.components().rev().map(|c| c.as_os_str().to_os_string()).collect::<Vec<_>>();
+    let (mut left, mut out, mut links) = (names(&plain(path)?), PathBuf::new(), 0);
+    while let Some(name) = left.pop() {
+        if name == ".." {
+            out.pop();
+        } else if name == "/" {
+            out = PathBuf::from("/");
+        } else if name != "." {
+            let next = out.join(&name);
+            match std::fs::read_link(&next) {
+                Ok(target) if links == MOST_LINKS => return Err(std::io::Error::other(format!("too many links on the way, the last to {}", target.display()))),
+                Ok(target) => {
+                    links += 1;
+                    left.extend(names(&target));
+                }
+                Err(_) => out = next,
+            }
         }
     }
-    Ok(abs)
+    Ok(out)
 }
 
 /// Whether `path` (or, before it is made, the nearest folder above it that exists) is on ZFS.
@@ -148,15 +164,22 @@ mod tests {
 
     #[cfg(feature = "ui")]
     #[test]
-    #[ignore = "defect: resolved takes a link whose target is not made yet for a plain folder"]
     fn a_link_to_a_folder_still_to_be_made_resolves_to_that_folder() {
         let dir = scratch("dangling");
         std::fs::create_dir_all(dir.join("far")).unwrap();
         std::os::unix::fs::symlink(dir.join("far/new"), dir.join("link")).unwrap();
         let got = resolved(&dir.join("link/x"));
         let want = dir.join("far/new/x");
+        // A relative link counts from the folder it is in, and a circle of links leads nowhere.
+        std::os::unix::fs::symlink("far/other", dir.join("near")).unwrap();
+        let relative = resolved(&dir.join("near/x"));
+        std::os::unix::fs::symlink("round", dir.join("round")).unwrap();
+        let circle = resolved(&dir.join("round/x"));
+        let far = dir.join("far/other/x");
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(got.unwrap(), want);
+        assert_eq!(relative.unwrap(), far);
+        assert!(circle.unwrap_err().to_string().starts_with("too many links"));
     }
 
     #[test]

@@ -1602,7 +1602,10 @@ fn encoded_size(info: &MediaInfo) -> (u32, u32) {
 }
 
 /// How wide the encoded picture is shown against its height, as `-aspect` takes it ("4:3"),
-/// for a source whose pixels are not square; None for square ones.
+/// for a source whose pixels are not square; None for square ones. ffmpeg reads each term up
+/// to 255 and takes the nearest ratio within that, so a few shapes come out a hair off:
+/// 640x360 of 16:15 pixels is 256:135, which became 201:106 (0.006 % narrower, pixels
+/// 1809:1696), shown at the same 683 pixels wide in Matroska.
 fn display_aspect(info: &MediaInfo) -> Option<String> {
     let (w, h) = info.sample_aspect;
     let (width, height) = encoded_size(info);

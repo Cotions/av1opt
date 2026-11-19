@@ -2419,3 +2419,142 @@ fn videos_of_a_few_frames_a_second_are_measured_on_clips_that_hold_enough_of_the
     assert!(!log.contains("sample0.crf"), "{log}");
     encode(&short);
 }
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn wide_pixels_keep_their_shape_when_stretches_are_encoded_again() {
+    let c = Case::new("shape-repair");
+    c.scenes_clip("uneven.mp4");
+    // 640x360 of 16:15 pixels, shown 256:135, as a DVD or an anamorphic camera makes them. The
+    // stretches encoded again are joined from a bare stream, which has no shape of its own.
+    c.ffmpeg(&["-i", "uneven.mp4", "-vf", "setsar=16/15", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "16", "-c:a", "copy", "wide.mkv"]);
+    let src = c.videos().join("wide.mkv");
+    for container in ["mp4", "mkv"] {
+        let out_dir = c.dir.join(format!("out-{container}"));
+        c.encode_into(&out_dir, &[&src], &["--container", container]).ok().has("encoding again:");
+        let v = video(&out_dir.join(format!("wide.{container}")));
+        // ffmpeg's -aspect takes terms up to 255, so 256:135 comes back as 201:106.
+        let ratio = |key: &str| v[key].as_str().and_then(|r| r.split_once(':')).map(|(n, d)| n.parse::<f64>().unwrap() / d.parse::<f64>().unwrap());
+        let (pixel, shown) = (ratio("sample_aspect_ratio").unwrap_or(1.0), ratio("display_aspect_ratio").unwrap_or(0.0));
+        assert!((pixel / (16.0 / 15.0) - 1.0).abs() < 0.001 && (shown / (256.0 / 135.0) - 1.0).abs() < 0.001, "{container}: {v}");
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn sound_keeps_its_place_against_the_picture_when_stretches_are_encoded_again() {
+    let c = Case::new("sync-repair");
+    c.scenes_clip("uneven.mp4");
+    // Transport streams, as television is recorded: one whose sound starts 0.3 s after its
+    // picture, one whose picture starts 0.3 s after its sound. Joined again after repair, the
+    // first lost the 0.3 s and the second could not be measured at all.
+    c.ffmpeg(&["-i", "uneven.mp4", "-itsoffset", "0.3", "-i", "uneven.mp4", "-map", "0:v", "-map", "1:a", "-c", "copy", "late-sound.ts"]);
+    c.ffmpeg(&["-itsoffset", "0.3", "-i", "uneven.mp4", "-i", "uneven.mp4", "-map", "0:v", "-map", "1:a", "-c", "copy", "late-picture.ts"]);
+    for name in ["late-sound.ts", "late-picture.ts"] {
+        let src = c.videos().join(name);
+        for container in ["mp4", "mkv"] {
+            let out_dir = c.dir.join(format!("out-{container}"));
+            c.encode_into(&out_dir, &[&src], &["--container", container]).ok().has("encoding again:");
+            let out = out_dir.join(name).with_extension(container);
+            let (before, after) = (sound_lead(&src), sound_lead(&out));
+            assert!((before - after).abs() < 1.0 / 24.0, "{name} to {container}: sound led by {before:.3} s, now {after:.3} s");
+            assert_eq!(frames(&out), 576, "{name} to {container}");
+            assert_in_step(&out, &src, "1");
+        }
+    }
+}
+
+/// What a player shows as a track's name: Matroska's title, MP4's name as ffmpeg reads it.
+fn track_name(stream: &Value) -> Option<&str> {
+    tag(stream, "title").or_else(|| tag(stream, "name"))
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn track_names_languages_and_marks_are_read_back_on_both_routes() {
+    let c = Case::new("track-names");
+    c.scenes_clip("uneven.mp4");
+    std::fs::write(c.videos().join("signs.srt"), "1\n00:00:01,000 --> 00:00:02,500\nA sign\n").unwrap();
+    // MP4 keeps a track's name in its user data, which ffmpeg reads as `name` and writes from
+    // `title`: copied as tags, MP4 to MP4 lost every name.
+    c.ffmpeg(&[
+        "-i", "uneven.mp4", "-i", "signs.srt", "-map", "0", "-map", "1", "-c", "copy", "-c:s", "mov_text",
+        "-metadata:s:v:0", "title=Main picture", "-metadata:s:v:0", "language=deu", "-metadata:s:a:0", "title=Commentary",
+        "-metadata:s:a:0", "language=fra", "-metadata:s:s:0", "title=Signs", "-metadata:s:s:0", "language=eng", "named.mp4",
+    ]);
+    let src = c.videos().join("named.mp4");
+    let p = probe(&src);
+    assert_eq!(track_name(streams(&p, "audio")[0]), Some("Commentary"), "{p}");
+    // Into MP4 and Matroska, after stretches were encoded again and the video joined from a
+    // bare stream, which has no name, language or mark of its own.
+    for container in ["mp4", "mkv"] {
+        let out_dir = c.dir.join(format!("out-{container}"));
+        c.encode_into(&out_dir, &[&src], &["--container", container]).ok().has("encoding again:");
+        let p = probe(&out_dir.join(format!("named.{container}")));
+        let (v, a, s) = (streams(&p, "video")[0], streams(&p, "audio")[0], streams(&p, "subtitle")[0]);
+        for (stream, name, language) in [(v, "Main picture", "deu"), (a, "Commentary", "fra"), (s, "Signs", "eng")] {
+            assert_eq!((track_name(stream), tag(stream, "language")), (Some(name), Some(language)), "{container}: {stream}");
+        }
+        assert_eq!(v["disposition"]["default"], 1, "{container}: {v}");
+        if container == "mkv" {
+            // Under its title, where players look, and not in a tag NAME as well.
+            assert!(tag(a, "title").is_some() && a["tags"].get("NAME").is_none(), "{a}");
+        }
+    }
+    // The one pass and the cut name them too, on a picture easy enough to need no repair.
+    c.clip("easy.mp4", "320x180", 8);
+    c.ffmpeg(&[
+        "-i", "easy.mp4", "-c", "copy", "-metadata:s:v:0", "title=Main picture", "-metadata:s:v:0", "language=deu", "-metadata:s:a:0", "title=Commentary",
+        "-metadata:s:a:0", "language=fra", "easy-named.mp4",
+    ]);
+    let src = c.videos().join("easy-named.mp4");
+    for (folder, extra) in [("plain", None), ("cut", Some("6-end"))] {
+        let out_dir = c.dir.join(folder);
+        let mut args = vec!["--container", "mkv"];
+        if let Some(range) = extra {
+            args.extend(["--remove", range]);
+        }
+        c.encode_into(&out_dir, &[&src], &args).ok();
+        let p = probe(&out_dir.join("easy-named.mkv"));
+        let (v, a) = (streams(&p, "video")[0], streams(&p, "audio")[0]);
+        for (stream, name, language) in [(v, "Main picture", "deu"), (a, "Commentary", "fra")] {
+            assert_eq!((track_name(stream), tag(stream, "language")), (Some(name), Some(language)), "{folder}: {stream}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn chapters_stay_in_place_after_a_cut_wherever_the_file_starts() {
+    let c = Case::new("cut-chapters");
+    c.clip("plain.mp4", "320x180", 10);
+    // Chapters at 0-4, 4-7 and 7-10 s from the picture's start, written in the file's own
+    // times, which for the second file start at 1.4 s (-output_ts_offset leaves chapters
+    // where they are, so they are moved by hand).
+    for (name, start) in [("zero.mkv", "0"), ("late.mkv", "1.4")] {
+        let at = |secs: u32| secs * 1000 + if start == "0" { 0 } else { 1400 };
+        let meta = format!(
+            ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART={}\nEND={}\ntitle=One\n[CHAPTER]\nTIMEBASE=1/1000\nSTART={}\nEND={}\ntitle=Two\n[CHAPTER]\nTIMEBASE=1/1000\nSTART={}\nEND={}\ntitle=Three\n",
+            at(0), at(4), at(4), at(7), at(7), at(10)
+        );
+        std::fs::write(c.videos().join("meta.txt"), meta).unwrap();
+        c.ffmpeg(&["-i", "plain.mp4", "-f", "ffmetadata", "-i", "meta.txt", "-map", "0", "-map_chapters", "1", "-c", "copy", "-output_ts_offset", start, name]);
+        let src = c.videos().join(name);
+        let begins = probe(&src)["format"]["start_time"].as_str().and_then(|t| t.parse::<f64>().ok()).unwrap();
+        assert!((begins - start.parse::<f64>().unwrap()).abs() < 0.01, "{name} starts at {begins}");
+        let out_dir = c.dir.join(name.trim_end_matches(".mkv"));
+        c.encode_into(&out_dir, &[&src], &["--container", "mkv", "--remove", "2-4"]).ok();
+        let p = probe(&out_dir.join(name));
+        let got: Vec<(f64, f64, String)> = p["chapters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|ch| (ch["start_time"].as_str().unwrap().parse().unwrap(), ch["end_time"].as_str().unwrap().parse().unwrap(), tag(ch, "title").unwrap_or("").to_string()))
+            .collect();
+        let want = [(0.0, 2.0, "One"), (2.0, 5.0, "Two"), (5.0, 8.0, "Three")];
+        assert_eq!(got.len(), want.len(), "{name}: {got:?}");
+        for ((s, e, t), (ws, we, wt)) in got.iter().zip(want) {
+            assert!((s - ws).abs() < 0.05 && (e - we).abs() < 0.05 && t == wt, "{name}: {got:?}");
+        }
+    }
+}

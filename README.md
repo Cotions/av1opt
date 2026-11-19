@@ -238,7 +238,8 @@ For each file:
    smaller by less than `--min-savings`, it is kept with a note.
    HDR10 and HLG are encoded with their colour signalling
    and mastering/light-level metadata intact (VMAF is then measured on the HDR signal, which
-   tracks encoding damage but is not calibrated like SDR scores). They are encoded in one
+   tracks encoding damage but is not calibrated like SDR scores). HDR10+ dynamic metadata is
+   not kept: such a file plays as HDR10, and the report says so. They are encoded in one
    pass even with `--scenes`, with a note in the report: a video joined from scenes would
    lose that metadata from its container.
 4. **Encode** – SVT-AV1, 10-bit, `--preset` 5 with `tune=0` unless `--svt-params` or `--tuned`
@@ -249,10 +250,23 @@ For each file:
    Opus needs (96 kbps stereo, 56 mono, 256 for 5.1): a 320 kbps MP3 or 256 kbps AAC track
    becomes 96 kbps Opus, a 128 kbps one is left alone. It is a second lossy pass, so it is
    off unless asked for; the report notes every track it changed. MP4 output keeps text subtitles (as mov_text) and plays in Chrome and Firefox; use
-   `--container mkv` to keep image subtitles too. Cover art is kept: JPEG and PNG in MP4 (as
+   `--container mkv` to keep image subtitles too. 608 closed-caption tracks become text
+   subtitles (mov_text in MP4, ASS in MKV) and lose where they stand on screen; TTML is copied
+   into MP4 and dropped from MKV, which has no place for it. In MP4, ASS subtitles lose their
+   styles and attachments (fonts) are dropped; the report says so, and `--container mkv` keeps
+   them. Cover art is kept: JPEG and PNG in MP4 (as
    attached pictures), JPEG, PNG, BMP and WebP in MKV (as attachments with their original
    file names). A cover of another kind is dropped, with a note in the report.
-5. **Verify** – codec, duration, stream and cover counts, HDR transfer, mastering display
+   The report also says what of the picture an encode to 10-bit 4:2:0 cannot keep: an
+   interlaced source comes out as progressive frames, one per pair of fields; closed captions
+   inside the picture are lost (the note gives the ffmpeg command that takes them out first);
+   4:2:2 and 4:4:4 colour, 12-bit and up, and transparency are reduced. RGB is made YUV by the
+   BT.709 matrix (BT.2020's where its primaries are those) and tagged with it. 3D and 360
+   degree marks are kept; a video joined from pieces (after repair or with `--scenes`) keeps
+   the 3D layout but loses the 360 degree mark, which ffmpeg cannot write there, with a note.
+5. **Verify** – codec, duration, stream and cover counts, track names and languages, the
+   shape the picture is shown at, where the sound starts against the picture (within a frame
+   or 40 ms, whichever is longer), 3D and 360 degree marks, HDR transfer, mastering display
    and light level (an output whose container lost what the source says of them is refused),
    and the picture.
    A video encoded in one pass is scored against its source along its whole length (every
@@ -335,7 +349,7 @@ may overlap and come in any order. The video is re-encoded anyway, so the cuts a
 frame-accurate: the kept parts are trimmed from the decoded source and joined (ffmpeg
 `trim`/`concat`). Audio is cut the same way and re-encoded to Opus; text subtitles and chapters
 are moved to their new times (lines and chapters inside removed parts go); image subtitles
-(PGS, DVD) are dropped. Sample clips and spot checks are taken from kept parts only. A cut is
+(PGS, DVD) and TTML are dropped. Sample clips and spot checks are taken from kept parts only. A cut is
 never skipped for being AV1 already or saving too little, and if the VMAF target is out of reach
 it is encoded at the best CRF tried. A Dolby Vision file is skipped all the same, and sections
 can't be removed from a file whose sound or subtitles run more than a second past its picture. Per-scene
@@ -362,7 +376,8 @@ pass, and the report says so):
    highest CRF that scored within half a point of the best and not redone, and the report
    counts such scenes.
 4. Chunks are joined into one AV1 stream and muxed with the source's audio, subtitles, chapters
-   and metadata. Verification additionally checks the exact frame count.
+   and metadata, at the source's picture shape and with its sound in the same place against the
+   picture. Verification additionally checks the exact frame count.
 
 On a 60 s test clip mixing six kinds of footage, `--scenes` gave a 6% smaller file at identical
 full-length VMAF (93.07), with per-segment VMAF between 91.9 and 94.1 instead of 90.8 to 95.9.
@@ -469,7 +484,7 @@ folder), the file is refused before any sample is cut, with a message to rename 
 | Option | Default | What it does |
 |---|---|---|
 | `-o`, `--out-dir` | required | Folder for the finished files and their `.av1opt.json` reports; not on ZFS. |
-| `--container` | `mp4` | `mp4` (plays in browsers; image subtitles dropped) or `mkv` (keeps every subtitle and attachment). |
+| `--container` | `mp4` | `mp4` (plays in browsers; image subtitles dropped) or `mkv` (keeps every subtitle but TTML, and attachments). |
 | `--target-vmaf` | 93 | Mean VMAF the samples must reach. |
 | `--preset` | 5 | SVT-AV1 preset: lower is slower and smaller. |
 | `--svt-params` | `tune=0` | SVT-AV1 parameters besides the CRF, as `key=value:key=value`. |

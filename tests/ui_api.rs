@@ -538,7 +538,16 @@ fn benchmark_requests_and_tuned_settings() {
     assert_eq!(s.post("/api/bench/cancel", &json!({})).status, 200);
 
     // Settings come from the result on the page, with that size's own numbers.
-    let r = s.post("/api/bench/tuning", &json!({ "classes": ["hd"], "config": 1 }));
+    // Named as the page saw it: if that is no longer what the place holds, nothing is saved.
+    for wrong in [json!({ "preset": 9, "params": "tune=0:enable-qm=1" }), json!({ "preset": 4, "params": "tune=1" })] {
+        let mut body = json!({ "classes": ["hd"], "config": 1 });
+        body.as_object_mut().unwrap().extend(wrong.as_object().unwrap().clone());
+        let r = s.post("/api/bench/tuning", &body);
+        assert_eq!(r.status, 400, "{body}: {}", r.body);
+        assert!(r.body.contains("has changed"), "{}", r.body);
+        assert!(!s.data("tuning.json").exists());
+    }
+    let r = s.post("/api/bench/tuning", &json!({ "classes": ["hd"], "config": 1, "preset": 4, "params": "tune=0:enable-qm=1" }));
     assert_eq!(r.status, 200, "{}", r.body);
     let t = r.json();
     assert_eq!(t["tuning"][0]["class"], "hd");

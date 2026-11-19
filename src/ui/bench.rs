@@ -313,6 +313,11 @@ struct TuneRequest {
     /// Index of the setting in the last result to use; None forgets the classes' settings.
     #[serde(default)]
     config: Option<usize>,
+    /// What the page showed at that index, which has to be what is there now.
+    #[serde(default)]
+    preset: Option<u8>,
+    #[serde(default)]
+    params: Option<String>,
 }
 
 /// Makes a setting of the last result the tuned one for some resolution classes (with the
@@ -336,6 +341,12 @@ pub fn tune(app: &App, body: &Value) -> Result<Value> {
                 Shown::Saved => Arc::new(saved_report().ok_or_else(|| anyhow!("no finished benchmark to take settings from"))?),
                 Shown::Partial(_) | Shown::Nothing => bail!("the benchmark hasn't measured every video; let one finish first (what was measured is remembered)"),
             };
+            // The result can have changed since the page drew it, and the index with it.
+            if let Some(there) = report.configs.get(config)
+                && (r.preset.is_some_and(|p| p != there.preset) || r.params.as_ref().is_some_and(|p| *p != there.params))
+            {
+                bail!("the benchmark result has changed since this page showed it, so nothing was saved; choose again from the new list");
+            }
             let mut set = 0;
             for s in report.summaries.iter() {
                 let Some(class) = s.class else { continue };

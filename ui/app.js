@@ -1491,7 +1491,7 @@ views.bench = (root) => {
   const progress = h("div", { class: "bar grow" }, h("div"));
   const progText = h("span", { class: "dim" });
   const out = h("div");
-  const ui = { tab: prefs.get("benchTab", "all"), video: 0, sort: "size", dir: 1, stopChart: null };
+  const ui = { tab: prefs.get("benchTab", "all"), video: 0, sort: "size", dir: 1, stopChart: null, reload: () => load() };
   let base = { preset: 5, params: "tune=0" };
   let defaults = null;
   let running = false;
@@ -1754,14 +1754,17 @@ function renderBench(out, data, ui) {
   if (run && run.status === "failed") kids.push(h("div", { class: "panel bad" }, run.error || "The benchmark failed."));
   if (run && run.note) kids.push(h("div", { class: "panel warn" }, run.note));
 
+  // A setting goes by its place in the result, and says what it is: the result can have
+  // changed since this was drawn, and the server then refuses.
   const setTuning = async (classes, config, done) => {
+    const setting = config == null ? {} : { preset: rep.configs[config].preset, params: rep.configs[config].params };
     try {
-      const r = await api("/api/bench/tuning", { classes, config });
+      const r = await api("/api/bench/tuning", { classes, config, ...setting });
       data.tuning = r.tuning;
       if (STATE) STATE.tuning = r.tuning;
       renderBench(out, data, ui);
       toast(done);
-    } catch (e) { toast(e.message, true); }
+    } catch (e) { toast(e.message, true); ui.reload(); }
   };
   const tunedPanel = h("div", { class: "panel" },
     h("div", { class: "row" }, h("h3", { class: "flat" }, "Tuned settings"), h("span", { class: "spacer" }),

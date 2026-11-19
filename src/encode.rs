@@ -1843,7 +1843,7 @@ fn prepare_cut<'a>(
         let list = sections::read_chapters(&tools.ffprobe, input)?;
         if !list.is_empty() {
             let path = tmp.join("chapters.ffmeta");
-            crate::files::write_new(&path, sections.chapters(&list).as_bytes())?;
+            crate::files::write_new(&path, sections.chapters(&list, info.start_time).as_bytes())?;
             chapters = Some(path);
         }
     }

@@ -262,10 +262,13 @@ impl Sections {
     }
 
     /// FFMETADATA chapters moved onto the output; chapters inside removed parts are dropped.
-    pub fn chapters(&self, chapters: &[Chapter]) -> String {
+    /// Chapters are read at the file's timestamps, sections counted from its start at
+    /// `file_start`: a Matroska file starting at 5 s with --remove 2-4 had its chapters at
+    /// 0-4, 4-7 and 7-10 come out at 3-7 and 7-9, the last one gone.
+    pub fn chapters(&self, chapters: &[Chapter], file_start: f64) -> String {
         let mut out = String::from(";FFMETADATA1\n");
         for c in chapters {
-            let Some((s, e)) = self.event(c.start, c.end) else { continue };
+            let Some((s, e)) = self.event(c.start - file_start, c.end - file_start) else { continue };
             let _ = writeln!(out, "\n[CHAPTER]\nTIMEBASE=1/1000\nSTART={}\nEND={}", (s * 1000.0).round() as u64, (e * 1000.0).round() as u64);
             if let Some(t) = &c.title {
                 let esc: String = t.chars().flat_map(|ch| if "=;#\\\n".contains(ch) { vec!['\\', ch] } else { vec![ch] }).collect();
@@ -422,7 +425,7 @@ mod tests {
             Chapter { start: 18.0, end: 100.0, title: Some("A=B".into()) },
         ];
         assert_eq!(
-            s.chapters(&ch),
+            s.chapters(&ch, 0.0),
             ";FFMETADATA1\n\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=10000\ntitle=Intro\n\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=10000\nEND=90000\ntitle=A\\=B\n"
         );
     }
@@ -703,11 +706,23 @@ mod tests {
             Chapter { start: 50.0, end: 50.0, title: Some("no length".into()) },
         ];
         assert_eq!(
-            s.chapters(&ch),
+            s.chapters(&ch, 0.0),
             ";FFMETADATA1\n\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=1001\nEND=15000\ntitle=a\\;b\\#c\\\\d\\\ne\n\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=20000\nEND=30000\n"
         );
-        assert_eq!(s.chapters(&[]), ";FFMETADATA1\n");
-        assert_eq!(s.chapters(&[Chapter { start: 11.0, end: 19.0, title: None }]), ";FFMETADATA1\n");
+        assert_eq!(s.chapters(&[], 0.0), ";FFMETADATA1\n");
+        assert_eq!(s.chapters(&[Chapter { start: 11.0, end: 19.0, title: None }], 0.0), ";FFMETADATA1\n");
+    }
+
+    #[test]
+    fn chapters_of_a_file_that_starts_late_are_counted_from_its_start() {
+        // The reviewer's file: it starts at 5 s, its chapters are 0-4, 4-7 and 7-10 into it,
+        // and 2-4 is removed.
+        let s = Sections::new(&[(2.0, 4.0)], 10.0).unwrap();
+        let ch = [5.0, 9.0, 12.0].map(|start| Chapter { start, end: start + if start < 9.0 { 4.0 } else { 3.0 }, title: None });
+        let starts_ends = |text: String| text.lines().filter(|l| l.starts_with("START=") || l.starts_with("END=")).map(String::from).collect::<Vec<_>>();
+        assert_eq!(starts_ends(s.chapters(&ch, 5.0)), ["START=0", "END=2000", "START=2000", "END=5000", "START=5000", "END=8000"]);
+        let at_zero = ch.each_ref().map(|c| Chapter { start: c.start - 5.0, end: c.end - 5.0, title: None });
+        assert_eq!(s.chapters(&at_zero, 0.0), s.chapters(&ch, 5.0));
     }
 
     #[test]

@@ -6,7 +6,9 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 /// What an ffmpeg/ffprobe pair can do. Encoding needs the libsvtav1 encoder and the libvmaf
 /// filter, which many distribution builds of ffmpeg lack.
@@ -155,6 +157,129 @@ fn die_with_parent(c: &mut Command) {
     }
 }
 
+/// How long an ffmpeg may go without moving before it is stopped. An encode at its slowest
+/// finishes a frame, or reads the next, in far less; a file or drive that stopped answering
+/// would otherwise hold the run for ever.
+const STALL_LIMIT: Duration = Duration::from_secs(600);
+
+/// The lines of `-progress` that change when work gets done. The others do not say so: ffmpeg
+/// keeps printing all of them on time, the same values, while it is stuck.
+const MOVING_PROGRESS: [&str; 3] = ["frame=", "out_time_us=", "total_size="];
+
+/// How many times [`STALL_LIMIT`] an ffmpeg gets while it keeps the processor busy. It is working
+/// on something that has no result to show yet: the largest pictures at the slowest presets
+/// take minutes a frame, and the encoder hands frames over in groups. One spinning for ever on
+/// a damaged file still ends.
+const BUSY_STALL_FACTOR: u32 = 6;
+
+/// What `/proc/<pid>/io` counts as read and written so far by the whole process.
+fn bytes_moved(pid: u32) -> Option<(u64, u64)> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/io")).ok()?;
+    let field = |name: &str| text.lines().find_map(|l| l.strip_prefix(name)?.trim().parse().ok());
+    Some((field("rchar:")?, field("wchar:")?))
+}
+
+/// Processor time used so far by all the threads of process `pid`.
+fn processor_time(pid: u32) -> Option<Duration> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Counted from the bracket that ends the program's name: user time is field 14, system
+    // time field 15, and the first after the bracket is field 3.
+    let mut fields = stat.rsplit_once(')')?.1.split_whitespace().skip(11);
+    let ticks = fields.next()?.parse::<u64>().ok()? + fields.next()?.parse::<u64>().ok()?;
+    // SAFETY: sysconf takes a number and touches no memory of ours.
+    let per_second = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).ok().filter(|t| *t > 0)?;
+    Some(Duration::from_millis(ticks * 1000 / per_second))
+}
+
+/// What has been seen of a run, to tell whether it has stood still for too long.
+#[derive(Default)]
+struct Stillness {
+    signs: Option<[u64; 3]>,
+    last_move: Duration,
+    processor_at_move: Duration,
+}
+
+impl Stillness {
+    /// Takes in what the run shows `worked` into it. True once it has shown nothing new for
+    /// `limit`, or for [`BUSY_STALL_FACTOR`] times that if it has used at least a quarter of a
+    /// processor meanwhile.
+    fn too_long(&mut self, signs: [u64; 3], processor: Duration, worked: Duration, limit: Duration) -> bool {
+        if self.signs != Some(signs) {
+            (self.signs, self.last_move, self.processor_at_move) = (Some(signs), worked, processor);
+            return false;
+        }
+        let still = worked.saturating_sub(self.last_move);
+        let busy = processor.saturating_sub(self.processor_at_move) * 4 >= still;
+        still >= if busy { limit * BUSY_STALL_FACTOR } else { limit }
+    }
+}
+
+/// Picks out of ffmpeg's `-progress` lines the ones that say something new.
+#[derive(Default)]
+struct ProgressLines([String; MOVING_PROGRESS.len()]);
+
+impl ProgressLines {
+    fn moved(&mut self, line: &str) -> bool {
+        let Some(i) = MOVING_PROGRESS.iter().position(|m| line.starts_with(m)) else { return false };
+        let new = self.0[i] != line;
+        if new {
+            line.clone_into(&mut self.0[i]);
+        }
+        new
+    }
+}
+
+/// Kills an ffmpeg that has stopped moving, for as long as this value lives. It has moved when
+/// it read anything, when its reported progress changed, or, on a run that reports none, when
+/// it wrote anything. On a run that reports progress the writes say nothing, as the reports
+/// are writes themselves. Time spent paused does not count.
+struct Watchdog {
+    /// Dropping this ends the watch at once, however the run went.
+    _running: mpsc::Sender<()>,
+    stalled: Arc<AtomicBool>,
+    progress: Arc<AtomicU64>,
+}
+
+impl Watchdog {
+    fn start(pid: u32, limit: Duration, hooks: Option<Arc<Hooks>>, reports_progress: bool) -> Self {
+        let (running, ended) = mpsc::channel::<()>();
+        let (stalled, progress) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicU64::new(0)));
+        let (stall, moved) = (stalled.clone(), progress.clone());
+        std::thread::spawn(move || {
+            let paused = || hooks.as_ref().map_or(Duration::ZERO, |h| h.paused_time());
+            let (began, paused_before, identity) = (Instant::now(), paused(), crate::files::process_start(pid));
+            let worked = || began.elapsed().saturating_sub(paused().saturating_sub(paused_before));
+            let mut stillness = Stillness::default();
+            while let Err(mpsc::RecvTimeoutError::Timeout) = ended.recv_timeout((limit / 4).clamp(Duration::from_millis(50), Duration::from_secs(5))) {
+                // Counters that cannot be read prove nothing, so they never condemn a run.
+                let (Some((read, written)), Some(processor)) = (bytes_moved(pid), processor_time(pid)) else {
+                    stillness = Stillness { last_move: worked(), ..Stillness::default() };
+                    continue;
+                };
+                let signs = [read, if reports_progress { 0 } else { written }, moved.load(Ordering::Relaxed)];
+                if stillness.too_long(signs, processor, worked(), limit) {
+                    // Still the process that was started, not one given its number since.
+                    if identity.is_some() && crate::files::process_start(pid) == identity {
+                        stall.store(true, Ordering::SeqCst);
+                        // SAFETY: kill takes plain numbers and touches no memory of ours.
+                        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                    }
+                    return;
+                }
+            }
+        });
+        Watchdog { _running: running, stalled, progress }
+    }
+
+    fn progress_moved(&self) {
+        self.progress.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn stalled(&self) -> bool {
+        self.stalled.load(Ordering::SeqCst)
+    }
+}
+
 /// See [`Tools::stopwatch`].
 pub struct Stopwatch {
     start: Instant,
@@ -183,6 +308,8 @@ pub struct Tools {
     pub hooks: Option<Arc<Hooks>>,
     /// First line of `ffmpeg -version`, asked for once.
     version: std::sync::OnceLock<String>,
+    /// How long a run may go without moving, see [`Watchdog`].
+    stall_limit: Duration,
 }
 
 impl Tools {
@@ -194,7 +321,7 @@ impl Tools {
             }
             works
         });
-        Tools { ffmpeg, ffprobe, side_by_side_cap: cap.clone(), cap, hooks: None, version: std::sync::OnceLock::new() }
+        Tools { ffmpeg, ffprobe, side_by_side_cap: cap.clone(), cap, hooks: None, version: std::sync::OnceLock::new(), stall_limit: STALL_LIMIT }
     }
 
     /// Sets what each chunk encode gets when several run at once. Every other ffmpeg run is
@@ -215,6 +342,7 @@ impl Tools {
             side_by_side_cap: self.side_by_side_cap.clone(),
             hooks: self.hooks.clone(),
             version: self.version.clone(),
+            stall_limit: self.stall_limit,
         })
     }
 
@@ -272,8 +400,9 @@ impl Tools {
             }
             None => Command::new(&self.ffmpeg),
         };
-        // SVT-AV1 prints its config banner to stderr on every run; errors only.
-        c.env("SVT_LOG", "1").arg("-hide_banner").arg("-nostdin").args(first).args(args);
+        // SVT-AV1 prints its config banner to stderr on every run; errors only. No running
+        // statistics either: they are writes, and would look like work to the watchdog.
+        c.env("SVT_LOG", "1").arg("-hide_banner").arg("-nostdin").arg("-nostats").args(first).args(args);
         die_with_parent(&mut c);
         c
     }
@@ -316,6 +445,17 @@ impl Tools {
         Ok(child)
     }
 
+    fn watchdog(&self, child: &Child, reports_progress: bool) -> Watchdog {
+        Watchdog::start(child.id(), self.stall_limit, self.hooks.clone(), reports_progress)
+    }
+
+    /// What a run the watchdog stopped failed of.
+    fn stalled(&self) -> anyhow::Error {
+        let secs = self.stall_limit.as_secs();
+        let time = if secs >= 60 { format!("{} minutes", secs / 60) } else { format!("{secs} seconds") };
+        anyhow::anyhow!("ffmpeg stopped making progress: it read, wrote and encoded nothing for {time}, so it was stopped. The file may be damaged or its drive may have stalled; the original has not been touched")
+    }
+
     fn finish(&self, child: Child) -> Result<Output> {
         let id = child.id();
         let out = child.wait_with_output();
@@ -339,9 +479,14 @@ impl Tools {
         }
         cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
         let child = self.spawn(&mut cmd)?;
+        let watchdog = self.watchdog(&child, false);
         let out = self.finish(child)?;
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         if !out.status.success() {
+            // Asked first: the watchdog kills outright, as going over a memory cap does.
+            if watchdog.stalled() {
+                return Err(self.stalled());
+            }
             return Err(self.failure(out.status, &stderr, 15));
         }
         Ok(stderr)
@@ -404,12 +549,13 @@ impl Tools {
     /// Like [`Tools::run_with_progress_in`], also returning what ffmpeg wrote to its log
     /// (errors only, unless `args` raise the level with `-v`).
     pub fn run_with_progress_log(&self, dir: Option<&Path>, args: &[String], total_secs: f64, label: &str) -> Result<(u64, String)> {
-        let mut cmd = self.command_for(&["-progress", "pipe:1", "-nostats", "-v", "error"], args);
+        let mut cmd = self.command_for(&["-progress", "pipe:1", "-v", "error"], args);
         if let Some(d) = dir {
             cmd.current_dir(d);
         }
         cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = self.spawn(&mut cmd)?;
+        let watchdog = self.watchdog(&child, true);
         let mut stderr = child.stderr.take().unwrap();
         let err_reader = std::thread::spawn(move || {
             let mut s = String::new();
@@ -420,9 +566,13 @@ impl Tools {
         let watch = self.stopwatch();
         let listened_to = self.hooks.as_ref().is_some_and(|h| !h.is_on_terminal());
         let (mut done_secs, mut fps, mut frames) = (0.0_f64, String::new(), 0u64);
+        let mut progress_lines = ProgressLines::default();
         // Read errors end the loop instead of returning, so the child is always reaped
         // (and untracked) below.
         for line in BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok) {
+            if progress_lines.moved(&line) {
+                watchdog.progress_moved();
+            }
             if let Some(us) = line.strip_prefix("out_time_us=").and_then(|v| v.parse::<f64>().ok()) {
                 done_secs = us / 1e6;
             } else if let Some(n) = line.strip_prefix("frame=").and_then(|v| v.trim().parse().ok()) {
@@ -447,6 +597,9 @@ impl Tools {
         let status = out.status;
         let stderr = err_reader.join().unwrap_or_default();
         if !status.success() {
+            if watchdog.stalled() {
+                return Err(self.stalled());
+            }
             return Err(self.failure(status, &stderr, 15));
         }
         Ok((frames, stderr))
@@ -668,7 +821,7 @@ mod tests {
     use super::*;
 
     fn capped(cap: &str, part: &str) -> Tools {
-        Tools { ffmpeg: "ffmpeg".into(), ffprobe: "ffprobe".into(), cap: Some(cap.into()), side_by_side_cap: Some(part.into()), hooks: None, version: Default::default() }
+        Tools { ffmpeg: "ffmpeg".into(), ffprobe: "ffprobe".into(), cap: Some(cap.into()), side_by_side_cap: Some(part.into()), hooks: None, version: Default::default(), stall_limit: STALL_LIMIT }
     }
 
     fn cap_of(tools: &Tools) -> String {
@@ -699,6 +852,122 @@ mod tests {
         assert!(!free.failure(killed, "", 5).to_string().contains("--memory-limit"));
         let ended = std::process::ExitStatus::from_raw(1 << 8);
         assert!(!capped("1G", "1G").failure(ended, "", 5).to_string().contains("--memory-limit"));
+    }
+
+    /// Tools whose ffmpeg is `script`, stopped after `limit` seconds without moving.
+    fn stand_in(name: &str, script: &str, limit: u64) -> (Tools, std::path::PathBuf) {
+        let dir = room(name);
+        let ffmpeg = dir.join("ffmpeg");
+        crate::files::write_script(&ffmpeg, script);
+        let mut tools = Tools::new(ffmpeg.to_string_lossy().into_owned(), "ffprobe".into(), None);
+        tools.stall_limit = Duration::from_secs(limit);
+        (tools, dir)
+    }
+
+    fn progress_run(tools: &Tools) -> Result<(u64, String)> {
+        tools.run_with_progress_log(None, &strings(&["out.mkv"]), 0.0, "test")
+    }
+
+    #[test]
+    fn an_ffmpeg_repeating_the_same_progress_is_stopped() {
+        // What a stuck ffmpeg does: the reports keep coming and say the same thing. Only shell
+        // built-ins: what a program started here reads would be counted for the shell when it
+        // ends. The loop has an end so that a watchdog taken in by the reports fails the test.
+        let (tools, dir) = stand_in("repeats", "echo $$ > \"$(dirname \"$0\")/pid\"\ni=0\nwhile [ $i -lt 20000000 ]; do i=$((i+1)); printf 'frame=5\\nfps=0\\nout_time_us=1000\\ntotal_size=10\\nspeed=0x\\nprogress=continue\\n'; done\n", 1);
+        let e = progress_run(&tools).unwrap_err().to_string();
+        assert!(e.contains("stopped making progress") && e.contains("1 seconds") && e.contains("not been touched"), "{e}");
+        let pid = std::fs::read_to_string(dir.join("pid")).unwrap();
+        assert!(!Path::new("/proc").join(pid.trim()).exists(), "the stopped ffmpeg is gone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_ffmpeg_that_does_nothing_at_all_is_stopped() {
+        let (tools, dir) = stand_in("silent", "exec sleep 600\n", 1);
+        let began = Instant::now();
+        let e = tools.run(&strings(&["out.mkv"])).unwrap_err().to_string();
+        assert!(e.contains("stopped making progress"), "{e}");
+        let e = progress_run(&tools).unwrap_err().to_string();
+        assert!(e.contains("stopped making progress"), "{e}");
+        assert!(began.elapsed() < Duration::from_secs(60), "{:?}", began.elapsed());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn any_sign_of_work_puts_off_the_stop() {
+        let (second, minute, limit) = (Duration::from_secs(1), Duration::from_secs(60), Duration::from_secs(600));
+        let at = |minutes: u32| minute * minutes;
+        // Nothing new and an idle processor: stopped when the limit is reached, not before.
+        let mut s = Stillness::default();
+        assert!(!s.too_long([1, 2, 3], second, at(0), limit));
+        assert!(!s.too_long([1, 2, 3], second, at(9), limit));
+        assert!(s.too_long([1, 2, 3], second, at(10), limit));
+        // Bytes read, bytes written or progress reported each start the wait again.
+        for moved in [[2, 2, 3], [1, 3, 3], [1, 2, 4]] {
+            let mut s = Stillness::default();
+            assert!(!s.too_long([1, 2, 3], second, at(0), limit));
+            assert!(!s.too_long([1, 2, 3], second, at(9), limit));
+            assert!(!s.too_long(moved, second, at(9), limit), "{moved:?}");
+            assert!(!s.too_long(moved, second, at(18), limit), "{moved:?}");
+            assert!(s.too_long(moved, second, at(19), limit), "{moved:?}");
+        }
+        // A quarter of a processor in use is work: it gets six times as long, and no more.
+        let mut s = Stillness::default();
+        assert!(!s.too_long([1, 2, 3], Duration::ZERO, at(0), limit));
+        assert!(!s.too_long([1, 2, 3], at(15), at(59), limit));
+        assert!(s.too_long([1, 2, 3], at(15), at(60), limit));
+        // Less than that is what waiting costs.
+        let mut s = Stillness::default();
+        assert!(!s.too_long([1, 2, 3], Duration::ZERO, at(0), limit));
+        assert!(s.too_long([1, 2, 3], at(2), at(10), limit));
+    }
+
+    #[test]
+    fn only_progress_lines_with_something_new_count() {
+        let mut lines = ProgressLines::default();
+        assert!(lines.moved("frame=5"));
+        assert!(!lines.moved("frame=5"));
+        assert!(lines.moved("out_time_us=1000"));
+        assert!(lines.moved("total_size=10"));
+        assert!(!lines.moved("out_time_us=1000"));
+        // These are printed anew every time, whatever is happening.
+        assert!(!lines.moved("fps=3.5") && !lines.moved("speed=0.1x") && !lines.moved("progress=continue"));
+        assert!(lines.moved("frame=6"));
+    }
+
+    #[test]
+    fn the_processor_time_of_a_process_is_read() {
+        let began = processor_time(std::process::id()).unwrap();
+        let until = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < until {
+            std::hint::black_box(0);
+        }
+        assert!(processor_time(std::process::id()).unwrap() > began);
+        assert_eq!(processor_time(u32::MAX), None);
+    }
+
+    #[test]
+    fn a_pause_is_not_a_stall() {
+        let (mut tools, dir) = stand_in("paused", "exec sleep 0.2\n", 1);
+        let hooks = Arc::new(Hooks::new(|_| {}));
+        tools.hooks = Some(hooks.clone());
+        hooks.pause();
+        let resume = hooks.clone();
+        let later = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(4));
+            resume.resume();
+        });
+        tools.run(&strings(&["out.mkv"])).unwrap();
+        later.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failure_of_ffmpeg_is_not_called_a_stall() {
+        let (tools, dir) = stand_in("fails", "echo 'it broke' >&2\nexit 3\n", 60);
+        let e = tools.run(&strings(&["out.mkv"])).unwrap_err().to_string();
+        assert!(e.contains("it broke") && !e.contains("stopped making progress"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn strings(args: &[&str]) -> Vec<String> {

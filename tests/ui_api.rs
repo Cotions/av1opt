@@ -1096,10 +1096,15 @@ fn waiting_jobs_can_be_moved_first_and_stopped_ones_queued_again() {
 /// and watches get as far as what comes before an encode. `on_a_file` is the shell text ffprobe
 /// runs when asked about a file.
 fn stand_in_tools(name: &str, on_a_file: &str) -> (String, String) {
+    stand_in_tools_running(name, on_a_file, "")
+}
+
+/// Like [`stand_in_tools`], with `on_a_run` as the shell text ffmpeg runs when asked to work.
+fn stand_in_tools_running(name: &str, on_a_file: &str, on_a_run: &str) -> (String, String) {
     let bin = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("tools-{name}"));
     let _ = std::fs::remove_dir_all(&bin);
     std::fs::create_dir_all(&bin).unwrap();
-    let ffmpeg = "#!/bin/sh\n[ \"$1\" = --ready ] && exit 0\ncase \"$2\" in\n-version) echo 'ffmpeg version 8.0';;\n-encoders) echo ' V....D libsvtav1 SVT-AV1';;\n-filters) echo ' ... libvmaf VV->V VMAF';;\nesac\n".to_string();
+    let ffmpeg = format!("#!/bin/sh\n[ \"$1\" = --ready ] && exit 0\ncase \"$2\" in\n-version) echo 'ffmpeg version 8.0';;\n-encoders) echo ' V....D libsvtav1 SVT-AV1';;\n-filters) echo ' ... libvmaf VV->V VMAF';;\n-nostdin) {on_a_run}\n;;\nesac\n");
     let ffprobe = format!("#!/bin/sh\n[ \"$1\" = --ready ] && exit 0\nif [ \"$2\" = -version ]; then echo 'ffprobe version 8.0'; exit 0; fi\n{on_a_file}\n");
     let write = |file: &str, text: &str| {
         use std::os::unix::fs::PermissionsExt;
@@ -1121,6 +1126,79 @@ fn stand_in_tools(name: &str, on_a_file: &str) -> (String, String) {
         path.to_str().unwrap().to_string()
     };
     (write("ffmpeg", &ffmpeg), write("ffprobe", &ffprobe))
+}
+
+/// A stand-in ffmpeg that writes its output, except for a file with `hang` in its name: there
+/// it notes its process number beside itself and never ends.
+const HANGS_ON_ONE_FILE: &str = "case \"$*\" in\n*hang*) echo $$ > \"$(dirname \"$0\")/hung\"; exec sleep 600;;\nesac\nfor last; do :; done\nprintf x > \"$last\"";
+
+const A_VIDEO: &str = r#"echo '{"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":64,"height":64,"pix_fmt":"yuv420p","r_frame_rate":"25/1","avg_frame_rate":"25/1","duration":"9"}],"format":{"format_name":"mov","duration":"9","size":"2"}}'"#;
+
+/// A server whose ffmpeg hangs on `hang.mp4`, given `limit` seconds, with both clips listed.
+fn server_with_a_clip_that_hangs(name: &str, limit: &str) -> (Server, PathBuf, PathBuf, PathBuf) {
+    let (ffmpeg, ffprobe) = stand_in_tools_running(name, A_VIDEO, HANGS_ON_ONE_FILE);
+    let hung = Path::new(&ffmpeg).with_file_name("hung");
+    let s = Server::launch_with(name, &ffmpeg, &ffprobe, &[("AV1OPT_PREVIEW_LIMIT_SECS", limit)], |d| {
+        for clip in ["hang.mp4", "fine.mp4", "other.mp4"] {
+            std::fs::write(d.join("videos").join(clip), b"xx").unwrap();
+        }
+    });
+    s.wait_for_restored_jobs();
+    let (hangs, fine) = (s.dir.join("videos/hang.mp4"), s.dir.join("videos/fine.mp4"));
+    for clip in [&hangs, &fine, &s.dir.join("videos/other.mp4")] {
+        let r = s.post("/api/source", &json!({ "path": clip }));
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+    (s, hangs, fine, hung)
+}
+
+/// Waits for the stand-in to be hanging, and returns its process number.
+fn hanging_process(hung: &Path) -> String {
+    let started = Instant::now();
+    loop {
+        if let Some(pid) = std::fs::read_to_string(hung).ok().filter(|p| p.ends_with('\n')) {
+            return pid.trim().to_string();
+        }
+        assert!(started.elapsed() < Duration::from_secs(20), "ffmpeg was not started");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn a_preview_that_hangs_is_killed_and_holds_up_no_other() {
+    let (s, hangs, fine, hung) = server_with_a_clip_that_hangs("hung-preview", "4");
+    let preview = |clip: &Path| s.post("/api/preview", &json!({ "path": clip, "kind": "remux" }));
+    std::thread::scope(|scope| {
+        let hanging = scope.spawn(|| preview(&hangs));
+        let pid = hanging_process(&hung);
+        // While it hangs another clip is made, as the hung one holds only its own lock.
+        let r = preview(&fine);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(!hanging.is_finished(), "the other clip waited for the hung one to be stopped");
+        let r = hanging.join().unwrap();
+        assert!(r.status >= 400 && r.body.contains("no answer within 4 s"), "{} {}", r.status, r.body);
+        assert!(!Path::new("/proc").join(&pid).exists(), "ffmpeg {pid} is still there");
+    });
+    // Its turn was given back, and nothing of it is left to be taken for a preview.
+    let r = preview(&s.dir.join("videos/other.mp4"));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let left: Vec<String> = std::fs::read_dir(s.dir.join("cache/av1opt/previews")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.contains(".part.")).collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
+fn a_thumbnail_that_hangs_is_killed_and_holds_up_no_other() {
+    let (s, hangs, fine, hung) = server_with_a_clip_that_hangs("hung-thumb", "4");
+    let thumb = |clip: &Path| s.get(&format!("/thumb?path={}&t=1", clip.display()));
+    std::thread::scope(|scope| {
+        let hanging = scope.spawn(|| thumb(&hangs));
+        let pid = hanging_process(&hung);
+        let r = thumb(&fine);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(!hanging.is_finished());
+        assert_ne!(hanging.join().unwrap().status, 200);
+        assert!(!Path::new("/proc").join(&pid).exists(), "ffmpeg {pid} is still there");
+    });
 }
 
 fn saved_queue(s: &Server) -> Value {

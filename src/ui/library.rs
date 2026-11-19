@@ -1,5 +1,6 @@
 //! Folder browsing, scans, encode history (the `.av1opt.json` reports) and playback previews.
 
+use super::turns::Turns;
 use super::{App, now, text_path};
 use crate::estimate::{Model, TimeModel, Verdict};
 use crate::history;
@@ -13,7 +14,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
 fn base_dir(var: &str, fallback: &str) -> Option<PathBuf> {
     std::env::var_os(var).map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(fallback)))
@@ -719,6 +720,16 @@ const NOT_OPENED: &str = "this file was not opened: only a report names it, and 
 /// What the page gets for a path it did not list in this session, or one that has since gone.
 pub const NOT_LISTED: &str = "this file is not among those the page has listed, or it has moved; reload the page or pick the file again";
 
+/// How long ffmpeg gets to make a preview. It is cut to two minutes of video at most, so one
+/// taking longer has met a file or a drive that does not answer.
+const PREVIEW_LIMIT: Duration = Duration::from_secs(600);
+
+/// `normal`, or the time set in `AV1OPT_PREVIEW_LIMIT_SECS` for what the page asks ffmpeg to
+/// make while someone waits.
+pub fn time_limit(normal: Duration) -> Duration {
+    std::env::var("AV1OPT_PREVIEW_LIMIT_SECS").ok().and_then(|s| s.parse().ok()).filter(|s| *s > 0).map_or(normal, Duration::from_secs)
+}
+
 /// Builds (or reuses) a playable stand-in for a file the browser can't play directly.
 pub fn preview(app: &App, body: &Value) -> Result<Value> {
     let r: PreviewRequest = serde_json::from_value(body.clone())?;
@@ -730,12 +741,16 @@ pub fn preview(app: &App, body: &Value) -> Result<Value> {
     let key = format!("{}|{}|{}|{mtime}|{start:.3}|{secs:.3}", r.kind, src.display(), meta.len());
     let out = app.preview_dir.join(format!("{:016x}.mp4", crate::scenes::fnv1a(&key)));
     let url = |p: &Path| format!("/media?path={}", percent_encode(&p.to_string_lossy()));
-    // One preview at a time: they are CPU-heavy and a second request for the same clip waits
-    // for the first instead of encoding it twice.
-    let _guard = app.preview_lock.lock().unwrap_or_else(|e| e.into_inner());
+    // A second request for the same clip waits for the first instead of encoding it twice.
+    // Other clips only wait for a turn: previews are CPU-heavy, and one that hangs until its
+    // time limit leaves the other turn free.
+    static TURNS: Turns = Turns::new(2);
+    let clip = TURNS.clip(&key);
+    let _same_clip = clip.lock().unwrap_or_else(|e| e.into_inner());
     if out.exists() {
         return Ok(json!({ "url": url(&out), "start": start, "secs": secs, "kind": r.kind }));
     }
+    let _turn = TURNS.wait();
     let info = crate::probe::probe(&app.ffprobe(), &src, meta.len())?;
     let part = out.with_extension("part.mp4");
     let mut a: Vec<String> = vec!["-y".into(), "-v".into(), "error".into()];
@@ -760,7 +775,10 @@ pub fn preview(app: &App, body: &Value) -> Result<Value> {
     let mut tools = app.tools(1);
     // Tracked so shutting down stops a preview transcode too.
     tools.hooks = Some(app.preview_hooks.clone());
-    tools.run(&a).context("preview encode failed")?;
+    if let Err(e) = tools.run_capture(&a, time_limit(PREVIEW_LIMIT)) {
+        let _ = std::fs::remove_file(&part);
+        return Err(e.context("preview encode failed"));
+    }
     std::fs::rename(&part, &out)?;
     Ok(json!({ "url": url(&out), "start": start, "secs": secs, "kind": r.kind }))
 }

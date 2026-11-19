@@ -1,6 +1,7 @@
 //! Duplicate search for the page: runs in the background with progress events, keeps the last
 //! results, serves frame thumbnails and describes a pair of files for the comparison player.
 
+use super::turns::Turns;
 use super::{App, library, now};
 use crate::dups::{self, File, Progress, Report, matching::Prefs};
 use crate::events::Hooks;
@@ -12,7 +13,7 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 pub struct Run {
     id: u64,
@@ -302,6 +303,9 @@ fn trim_thumbs(keep: usize) {
     }
 }
 
+/// How long ffmpeg gets to find one frame.
+const THUMB_LIMIT: Duration = Duration::from_secs(60);
+
 /// A small JPEG of the frame at `t` seconds of a file from a result (made once, then cached).
 pub fn thumb(app: &App, path: &Path, t: f64) -> Result<Vec<u8>> {
     let src = app.is_allowed(path).filter(|c| is_video(c)).ok_or_else(|| anyhow!(library::NOT_LISTED))?;
@@ -312,10 +316,13 @@ pub fn thumb(app: &App, path: &Path, t: f64) -> Result<Vec<u8>> {
     let dir = thumb_dir().context("no cache folder for thumbnails")?;
     crate::fsguard::ensure_writable_location(&dir, false)?;
     let out = dir.join(format!("{key:016x}.jpg"));
-    // A page of results asks for dozens at once; three ffmpeg runs at a time is plenty.
-    static SLOTS: [Mutex<()>; 3] = [Mutex::new(()), Mutex::new(()), Mutex::new(())];
-    let _slot = SLOTS[(key % 3) as usize].lock().unwrap_or_else(|e| e.into_inner());
+    // A page of results asks for dozens at once; three ffmpeg runs at a time is plenty, and
+    // the same picture is made once.
+    static TURNS: Turns = Turns::new(3);
+    let picture = TURNS.clip(&format!("{key:016x}"));
+    let _same_picture = picture.lock().unwrap_or_else(|e| e.into_inner());
     if !out.exists() {
+        let _turn = TURNS.wait();
         let part = dir.join(format!("{key:016x}.part.jpg"));
         let mut a: Vec<String> = ["-y", "-v", "error", "-threads", "1", "-skip_loop_filter", "all", "-skip_frame", "noref", "-ss"].map(String::from).to_vec();
         a.extend([format!("{t:.3}"), "-i".into(), path_arg(&src)]);
@@ -326,7 +333,10 @@ pub fn thumb(app: &App, path: &Path, t: f64) -> Result<Vec<u8>> {
         a.push(path_arg(&part));
         let mut tools = app.tools(1);
         tools.hooks = Some(app.preview_hooks.clone());
-        tools.run(&a).context("could not read a frame")?;
+        if let Err(e) = tools.run_capture(&a, library::time_limit(THUMB_LIMIT)) {
+            let _ = std::fs::remove_file(&part);
+            return Err(e.context("could not read a frame"));
+        }
         if std::fs::metadata(&part).map_or(0, |m| m.len()) == 0 {
             let _ = std::fs::remove_file(&part);
             bail!("no frame at {t:.1} s");

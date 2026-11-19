@@ -70,13 +70,18 @@ impl Server {
 
     /// Starts a server and returns as soon as it says it is listening.
     pub fn launch(name: &str, ffmpeg: &str, ffprobe: &str, prepare: impl FnOnce(&Path)) -> Server {
+        Server::launch_with(name, ffmpeg, ffprobe, &[], prepare)
+    }
+
+    /// Like [`Server::launch`], with `environment` set for the server.
+    pub fn launch_with(name: &str, ffmpeg: &str, ffprobe: &str, environment: &[(&str, &str)], prepare: impl FnOnce(&Path)) -> Server {
         let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("ui-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("data/av1opt")).unwrap();
         std::fs::create_dir_all(dir.join("cache")).unwrap();
         std::fs::create_dir_all(dir.join("videos")).unwrap();
         prepare(&dir);
-        let mut child = Server::command(&dir, ffmpeg, ffprobe).stderr(Stdio::piped()).spawn().expect("start av1opt ui");
+        let mut child = Server::command(&dir, ffmpeg, ffprobe).envs(environment.iter().copied()).stderr(Stdio::piped()).spawn().expect("start av1opt ui");
         let mut err = BufReader::new(child.stderr.take().unwrap());
         let mut port = None;
         let mut seen = String::new();

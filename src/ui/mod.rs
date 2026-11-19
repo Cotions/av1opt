@@ -16,6 +16,7 @@ mod hold;
 mod http;
 mod jobs;
 mod library;
+mod turns;
 mod watch;
 
 use crate::tools::{Capabilities, Tools};
@@ -106,7 +107,6 @@ pub struct App {
     /// The benchmark of this session, running or finished.
     pub bench: Mutex<Option<bench::Run>>,
     pub preview_dir: PathBuf,
-    pub preview_lock: Mutex<()>,
     /// Shared by preview transcodes so shutdown can stop them.
     pub preview_hooks: Arc<crate::events::Hooks>,
     /// Capabilities of the current ffmpeg/ffprobe pair, keyed by their paths.
@@ -423,7 +423,6 @@ pub fn run(cfg: Config) -> Result<()> {
         dups: Mutex::new(Vec::new()),
         bench: Mutex::new(None),
         preview_dir,
-        preview_lock: Mutex::new(()),
         preview_hooks: Arc::new(crate::events::Hooks::new(|_| {})),
         caps: Mutex::new(None),
         bench_saves: Saves::default(),

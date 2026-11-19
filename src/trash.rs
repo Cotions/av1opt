@@ -48,25 +48,75 @@ fn make_private(dir: &Path) -> std::io::Result<()> {
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
 }
 
-/// Whether `dir` will do as a trash on a drive whose top folder belongs to `top_owner`: a real
-/// folder, never a link, that is user `me`'s. Drives that map owners (sshfs, NFS, CIFS) show
-/// a user's own folders under another number, the same as the drive's top folder.
-fn usable_bin(dir: &Path, me: u32, top_owner: Option<u32>) -> std::io::Result<()> {
-    match std::fs::symlink_metadata(dir) {
-        Ok(m) if m.is_dir() && (m.uid() == me || Some(m.uid()) == top_owner) => Ok(()),
-        Ok(_) => Err(std::io::Error::other(format!("{} is not a folder of this user's", dir.display()))),
-        Err(e) => Err(e),
+/// Whether what this user creates in `dir` shows up as belonging to `owner`. Drives that map
+/// owners (sshfs, NFS, CIFS) show a user's own folders under another number, and a small file
+/// is the one proof of that: in another user's closed folder it cannot even be made.
+fn own_files_show_as(dir: &Path, owner: u32) -> bool {
+    let probe = dir.join(format!(".av1opt-owner-check-{}", std::process::id()));
+    let Ok(file) = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&probe) else { return false };
+    let shown = file.metadata().map(|m| m.uid());
+    let _ = std::fs::remove_file(&probe);
+    shown.is_ok_and(|uid| uid == owner)
+}
+
+/// Whether `dir` can be trusted with what is thrown away: a real folder, never a link, that is
+/// user `me`'s and that nobody else can write to. Anyone who could would be able to take the
+/// files out, or put others in their place.
+fn usable_bin(dir: &Path, me: u32) -> std::io::Result<()> {
+    let m = std::fs::symlink_metadata(dir)?;
+    let refused = |why: &str| Err(std::io::Error::other(format!("{} {why}", dir.display())));
+    if !m.is_dir() {
+        return refused("is not a folder of this user's");
     }
+    if m.mode() & 0o022 != 0 {
+        return refused("can be written to by other users; `chmod go-w` on it would make it usable");
+    }
+    if m.uid() != me && !own_files_show_as(dir, m.uid()) {
+        return refused("is not a folder of this user's");
+    }
+    Ok(())
+}
+
+/// Makes what is missing of the trash at `dir`, and checks all three folders it consists of.
+fn ready_bin(dir: &Path, me: u32) -> std::io::Result<()> {
+    for folder in [dir.to_path_buf(), dir.join("files"), dir.join("info")] {
+        make_private(&folder)?;
+        usable_bin(&folder, me)?;
+    }
+    Ok(())
+}
+
+/// The trash at the top of a drive, as the specification orders them: `.Trash/<uid>` when an
+/// administrator set up a shared `.Trash`, else `.Trash-<uid>`.
+fn bin_on_drive(top: &Path, uid: u32, me: u32) -> std::io::Result<Bin> {
+    // A shared `.Trash` counts only as a real folder with the sticky bit, as the specification
+    // asks: anything else could be another user's trap.
+    let shared = top.join(".Trash");
+    let shared_ok = std::fs::symlink_metadata(&shared).is_ok_and(|m| m.is_dir() && m.mode() & 0o1000 != 0);
+    let mut last = None;
+    for dir in [shared_ok.then(|| shared.join(uid.to_string())), Some(top.join(format!(".Trash-{uid}")))].into_iter().flatten() {
+        // On a drive others write to, a folder of that name can be someone's link to anywhere,
+        // or their own folder.
+        match ready_bin(&dir, me) {
+            Ok(()) => return Ok(Bin { dir, relative_to: Some(top.to_path_buf()) }),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("cannot make one")))
 }
 
 /// The trash for a file on device `dev`: the home trash when that is on the same filesystem,
-/// else the one at the top of the file's filesystem (`.Trash/<uid>` when an administrator set
-/// one up, `.Trash-<uid>` otherwise).
+/// else the one at the top of the file's filesystem.
 fn bin_for(path: &Path, dev: u64, home: Option<&Path>, uid: u32) -> Result<Bin> {
+    // SAFETY: getuid has no failure mode and touches no memory.
+    let me = unsafe { libc::getuid() };
     if let Some(home) = home
         && make_private(home).is_ok()
         && std::fs::metadata(home).is_ok_and(|m| m.dev() == dev)
     {
+        // The specification knows no other place for a file of this drive: better no trash
+        // than one that others can reach.
+        ready_bin(home, me).with_context(|| format!("cannot use the trash at {}", home.display()))?;
         return Ok(Bin { dir: home.to_path_buf(), relative_to: None });
     }
     // The top of the filesystem: the last parent still on the same device.
@@ -78,24 +128,7 @@ fn bin_for(path: &Path, dev: u64, home: Option<&Path>, uid: u32) -> Result<Bin> 
         }
     }
     let top = top.with_context(|| format!("cannot tell which drive {} is on", path.display()))?;
-    // A shared `.Trash` counts only as a real folder with the sticky bit, as the specification
-    // asks: anything else could be another user's trap.
-    let shared = top.join(".Trash");
-    let shared_ok = std::fs::symlink_metadata(&shared).is_ok_and(|m| m.is_dir() && m.mode() & 0o1000 != 0);
-    let candidates = [shared_ok.then(|| shared.join(uid.to_string())), Some(top.join(format!(".Trash-{uid}")))];
-    // SAFETY: getuid has no failure mode and touches no memory.
-    let me = unsafe { libc::getuid() };
-    let top_owner = std::fs::metadata(top).ok().map(|m| m.uid());
-    let mut last = None;
-    for dir in candidates.into_iter().flatten() {
-        // On a drive others write to, a folder of that name can be someone's link to
-        // anywhere, or their own folder.
-        match make_private(&dir).and_then(|()| usable_bin(&dir, me, top_owner)) {
-            Ok(()) => return Ok(Bin { dir, relative_to: Some(top.to_path_buf()) }),
-            Err(e) => last = Some(e),
-        }
-    }
-    bail!("no trash on the drive of {} ({}): {}", path.display(), top.display(), last.map_or("cannot make one".to_string(), |e| e.to_string()))
+    bin_on_drive(top, uid, me).map_err(|e| anyhow::anyhow!("no trash on the drive of {} ({}): {e}", path.display(), top.display()))
 }
 
 /// Percent-encoding of the info file's `Path=`: everything but unreserved characters and `/`.
@@ -134,7 +167,6 @@ pub(crate) fn trash_with(path: &Path, home: Option<&Path>, uid: u32, when: Strin
     let name = path.file_name().with_context(|| format!("{} has no name", path.display()))?;
     let bin = bin_for(path, meta.dev(), home, uid)?;
     let (files, info) = (bin.dir.join("files"), bin.dir.join("info"));
-    make_private(&files).and_then(|_| make_private(&info)).with_context(|| format!("cannot use the trash at {}", bin.dir.display()))?;
     let recorded = match &bin.relative_to {
         Some(top) => path.strip_prefix(top).unwrap_or(path),
         None => path,
@@ -515,28 +547,124 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Files on another filesystem than the home trash stay on theirs. `/dev/shm` is the one
-    /// other filesystem a test can count on; where it isn't one, there is nothing to check.
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
     #[test]
-    fn a_trash_on_a_drive_that_maps_owners_is_recognised() {
+    fn a_trash_on_a_drive_that_maps_owners_is_recognised_by_what_is_made_in_it() {
         let dir = scratch("owners");
         let bin = dir.join(".Trash-1000");
-        std::fs::create_dir_all(&bin).unwrap();
+        make_private(&bin).unwrap();
         std::os::unix::fs::symlink(&bin, dir.join("link")).unwrap();
         std::fs::write(dir.join("file"), b"x").unwrap();
         let owner = std::fs::metadata(&bin).unwrap().uid();
-        // A number this user does not go by on the drive, as with sshfs or NFS.
+        // A number this user does not go by on the drive, as with sshfs or NFS: what is made
+        // in the folder shows up under the folder's owner, so it is this user's.
         let me = owner.wrapping_add(1);
-        assert!(usable_bin(&bin, owner, None).is_ok());
-        assert!(usable_bin(&bin, me, Some(owner)).is_ok());
-        let refused = usable_bin(&bin, me, Some(me)).unwrap_err().to_string();
-        assert!(refused.ends_with("is not a folder of this user's"), "{refused}");
-        assert!(usable_bin(&bin, me, None).is_err());
+        assert!(usable_bin(&bin, owner).is_ok());
+        assert!(usable_bin(&bin, me).is_ok());
+        assert_eq!(std::fs::read_dir(&bin).unwrap().count(), 0, "the proof is not left behind");
+        // A folder this user cannot make anything in is somebody else's.
+        // SAFETY: a plain query of this process's user.
+        if unsafe { libc::geteuid() } != 0 {
+            set_mode(&bin, 0o500);
+            let refused = usable_bin(&bin, me).unwrap_err().to_string();
+            set_mode(&bin, 0o700);
+            assert!(refused.ends_with("is not a folder of this user's"), "{refused}");
+        }
         // A link or a file is no trash, whoever it seems to belong to.
-        assert!(usable_bin(&dir.join("link"), owner, Some(owner)).is_err());
-        assert!(usable_bin(&dir.join("file"), owner, Some(owner)).is_err());
+        assert!(usable_bin(&dir.join("link"), owner).is_err());
+        assert!(usable_bin(&dir.join("file"), owner).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn a_trash_others_can_write_to_is_refused_and_nothing_moves() {
+        let dir = scratch("open");
+        let me = std::fs::metadata(&dir).unwrap().uid();
+        for mode in [0o777, 0o775, 0o757, 0o1777] {
+            let bin = dir.join(format!("bin{mode:o}"));
+            make_private(&bin).unwrap();
+            set_mode(&bin, mode);
+            let refused = usable_bin(&bin, me).unwrap_err().to_string();
+            assert!(refused.contains("can be written to by other users"), "{refused}");
+        }
+        for mode in [0o700, 0o755, 0o750] {
+            let bin = dir.join(format!("fine{mode:o}"));
+            make_private(&bin).unwrap();
+            set_mode(&bin, mode);
+            assert!(usable_bin(&bin, me).is_ok(), "{mode:o}");
+        }
+        // The same goes for the folders inside, in the user's own trash too.
+        let home = dir.join("Trash");
+        make_private(&home.join("info")).unwrap();
+        set_mode(&home.join("info"), 0o777);
+        let a = dir.join("a.mkv");
+        std::fs::write(&a, b"x").unwrap();
+        let e = format!("{:#}", trash_with(&a, Some(&home), 1000, "x".into()).unwrap_err());
+        assert!(e.contains("cannot use the trash") && e.contains("can be written to by other users"), "{e}");
+        assert!(a.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_link_inside_a_trash_leads_nothing_there() {
+        let dir = scratch("inner-link");
+        let home = dir.join("Trash");
+        let away = dir.join("away");
+        make_private(&home).unwrap();
+        make_private(&away).unwrap();
+        std::os::unix::fs::symlink(&away, home.join("files")).unwrap();
+        let a = dir.join("a.mkv");
+        std::fs::write(&a, b"x").unwrap();
+        let e = format!("{:#}", trash_with(&a, Some(&home), 1000, "x".into()).unwrap_err());
+        assert!(e.contains("is not a folder of this user's"), "{e}");
+        assert!(a.exists() && std::fs::read_dir(&away).unwrap().count() == 0);
+        assert!(!home.join("info").read_dir().is_ok_and(|mut d| d.next().is_some()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_drive_falls_back_from_the_shared_trash_as_the_specification_says() {
+        let top = scratch("fallback");
+        let me = std::fs::metadata(&top).unwrap().uid();
+        let own = top.join(".Trash-77");
+        let shared = top.join(".Trash");
+        // Nothing set up: the user's own folder at the top, made private.
+        assert_eq!(bin_on_drive(&top, 77, me).unwrap().dir, own);
+        assert_eq!(std::fs::metadata(own.join("files")).unwrap().mode() & 0o777, 0o700);
+        // A `.Trash` without the sticky bit is passed over.
+        make_private(&shared).unwrap();
+        assert_eq!(bin_on_drive(&top, 77, me).unwrap().dir, own);
+        assert!(!shared.join("77").exists());
+        // With it, the user's folder in there comes first.
+        set_mode(&shared, 0o1777);
+        assert_eq!(bin_on_drive(&top, 77, me).unwrap().dir, shared.join("77"));
+        // One whose `files` leads elsewhere is passed over as well.
+        std::fs::remove_dir(shared.join("77/files")).unwrap();
+        std::os::unix::fs::symlink(top.join("elsewhere"), shared.join("77/files")).unwrap();
+        assert_eq!(bin_on_drive(&top, 77, me).unwrap().dir, own);
+        // A `.Trash` that is a link is no shared trash.
+        std::fs::remove_file(shared.join("77/files")).unwrap();
+        set_mode(&shared, 0o700);
+        std::fs::remove_dir_all(&shared).unwrap();
+        let real = top.join("real");
+        make_private(&real).unwrap();
+        set_mode(&real, 0o1777);
+        std::os::unix::fs::symlink(&real, &shared).unwrap();
+        assert_eq!(bin_on_drive(&top, 77, me).unwrap().dir, own);
+        assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
+        // With neither usable there is no trash, and the message says what is wrong.
+        set_mode(&own, 0o777);
+        let refused = bin_on_drive(&top, 77, me).err().unwrap().to_string();
+        assert!(refused.contains("can be written to by other users"), "{refused}");
+        std::fs::remove_dir_all(&top).unwrap();
+    }
+
+    /// Files on another filesystem than the home trash stay on theirs. `/dev/shm` is the one
+    /// other filesystem a test can count on; where it isn't one, there is nothing to check.
 
     #[test]
     fn other_drives_use_their_own_trash() {
@@ -746,7 +874,7 @@ mod tests {
     fn a_file_left_in_the_trash_without_its_info_is_not_replaced() {
         let dir = scratch("leftover");
         let home = dir.join("Trash");
-        std::fs::create_dir_all(home.join("files")).unwrap();
+        make_private(&home.join("files")).unwrap();
         std::fs::write(home.join("files/clip.mp4"), b"left behind").unwrap();
         let a = dir.join("clip.mp4");
         std::fs::write(&a, b"new").unwrap();
@@ -809,7 +937,7 @@ mod tests {
     #[test]
     fn a_trash_that_is_not_there_is_not_usable() {
         let dir = scratch("missing");
-        assert_eq!(usable_bin(&dir.join("none"), 0, None).unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(usable_bin(&dir.join("none"), 0).unwrap_err().kind(), std::io::ErrorKind::NotFound);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

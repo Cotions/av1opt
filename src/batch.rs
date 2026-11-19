@@ -5,7 +5,7 @@ use crate::encode::{self, Options, Skip};
 use crate::events::{self, Event};
 use crate::source::Verdict;
 use crate::tools::Tools;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -88,7 +88,9 @@ pub fn is_out_dir_problem(error: &anyhow::Error) -> bool {
 /// last part of the path is made: with its parent missing the drive is taken to be away, and
 /// the same with a parent that is empty and on the same drive as the folder above it, which is
 /// what the mount point of an unmounted drive looks like.
+#[cfg(any(feature = "ui", test))]
 pub fn make_out_dir_once(out_dir: &Path) -> Result<()> {
+    use anyhow::Context;
     if out_dir.is_dir() {
         return Ok(());
     }
@@ -104,6 +106,7 @@ pub fn make_out_dir_once(out_dir: &Path) -> Result<()> {
     }
 }
 
+#[cfg(any(feature = "ui", test))]
 fn could_be_empty_mount_point(dir: &Path) -> bool {
     let device = |p: &Path| std::fs::metadata(p).ok().map(|m| m.dev());
     let empty = std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_none());

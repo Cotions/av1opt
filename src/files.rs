@@ -102,7 +102,7 @@ pub fn append_line(path: &Path, line: &str, follow: bool) -> std::io::Result<()>
 fn needs_line_end_first(file: &std::fs::File) -> bool {
     use std::os::unix::fs::FileExt;
     let Ok(size) = file.metadata().map(|m| m.len()) else { return true };
-    let mut last = [b'\n'];
+    let mut last = *b"\n";
     size > 0 && file.read_exact_at(&mut last, size - 1).map_or(true, |()| last[0] != b'\n')
 }
 
@@ -180,9 +180,8 @@ pub fn whole_digest(path: &Path, size: u64, got: &AtomicU64, stop: &AtomicBool) 
             return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "the file is shorter than it was"));
         }
         // A block is a whole number of words, so only the last one can end inside a word.
-        let words = buffer[..room].chunks_exact(8);
-        let end = words.remainder();
-        hash = words.fold(hash, |h, w| mix_word(h, u64::from_le_bytes(w.try_into().expect("eight bytes"))));
+        let (words, end) = buffer[..room].as_chunks::<8>();
+        hash = words.iter().fold(hash, |h, word| mix_word(h, u64::from_le_bytes(*word)));
         if !end.is_empty() {
             let mut last = [0; 8];
             last[..end.len()].copy_from_slice(end);

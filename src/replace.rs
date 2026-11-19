@@ -163,6 +163,7 @@ pub fn check(report: &Path) -> Check {
 
 /// [`check`] for a list of reports, which does not read whole originals: one that would have to
 /// be read is listed as ready, and replacing it checks it in full.
+#[cfg(any(feature = "ui", test))]
 pub fn check_for_list(report: &Path) -> Check {
     check_judging(report, Judging { for_list: true, ..Judging::default() })
 }
@@ -442,10 +443,12 @@ impl Drop for Lock {
 /// copied next to the original under a hidden name, so a copy that fails (no room, a read
 /// error) leaves the original untouched; its old file is removed once the copy is in place.
 /// The hidden file is only ever a copy: deleting one never loses anything.
+#[cfg(feature = "ui")]
 pub fn apply(report: &Path, allow_zfs: bool) -> Result<Done> {
     apply_with(report, allow_zfs, &trash::trash)
 }
 
+#[cfg(any(feature = "ui", test))]
 fn apply_with(report: &Path, allow_zfs: bool, to_trash: &dyn Fn(&Path) -> Result<PathBuf>) -> Result<Done> {
     apply_judging(report, allow_zfs, Judging::default(), to_trash)
 }

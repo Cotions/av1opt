@@ -629,7 +629,11 @@ function pick({ title, mode = "dir", start }) {
     const files = new Set();
     let cur = start || prefs.get("pickerDir", "") || (STATE && STATE.home) || "/";
     let hidden = false;
-    const pathEl = h("div", { class: "picker-path" });
+    // The folder shown, which can also be typed: Enter goes there. A path that cannot be listed
+    // (none, not a folder, not readable) is said under the field, and the folder stays.
+    const pathIn = h("input", { type: "text", class: "picker-path", spellcheck: "false", autocomplete: "off", title: "Type a folder and press Enter",
+      onkeydown: (e) => { if (e.key !== "Enter") return; e.preventDefault(); const p = pathIn.value.trim(); if (p) go(p); } });
+    const pathErr = h("div", { class: "bad picker-error", role: "alert", hidden: true });
     const list = h("ul", { class: "picker-list" });
     const places = h("div", { class: "places" });
     const selInfo = h("span", { class: "dim grow" });
@@ -653,10 +657,11 @@ function pick({ title, mode = "dir", start }) {
       const isNewest = askFolder();
       let r;
       try { r = await api("/api/browse?path=" + encodeURIComponent(p) + (hidden ? "&hidden=1" : "")); }
-      catch (e) { if (!isNewest()) return; if (opening) return go(""); toast(e.message, true); return; }
+      catch (e) { if (!isNewest()) return; if (opening) return go(""); pathErr.textContent = e.message; pathErr.hidden = false; return; }
       if (!isNewest()) return;
       cur = r.path;
-      pathEl.textContent = r.path;
+      pathIn.value = r.path;
+      pathErr.hidden = true;
       places.replaceChildren(...r.places.map((pl) => h("button", { class: "small", onclick: () => go(pl.path) }, pl.name)));
       const join = (n) => (r.path === "/" ? "/" : r.path + "/") + n;
       const items = [];
@@ -715,7 +720,9 @@ function pick({ title, mode = "dir", start }) {
       h("div", { class: "modal" },
         h("div", { class: "head" }, h("strong", {}, title || "Pick a folder"), h("span", { class: "spacer" }),
           h("label", { class: "check dim" }, h("input", { type: "checkbox", onchange: (e) => { hidden = e.target.checked; go(cur); } }), "hidden")),
-        h("div", { class: "body" }, places, h("div", { class: "row" }, pathEl), h("hr", { class: "dim" }), list),
+        h("div", { class: "body" },
+          h("label", { class: "picker-go" }, h("span", { class: "dim" }, "Folder"), pathIn), pathErr,
+          places, h("hr", { class: "dim" }), list),
         h("div", { class: "foot" }, selInfo, h("button", { onclick: () => close(null) }, "Cancel"), choose)));
     document.body.append(bg);
     const release = holdFocus(bg, () => close(null));

@@ -692,6 +692,41 @@ checks["form numbers are remembered when they change to one their field takes, a
   const kept = page.remembered("benchForm");
   assert.deepStrictEqual([kept.vmaf, kept.videos, kept.presets, kept.params], [90, 3, [2, 5], "tune=0"]);
 };
+checks["folder picker: a typed path is gone to on Enter, and one that is no folder is said in place"] = async () => {
+  const listing = (path, dirs) => ({ path, parent: "/", places: [], dirs, files: [{ name: "file.mp4", size: 1 }] });
+  const asked = [];
+  const page = openPage((path) => {
+    if (!path.startsWith("/api/browse")) return {};
+    const p = new URLSearchParams(path.split("?")[1]).get("path");
+    asked.push(p);
+    if (p === "/s") return listing("/s", ["a"]);
+    if (p === "/s/a") return listing("/s/a", ["deeper"]);
+    return { refuse: `cannot list ${p}: Not a directory (os error 20)` };
+  }, { pickerDir: "/s" });
+  await settled();
+  page.run("var __picked; pick({ title: 'Pick a folder' }).then((v) => (__picked = v))");
+  await settled();
+  const body = page.document.body;
+  const field = body.field("Folder");
+  assert.strictEqual(field.value, "/s");
+  const enter = (value) => { field.value = value; for (const fn of field.listeners.keydown) fn({ key: "Enter", target: field, preventDefault() {} }); };
+  const error = () => body.all().find((e) => e.names().includes("picker-error"));
+  const rows = () => body.all().filter((e) => e.tag === "li").map((e) => e.textContent);
+  enter("/s/a");
+  await settled();
+  assert.strictEqual(field.value, "/s/a");
+  assert(rows().some((t) => t.includes("deeper")), rows().join(" | "));
+  assert(error().hidden);
+  enter("/s/a/file.mp4");
+  await settled();
+  assert(!error().hidden && error().textContent.includes("Not a directory"), "the refusal is not said under the field");
+  assert.strictEqual(page.toasts.length, 0, "the refusal went to a passing message");
+  assert(rows().some((t) => t.includes("deeper")), "the folder shown changed");
+  await body.named("button", "Use this folder").click();
+  await settled();
+  assert.deepStrictEqual([...page.context.__picked], ["/s/a"]);
+  assert.deepStrictEqual(asked, ["/s", "/s/a", "/s/a/file.mp4"]);
+};
 checks["scan table: dashes sort last, names as people count, and select all stops at what is drawn"] = async () => {
   const page = openPage(() => ({}), { scanFilter: "all" });
   await settled();

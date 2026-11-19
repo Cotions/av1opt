@@ -784,6 +784,8 @@ av1opt ui [--port N] [--no-open] [--memory-limit 12G]
 A local web app in the browser (Chrome or Firefox), built from the same scan and encode code:
 
 - **Scan**: pick folders, see per-file and total savings estimates, select candidates and queue them.
+  The page's folder picker (the desktop app uses the system's) has a path field at the top:
+  type a folder and press Enter to go there; a path it cannot list is said under the field.
   **Time** is the estimated search and encode time of a file and **Per hour** its saving per
   hour of encoding (click to sort); the selection line adds up both for the ticked files.
   **Most saved in N h → Pick** ticks the candidates that save the most together in that many

@@ -1187,20 +1187,26 @@ fn outputs_from_before_the_record_are_adopted_and_then_work_on_the_page() {
     let r = s.post("/api/replace", &json!({ "report": report }));
     assert!(r.status == 400 && r.body.contains("no record of making this output"), "{}", r.body);
 
-    // Listing writes nothing.
+    // The output folder alone does not reach the original.
     let record = s.dir.join("data/av1opt/ledger.jsonl");
     let before = std::fs::read(&record).unwrap_or_default();
-    let run = adopt_command(&s.dir, &[out.as_os_str()]);
+    let said = out_of(&adopt_command(&s.dir, &[out.as_os_str(), apply]));
+    assert!(said.contains("1 report refused") && said.contains("outside the folders named here") && said.contains("--anywhere"), "{said}");
+    assert_eq!(std::fs::read(&record).unwrap_or_default(), before);
+
+    // Listing writes nothing.
+    let videos = s.dir.join("videos");
+    let run = adopt_command(&s.dir, &[out.as_os_str(), videos.as_os_str()]);
     let said = out_of(&run);
     assert!(run.status.success() && said.contains("you trust the reports") && said.contains("1 output can go on record") && said.contains("movie.mkv") && said.contains("movie.mp4") && said.contains("--apply"), "{said}");
     assert_eq!(std::fs::read(&record).unwrap_or_default(), before);
     assert_eq!(s.post("/api/replace", &json!({ "report": report })).status, 400);
 
-    let run = adopt_command(&s.dir, &[out.as_os_str(), apply]);
+    let run = adopt_command(&s.dir, &[out.as_os_str(), videos.as_os_str(), apply]);
     assert!(run.status.success(), "{}", out_of(&run));
     assert!(std::fs::read_to_string(&record).unwrap().contains(&sha256(&output)));
     assert_eq!(s.get("/api/history").json()["reports"][0]["replace"]["state"], json!("ready"));
-    let run = adopt_command(&s.dir, &[out.as_os_str(), apply]);
+    let run = adopt_command(&s.dir, &[out.as_os_str(), videos.as_os_str(), apply]);
     assert!(out_of(&run).contains("1 output is on record already") && out_of(&run).contains("0 outputs taken on record"), "{}", out_of(&run));
 
     let r = s.post("/api/replace", &json!({ "report": report }));
@@ -1231,9 +1237,12 @@ fn an_output_that_already_replaced_its_original_is_adopted_and_can_be_put_back()
     assert!(placed.exists() && !original.exists());
     assert_eq!(s.post("/api/replace/undo", &json!({ "report": report })).status, 400);
 
+    let videos = s.dir.join("videos");
     let run = adopt_command(&s.dir, &[out.as_os_str()]);
+    assert!(out_of(&run).contains("1 report refused") && out_of(&run).contains("outside the folders named here"), "{}", out_of(&run));
+    let run = adopt_command(&s.dir, &[out.as_os_str(), videos.as_os_str()]);
     assert!(out_of(&run).contains("1 output that already took the original's place"), "{}", out_of(&run));
-    let run = adopt_command(&s.dir, &[out.as_os_str(), std::ffi::OsStr::new("--apply")]);
+    let run = adopt_command(&s.dir, &[out.as_os_str(), videos.as_os_str(), std::ffi::OsStr::new("--apply")]);
     assert!(run.status.success() && out_of(&run).contains("1 output taken on record"), "{}", out_of(&run));
     let r = s.post("/api/replace/undo", &json!({ "report": report }));
     assert_eq!(r.status, 200, "{}", r.body);
@@ -1307,7 +1316,7 @@ fn adopting_closes_a_data_folder_an_earlier_version_left_open() {
     let (dir, _, _) = command_folder("ui-adopt-open-folder");
     let folder = dir.join("data/av1opt");
     std::fs::set_permissions(&folder, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    let run = adopt_command(&dir, &[dir.join("out").as_os_str(), std::ffi::OsStr::new("--apply")]);
+    let run = adopt_command(&dir, &[dir.as_os_str(), std::ffi::OsStr::new("--apply")]);
     assert!(run.status.success() && out_of(&run).contains("1 output taken on record"), "{}", out_of(&run));
     assert_eq!(std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(&folder).unwrap()) & 0o777, 0o700);
 }
@@ -1315,20 +1324,20 @@ fn adopting_closes_a_data_folder_an_earlier_version_left_open() {
 #[test]
 fn reports_that_do_not_check_out_are_not_adopted() {
     let (dir, original, output) = command_folder("ui-adopt-refused");
-    let (out, apply) = (dir.join("out"), std::ffi::OsStr::new("--apply"));
+    let (out, videos, apply) = (dir.join("out"), dir.join("videos"), std::ffi::OsStr::new("--apply"));
     let record = dir.join("data/av1opt/ledger.jsonl");
     let adopted = || std::fs::read_to_string(&record).unwrap_or_default().contains("\"adopted\"");
 
     // An original that is not the size the report says.
     std::fs::write(&original, vec![b's'; 2000]).unwrap();
-    let said = out_of(&adopt_command(&dir, &[out.as_os_str(), apply]));
+    let said = out_of(&adopt_command(&dir, &[out.as_os_str(), videos.as_os_str(), apply]));
     assert!(said.contains("1 report refused") && said.contains("the original changed since the encode"), "{said}");
     assert!(!adopted());
 
     // Of that size, but not the file its hash belongs to.
     std::fs::write(&original, vec![b's'; 3000]).unwrap();
     write_report(&dir.join("out/film.av1opt.json"), json!({ "format": 1, "input": original, "output": output, "source_bytes": 3000, "output_bytes": 1000, "source_mtime": 1000, "source_hash": "0123456789abcdef" }));
-    let said = out_of(&adopt_command(&dir, &[out.as_os_str(), apply]));
+    let said = out_of(&adopt_command(&dir, &[out.as_os_str(), videos.as_os_str(), apply]));
     assert!(said.contains("the original changed since the encode") && !adopted(), "{said}");
 
     // Neither a link nor a pipe is a report.
@@ -1336,12 +1345,12 @@ fn reports_that_do_not_check_out_are_not_adopted() {
     let real = dir.join("real-report");
     std::fs::rename(&report, &real).unwrap();
     std::os::unix::fs::symlink(&real, &report).unwrap();
-    let said = out_of(&adopt_command(&dir, &[out.as_os_str(), apply]));
+    let said = out_of(&adopt_command(&dir, &[out.as_os_str(), videos.as_os_str(), apply]));
     assert!(said.contains("the report is a link") && !adopted(), "{said}");
     std::fs::remove_file(&report).unwrap();
     let made = std::process::Command::new("mkfifo").arg(&report).status().unwrap();
     assert!(made.success());
-    let said = out_of(&adopt_command(&dir, &[out.as_os_str(), apply]));
+    let said = out_of(&adopt_command(&dir, &[out.as_os_str(), videos.as_os_str(), apply]));
     assert!(said.contains("the report is not a plain file") && !adopted(), "{said}");
     std::fs::remove_file(&report).unwrap();
 
@@ -1350,7 +1359,7 @@ fn reports_that_do_not_check_out_are_not_adopted() {
     let other = dir.join("videos/other.mp4");
     std::fs::write(&other, vec![b't'; 3000]).unwrap();
     write_record(&dir, &[encoded_line(&other, &output)]);
-    let said = out_of(&adopt_command(&dir, &[out.as_os_str(), apply]));
+    let said = out_of(&adopt_command(&dir, &[out.as_os_str(), videos.as_os_str(), apply]));
     assert!(said.contains("came from another original") && !adopted(), "{said}");
     std::fs::remove_file(&record).unwrap();
 
@@ -1359,8 +1368,142 @@ fn reports_that_do_not_check_out_are_not_adopted() {
     assert!(run.status.success(), "{}", out_of(&run));
     std::fs::remove_file(&record).unwrap();
     std::fs::remove_file(dir.join("data/Trash/files/film.mp4")).unwrap();
-    let said = out_of(&adopt_command(&dir, &[out.as_os_str(), apply]));
+    let said = out_of(&adopt_command(&dir, &[out.as_os_str(), videos.as_os_str(), apply]));
     assert!(said.contains("the original is no longer in the trash") && !adopted(), "{said}");
+}
+
+#[test]
+fn a_report_without_the_original_s_date_and_contents_is_not_adopted() {
+    let (dir, original, output) = command_folder("ui-adopt-sizes-only");
+    let (out, videos, apply) = (dir.join("out"), dir.join("videos"), std::ffi::OsStr::new("--apply"));
+    let record = dir.join("data/av1opt/ledger.jsonl");
+    let time = std::fs::metadata(&original).unwrap().modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    for (report, missing) in [
+        (json!({ "format": 1, "input": original, "output": output, "source_bytes": 3000, "output_bytes": 1000 }), "the original's date or a fingerprint or hash"),
+        (json!({ "format": 1, "input": original, "output": output, "source_bytes": 3000, "output_bytes": 1000, "source_mtime": time }), "does not hold a fingerprint or hash"),
+        (json!({ "format": 1, "input": original, "output": output, "source_bytes": 3000, "output_bytes": 1000, "source_fingerprint": "0123456789abcdef" }), "does not hold the original's date,"),
+    ] {
+        write_report(&dir.join("out/film.av1opt.json"), report);
+        let said = out_of(&adopt_command(&dir, &[out.as_os_str(), videos.as_os_str(), apply]));
+        assert!(said.contains("1 report refused") && said.contains(missing) && said.contains("--accept-changed-date"), "{said}");
+        assert!(!record.exists(), "{said}");
+    }
+}
+
+#[test]
+fn listing_what_adopt_would_take_writes_nothing() {
+    let (dir, _, _) = command_folder("ui-adopt-dry-run");
+    std::fs::remove_dir_all(dir.join("data")).unwrap();
+    let run = adopt_command(&dir, &[dir.as_os_str()]);
+    assert!(run.status.success() && out_of(&run).contains("1 output can go on record"), "{}", out_of(&run));
+    assert!(!dir.join("data").exists(), "the listing made {}", dir.join("data").display());
+}
+
+#[test]
+fn a_planted_report_is_not_adopted_and_nothing_moves_on_its_word() {
+    let s = Server::start("adopt-planted", |d| {
+        std::fs::write(d.join("videos/precious.mp4"), vec![b's'; 3000]).unwrap();
+        std::fs::create_dir_all(d.join("drop")).unwrap();
+        std::fs::write(d.join("drop/precious.mkv"), vec![b'e'; 500]).unwrap();
+        let r = json!({ "format": 1, "input": d.join("videos/precious.mp4"), "output": d.join("drop/precious.mkv"), "source_bytes": 3000, "output_bytes": 500 });
+        write_report(&d.join("drop/precious.av1opt.json"), knowing(&d.join("videos/precious.mp4"), r));
+    });
+    add_history_folder(&s, "drop");
+    let (precious, drop, report, record) = (s.dir.join("videos/precious.mp4"), s.dir.join("drop"), s.dir.join("drop/precious.av1opt.json"), s.dir.join("data/av1opt/ledger.jsonl"));
+    let apply = std::ffi::OsStr::new("--apply");
+    let adopted = || std::fs::read_to_string(&record).unwrap_or_default().contains("\"adopted\"");
+
+    // The person names the folder of downloads only: the report reaches no further.
+    let said = out_of(&adopt_command(&s.dir, &[drop.as_os_str(), apply]));
+    assert!(said.contains("1 report refused") && said.contains("outside the folders named here") && said.contains("--anywhere"), "{said}");
+    assert!(!adopted(), "{said}");
+    let said = out_of(&replace_command(&s.dir, &[drop.as_os_str(), apply]));
+    assert!(said.contains("0 originals replaced"), "{said}");
+    let r = s.post("/api/replace", &json!({ "report": report }));
+    assert!(r.status == 400 && r.body.contains("no record of making this output"), "{}", r.body);
+
+    // A path that climbs out of a folder is no path av1opt wrote.
+    let climbing = format!("{}/drop/../videos/precious.mp4", s.dir.display());
+    write_report(&report, knowing(&precious, json!({ "format": 1, "input": climbing, "output": drop.join("precious.mkv"), "source_bytes": 3000, "output_bytes": 500 })));
+    let videos = s.dir.join("videos");
+    let said = out_of(&adopt_command(&s.dir, &[drop.as_os_str(), videos.as_os_str(), apply]));
+    assert!(said.contains("1 report refused") && said.contains("with `..` in it"), "{said}");
+    assert!(!adopted(), "{said}");
+    let r = s.post("/api/replace", &json!({ "report": report }));
+    assert_eq!(r.status, 400, "{}", r.body);
+
+    assert_eq!(std::fs::read(&precious).unwrap(), vec![b's'; 3000]);
+    assert!(!videos.join("precious.mkv").exists() && nothing_in_the_trash(&s));
+}
+
+/// A report of a replacement, made up in `folder`: the original `original` went to the trash
+/// at `trashed`, and the AV1 file once at `from` is now at `output`.
+fn replacement_report(folder: &Path, original: &Path, output: &Path, from: &Path, trashed: &Path) -> Value {
+    let mut r = knowing(trashed, json!({ "format": 1, "input": original, "output": output, "source_bytes": 3000, "output_bytes": 1000 }));
+    r["replaced"] = json!({ "time": 1, "from": from, "trash": trashed });
+    write_report(&from.with_extension("av1opt.json"), r.clone());
+    assert_eq!(from.parent().unwrap(), folder);
+    r
+}
+
+#[test]
+fn a_report_of_a_replacement_is_adopted_only_where_replace_would_have_left_its_files() {
+    let s = Server::start("adopt-planted-replaced", |d| {
+        // The person's own: a video they sent to the trash, and another under its name in .mkv.
+        in_the_trash(d, &d.join("videos/old.mp4"), 3000);
+        std::fs::write(d.join("videos/old.mkv"), vec![b'n'; 1000]).unwrap();
+    });
+    let (old, neighbour, trashed, record) = (s.dir.join("videos/old.mp4"), s.dir.join("videos/old.mkv"), s.dir.join("data/Trash/files/old.mp4"), s.dir.join("data/av1opt/ledger.jsonl"));
+    let videos = s.dir.join("videos");
+    let apply = std::ffi::OsStr::new("--apply");
+    let adopted = || std::fs::read_to_string(&record).unwrap_or_default().contains("\"adopted\"");
+    let untouched = || {
+        assert_eq!(std::fs::read(&neighbour).unwrap(), vec![b'n'; 1000]);
+        assert_eq!(std::fs::read(&trashed).unwrap(), vec![b's'; 3000]);
+        assert!(!old.exists());
+    };
+
+    // One that says the AV1 file stayed in a folder of downloads: undoing it would bring the
+    // person's file out of the trash for a file of the report's choosing.
+    let first = s.dir.join("drop1");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::write(first.join("x.mkv"), vec![b'e'; 1000]).unwrap();
+    replacement_report(&first, &old, &first.join("x.mkv"), &first.join("x.mkv"), &trashed);
+    let said = out_of(&adopt_command(&s.dir, &[first.as_os_str(), videos.as_os_str(), apply]));
+    assert!(said.contains("1 report refused") && said.contains("which is not the original's place"), "{said}");
+    assert!(!adopted(), "{said}");
+
+    // One that names the person's other video as the AV1 file: undoing it would move that file
+    // into the folder of downloads. Only the folder of downloads is named.
+    let second = s.dir.join("drop2");
+    std::fs::create_dir_all(&second).unwrap();
+    replacement_report(&second, &old, &neighbour, &second.join("old.mkv"), &trashed);
+    let said = out_of(&adopt_command(&s.dir, &[second.as_os_str(), apply]));
+    assert!(said.contains("1 report refused") && said.contains("outside the folders named here"), "{said}");
+    assert!(!adopted(), "{said}");
+    add_history_folder(&s, "drop2");
+    let r = s.post("/api/replace/undo", &json!({ "report": second.join("old.av1opt.json") }));
+    assert_eq!(r.status, 400, "{}", r.body);
+
+    // One whose trash entry is of another file than the one in the report.
+    let third = s.dir.join("drop3");
+    std::fs::create_dir_all(&third).unwrap();
+    let mut r = replacement_report(&third, &old, &neighbour, &third.join("old.mkv"), &trashed);
+    r["source_fingerprint"] = json!("0123456789abcdef");
+    write_report(&third.join("old.av1opt.json"), r);
+    let said = out_of(&adopt_command(&s.dir, &[third.as_os_str(), videos.as_os_str(), apply]));
+    assert!(said.contains("the file in the trash is not the original"), "{said}");
+    assert!(!adopted(), "{said}");
+    // And one whose trash entry says it came from somewhere else.
+    let mut r = replacement_report(&third, &old, &neighbour, &third.join("old.mkv"), &trashed);
+    r["input"] = json!(videos.join("other.mp4"));
+    r["output"] = json!(videos.join("other.mkv"));
+    std::fs::write(videos.join("other.mkv"), vec![b'n'; 1000]).unwrap();
+    write_report(&third.join("old.av1opt.json"), r);
+    let said = out_of(&adopt_command(&s.dir, &[third.as_os_str(), videos.as_os_str(), apply]));
+    assert!(said.contains("the trash does not say that"), "{said}");
+    assert!(!adopted(), "{said}");
+    untouched();
 }
 
 #[test]

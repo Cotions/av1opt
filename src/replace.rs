@@ -98,7 +98,13 @@ fn full_path(r: &Value, key: &str) -> Result<PathBuf, String> {
     if !p.is_absolute() {
         return Err("report from an older av1opt, without full paths".into());
     }
-    Ok(p)
+    // `a/../b` names a file outside `a` that a check of the folder `a` would let through, and
+    // `encode` never writes one.
+    if p.components().any(|c| c == std::path::Component::ParentDir) {
+        return Err(format!("the report names a path with `..` in it ({}), which av1opt never writes", p.display()));
+    }
+    // Rebuilt from its parts, `/a/./b` and `/a/b` are one path, as they are one file.
+    Ok(p.components().collect())
 }
 
 /// Whether `report` is the report `encode` wrote for an output at `output`: the same folder,
@@ -1065,26 +1071,94 @@ fn why_it_cannot_come_back(d: &Replaced) -> Option<String> {
     })
 }
 
-fn found_for_adoption(report: &Path, judging: Judging, ledger: &crate::ledger::Ledger) -> Found {
+fn found_for_adoption(report: &Path, judging: Judging, ledger: &crate::ledger::Ledger, named: &NamedFolders) -> Found {
     use crate::ledger::Standing;
     match std::fs::symlink_metadata(report) {
         Ok(m) if m.file_type().is_symlink() => return Found::Refused("the report is a link".into()),
         Ok(m) if !m.is_file() => return Found::Refused("the report is not a plain file".into()),
         _ => {}
     }
+    if let Err(why) = holds_enough_to_adopt(report) {
+        return Found::Refused(why);
+    }
     match check_judging(report, judging) {
         Check::No(why) => Found::Refused(why),
+        Check::Ready(p) if !named.holds(&p.source) => Found::Refused(outside_named_for_adoption(&p.source)),
         Check::Ready(p) => match ledger.adopting(&p) {
             Standing::NotYet => Found::Ready(p),
             Standing::OnRecord => Found::OnRecord,
             Standing::Refused(why) => Found::Refused(why),
         },
         Check::Replaced(d) => match ledger.adopting_replaced(&d) {
-            Standing::NotYet => why_it_cannot_come_back(&d).map_or(Found::Replaced(d), Found::Refused),
+            Standing::NotYet => match why_not_adopted_replaced(&d, named) {
+                Some(why) => Found::Refused(why),
+                None => why_it_cannot_come_back(&d).map_or(Found::Replaced(d), Found::Refused),
+            },
             Standing::OnRecord => Found::OnRecord,
             Standing::Refused(why) => Found::Refused(why),
         },
     }
+}
+
+/// Whether a report holds enough of its original to take it on record: its date, and a
+/// fingerprint or a hash of its contents. Size and date alone another file can have too, and
+/// what goes on record is what the page later moves files on the strength of.
+fn holds_enough_to_adopt(report: &Path) -> Result<(), String> {
+    let r = read_report(report)?;
+    let known = Recorded::in_report(&r);
+    let missing: Vec<&str> = [
+        known.modified.is_none().then_some("the original's date"),
+        (known.fingerprint.is_none() && known.whole.is_none()).then_some("a fingerprint or hash of the original's contents"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "its report does not hold {}, which av1opt needs to take an output on record (reports written before 2026-11-18 lack them); `av1opt replace` on the output's and the original's folders, with --accept-changed-date, can still replace it",
+        missing.join(" or ")
+    ))
+}
+
+fn outside_named_for_adoption(source: &Path) -> String {
+    format!("the original {} is outside the folders named here; name its folder too, or add --anywhere if you trust this report", source.display())
+}
+
+/// Why an output that took its original's place is not taken on record, if it is not: it has
+/// to be where `replace` would have put it, and its original's place inside the folders named.
+/// The report alone says where the original is in the trash and where the AV1 file goes back
+/// to, and the page puts files there on the strength of the record.
+fn why_not_adopted_replaced(d: &Replaced, named: &NamedFolders) -> Option<String> {
+    if d.recorded_from.extension().map(|ext| d.source.with_extension(ext)).as_ref() != Some(&d.dest) {
+        return Some(format!("the report says the AV1 file is at {}, which is not the original's place, where `replace` puts it", d.dest.display()));
+    }
+    if !named.holds(&d.source) {
+        return Some(outside_named_for_adoption(&d.source));
+    }
+    None
+}
+
+/// The full check of the file in the trash, through one descriptor: its info says it came from
+/// the original's place, and its size, date and contents are those the report holds.
+fn trash_holds_the_original(d: &Replaced) -> Result<()> {
+    let file = OpenFile::open(&d.trash, d.source_bytes)?;
+    if !trash::says_came_from(&d.trash, &d.source) {
+        bail!("the trash does not say that {} came from {}", d.trash.display(), d.source.display());
+    }
+    let then = d.original.modified.context("the report does not hold the original's date")?;
+    let now = file.file.metadata().ok().as_ref().and_then(crate::source::modified_seconds);
+    if !now.is_some_and(|now| crate::source::same_time(then, now)) {
+        bail!("the file in the trash was last changed at another time than the report says of the original");
+    }
+    if !trash::is_open_file_recorded(&file.file, &d.original) {
+        bail!("the file in the trash is not the original: its contents are not what the report holds of it");
+    }
+    if !file.is_at(&d.trash) || !file.untouched() {
+        bail!("the file in the trash changed while it was being read");
+    }
+    Ok(())
 }
 
 /// Reads the output once, through the descriptor it stays compared with.
@@ -1099,11 +1173,11 @@ fn hash_of_output(path: &Path, bytes: u64) -> Result<String> {
 
 /// Looks at one report again, with nothing else acting on it, and takes it on record. False if
 /// it turned out to be there already.
-fn adopt_one(report: &Path, reads: &WholeReads) -> Result<bool> {
-    use crate::ledger::{AdoptedReplacement, Adoption, note_adopted};
+fn adopt_one(report: &Path, reads: &WholeReads, held: &mut crate::ledger::Held, named: &NamedFolders) -> Result<bool> {
+    use crate::ledger::{AdoptedReplacement, Adoption};
     let _lock = lock(report)?;
     let judging = Judging { remember: Some(reads), acting: true, ..Judging::default() };
-    match found_for_adoption(report, judging, &crate::ledger::load()) {
+    match found_for_adoption(report, judging, held.current(), named) {
         Found::Refused(why) => bail!("{why}"),
         Found::OnRecord => return Ok(false),
         Found::Ready(p) => {
@@ -1112,38 +1186,48 @@ fn adopt_one(report: &Path, reads: &WholeReads) -> Result<bool> {
             if !std::fs::symlink_metadata(&p.source).is_ok_and(|m| Stamp::of(&m) == stamp) {
                 bail!("{CHANGED_WHILE_CHECKED}");
             }
-            note_adopted(Adoption { output: &p.output, report, source: &p.source, source_bytes: p.source_bytes, original: &p.original, output_bytes: p.output_bytes, output_sha256, replaced: None })?;
+            held.note_adopted(Adoption { output: &p.output, report, source: &p.source, source_bytes: p.source_bytes, original: &p.original, output_bytes: p.output_bytes, output_sha256, replaced: None })?;
         }
         Found::Replaced(d) => {
+            trash_holds_the_original(&d)?;
             let output_sha256 = hash_of_output(&d.dest, d.output_bytes)?;
             // The report says how the original was when it was encoded, which is what it has to
             // match if the replacement is undone and the output offered again.
             let encoded = Recorded::in_report(&read_report(report).map_err(|why| anyhow!(why))?);
             let replaced = Some(AdoptedReplacement { trash: &d.trash, from: &d.recorded_from, known: &d.original });
-            note_adopted(Adoption { output: &d.dest, report, source: &d.source, source_bytes: d.source_bytes, original: &encoded, output_bytes: d.output_bytes, output_sha256, replaced })?;
+            held.note_adopted(Adoption { output: &d.dest, report, source: &d.source, source_bytes: d.source_bytes, original: &encoded, output_bytes: d.output_bytes, output_sha256, replaced })?;
         }
     }
     Ok(true)
 }
 
 /// The `adopt` command: lists which outputs under `paths` can go on av1opt's record, and with `go`
-/// writes them there. Nothing but the record is ever written.
-pub fn adopt(paths: &[PathBuf], go: bool) -> Result<()> {
-    println!("Naming a folder here says that you trust the reports in it, as `av1opt replace` on it does: what they say goes on av1opt's private record, and the page then moves these files on the strength of it.");
+/// writes them there. Nothing but the record is ever written, and without `go` nothing at all.
+/// A report is followed to an original inside the folders in `paths`, or anywhere with
+/// `anywhere`.
+pub fn adopt(paths: &[PathBuf], go: bool, anywhere: bool) -> Result<()> {
+    println!(
+        "Naming a folder here says that you trust the reports in it: what a report says of the output beside it and of its original goes on av1opt's private record, and the page then replaces that original, and puts it back, on the strength of it. A report is followed only to an original inside the folders named here{}, and is taken only if it holds the original's date and a fingerprint or hash of it that the original (or, once replaced, the file in the trash) still matches.",
+        if anywhere { " (anywhere, as --anywhere asks)" } else { "" }
+    );
     let reports = reports_found(paths, &|dirs| report_names(dirs, &|e| !e.file_type().is_dir()));
     if reports.is_empty() {
         bail!("no av1opt reports (*.av1opt.json) found there");
     }
-    crate::ledger::make_ready().context("av1opt's record of its own encodes cannot be used, so nothing can be taken on it")?;
-    let ledger = crate::ledger::load();
-    if let Some(why) = ledger.problem() {
-        bail!("av1opt's record of its own encodes cannot be used ({why}), so nothing can be taken on it");
+    if go {
+        crate::ledger::make_ready().context("av1opt's record of its own encodes cannot be used, so nothing can be taken on it")?;
     }
+    let mut held = crate::ledger::Held::load();
+    if let Some(why) = held.current().problem() {
+        let hint = if go { "" } else { "; if its folder is only open to other users, --apply closes it first" };
+        bail!("av1opt's record of its own encodes cannot be used ({why}), so nothing can be taken on it{hint}");
+    }
+    let named = NamedFolders::of(paths, anywhere);
     let reads = WholeReads::default();
-    let judging = Judging { remember: go.then_some(&reads), ..Judging::default() };
+    let judging = Judging { remember: go.then_some(&reads), listing: true, ..Judging::default() };
     let (mut ready, mut replaced, mut known, mut refused) = (Vec::new(), Vec::new(), 0, Vec::new());
     for report in &reports {
-        match found_for_adoption(report, judging, &ledger) {
+        match found_for_adoption(report, judging, held.current(), &named) {
             Found::Ready(p) => ready.push(p),
             Found::Replaced(d) => replaced.push(d),
             Found::OnRecord => known += 1,
@@ -1172,7 +1256,7 @@ pub fn adopt(paths: &[PathBuf], go: bool) -> Result<()> {
     }
     let (mut done, mut failed) = (0, 0);
     for report in wanted {
-        match adopt_one(report, &reads) {
+        match adopt_one(report, &reads, &mut held, &named) {
             Ok(added) => {
                 done += usize::from(added);
                 if added {
@@ -2311,5 +2395,88 @@ mod tests {
         std::fs::write(f.out(".av1opt-work/c.av1opt.json"), b"{}").unwrap();
         assert_eq!(reports_for(&[f.dir.join("out")]), vec![a.clone(), b.clone()]);
         assert_eq!(reports_for(&[f.out("b.mkv"), a.clone(), f.dir.join("out")]), vec![b, a]);
+    }
+
+    /// The record of this test's own, under its scratch folder, for as long as it lives.
+    fn record_in(f: &Fix) -> PathBuf {
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = Some(f.dir.join("data/av1opt")));
+        f.dir.join("data/av1opt/ledger.jsonl")
+    }
+
+    #[test]
+    fn adopt_reads_the_record_once_however_many_reports_it_takes() {
+        let f = Fix::new("adopt-once");
+        let record = record_in(&f);
+        for i in 0..2000 {
+            f.encode(&format!("v{i}.mp4"), &format!("v{i}.mkv"), 30, 10);
+        }
+        let loads = || crate::ledger::LOADS.with(std::cell::Cell::get);
+        let (before, started) = (loads(), std::time::Instant::now());
+        adopt(std::slice::from_ref(&f.dir), false, false).unwrap();
+        assert_eq!(loads() - before, 1);
+        assert!(!f.dir.join("data").exists(), "the listing wrote to the record");
+        let before = loads();
+        adopt(std::slice::from_ref(&f.dir), true, false).unwrap();
+        assert_eq!(loads() - before, 1);
+        let text = std::fs::read_to_string(&record).unwrap();
+        assert_eq!(text.lines().filter(|l| l.contains("\"adopted\"")).count(), 2000);
+        // Each report is read a handful of times, and each file once; reading the record again
+        // for each would make this quadratic.
+        assert!(started.elapsed() < std::time::Duration::from_secs(120), "{:?}", started.elapsed());
+        // What another run writes meanwhile is seen: the record is read again once it changed.
+        let mut held = crate::ledger::Held::load();
+        let before = loads();
+        held.current();
+        assert_eq!(loads() - before, 0);
+        crate::ledger::note_undone(&f.lib("v0.mp4"), &f.lib("v0.mkv"), &f.out("v0.mkv")).unwrap();
+        held.current();
+        assert_eq!(loads() - before, 1);
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
+
+    #[test]
+    fn an_original_in_the_trash_is_taken_on_record_only_if_all_of_it_is_what_the_report_holds() {
+        let f = Fix::new("adopt-trash-whole");
+        let record = record_in(&f);
+        let size = 4 << 20;
+        let report = f.encode("big.mp4", "big.mkv", size, 1000);
+        let source = f.lib("big.mp4");
+        // A byte between the samples of the fingerprint, which only the whole hash covers.
+        let mut bytes = std::fs::read(&source).unwrap();
+        bytes[(5 << 20) / 4] = b'x';
+        std::fs::write(&source, &bytes).unwrap();
+        let mut r = read_report(&report).unwrap();
+        let (_, known) = crate::source::Recorded::of(&source).unwrap();
+        r["source_mtime"] = json!(known.modified);
+        r["source_fingerprint"] = json!(known.fingerprint);
+        r["source_hash"] = json!(crate::source::whole_hash_of_open(&File::open(&source).unwrap()).unwrap());
+        write_report(&report, &r).unwrap();
+        f.apply(&report).unwrap();
+        std::fs::remove_file(&record).unwrap();
+        let trashed = f.dir.join("Trash/files/big.mp4");
+        let change = |byte: u8| {
+            let date = std::fs::metadata(&trashed).unwrap().modified().unwrap();
+            let mut bytes = std::fs::read(&trashed).unwrap();
+            bytes[(5 << 20) / 4] = byte;
+            std::fs::write(&trashed, &bytes).unwrap();
+            File::options().write(true).open(&trashed).unwrap().set_modified(date).unwrap();
+        };
+        let named = [f.dir.join("out"), f.dir.join("lib")];
+
+        change(b's');
+        let failed = adopt(&named, true, false).unwrap_err();
+        assert!(failed.to_string().contains("could not be taken on record"), "{failed:#}");
+        assert!(!record.exists() || !std::fs::read_to_string(&record).unwrap().contains("\"adopted\""));
+        change(b'x');
+        adopt(&named, true, false).unwrap();
+        assert!(std::fs::read_to_string(&record).unwrap().contains("\"adopted\""));
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
+
+    #[test]
+    fn a_path_that_climbs_out_of_a_folder_is_refused_and_one_with_dots_is_the_same_path() {
+        let r = json!({ "input": "/videos/a/../b.mp4", "output": "/videos/./a/b.mkv" });
+        assert!(full_path(&r, "input").unwrap_err().contains("with `..` in it"));
+        assert_eq!(full_path(&r, "output").unwrap(), PathBuf::from("/videos/a/b.mkv"));
     }
 }

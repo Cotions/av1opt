@@ -168,15 +168,22 @@ enum Cmd {
     /// onto it, so that the page can replace them and put their originals back. Reads the reports
     /// under the folders named and lists what each would add; only --apply writes, and only to
     /// the record. Naming a folder here says that you trust the reports in it, as naming it to
-    /// `replace` does. A report is refused unless its output and original (or, once replaced,
-    /// the original in the trash) pass the checks `replace` makes.
+    /// `replace` does. A report is followed only to originals inside the folders named here
+    /// (name the originals' folder as well as the output folder, or give --anywhere), and is
+    /// refused unless it holds the original's date and a fingerprint or hash of it, and its
+    /// output and original (or, once replaced, the original in the trash) pass the checks
+    /// `replace` makes.
     Adopt {
         /// Output folders, reports (`.av1opt.json`) or output files.
         #[arg(required = true)]
         paths: Vec<PathBuf>,
-        /// Write to the record. Without this the command only lists.
+        /// Write to the record. Without this the command only lists, and writes nothing.
         #[arg(long)]
         apply: bool,
+        /// Follow reports to originals wherever they are, not only in the folders named. A
+        /// report can name any file: use this only for reports you trust.
+        #[arg(long)]
+        anywhere: bool,
     },
     /// Compare encoder settings on your own videos: for every preset and SVT-AV1 parameter set,
     /// find the CRF that reaches the target VMAF on sample clips, then rank the settings by
@@ -606,9 +613,9 @@ fn run_command(command: Cmd) -> Result<()> {
             let paths: Vec<PathBuf> = paths.iter().map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone())).collect();
             replace::run(&paths, apply, undo, allow_zfs, accept_changed_date, anywhere)
         }
-        Cmd::Adopt { paths, apply } => {
+        Cmd::Adopt { paths, apply, anywhere } => {
             let paths: Vec<PathBuf> = paths.iter().map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone())).collect();
-            replace::adopt(&paths, apply)
+            replace::adopt(&paths, apply, anywhere)
         }
         Cmd::Bench {
             paths, presets, param_sets, target_vmaf, max_videos, samples, sample_secs, min_crf, max_crf, refresh, work_dir, save, csv, json,

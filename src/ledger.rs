@@ -38,6 +38,12 @@ thread_local! {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// How often this thread has read the record, for the tests that count it.
+    pub(crate) static LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 fn folder() -> Option<PathBuf> {
     TEST_FOLDER.with(|f| f.borrow().clone())
 }
@@ -330,7 +336,6 @@ impl Ledger {
 #[derive(Default)]
 pub struct Shared(Mutex<Option<(Option<Stamp>, Arc<Ledger>)>>);
 
-#[cfg(any(feature = "ui", test))]
 type Stamp = [u64; 7];
 
 #[cfg(any(feature = "ui", test))]
@@ -352,7 +357,6 @@ impl Shared {
 
 /// Lines are only added, so the same file at the same length holds the same lines. Who owns the
 /// file and its folder and who may write to them count too: a change there is looked at anew.
-#[cfg(any(feature = "ui", test))]
 fn stamp() -> Option<Stamp> {
     let dir = folder()?;
     let d = std::fs::metadata(&dir).ok()?;
@@ -390,6 +394,8 @@ fn file_problem(meta: &std::fs::Metadata, path: &Path) -> Option<String> {
 /// Reads the record. One that is missing is empty; one others could have written to is not
 /// believed, and the page then acts as if nothing were on record.
 pub fn load() -> Ledger {
+    #[cfg(test)]
+    LOADS.with(|n| n.set(n.get() + 1));
     let Some(dir) = folder() else { return Ledger::default() };
     let unusable = |why: String| Ledger { problem: Some(why), ..Ledger::default() };
     let path = dir.join(FILE_NAME);
@@ -540,20 +546,53 @@ pub struct AdoptedReplacement<'a> {
     pub known: &'a Recorded,
 }
 
-pub fn note_adopted(a: Adoption) -> Result<()> {
-    if folder().is_none() {
-        bail!("there is no folder to keep av1opt's record in (neither XDG_DATA_HOME nor HOME is an absolute path)");
+/// The record as one long run holds it: read once, kept up to date with what this run adds,
+/// and read again only when something else has written to it since.
+pub struct Held {
+    stamp: Option<Stamp>,
+    ledger: Ledger,
+}
+
+impl Held {
+    pub fn load() -> Held {
+        // Taken first: a line added in between makes the next look read the file again.
+        let stamp = stamp();
+        Held { stamp, ledger: load() }
     }
-    let replaced = a.replaced.map(|m| WentToTrash { trash: m.trash.to_path_buf(), from: m.from.to_path_buf(), original: Original::new(a.source_bytes, m.known) });
-    add(Event::Adopted {
-        output: a.output.to_path_buf(),
-        report: a.report.to_path_buf(),
-        source: a.source.to_path_buf(),
-        original: Original::new(a.source_bytes, a.original),
-        output_bytes: a.output_bytes,
-        output_sha256: a.output_sha256,
-        replaced,
-    })
+
+    pub fn current(&mut self) -> &Ledger {
+        // No file before and none now is still nothing on record.
+        if stamp() != self.stamp {
+            *self = Held::load();
+        }
+        &self.ledger
+    }
+
+    /// Takes an output on record, in the file and in what is held of it.
+    pub fn note_adopted(&mut self, a: Adoption) -> Result<()> {
+        if folder().is_none() {
+            bail!("there is no folder to keep av1opt's record in (neither XDG_DATA_HOME nor HOME is an absolute path)");
+        }
+        let replaced = a.replaced.map(|m| WentToTrash { trash: m.trash.to_path_buf(), from: m.from.to_path_buf(), original: Original::new(a.source_bytes, m.known) });
+        let event = Event::Adopted {
+            output: a.output.to_path_buf(),
+            report: a.report.to_path_buf(),
+            source: a.source.to_path_buf(),
+            original: Original::new(a.source_bytes, a.original),
+            output_bytes: a.output_bytes,
+            output_sha256: a.output_sha256,
+            replaced,
+        };
+        let unchanged = stamp() == self.stamp;
+        add(event.clone())?;
+        if unchanged {
+            self.ledger.apply(event);
+            self.stamp = stamp();
+        } else {
+            *self = Held::load();
+        }
+        Ok(())
+    }
 }
 
 /// Gets the record ready when the page starts, and the first time looks at the encode history

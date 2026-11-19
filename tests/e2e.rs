@@ -874,13 +874,7 @@ fn variable_frame_rate_keeps_every_frame_at_its_time() {
     assert_eq!(want.len(), 96);
     for (extra, dir) in [(&[][..], "out"), (&["--scenes"][..], "out-scenes"), (&["--container", "mkv"][..], "out-mkv")] {
         let out_dir = c.dir.join(dir);
-        let run = c.encode_into(&out_dir, &[&src], extra);
-        run.ok().has("encoded 1,");
-        // Its frames can't be scored along the whole length, so nothing could make up a mean
-        // aimed below the target: the search aims at the target itself.
-        if dir == "out" {
-            run.has("the source's frames are shown for unequal times");
-        }
+        c.encode_into(&out_dir, &[&src], extra).ok().has("encoded 1,");
         let out = out_dir.join(if dir == "out-mkv" { "screen.mkv" } else { "screen.mp4" });
         let got = frame_times(&out);
         assert_eq!(got.len(), want.len(), "{dir}");
@@ -889,6 +883,12 @@ fn variable_frame_rate_keeps_every_frame_at_its_time() {
         assert_in_step(&out, &src, "1");
         assert!((sound_lead(&out) - sound_lead(&src)).abs() < 0.03, "{dir}");
     }
+    // Left to choose its own clips, the search would aim below the target and count on the
+    // whole video being scored and repaired after; these frames can't be set against the
+    // source's one for one, so it aims at the target itself.
+    let args: Vec<std::ffi::OsString> = ["encode", "-o"].iter().map(Into::into).chain([c.dir.join("out-own").into(), "--preset".into(), "10".into(), src.clone().into()]).collect();
+    c.av1opt(&args).ok().has("the source's frames are shown for unequal times").has("searching CRF for VMAF >= 93 (").has("encoded 1,");
+
     // Matroska's header names 24 fps here whatever the frames do. Scene mode cuts chunks at
     // a constant rate, which would show 94 frames twice: it notices and encodes in one pass.
     let r: Value = serde_json::from_slice(&std::fs::read(c.dir.join("out-scenes/screen.av1opt.json")).unwrap()).unwrap();

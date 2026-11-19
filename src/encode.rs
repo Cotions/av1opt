@@ -850,7 +850,8 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
             }
             None => joined,
         };
-        let (args, streams) = mux_args(&video, plan.timed.is_none(), input, &info, o.container, o.audio, &covers, &meta, &o.meta, &partial, &mut notes);
+        let first = if plan.timed.is_some() { first_video_time(tools, &video)? } else { 0.0 };
+        let (args, streams) = mux_args(&video, plan.timed.is_none(), first, input, &info, o.container, o.audio, &covers, &meta, &o.meta, &partial, &mut notes);
         tools.run(&args)?;
         let _ = std::fs::remove_file(&video);
         (streams, Some(chunks), Some(plan.total_frames))
@@ -875,7 +876,9 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
 
     let lifted_crf = mean_only.then_some(best.crf);
     let floor_for = |best: &search::Trial| o.target_vmaf.min(best.mean_vmaf) - VERIFY_SLACK;
-    let remux = |video: &Path, out: &Path| mux_args(video, false, input, &info, o.container, o.audio, &covers, &meta, &o.meta, out, &mut Vec::new()).0;
+    let remux = |video: &Path, out: &Path| -> Result<Vec<String>> {
+        Ok(mux_args(video, false, first_video_time(tools, video)?, input, &info, o.container, o.audio, &covers, &meta, &o.meta, out, &mut Vec::new()).0)
+    };
     // The CRF of a search that counted weak samples as encoded again (see `search::lifted_mean`).
     // The whole video where it can be gone by, spot checks where not.
     let check = |best: &search::Trial, notes: &mut Vec<String>| -> Result<(Vec<f64>, MediaInfo, Option<repair::Summary>)> {
@@ -1348,6 +1351,7 @@ fn full_encode_args(
 fn mux_args(
     video: &Path,
     grid: bool,
+    video_first: f64,
     input: &Path,
     info: &MediaInfo,
     container: Container,
@@ -1358,13 +1362,19 @@ fn mux_args(
     out: &Path,
     notes: &mut Vec<String>,
 ) -> (Vec<String>, Streams) {
-    // Keep the source's video/audio offset; the joined video itself starts at zero.
-    let offset = info.video_start - info.start_time;
-    let mut a: Vec<String> = ["-y", "-v", "error", "-itsoffset", &format!("{offset:.6}")].map(String::from).to_vec();
+    // The picture is put where it stands against the sound in the source, by the timestamps
+    // both files hold: the source's moved so that it starts at zero, the video's so that its
+    // first frame (at `video_first`) comes where the source's first frame does. Left to count
+    // from the start, ffmpeg starts an MPEG-TS at the first packet of the streams it reads
+    // from it, here everything but the picture: sound 0.28 s behind the picture came out with
+    // none.
+    let offset = info.video_start - info.start_time - video_first;
+    let mut a: Vec<String> = ["-y", "-v", "error", "-copyts", "-itsoffset", &format!("{offset:.6}")].map(String::from).to_vec();
     if grid {
         a.extend(["-framerate".into(), search::cfr(info)]);
     }
-    a.extend(["-i", &path_arg(video), "-i", &path_arg(input), "-map", "0:v", "-c:v", "copy"].map(String::from));
+    a.extend(["-i".into(), path_arg(video), "-itsoffset".into(), format!("{:.6}", -info.start_time)]);
+    a.extend(["-i", &path_arg(input), "-map", "0:v", "-c:v", "copy"].map(String::from));
     // A bare stream says nothing about fields and the header would say "unknown"; what an
     // encode in one pass says of itself holds here too.
     a.extend(["-field_order:v:0", "progressive"].map(String::from));
@@ -1553,6 +1563,20 @@ fn plan_sound(info: &MediaInfo, container: Container, audio: Audio, cut: bool) -
         }
     }
     Ok(plan)
+}
+
+/// When the first frame of a bare video stream made here is shown, by its own timestamps.
+fn first_video_time(tools: &Tools, video: &Path) -> Result<f64> {
+    let out = crate::tools::probe_command(&tools.ffprobe)
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=start_time", "-of", "csv=p=0"])
+        .arg(crate::tools::probe_arg(video))
+        .output()
+        .context("ffprobe did not run")?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    match text.trim().parse::<f64>() {
+        Ok(t) if out.status.success() && t.is_finite() => Ok(t),
+        _ => bail!("ffprobe gave no start time for {} ({}); {FAILED_INSIDE}", video.display(), String::from_utf8_lossy(&out.stderr).trim()),
+    }
 }
 
 /// Width and height of the picture an encode of this source makes: even, as 4:2:0 needs
@@ -1874,6 +1898,13 @@ fn check_layout(tools: &Tools, info: &MediaInfo, out: &Path, streams: &Streams, 
     if (shown / should - 1.0).abs() > 0.005 {
         bail!("the finished video is shown {shown:.4} times as wide as it is high where its source is shown {should:.4} times; {NOT_WRITTEN}");
     }
+    if let Some(off) = sound_moved(info, &out_info, streams, cut) {
+        bail!(
+            "the sound of the finished video starts {:.3} s {} the picture than in its source; {NOT_WRITTEN}",
+            off.abs(),
+            if off > 0.0 { "later against" } else { "earlier against" }
+        );
+    }
     if out_info.color_transfer != info.color_transfer && info.hdr {
         bail!("the finished video lost its HDR signalling (its transfer is '{}', the source's is '{}'); {NOT_WRITTEN}", out_info.color_transfer, info.color_transfer);
     }
@@ -1908,6 +1939,21 @@ fn check_hdr_data(tools: &Tools, input: &Path, info: &MediaInfo, out: &Path, out
     Ok(())
 }
 
+/// How much later against the picture the first sound track starts in the output than in the
+/// source, where that is more than a frame or two (lip sync); None where it is not, or where
+/// the two cannot be compared (no sound kept, a cut, a file that does not say).
+fn sound_moved(info: &MediaInfo, out: &MediaInfo, streams: &Streams, cut: Option<&Sections>) -> Option<f64> {
+    if cut.is_some() || streams.audio == 0 || streams.audio != info.audio.len() {
+        return None;
+    }
+    let lead = |m: &MediaInfo| Some(m.audio.first()?.start? - m.video_start);
+    let moved = lead(out)? - lead(info)?;
+    // One frame, but not less than 40 ms: a track made Opus starts 6.5 ms early by its
+    // encoder's delay, where AAC starts 21 ms early by its own, and a 120 fps frame is 8 ms.
+    let frame = if info.fps > 0.0 { 1.0 / info.fps } else { 0.04 };
+    (moved.abs() > frame.max(0.04) + 1e-6).then_some(moved)
+}
+
 /// How long a finished file is and how long it should be. The picture is what was encoded:
 /// the length of the container can come from a track that was not kept (image subtitles do
 /// not go into MP4) or be an estimate (TS, AVI). Where either file does not say how long its
@@ -1940,8 +1986,8 @@ fn spot_check(
     let (model, pix) = (search::vmaf_model(info), search::reference_pix_fmt(info));
     let r = tmp.join(format!("{name}.ref.mkv"));
     let d = tmp.join(format!("{name}.out.mkv"));
-    search::extract_reference(tools, input, info, true, search::first_frame(info), src_start, secs, &r)?;
-    search::extract_reference(tools, out, info, false, search::first_frame(out_info), start, secs, &d)?;
+    search::extract_reference(tools, input, info, true, search::first_frame(info), info.start_time, src_start, secs, &r)?;
+    search::extract_reference(tools, out, info, false, search::first_frame(out_info), out_info.start_time, start, secs, &d)?;
     let mut v = tools.vmaf(&d, &r, model, pix, threads, 0, 1)?;
     // Seeking two different files can land a frame or two apart; retry nearby alignments
     // before calling the encode bad.
@@ -2023,7 +2069,7 @@ fn verify_whole(
     min_crf: u8,
     threads: usize,
     tmp: &Path,
-    remux: &dyn Fn(&Path, &Path) -> Vec<String>,
+    remux: &dyn Fn(&Path, &Path) -> Result<Vec<String>>,
     notes: &mut Vec<String>,
 ) -> Result<Option<(Vec<f64>, MediaInfo, repair::Summary)>> {
     let took = tools.stopwatch();
@@ -2062,7 +2108,7 @@ fn verify_whole(
     if let Some(video) = &outcome.video {
         tools.emit(Event::Phase { phase: "muxing".into(), detail: format!("joining {} stretches encoded again", s.stretches.len()) });
         let joined = tmp.join(format!("repaired.{}", out.extension().map_or("mp4".into(), |e| e.to_string_lossy())));
-        tools.run(&remux(video, &joined))?;
+        tools.run(&remux(video, &joined)?)?;
         let _ = std::fs::remove_file(video);
         std::fs::rename(&joined, out)?;
         out_info = check_layout(tools, info, out, streams, Some(frames), None)?;
@@ -2719,13 +2765,50 @@ mod tests {
         assert_eq!(display_aspect(&shaped((964, 963), 321, 241)).as_deref(), Some("3856:2889"));
         assert_eq!(display_aspect(&shaped((0, 0), 720, 576)), None);
         let mut notes = Vec::new();
-        let (args, _) = mux_args(Path::new("v.ivf"), false, Path::new("in.mkv"), &shaped((16, 15), 720, 576), Container::Mkv, Audio::Keep, &[], &Resolved::default(), &MetaOptions::default(), Path::new("o.mkv"), &mut notes);
+        let (args, _) = mux_args(Path::new("v.ivf"), false, 0.0, Path::new("in.mkv"), &shaped((16, 15), 720, 576), Container::Mkv, Audio::Keep, &[], &Resolved::default(), &MetaOptions::default(), Path::new("o.mkv"), &mut notes);
         assert!(args.windows(2).any(|w| w == ["-aspect:v:0", "4:3"]), "{args:?}");
-        let (args, _) = mux_args(Path::new("v.ivf"), false, Path::new("in.mkv"), &shaped((0, 0), 720, 576), Container::Mkv, Audio::Keep, &[], &Resolved::default(), &MetaOptions::default(), Path::new("o.mkv"), &mut notes);
+        let (args, _) = mux_args(Path::new("v.ivf"), false, 0.0, Path::new("in.mkv"), &shaped((0, 0), 720, 576), Container::Mkv, Audio::Keep, &[], &Resolved::default(), &MetaOptions::default(), Path::new("o.mkv"), &mut notes);
         assert!(!args.iter().any(|a| a.starts_with("-aspect")), "{args:?}");
         // What the check compares: 4:3 against the 5:4 square pixels would show.
         assert!((shown_ratio((16, 15), 720, 576) - 4.0 / 3.0).abs() < 1e-9);
         assert!((shown_ratio((0, 0), 720, 576) - 1.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_video_joined_from_bare_streams_keeps_its_place_against_the_sound() {
+        // A transport stream whose picture starts at 1.7 s, 0.3 s after its sound, and a
+        // repaired video whose first frame says 0.3 s: the source is moved to start at zero,
+        // the video not at all. A video joined from chunks starts at zero and is moved 0.3 s.
+        let ts = MediaInfo { start_time: 1.4, video_start: 1.7, ..info(&[("aac", 2, 128_000.0)]) };
+        let mut notes = Vec::new();
+        for (first, video_offset) in [(0.3, "0.000000"), (0.0, "0.300000")] {
+            let (args, _) = mux_args(Path::new("v.ivf"), false, first, Path::new("in.ts"), &ts, Container::Mp4, Audio::Keep, &[], &Resolved::default(), &MetaOptions::default(), Path::new("o.mp4"), &mut notes);
+            assert!(args.contains(&"-copyts".to_string()), "{args:?}");
+            let at = |file: &str| args.iter().position(|a| a.ends_with(file)).unwrap();
+            assert_eq!(args[at("/v.ivf") - 3..at("/v.ivf") - 1], ["-itsoffset", video_offset].map(String::from), "{args:?}");
+            assert_eq!(args[at("/in.ts") - 3..at("/in.ts") - 1], ["-itsoffset", "-1.400000"].map(String::from), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn sound_moved_against_the_picture_is_found() {
+        let sound_at = |video_start: f64, audio: f64| MediaInfo {
+            video_start,
+            audio: vec![AudioInfo { codec: "aac".into(), channels: 2, start: Some(audio), ..Default::default() }],
+            audio_streams: 1,
+            ..info(&[])
+        };
+        let streams = |audio| Streams { args: Vec::new(), meta_from: Vec::new(), audio, subs: 0, covers: 0 };
+        // The 0.28 s a joined TS lost, both ways; what Opus and AAC delays differ by is not.
+        let source = sound_at(1.4, 1.6787);
+        assert!(sound_moved(&source, &sound_at(0.0, 0.0), &streams(1), None).is_some_and(|m| (m + 0.2787).abs() < 1e-6));
+        assert!(sound_moved(&source, &sound_at(0.0, 0.5574), &streams(1), None).is_some_and(|m| (m - 0.2787).abs() < 1e-6));
+        assert_eq!(sound_moved(&source, &sound_at(0.0, 0.2787 - 0.0148), &streams(1), None), None);
+        // Nothing to compare: no sound kept, a cut, a file that does not say.
+        assert_eq!(sound_moved(&source, &sound_at(0.0, 0.0), &streams(0), None), None);
+        assert_eq!(sound_moved(&source, &sound_at(0.0, 0.0), &streams(1), Some(&Sections::new(&[(1.0, 2.0)], 60.0).unwrap())), None);
+        let unsaid = MediaInfo { audio: vec![AudioInfo::default()], ..sound_at(0.0, 0.0) };
+        assert_eq!(sound_moved(&source, &unsaid, &streams(1), None), None);
     }
 
     #[test]

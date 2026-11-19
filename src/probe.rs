@@ -262,6 +262,9 @@ pub struct AudioInfo {
     pub layout: String,
     #[serde(default)]
     pub track: Track,
+    /// The timestamp of its first packet; None when the file does not say.
+    #[serde(default)]
+    pub start: Option<f64>,
 }
 
 /// Why a file in a format outside `tools::VIDEO_FORMATS` is not read.
@@ -731,6 +734,7 @@ fn probe_within(ffprobe: &str, path: &Path, file_size: u64, limit: Duration) -> 
                 disposition: marks(s),
                 layout: s["channel_layout"].as_str().filter(|l| *l != "unknown").unwrap_or("").to_string(),
                 track: Track::from_tags(&s["tags"]),
+                start: num(&s["start_time"]),
             })
             .collect(),
         subtitle_codecs: streams

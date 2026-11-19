@@ -249,7 +249,7 @@ fn clip_place(start: f64, rate: f64, first_frame: f64) -> ClipPlace {
 /// than a frame, see [`clip_place`]). Returns how many frames it holds, which is more than
 /// none. `is_source` applies [`source_filters`]; pass false when cutting from an
 /// already-encoded output. `first_frame` is the time of this file's first video frame after
-/// the start of the file.
+/// the start of the file, and `file_start` the timestamp that start has.
 #[allow(clippy::too_many_arguments)]
 pub fn extract_reference(
     tools: &Tools,
@@ -257,6 +257,7 @@ pub fn extract_reference(
     info: &MediaInfo,
     is_source: bool,
     first_frame: f64,
+    file_start: f64,
     start: f64,
     secs: f64,
     out: &Path,
@@ -264,12 +265,15 @@ pub fn extract_reference(
     let place = clip_place(start, cfr_value(info), first_frame);
     let cut = |seek: Option<f64>| -> Result<u64> {
         let mut vf = if is_source { source_filters(info) } else { Vec::new() };
-        // The frames are chosen by the file's own times, which ffmpeg counts from the seek
-        // point: where the decoder happens to start must not move the clip. Decoding has to
-        // start before the clip: a seek can land past the place it was sent to (MPEG-TS, no
-        // index, key frames far apart), and then the first frame seen is not the clip's first.
-        // Such a cut keeps nothing, and is made again from further back.
-        let from = place.from - seek.unwrap_or(0.0);
+        // The frames are chosen by the file's own timestamps (`-copyts`): where the decoder
+        // happens to start must not move the clip. Nor what else the file holds: counting from
+        // the start, ffmpeg starts an MPEG-TS at the first frame of the streams it reads, here
+        // the picture alone, so a picture 0.3 s behind the sound was cut 0.3 s late and a
+        // stretch put back after repair scored VMAF 2.3 against it. Decoding has to start
+        // before the clip: a seek can land past the place it was sent to (MPEG-TS, no index,
+        // key frames far apart), and then the first frame seen is not the clip's first. Such a
+        // cut keeps nothing, and is made again from further back.
+        let from = place.from + file_start;
         vf.push(match seek {
             Some(_) => format!("select='gte(t,{from:.6})*if(eq(n,0),st(0,lt(t,{from:.6})),ld(0))'"),
             None => format!("select='gte(t,{from:.6})'"),
@@ -283,7 +287,7 @@ pub fn extract_reference(
         // check of VMAF 70).
         vf.push("setpts=PTS-STARTPTS".into());
         vf.push(format!("fps={}", cfr(info)));
-        let mut args: Vec<String> = vec!["-y".into(), "-v".into(), "error".into()];
+        let mut args: Vec<String> = vec!["-y".into(), "-v".into(), "error".into(), "-copyts".into()];
         if let Some(seek) = seek {
             args.extend(["-ss".into(), format!("{seek:.6}")]);
         }
@@ -418,7 +422,7 @@ pub fn extract_samples(tools: &Tools, input: &Path, info: &MediaInfo, tmp: &Path
                     let reference = tmp.join(format!("sample{i}.ref.mkv"));
                     eprintln!("  sample {}/{n} at {} ({secs:.0}s)", i + 1, crate::tools::hms(start));
                     tools.emit(crate::events::Event::Phase { phase: "sampling".into(), detail: format!("sample {}/{n} at {}", i + 1, crate::tools::hms(start)) });
-                    let cut = extract_reference(tools, input, info, true, first, start, secs, &reference).map(|frames| Sample { reference, secs, frames });
+                    let cut = extract_reference(tools, input, info, true, first, info.start_time, start, secs, &reference).map(|frames| Sample { reference, secs, frames });
                     if cut.is_err() {
                         failed.store(true, Ordering::SeqCst);
                     }
@@ -1558,22 +1562,30 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // A transport stream has no index, and a seek in it lands on the next key frame: with
         // two seconds between them inside the run-in, with eight past the clip altogether.
-        for (name, gop, format) in [("two.ts", "50", "mpegts"), ("eight.ts", "200", "mpegts"), ("plain.mkv", "50", "matroska")] {
+        // Sound 0.3 s ahead of the picture puts the picture's first frame that far into a
+        // transport stream.
+        for (name, gop, format, sound_first) in [("two.ts", "50", "mpegts", false), ("eight.ts", "200", "mpegts", false), ("plain.mkv", "50", "matroska", false), ("late.ts", "50", "mpegts", true)] {
             let path = dir.join(name);
-            let made = std::process::Command::new(&ffmpeg)
-                .args(["-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i", "testsrc2=s=160x120:r=25:d=16", "-c:v", "libx264", "-preset", "ultrafast", "-bf", "2"])
+            let mut made = std::process::Command::new(&ffmpeg);
+            made.args(["-v", "error", "-nostdin", "-y", "-itsoffset", if sound_first { "0.3" } else { "0" }, "-f", "lavfi", "-i", "testsrc2=s=160x120:r=25:d=16"]);
+            if sound_first {
+                made.args(["-f", "lavfi", "-i", "sine=d=16", "-c:a", "aac"]);
+            }
+            let made = made
+                .args(["-c:v", "libx264", "-preset", "ultrafast", "-bf", "2"])
                 .args(["-pix_fmt", "yuv420p", "-g", gop, "-keyint_min", gop, "-sc_threshold", "0", "-f", format])
                 .arg(&path)
                 .output()
                 .unwrap();
             assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
             let info = crate::probe::probe(&tools.ffprobe, &path, std::fs::metadata(&path).unwrap().len()).unwrap();
+            assert_eq!(first_frame(&info) > 0.2, sound_first, "{name}: {info:?}");
             let all = frame_hashes(&ffmpeg, &path, None);
             assert_eq!(all.len(), 400, "{name}");
             for start in [0.0, 1.0, 2.2, 3.32, 9.0, 15.0] {
                 let clip = dir.join("clip.mkv");
-                let frames = extract_reference(&tools, &path, &info, true, first_frame(&info), start, 1.0, &clip).unwrap() as usize;
-                let first = (clip_place(start, 25.0, 0.0).from * 25.0).ceil() as usize;
+                let frames = extract_reference(&tools, &path, &info, true, first_frame(&info), info.start_time, start, 1.0, &clip).unwrap() as usize;
+                let first = ((clip_place(start, 25.0, first_frame(&info)).from - first_frame(&info)) * 25.0).ceil() as usize;
                 let got = frame_hashes(&ffmpeg, &clip, None);
                 assert_eq!(got.len(), frames, "{name} at {start}");
                 assert_eq!(got, all[first..(first + 25).min(all.len())], "{name} at {start}: not frames {first} on");

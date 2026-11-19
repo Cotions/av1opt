@@ -446,15 +446,16 @@ impl HeldFolder {
         // rename the folder.
         let leads = std::fs::metadata(&inside).is_ok_and(|m| (m.dev(), m.ino()) == (meta.dev(), meta.ino()));
         if leads && reach(&inside) {
+            HELD_NAMES.lock().unwrap_or_else(|e| e.into_inner()).push((inside.clone(), path.to_path_buf()));
             return Ok(HeldFolder { folder, inside, by_name: false, keeps_modes: true });
         }
         if !others_may_rename_in(folder_of(path)) {
             return Ok(HeldFolder { folder, inside: path.to_path_buf(), by_name: true, keeps_modes: true });
         }
         let why = if leads {
-            format!("ffmpeg or ffprobe cannot open files through {} (are they run in a sandbox of their own?)", inside.display())
+            "ffmpeg or ffprobe cannot open files through av1opt's open folders in /proc (are they run in a sandbox of their own?)"
         } else {
-            format!("{} does not lead to the folder (is /proc there?)", inside.display())
+            "av1opt's open folders cannot be reached through /proc (is /proc there?)"
         };
         Err(std::io::Error::new(std::io::ErrorKind::Unsupported, why))
     }
@@ -550,6 +551,56 @@ impl HeldFolder {
             Some(now) => std::fs::remove_dir(now),
             None => Ok(()),
         }
+    }
+}
+
+impl Drop for HeldFolder {
+    fn drop(&mut self) {
+        // The descriptor's number is free for another file once this one is closed, and its
+        // path no longer means this folder.
+        if !self.by_name {
+            HELD_NAMES.lock().unwrap_or_else(|e| e.into_inner()).retain(|(inside, _)| *inside != self.inside);
+        }
+    }
+}
+
+/// The paths of the folders held through their descriptors, each with the folder's name. The
+/// tools are given the first, but a `/proc/<pid>/fd/<n>` path in what is shown or kept means
+/// nothing to the person, and leads nowhere once the run has ended.
+static HELD_NAMES: std::sync::Mutex<Vec<(PathBuf, PathBuf)>> = std::sync::Mutex::new(Vec::new());
+
+/// `text` with the path of each held folder's descriptor in it put back as the folder's name.
+/// Tool output and av1opt's own messages go through this before they are shown or kept.
+pub fn without_held(text: &str) -> std::borrow::Cow<'_, str> {
+    let held = HELD_NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut text = std::borrow::Cow::Borrowed(text);
+    for (inside, name) in held.iter() {
+        let (inside, name) = (inside.to_string_lossy(), name.to_string_lossy());
+        if !text.contains(&*inside) {
+            continue;
+        }
+        let mut put = String::with_capacity(text.len());
+        let mut rest = &*text;
+        while let Some(at) = rest.find(&*inside) {
+            let after = &rest[at + inside.len()..];
+            put.push_str(&rest[..at]);
+            // `/proc/1/fd/6` is not the start of `/proc/1/fd/60`.
+            put.push_str(if after.starts_with(|c: char| c.is_ascii_digit()) { &inside } else { &name });
+            rest = after;
+        }
+        put.push_str(rest);
+        text = std::borrow::Cow::Owned(put);
+    }
+    text
+}
+
+/// A path shown by the name of the held folder it is in rather than by its descriptor: see
+/// [`without_held`].
+pub struct Named<'a>(pub &'a Path);
+
+impl std::fmt::Display for Named<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&without_held(&self.0.to_string_lossy()))
     }
 }
 
@@ -1323,6 +1374,25 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn what_is_said_of_a_held_folder_names_it_and_not_its_descriptor() {
+        let dir = room("held-names");
+        let made = dir.join("made");
+        std::fs::DirBuilder::new().mode(0o700).create(&made).unwrap();
+        let held = HeldFolder::made(&made, &|_| true).unwrap();
+        let inside = held.path().to_string_lossy().into_owned();
+        assert!(inside.starts_with("/proc/"), "{inside}");
+        let said = format!("Error opening output {inside}/nodir/partial.mp4: No such file or directory\nat {inside}");
+        let named = made.to_string_lossy();
+        assert_eq!(without_held(&said), format!("Error opening output {named}/nodir/partial.mp4: No such file or directory\nat {named}"));
+        assert_eq!(Named(&held.path().join("partial.mp4")).to_string(), format!("{named}/partial.mp4"));
+        // Another descriptor whose number starts with the same digits is not this folder.
+        assert_eq!(without_held(&format!("{inside}0/x")), format!("{inside}0/x"));
+        drop(held);
+        assert!(!without_held(&said).contains(&*named), "{said}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn a_folder_just_made_on_a_drive_without_modes_or_owners_is_used_by_its_name() {
         let dir = room("made-no-modes");
         let made = dir.join("made");
@@ -1375,7 +1445,7 @@ pub(crate) mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
         make();
         let e = HeldFolder::made_of(&made, me, &cannot, &real).unwrap_err();
-        assert!(e.kind() == std::io::ErrorKind::Unsupported && e.to_string().contains("cannot open files through /proc/"), "{e}");
+        assert!(e.kind() == std::io::ErrorKind::Unsupported && e.to_string().contains("cannot open files through av1opt's open folders"), "{e}");
         assert!(!made.exists(), "the refused folder was left behind");
         // Written by its group only, the group being this user's own and nobody else's (the
         // umask of 0002 makes every folder so): as good as this user's alone.

@@ -284,7 +284,7 @@ pub(crate) fn reason(stderr: &str, path: &Path) -> String {
     }
     let last = one_line(stderr);
     let last = last.strip_prefix(&*path.to_string_lossy()).map_or(last, |rest| rest.trim_start_matches(':').trim_start());
-    if last.is_empty() { "could not read the file".into() } else { last.to_string() }
+    if last.is_empty() { "could not read the file".into() } else { crate::files::without_held(last).into_owned() }
 }
 
 /// The last line of a message that has something on it, for places with room for one line.

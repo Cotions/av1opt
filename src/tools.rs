@@ -436,7 +436,7 @@ impl Tools {
             }
             _ => String::new(),
         };
-        anyhow::anyhow!("ffmpeg failed ({status}){why}:\n{}", tail(log, lines))
+        anyhow::anyhow!("ffmpeg failed ({status}){why}:\n{}", tail(&crate::files::without_held(log), lines))
     }
 
     /// Which ffmpeg build this is (the first line of `ffmpeg -version`; empty if it won't
@@ -833,7 +833,7 @@ impl Tools {
         command.args(["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=flags", "-of", "csv=p=0"]).arg(probe_arg(path));
         let out = crate::probe::run_ffprobe(command, crate::probe::Reads::all_of(path))?;
         if !out.status.success() {
-            bail!("cannot read the packets of {}", path.display());
+            bail!("cannot read the packets of {}", crate::files::Named(path));
         }
         Ok(String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.trim().is_empty()).map(|l| l.contains('K')).collect())
     }

@@ -1102,7 +1102,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     // in a folder others may be able to write to: what av1opt records of its output has to be
     // what it made.
     let partial_name = partial.file_name().context("the encode has no file name")?.to_owned();
-    let made_file = tmp.open_file(&partial_name).with_context(|| format!("cannot open the finished encode {}", partial.display()))?;
+    let made_file = tmp.open_file(&partial_name).with_context(|| format!("cannot open the finished encode {}", crate::files::Named(&partial)))?;
     let output_sha256 = crate::ledger::sha256_of_open(&made_file).inspect_err(|e| eprintln!("warning: could not read the encode back for av1opt's own record: {e}")).ok();
     // Set on the descriptor too: by name, once the file is in the output folder, it could be
     // somebody else's file by then.
@@ -1730,7 +1730,7 @@ fn first_video_time(tools: &Tools, video: &Path) -> Result<f64> {
     let text = String::from_utf8_lossy(&out.stdout);
     match text.trim().parse::<f64>() {
         Ok(t) if out.status.success() && t.is_finite() => Ok(t),
-        _ => bail!("ffprobe gave no start time for {} ({}); {FAILED_INSIDE}", video.display(), String::from_utf8_lossy(&out.stderr).trim()),
+        _ => bail!("ffprobe gave no start time for {} ({}); {FAILED_INSIDE}", crate::files::Named(video), crate::files::without_held(String::from_utf8_lossy(&out.stderr).trim())),
     }
 }
 

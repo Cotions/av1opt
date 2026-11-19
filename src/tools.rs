@@ -825,7 +825,7 @@ mod tests {
     }
 
     fn cap_of(tools: &Tools) -> String {
-        let c = tools.command_for(&[]);
+        let c = tools.command_for(&[], &[]);
         assert_eq!(c.get_program(), "systemd-run");
         c.get_args().filter_map(|a| a.to_str()?.strip_prefix("MemoryMax=")).collect()
     }
@@ -838,7 +838,7 @@ mod tests {
         assert_eq!(cap_of(&tools.for_chunks_at_once(2).unwrap()), "6144M");
         // No cap in force stays no cap, whatever part was worked out.
         let free = Tools { cap: None, side_by_side_cap: None, ..capped("1G", "1G") }.sharing_between_chunks(Some("1M".into()));
-        assert_eq!(free.for_chunks_at_once(2).unwrap().command_for(&[]).get_program(), "ffmpeg");
+        assert_eq!(free.for_chunks_at_once(2).unwrap().command_for(&[], &[]).get_program(), "ffmpeg");
     }
 
     #[test]

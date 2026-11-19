@@ -516,16 +516,26 @@ const ROUND_CONSTANTS: [u32; 64] = [
     0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
+/// Takes the hash on by whole blocks.
+type Compression = fn(&mut [u32; 8], &[[u8; 64]]);
+
 /// SHA-256 as FIPS 180-4 has it, written out because the program has no cryptography library.
+/// Every encode and every replacement reads a whole video through this, so it works on as many
+/// blocks at once as it is given, with the processor's own instructions where there are any.
 struct Sha256 {
     state: [u32; 8],
     pending: Vec<u8>,
     length: u64,
+    compress: Compression,
 }
 
 impl Sha256 {
     fn new() -> Sha256 {
-        Sha256 { state: [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19], pending: Vec::with_capacity(64), length: 0 }
+        Sha256::using(fastest_compression())
+    }
+
+    fn using(compress: Compression) -> Sha256 {
+        Sha256 { state: [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19], pending: Vec::with_capacity(64), length: 0, compress }
     }
 
     fn add(&mut self, mut bytes: &[u8]) {
@@ -538,39 +548,12 @@ impl Sha256 {
                 return;
             }
             let block: [u8; 64] = self.pending.as_slice().try_into().expect("64 bytes are pending");
-            self.block(&block);
+            (self.compress)(&mut self.state, &[block]);
             self.pending.clear();
         }
         let (blocks, rest) = bytes.as_chunks::<64>();
-        for block in blocks {
-            self.block(block);
-        }
+        (self.compress)(&mut self.state, blocks);
         self.pending.extend_from_slice(rest);
-    }
-
-    fn block(&mut self, block: &[u8; 64]) {
-        let mut w = [0u32; 64];
-        for (word, bytes) in w.iter_mut().zip(block.as_chunks::<4>().0) {
-            *word = u32::from_be_bytes(*bytes);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = self.state;
-        for (constant, word) in ROUND_CONSTANTS.iter().zip(w) {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let choice = (e & f) ^ (!e & g);
-            let t1 = h.wrapping_add(s1).wrapping_add(choice).wrapping_add(*constant).wrapping_add(word);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let majority = (a & b) ^ (a & c) ^ (b & c);
-            let t2 = s0.wrapping_add(majority);
-            (h, g, f, e, d, c, b, a) = (g, f, e, d.wrapping_add(t1), c, b, a, t1.wrapping_add(t2));
-        }
-        for (now, more) in self.state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
-            *now = now.wrapping_add(more);
-        }
     }
 
     fn finish(mut self) -> String {
@@ -581,6 +564,89 @@ impl Sha256 {
         end.extend_from_slice(&bits.to_be_bytes());
         self.add(&end);
         self.state.iter().map(|word| format!("{word:08x}")).collect()
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn fastest_compression() -> Compression {
+    if std::is_x86_feature_detected!("sha") && std::is_x86_feature_detected!("ssse3") && std::is_x86_feature_detected!("sse4.1") { compress_by_processor } else { compress_by_hand }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn fastest_compression() -> Compression {
+    compress_by_hand
+}
+
+/// Only ever chosen by [`fastest_compression`], once the processor has said it has these.
+#[cfg(target_arch = "x86_64")]
+fn compress_by_processor(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
+    // SAFETY: the instructions this needs were found to be there before this was chosen.
+    unsafe { compress_with_sha_instructions(state, blocks) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sha,ssse3,sse4.1")]
+fn compress_with_sha_instructions(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
+    use std::arch::x86_64::*;
+    let big_endian = _mm_set_epi64x(0x0c0d0e0f08090a0b, 0x0405060700010203);
+    // SAFETY: each pointer is to 16 bytes inside the array or block it was taken from, and
+    // these loads and stores need no alignment.
+    let load = |bytes: *const u8| unsafe { _mm_loadu_si128(bytes.cast()) };
+    // The instructions want the words as ABEF and CDGH.
+    let first = _mm_shuffle_epi32(load(state.as_ptr().cast()), 0xB1);
+    let second = _mm_shuffle_epi32(load(state[4..].as_ptr().cast()), 0x1B);
+    let mut abef = _mm_alignr_epi8(first, second, 8);
+    let mut cdgh = _mm_blend_epi16(second, first, 0xF0);
+    for block in blocks {
+        let (abef_before, cdgh_before) = (abef, cdgh);
+        let mut schedule = [0, 16, 32, 48].map(|at| _mm_shuffle_epi8(load(block[at..].as_ptr()), big_endian));
+        for (group, constants) in ROUND_CONSTANTS.as_chunks::<4>().0.iter().enumerate() {
+            if group >= 4 {
+                let at = |offset: usize| (group + offset) % 4;
+                let mixed = _mm_add_epi32(_mm_sha256msg1_epu32(schedule[at(0)], schedule[at(1)]), _mm_alignr_epi8(schedule[at(3)], schedule[at(2)], 4));
+                schedule[at(0)] = _mm_sha256msg2_epu32(mixed, schedule[at(3)]);
+            }
+            let words = _mm_add_epi32(schedule[group % 4], load(constants.as_ptr().cast()));
+            cdgh = _mm_sha256rnds2_epu32(cdgh, abef, words);
+            abef = _mm_sha256rnds2_epu32(abef, cdgh, _mm_shuffle_epi32(words, 0x0E));
+        }
+        abef = _mm_add_epi32(abef, abef_before);
+        cdgh = _mm_add_epi32(cdgh, cdgh_before);
+    }
+    let fe_ba = _mm_shuffle_epi32(abef, 0x1B);
+    let dc_hg = _mm_shuffle_epi32(cdgh, 0xB1);
+    // SAFETY: the two stores together fill the eight words of `state`, which need no alignment.
+    unsafe {
+        _mm_storeu_si128(state.as_mut_ptr().cast(), _mm_blend_epi16(fe_ba, dc_hg, 0xF0));
+        _mm_storeu_si128(state[4..].as_mut_ptr().cast(), _mm_alignr_epi8(dc_hg, fe_ba, 8));
+    }
+}
+
+/// The same for processors without those instructions.
+fn compress_by_hand(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
+    for block in blocks {
+        let mut w = [0u32; 64];
+        for (word, bytes) in w.iter_mut().zip(block.as_chunks::<4>().0) {
+            *word = u32::from_be_bytes(*bytes);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+        for (constant, word) in ROUND_CONSTANTS.iter().zip(w) {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let choice = (e & f) ^ (!e & g);
+            let t1 = h.wrapping_add(s1).wrapping_add(choice).wrapping_add(*constant).wrapping_add(word);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let majority = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(majority);
+            (h, g, f, e, d, c, b, a) = (g, f, e, d.wrapping_add(t1), c, b, a, t1.wrapping_add(t2));
+        }
+        for (now, more) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *now = now.wrapping_add(more);
+        }
     }
 }
 
@@ -848,18 +914,22 @@ mod tests {
 
     #[test]
     fn the_hash_is_the_standard_one_at_every_length() {
-        let of = |bytes: &[u8], step: usize| {
-            let mut hash = Sha256::new();
-            bytes.chunks(step).for_each(|c| hash.add(c));
-            hash.finish()
-        };
-        assert_eq!(Sha256::new().finish(), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
-        assert_eq!(of(b"abc", 1), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
-        let long = b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
-        assert_eq!(of(long, 7), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
-        let million = vec![b'a'; 1_000_000];
-        assert_eq!(of(&million, 1000), "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
-        assert_eq!(of(&million, 999_999), "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+        // By hand, and by the processor where this one can.
+        let ways: [Compression; 2] = [compress_by_hand, fastest_compression()];
+        for way in ways {
+            let of = |bytes: &[u8], step: usize| {
+                let mut hash = Sha256::using(way);
+                bytes.chunks(step).for_each(|c| hash.add(c));
+                hash.finish()
+            };
+            assert_eq!(Sha256::using(way).finish(), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+            assert_eq!(of(b"abc", 1), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+            let long = b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+            assert_eq!(of(long, 7), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+            let million = vec![b'a'; 1_000_000];
+            assert_eq!(of(&million, 1000), "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+            assert_eq!(of(&million, 999_999), "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+        }
     }
 
     #[test]

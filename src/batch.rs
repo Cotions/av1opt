@@ -8,7 +8,7 @@ use crate::tools::Tools;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -117,17 +117,16 @@ fn could_be_empty_mount_point(dir: &Path) -> bool {
 pub struct Job {
     pub input: PathBuf,
     pub out_dir: PathBuf,
+    /// Where a run that was given this file's folder with more or fewer other folders put its
+    /// output (see [`folder_out_among`]), if that is another place.
+    pub also_at: Option<PathBuf>,
 }
 
-/// Where the files of the folder `input` go. Given alone, a folder's contents sit directly
-/// below `out_dir`. Given with other folders, each gets a folder of its own name there:
-/// two libraries encoded in one run stay apart, as they are where they came from.
-pub fn folder_out(inputs: &[PathBuf], input: &Path, out_dir: &Path) -> PathBuf {
-    folder_out_among(inputs.iter().filter(|p| p.is_dir()).count(), input, out_dir)
-}
-
-/// [`folder_out`] for a folder given with `folders` folders in all, counting itself: a job kept
-/// for later goes by how many there were when it was queued, whichever are there now.
+/// Where the files of the folder `input` go, given with `folders` folders in all, counting
+/// itself. Given alone, a folder's contents sit directly below `out_dir`. Given with other
+/// folders, each gets a folder of its own name there: two libraries encoded in one run stay
+/// apart, as they are where they came from. A job kept for later goes by how many there were
+/// when it was queued, whichever are there now.
 pub fn folder_out_among(folders: usize, input: &Path, out_dir: &Path) -> PathBuf {
     let abs = std::path::absolute(input).unwrap_or_else(|_| input.to_path_buf());
     match abs.file_name() {
@@ -137,40 +136,68 @@ pub fn folder_out_among(folders: usize, input: &Path, out_dir: &Path) -> PathBuf
 }
 
 /// Files are used as given; folders are walked and their structure is kept below `out_dir`
-/// (below a folder of their own name there when several are given, see [`folder_out`]).
+/// (below a folder of their own name there when several are given, see [`folder_out_among`]). A file
+/// reached twice is one job, and the run says so once.
 pub fn expand(inputs: &[PathBuf], out_dir: &Path, is_video: impl Fn(&Path) -> bool) -> Vec<Job> {
+    let (jobs, repeated) = expand_once(inputs, out_dir, is_video);
+    if let Some(first) = repeated.first() {
+        let more = if repeated.len() > 1 { format!(" and {} more", repeated.len() - 1) } else { String::new() };
+        eprintln!("note: left out, as the same file was already reached by way of an input before it: {}{more}", first.display());
+    }
+    jobs
+}
+
+/// The jobs, and the paths left out for leading to a file that already has one. Files are told
+/// apart by device and inode, as in a scan: one folder given inside another, or a hard link,
+/// would otherwise encode one video twice. The first input to reach a file decides its place.
+fn expand_once(inputs: &[PathBuf], out_dir: &Path, is_video: impl Fn(&Path) -> bool) -> (Vec<Job>, Vec<PathBuf>) {
     // Folders as the system resolves them: an output folder named through a link or `..`
     // is the same folder, and two strings would not say so.
     let real = |p: &Path| std::fs::canonicalize(p).or_else(|_| std::path::absolute(p)).unwrap_or_else(|_| p.to_path_buf());
     let out_abs = real(out_dir);
-    let mut jobs = Vec::new();
+    let folders = inputs.iter().filter(|p| p.is_dir()).count();
+    let mut seen = HashSet::new();
+    let (mut jobs, mut repeated) = (Vec::new(), Vec::new());
     for input in inputs {
         if input.is_dir() {
-            let below = folder_out(inputs, input, out_dir);
+            let below = folder_out_among(folders, input, out_dir);
+            let otherwise = folder_out_among(if folders > 1 { 1 } else { 2 }, input, out_dir);
             // A folder that lies in the output folder (or is it) is still walked: only an
             // output folder below the input is left out.
             let inside = real(input).starts_with(&out_abs);
-            let mut files: Vec<PathBuf> = walkdir::WalkDir::new(input)
+            let mut files: Vec<(PathBuf, Option<(u64, u64)>)> = walkdir::WalkDir::new(input)
                 .into_iter()
                 .filter_entry(|e| {
                     // Never descend into our own output or temp folders.
                     let ours = !inside && e.file_type().is_dir() && real(e.path()).starts_with(&out_abs);
-                    !ours && !e.file_name().to_string_lossy().starts_with(".av1opt-")
+                    !ours && !crate::scan::not_for_videos(e) && !e.file_name().to_string_lossy().starts_with(".av1opt-")
                 })
                 .flatten()
                 .filter(|e| e.file_type().is_file() && is_video(e.path()))
-                .map(|e| e.into_path())
+                .map(|e| {
+                    let inode = e.metadata().ok().map(|m| (m.dev(), m.ino()));
+                    (e.into_path(), inode)
+                })
                 .collect();
             files.sort();
-            for f in files {
-                let rel_dir = f.parent().and_then(|p| p.strip_prefix(input).ok()).unwrap_or(Path::new(""));
-                jobs.push(Job { out_dir: below.join(rel_dir), input: f });
+            for (f, inode) in files {
+                if inode.is_some_and(|i| !seen.insert(i)) {
+                    repeated.push(f);
+                    continue;
+                }
+                let rel_dir = f.parent().and_then(|p| p.strip_prefix(input).ok()).unwrap_or(Path::new("")).to_path_buf();
+                jobs.push(Job { out_dir: below.join(&rel_dir), also_at: (otherwise != below).then(|| otherwise.join(&rel_dir)), input: f });
             }
         } else {
-            jobs.push(Job { input: input.clone(), out_dir: out_dir.to_path_buf() });
+            // One that cannot be read is kept: its job says what is wrong with it.
+            if std::fs::metadata(input).is_ok_and(|m| !seen.insert((m.dev(), m.ino()))) {
+                repeated.push(input.clone());
+                continue;
+            }
+            jobs.push(Job { input: input.clone(), out_dir: out_dir.to_path_buf(), also_at: None });
         }
     }
-    jobs
+    (jobs, repeated)
 }
 
 /// Which file of a batch is encoded first.
@@ -426,6 +453,18 @@ pub(crate) fn overwrite_refused(output: &Path, input: &Path) -> Option<String> {
     }
 }
 
+/// The finished encode of this input that a run given its folder differently left at the job's
+/// other place: the same name, a report naming this file as it is now, and the same sections.
+fn done_elsewhere(job: &Job, input: &Path, o: &Options) -> Option<PathBuf> {
+    if o.overwrite {
+        return None;
+    }
+    let place = job.also_at.as_ref()?.join(output_of(job, o).file_name()?);
+    let made = report_input(&place).filter(|_| place.is_file())?;
+    let same = made.source == input && same_sections(&o.remove, &made.removed) && matches!(crate::source::compare(&made.then, input), Verdict::Same);
+    same.then_some(place)
+}
+
 /// What to do with a job before any work on it.
 #[derive(Debug, PartialEq)]
 enum Before {
@@ -581,6 +620,12 @@ pub fn run_placed(tools: &Tools, jobs: &[Job], out_dir: &Path, place: Option<&Ou
                 continue;
             }
         }
+        if let Some(place) = done_elsewhere(job, &abs, o) {
+            eprintln!("already done: {} (where a run given this folder with more or fewer others put it)", place.display());
+            end("done_before", &place.display().to_string(), std::fs::metadata(&place).map_or(0, |m| m.len()));
+            sum.already_done += 1;
+            continue;
+        }
         if let Some(reason) = skips.get(&(abs.clone(), size)) {
             eprintln!("skipped earlier: {reason} (use --retry-skipped to try again)");
             end("skip", &format!("skipped earlier: {reason}"), 0);
@@ -694,7 +739,17 @@ mod tests {
 
         /// The folder walked into `out`: per input name, the status and detail it ended with.
         fn walk(&self, out: &Path, o: &Options) -> (Summary, HashMap<String, (String, String)>) {
-            let jobs = expand(std::slice::from_ref(&self.0), out, |p| p.extension().is_some_and(|e| e != "json" && e != "tsv"));
+            run_all(&expand(std::slice::from_ref(&self.0), out, a_video), out, o)
+        }
+    }
+
+    fn a_video(p: &Path) -> bool {
+        p.extension().is_some_and(|e| e != "json" && e != "tsv")
+    }
+
+    /// What a batch of `jobs` comes to: per input name, the status and detail it ended with.
+    fn run_all(jobs: &[Job], out: &Path, o: &Options) -> (Summary, HashMap<String, (String, String)>) {
+        {
             let names: Vec<String> = jobs.iter().map(|j| j.input.file_name().unwrap().to_string_lossy().into_owned()).collect();
             let seen = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
             let mut tools = Tools::new("false".into(), "false".into(), None);
@@ -704,7 +759,7 @@ mod tests {
                     sink.lock().unwrap().insert(names[index].clone(), (status, detail));
                 }
             })));
-            let sum = run(&tools, &jobs, out, o, false).unwrap();
+            let sum = run(&tools, jobs, out, o, false).unwrap();
             let ends = seen.lock().unwrap().clone();
             (sum, ends)
         }
@@ -751,7 +806,7 @@ mod tests {
         // Another name for the same file: the output is that input, a hard link away.
         let g = Folder::new("hardlink", &["c.mkv", "d.mkv"]);
         std::fs::hard_link(g.0.join("c.mkv"), g.0.join("d.mp4")).unwrap();
-        let jobs: Vec<Job> = ["c.mkv", "d.mkv"].map(|n| Job { input: g.0.join(n), out_dir: g.0.clone() }).into();
+        let jobs: Vec<Job> = ["c.mkv", "d.mkv"].map(|n| Job { input: g.0.join(n), out_dir: g.0.clone(), also_at: None }).into();
         assert_eq!(clashes(&jobs, &options()), [None, Some(Clash::Input(g.0.join("c.mkv")))]);
 
         // Two inputs with one output name: with --overwrite the second would replace what
@@ -763,7 +818,7 @@ mod tests {
         assert_eq!(ends["e.mkv"].1, format!("its output is also that of another input, {}; give one of them another output folder", t.0.join("e.avi").display()));
         // And when that input is the job's own, it is its own.
         std::fs::rename(g.0.join("d.mp4"), g.0.join("c.mp4")).unwrap();
-        let own = [Job { input: g.0.join("c.mkv"), out_dir: g.0.clone() }];
+        let own = [Job { input: g.0.join("c.mkv"), out_dir: g.0.clone(), also_at: None }];
         assert_eq!(clashes(&own, &options()), [Some(Clash::Own)]);
     }
 
@@ -1059,8 +1114,98 @@ mod tests {
     }
 
     #[test]
+    fn a_walk_stays_out_of_what_a_scan_stays_out_of() {
+        let f = Folder::new("trash-walk", &[]);
+        for d in [".Trash-1000/files", ".Trash/files", "lost+found", "$RECYCLE.BIN", "System Volume Information", "shows"] {
+            std::fs::create_dir_all(f.0.join(d)).unwrap();
+            std::fs::write(f.0.join(d).join("old.mkv"), d).unwrap();
+        }
+        // A file of such a name is a file like any other.
+        std::fs::write(f.0.join(".Trash.mkv"), b"x").unwrap();
+        let out = Folder::new("trash-walk-out", &[]);
+        let jobs = expand(std::slice::from_ref(&f.0), &out.0, a_video);
+        let names: Vec<String> = jobs.iter().map(|j| j.input.strip_prefix(&f.0).unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, [".Trash.mkv", "shows/old.mkv"]);
+    }
+
+    #[test]
+    fn a_file_reached_twice_is_one_job_placed_by_the_first_input() {
+        let f = Folder::new("once", &["top.mkv"]);
+        let sub = f.0.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("x.mkv"), b"video").unwrap();
+        std::fs::hard_link(sub.join("x.mkv"), f.0.join("linked.mkv")).unwrap();
+        let out = PathBuf::from("/out");
+        let inputs = |names: &[PathBuf]| expand_once(names, &out, a_video);
+        let from = |jobs: &[Job]| jobs.iter().map(|j| (j.input.clone(), j.out_dir.clone())).collect::<Vec<_>>();
+        let lib = f.0.file_name().unwrap();
+
+        // The inner folder given as well, after the outer one and before it.
+        let (jobs, left) = inputs(&[f.0.clone(), sub.clone()]);
+        assert_eq!(from(&jobs), [(f.0.join("linked.mkv"), out.join(lib)), (f.0.join("top.mkv"), out.join(lib))]);
+        assert_eq!(left, [sub.join("x.mkv"), sub.join("x.mkv")], "by its link's folder, then as given");
+        let (jobs, left) = inputs(&[sub.clone(), f.0.clone()]);
+        assert_eq!(from(&jobs), [(sub.join("x.mkv"), out.join("sub")), (f.0.join("top.mkv"), out.join(lib))]);
+        assert_eq!(left, [f.0.join("linked.mkv"), sub.join("x.mkv")]);
+
+        // The same file named twice, once through a link to it; one that is not there stays,
+        // for its job to say so.
+        let link = f.0.join("link-to-top");
+        std::os::unix::fs::symlink(f.0.join("top.mkv"), &link).unwrap();
+        let gone = f.0.join("gone.mkv");
+        let (jobs, left) = inputs(&[f.0.join("top.mkv"), link.clone(), f.0.join("top.mkv"), gone.clone(), gone.clone()]);
+        assert_eq!(jobs.iter().map(|j| j.input.clone()).collect::<Vec<_>>(), [f.0.join("top.mkv"), gone.clone(), gone]);
+        assert_eq!(left, [link, f.0.join("top.mkv")]);
+    }
+
+    #[test]
+    fn an_encode_made_when_a_folder_was_given_differently_counts_as_done() {
+        let f = Folder::new("placed", &[]);
+        let (kay, sofia) = (f.0.join("Kay"), f.0.join("Sofia"));
+        for d in [&kay, &sofia] {
+            std::fs::create_dir_all(d.join("old")).unwrap();
+        }
+        for file in ["Kay/a.mkv", "Kay/old/b.mkv", "Sofia/c.mkv"] {
+            std::fs::write(f.0.join(file), b"video").unwrap();
+        }
+        let out = Folder::new("placed-out", &[]);
+        let finished = |place: &Path, stem: &str, source: &Path, bytes: u64| {
+            std::fs::create_dir_all(place).unwrap();
+            std::fs::write(place.join(format!("{stem}.mp4")), b"av1").unwrap();
+            let fields = serde_json::json!({"input": source, "output": place.join(format!("{stem}.mp4")), "source_bytes": bytes});
+            std::fs::write(place.join(format!("{stem}.av1opt.json")), fields.to_string()).unwrap();
+        };
+        let both = [kay.clone(), sofia.clone()];
+
+        // Made by `encode Kay -o out`, looked for by `encode Kay Sofia -o out`.
+        finished(&out.0, "a", &kay.join("a.mkv"), 5);
+        finished(&out.0.join("old"), "b", &kay.join("old/b.mkv"), 5);
+        let (sum, ends) = run_all(&expand(&both, &out.0, a_video), &out.0, &options());
+        assert_eq!(ends["a.mkv"], ("done_before".to_string(), out.0.join("a.mp4").display().to_string()));
+        assert_eq!(ends["b.mkv"], ("done_before".to_string(), out.0.join("old/b.mp4").display().to_string()));
+        assert!(reached_the_encode(&ends["c.mkv"]), "{:?}", ends["c.mkv"]);
+        assert_eq!(sum.already_done, 2);
+        assert!(!out.0.join("Kay").exists(), "nothing is made at the other place");
+
+        // Not when it is no longer this file's encode, or when it is to be made again.
+        finished(&out.0, "a", &kay.join("a.mkv"), 4);
+        finished(&out.0.join("old"), "b", &sofia.join("c.mkv"), 5);
+        let (_, ends) = run_all(&expand(&both, &out.0, a_video), &out.0, &options());
+        assert!(reached_the_encode(&ends["a.mkv"]) && reached_the_encode(&ends["b.mkv"]), "{ends:?}");
+        finished(&out.0, "a", &kay.join("a.mkv"), 5);
+        let (_, ends) = run_all(&expand(&both, &out.0, a_video), &out.0, &Options { overwrite: true, ..options() });
+        assert!(reached_the_encode(&ends["a.mkv"]), "{:?}", ends["a.mkv"]);
+
+        // And the other way round: made with both folders, looked for with one.
+        let other = Folder::new("placed-back", &[]);
+        finished(&other.0.join("Kay"), "a", &kay.join("a.mkv"), 5);
+        let (_, ends) = run_all(&expand(std::slice::from_ref(&kay), &other.0, a_video), &other.0, &options());
+        assert_eq!(ends["a.mkv"], ("done_before".to_string(), other.0.join("Kay/a.mp4").display().to_string()));
+    }
+
+    #[test]
     fn jobs_are_ordered_by_worth_and_ties_keep_their_place() {
-        let job = |name: &str| Job { input: PathBuf::from(name), out_dir: PathBuf::from("/out") };
+        let job = |name: &str| Job { input: PathBuf::from(name), out_dir: PathBuf::from("/out"), also_at: None };
         let mut jobs: Vec<Job> = ["a", "b", "c", "d", "e"].map(job).into();
         order_by(&mut jobs, |p| match p.to_str().unwrap() {
             "b" => 5.0,

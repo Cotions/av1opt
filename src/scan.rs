@@ -18,6 +18,13 @@ pub const VIDEO_EXTS: &[&str] = &[
 ];
 const SKIP_DIRS: &[&str] = &["System Volume Information", "$RECYCLE.BIN", "lost+found"];
 
+/// Whether a walk stays out of this: a drive's trash and the system's folders hold no videos
+/// of the library, and what `replace` sent to a trash must not come back as work.
+pub fn not_for_videos(entry: &walkdir::DirEntry) -> bool {
+    let name = entry.file_name().to_string_lossy();
+    entry.file_type().is_dir() && (SKIP_DIRS.contains(&name.as_ref()) || name.starts_with(".Trash"))
+}
+
 /// Probe results are cached by path, size and mtime so rescans of big libraries are fast.
 #[derive(Serialize, Deserialize, Clone)]
 struct CacheEntry {
@@ -99,10 +106,7 @@ fn collect_with_cache(
     let mut seen = std::collections::HashSet::new();
     let mut unreadable: Vec<PathBuf> = Vec::new();
     for root in paths {
-        for entry in WalkDir::new(root).into_iter().filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            !(e.file_type().is_dir() && (SKIP_DIRS.contains(&name.as_ref()) || name.starts_with(".Trash")))
-        }) {
+        for entry in WalkDir::new(root).into_iter().filter_entry(|e| !not_for_videos(e)) {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(e) => {

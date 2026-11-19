@@ -29,6 +29,18 @@ fn new_file_mode(path: &Path) -> u32 {
     if std::fs::metadata(folder_of(path)).is_ok_and(|m| m.mode() & 0o077 == 0) { 0o600 } else { 0o666 }
 }
 
+/// A base folder of the XDG specification: the variable's value, or `below_home` in the home
+/// folder. The specification has anything but an absolute path ignored; an empty or relative
+/// value would put av1opt's files in whatever folder it was started from.
+pub fn xdg_folder(variable: &str, below_home: &str) -> Option<PathBuf> {
+    xdg_folder_from(std::env::var_os(variable), std::env::var_os("HOME"), below_home)
+}
+
+fn xdg_folder_from(value: Option<OsString>, home: Option<OsString>, below_home: &str) -> Option<PathBuf> {
+    let absolute = |value: Option<OsString>| value.map(PathBuf::from).filter(|p| p.is_absolute());
+    absolute(value).or_else(|| Some(absolute(home)?.join(below_home)))
+}
+
 /// Makes `path` and what is missing above it, and leaves `path` open to this user alone
 /// whatever it was before. For the folders that hold what someone keeps, watches and encodes.
 pub fn private_folder(path: &Path) -> std::io::Result<()> {
@@ -457,6 +469,18 @@ pub fn write_script(path: &Path, body: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_absolute_paths_count_as_base_folders() {
+        let folder = |value: Option<&str>, home: Option<&str>| xdg_folder_from(value.map(OsString::from), home.map(OsString::from), ".cache");
+        assert_eq!(folder(Some("/x"), Some("/home/a")), Some(PathBuf::from("/x")));
+        for ignored in [None, Some(""), Some("relative"), Some("./here")] {
+            assert_eq!(folder(ignored, Some("/home/a")), Some(PathBuf::from("/home/a/.cache")), "{ignored:?}");
+        }
+        for no_home in [None, Some(""), Some("home")] {
+            assert_eq!(folder(Some(""), no_home), None, "{no_home:?}");
+        }
+    }
 
     fn room(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("av1opt-files-{name}-{}", std::process::id()));

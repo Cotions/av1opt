@@ -493,7 +493,18 @@ fn parse_memory(s: &str) -> Result<String, String> {
 /// stops the program is 1 and wrong usage is 2, so that a script can tell the three apart.
 const SOME_FILES_FAILED: i32 = 3;
 
+/// Takes the `AV1OPT_` variables set to nothing out of the environment: a variable left empty
+/// says nothing, and would otherwise name a program called "" or switch debugging on.
+fn forget_empty_settings() {
+    let is_empty_setting = |(name, value): &(std::ffi::OsString, std::ffi::OsString)| value.is_empty() && name.as_encoded_bytes().starts_with(b"AV1OPT_");
+    for (name, _) in std::env::vars_os().filter(is_empty_setting).collect::<Vec<_>>() {
+        // SAFETY: the first thing the program does, before any other thread is started.
+        unsafe { std::env::remove_var(name) };
+    }
+}
+
 fn main() -> Result<()> {
+    forget_empty_settings();
     let result = run_command(Cli::parse().cmd);
     // Stopped by a signal, whatever the work then ended with.
     if let Some(code) = signals::exit_code() {

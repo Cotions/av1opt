@@ -135,10 +135,7 @@ struct CacheEntry {
 }
 
 fn cache_file() -> Result<PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .context("no HOME or XDG_CACHE_HOME")?;
+    let base = crate::files::xdg_folder("XDG_CACHE_HOME", ".cache").context("no HOME or XDG_CACHE_HOME that is an absolute path")?;
     let dir = base.join("av1opt");
     crate::files::private_folder(&dir)?;
     // Bump the version when the frame times or the hash change, so old entries are redone.

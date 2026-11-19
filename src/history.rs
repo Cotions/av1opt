@@ -97,9 +97,7 @@ fn path() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("AV1OPT_HISTORY") {
         return Some(PathBuf::from(p));
     }
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
+    let base = crate::files::xdg_folder("XDG_DATA_HOME", ".local/share")?;
     Some(base.join("av1opt/history.jsonl"))
 }
 
@@ -114,7 +112,13 @@ pub fn append(r: &Record) -> Result<()> {
 
 /// All readable records; a missing or partly corrupt file just yields fewer.
 pub fn load() -> Vec<Record> {
-    path().map_or_else(Vec::new, |p| read(&p))
+    let Some(path) = path() else { return Vec::new() };
+    if path.is_dir() {
+        // Said once: a run reads the history more than once.
+        static TOLD: std::sync::Once = std::sync::Once::new();
+        TOLD.call_once(|| eprintln!("warning: the encode history {} is a folder, so no past encodes are used; AV1OPT_HISTORY should name a file", path.display()));
+    }
+    read(&path)
 }
 
 /// Read as bytes and line by line: one damaged line costs that line, not the whole history.

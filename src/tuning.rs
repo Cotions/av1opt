@@ -124,9 +124,7 @@ pub struct Tuning {
 }
 
 fn path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
+    let base = crate::files::xdg_folder("XDG_DATA_HOME", ".local/share")?;
     Some(base.join("av1opt/tuning.json"))
 }
 

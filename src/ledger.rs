@@ -44,10 +44,7 @@ fn folder() -> Option<PathBuf> {
 
 #[cfg(not(test))]
 fn folder() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
+    let base = crate::files::xdg_folder("XDG_DATA_HOME", ".local/share")?;
     Some(base.join("av1opt"))
 }
 
@@ -545,7 +542,7 @@ pub struct AdoptedReplacement<'a> {
 
 pub fn note_adopted(a: Adoption) -> Result<()> {
     if folder().is_none() {
-        bail!("there is no folder to keep av1opt's record in (neither XDG_DATA_HOME nor HOME is set)");
+        bail!("there is no folder to keep av1opt's record in (neither XDG_DATA_HOME nor HOME is an absolute path)");
     }
     let replaced = a.replaced.map(|m| WentToTrash { trash: m.trash.to_path_buf(), from: m.from.to_path_buf(), original: Original::new(a.source_bytes, m.known) });
     add(Event::Adopted {

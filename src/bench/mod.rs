@@ -197,10 +197,7 @@ fn read_lines(path: &Path) -> Vec<Line> {
 }
 
 pub fn cache_dir() -> Result<PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .context("no HOME or XDG_CACHE_HOME")?;
+    let base = crate::files::xdg_folder("XDG_CACHE_HOME", ".cache").context("no HOME or XDG_CACHE_HOME that is an absolute path")?;
     let dir = base.join("av1opt");
     crate::files::private_folder(&dir)?;
     Ok(dir)

@@ -438,3 +438,47 @@ fn a_path_that_cannot_be_read_is_an_error_and_a_folder_further_down_a_warning() 
     c.run(&["encode", "videos", "-o", "out"]).has(warning).has("folders not read 1");
     set_mode(0o755);
 }
+
+#[test]
+fn base_folders_that_are_empty_or_relative_are_ignored() {
+    let c = Case::new("xdg");
+    c.video("a.mkv");
+    for value in ["", "relative"] {
+        let mut scan = c.command(&["scan", "videos"]);
+        scan.env("XDG_CACHE_HOME", value).env("HOME", c.path("home"));
+        Run::of(scan.output().unwrap()).ended(0);
+        assert!(c.path("home/.cache/av1opt/probe-cache-v4.json").is_file(), "{value:?}");
+        assert!(!c.path("av1opt").exists() && !c.path("relative").exists(), "{value:?}");
+        std::fs::remove_dir_all(c.path("home")).unwrap();
+    }
+}
+
+#[test]
+fn a_setting_left_empty_counts_as_not_set() {
+    let c = Case::new("empty-settings");
+    c.video("a.mkv");
+    // The tools are then found by name, along the path.
+    let mut dups = c.command(&["dups", "videos"]);
+    dups.env("AV1OPT_FFMPEG", "").env("AV1OPT_FFPROBE", "").env("PATH", c.path("bin"));
+    Run::of(dups.output().unwrap()).ended(3).has("no frame could be read").lacks("cannot run");
+
+    // Debugging prints every ffmpeg command when it is on, and only then.
+    let reading = |debug: &str| {
+        let mut dups = c.command(&["dups", "videos", "--refresh"]);
+        dups.env("AV1OPT_DEBUG", debug);
+        Run::of(dups.output().unwrap())
+    };
+    reading("1").has("+ ffmpeg");
+    reading("").lacks("+ ffmpeg");
+}
+
+#[test]
+fn a_history_that_is_a_folder_is_mentioned_once() {
+    let c = Case::new("history-folder");
+    c.video("a.mkv");
+    let mut scan = c.command(&["scan", "videos"]);
+    scan.env("AV1OPT_HISTORY", c.path("data"));
+    let run = Run::of(scan.output().unwrap());
+    run.ended(0);
+    assert_eq!(run.said.matches("is a folder, so no past encodes are used").count(), 1, "{}", run.said);
+}

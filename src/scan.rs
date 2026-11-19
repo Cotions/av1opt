@@ -338,10 +338,7 @@ pub fn is_video(p: &Path) -> bool {
 }
 
 fn cache_file() -> Result<PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .context("no HOME or XDG_CACHE_HOME")?;
+    let base = crate::files::xdg_folder("XDG_CACHE_HOME", ".cache").context("no HOME or XDG_CACHE_HOME that is an absolute path")?;
     cache_file_in(&base.join("av1opt"))
 }
 

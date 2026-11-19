@@ -16,16 +16,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
-fn base_dir(var: &str, fallback: &str) -> Option<PathBuf> {
-    std::env::var_os(var).map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(fallback)))
-}
-
 pub fn settings_path() -> Option<PathBuf> {
-    Some(base_dir("XDG_DATA_HOME", ".local/share")?.join("av1opt/ui.json"))
+    Some(crate::files::xdg_folder("XDG_DATA_HOME", ".local/share")?.join("av1opt/ui.json"))
 }
 
 pub fn cache_dir() -> Option<PathBuf> {
-    let d = base_dir("XDG_CACHE_HOME", ".cache")?.join("av1opt");
+    let d = crate::files::xdg_folder("XDG_CACHE_HOME", ".cache")?.join("av1opt");
     crate::files::private_folder(&d).ok()?;
     Some(d)
 }

@@ -42,6 +42,8 @@ pub struct Fingerprint {
     pub tail: Vec<Frame>,
     /// `middle[i]` is the frame at the share `MIDDLE[i]` of the length.
     pub middle: Vec<Frame>,
+    /// Seconds one frame lasts, 0 when unknown.
+    pub frame_s: f64,
     /// A frame was given up on because ffmpeg took too long, which says nothing lasting about
     /// the file: such a fingerprint is used once and not remembered.
     #[serde(skip)]
@@ -104,6 +106,53 @@ fn side(x: &[Frame], y: &[Frame], max_dist: u32) -> (u32, u32) {
 
 /// The fewest frames of the middle two videos must both show to be called the same video.
 const MIN_MIDDLE: u32 = 3;
+/// The fewest different pictures that must match for that. One picture seen again and again
+/// (a fixed camera, a logo, a title card) says little about what the rest of a video shows.
+const MIN_DISTINCT: usize = 3;
+/// Clips shorter than this may not hold that many different pictures, however they are sampled.
+const SHORT_CLIP_S: f64 = 3.0;
+
+/// How many of `hashes` are different pictures: further apart than the frames of one picture
+/// can be.
+fn distinct(hashes: &[u64], max_dist: u32) -> usize {
+    let mut seen: Vec<u64> = Vec::new();
+    for &h in hashes {
+        if seen.iter().all(|&s| distance(s, h) > max_dist) {
+            seen.push(h);
+        }
+    }
+    seen.len()
+}
+
+/// The different pictures two videos have in common, counted in the one that shows fewer.
+fn distinct_matches(a: &Fingerprint, b: &Fingerprint, max_dist: u32) -> usize {
+    let pairs = |x: &'_ [Frame], y: &'_ [Frame]| -> Vec<(u64, u64)> {
+        x.iter()
+            .zip(y)
+            .filter_map(|pair| match pair {
+                (Frame::Picture(p), Frame::Picture(q)) if distance(*p, *q) <= max_dist => Some((*p, *q)),
+                _ => None,
+            })
+            .collect()
+    };
+    let all: Vec<(u64, u64)> = [(&a.head, &b.head), (&a.middle, &b.middle), (&a.tail, &b.tail)].into_iter().flat_map(|(x, y)| pairs(x, y)).collect();
+    let (of_a, of_b): (Vec<u64>, Vec<u64>) = all.into_iter().unzip();
+    distinct(&of_a, max_dist).min(distinct(&of_b, max_dist))
+}
+
+/// Whether two clips too short for [`MIN_DISTINCT`] are one: of equal length within a frame,
+/// and with every sampled frame a picture that matches.
+fn same_short_clip(dur_a: f64, a: &Fingerprint, dur_b: f64, b: &Fingerprint, max_dist: u32) -> bool {
+    let all_match = |x: &[Frame], y: &[Frame]| x.len() == y.len() && side(x, y, max_dist) == (x.len() as u32, x.len() as u32);
+    dur_a.max(dur_b) < SHORT_CLIP_S
+        && (dur_a - dur_b).abs() <= a.frame_s.max(b.frame_s) + 0.001
+        && !a.head.is_empty()
+        && !a.tail.is_empty()
+        && !a.middle.is_empty()
+        && all_match(&a.head, &b.head)
+        && all_match(&a.tail, &b.tail)
+        && all_match(&a.middle, &b.middle)
+}
 
 /// How two videos relate, if they do. `max_dist` is the most bits two frame hashes may differ
 /// by and still count as the same picture.
@@ -117,8 +166,11 @@ pub fn compare(dur_a: f64, a: &Fingerprint, dur_b: f64, b: &Fingerprint, max_dis
     // middle. Both ends can agree over a long way in two episodes with one opening and one set
     // of credits: only what lies between them tells such videos apart.
     let (all_matched, all_compared) = (m + mm, c + mc);
-    if close && hm > 0 && tm > 0 && mc >= MIN_MIDDLE && mm * 5 >= mc * 4 && all_matched * 4 >= all_compared * 3 {
+    if close && hm > 0 && tm > 0 && mc >= MIN_MIDDLE && mm * 5 >= mc * 4 && all_matched * 4 >= all_compared * 3 && distinct_matches(a, b, max_dist) >= MIN_DISTINCT {
         return Some((Kind::Same, all_matched as f32 / all_compared as f32));
+    }
+    if same_short_clip(dur_a, a, dur_b, b, max_dist) {
+        return Some((Kind::Same, 1.0));
     }
     // One end only: needs at least three frames and four in five to match, which reaches
     // past a few seconds of shared logo.
@@ -520,6 +572,66 @@ mod tests {
         assert_eq!(compare(600.0, &a, 600.0, &b, 10).map(|r| r.0), Some(Kind::Same));
         b.middle.clear();
         assert_eq!(compare(600.0, &a, 600.0, &b, 10).map(|r| r.0), Some(Kind::SameStart));
+    }
+
+    /// A video of `length` seconds that shows `pictures` over and over at all its samples.
+    fn showing(pictures: &[u64], length: f64) -> Fingerprint {
+        let n = ladder(length).len();
+        let at = |i: usize| Frame::Picture(pictures[i % pictures.len()]);
+        Fingerprint { head: (0..n).map(at).collect(), tail: (0..n).map(|i| at(i + 1)).collect(), middle: (0..MIDDLE.len()).map(|i| at(i + 2)).collect(), frame_s: 0.04, ..Default::default() }
+    }
+
+    const PICTURES: [u64; 4] = [0x0F0F_0F0F_0F0F_0F0F, 0x00FF_00FF_00FF_00FF, 0x3333_3333_3333_3333, 0x5555_5555_5555_5555];
+
+    #[test]
+    fn one_picture_seen_again_and_again_is_not_a_whole_video() {
+        for (count, kind) in [(1, Kind::SameStart), (2, Kind::SameStart), (3, Kind::Same), (4, Kind::Same)] {
+            let v = showing(&PICTURES[..count], 600.0);
+            assert_eq!(compare(600.0, &v, 600.0, &v, 10).map(|r| r.0), Some(kind), "{count} pictures");
+        }
+    }
+
+    #[test]
+    fn frames_that_differ_by_no_more_than_the_tolerance_are_one_picture() {
+        let h = PICTURES[0];
+        assert_eq!(distinct(&[h, off(h, 10), off(h, 3)], 10), 1);
+        assert_eq!(distinct(&[h, off(h, 11)], 10), 2);
+        assert_eq!(distinct(&[], 10), 0);
+        assert_eq!(distinct(&PICTURES, 10), 4);
+    }
+
+    #[test]
+    fn what_counts_is_the_pictures_that_match_in_the_video_showing_fewer() {
+        let a = showing(&PICTURES, 600.0);
+        // The other video shows one picture wherever the first shows any of two others.
+        let mut b = a.clone();
+        for f in b.head.iter_mut().chain(&mut b.tail).chain(&mut b.middle) {
+            if matches!(f, Frame::Picture(h) if *h != PICTURES[0]) {
+                *f = flipped(*f);
+            }
+        }
+        assert_eq!(distinct_matches(&a, &b, 10), 1);
+        assert_eq!(distinct_matches(&a, &a, 10), 4);
+        assert_eq!(compare(600.0, &a, 600.0, &b, 10), compare(600.0, &b, 600.0, &a, 10));
+    }
+
+    #[test]
+    fn very_short_clips_must_agree_in_every_frame_and_in_length() {
+        let clip = showing(&PICTURES[..1], 2.0);
+        assert_eq!(clip.head.len() + clip.tail.len() + clip.middle.len(), 7);
+        assert_eq!(compare(2.0, &clip, 2.0, &clip, 10), Some((Kind::Same, 1.0)));
+        // Within one frame of 40 ms, and not beyond.
+        assert_eq!(compare(2.0, &clip, 2.04, &clip, 10).map(|r| r.0), Some(Kind::Same));
+        assert_eq!(compare(2.0, &clip, 2.1, &clip, 10), None);
+        // One frame that differs, is flat or cannot be read is one too many.
+        for spoilt in [flipped(clip.middle[2]), Frame::Flat, Frame::Unread] {
+            let mut other = clip.clone();
+            other.middle[2] = spoilt;
+            assert_eq!(compare(2.0, &clip, 2.0, &other, 10), None, "{spoilt:?}");
+        }
+        // From three seconds on there is room for three pictures, and the rule is the usual one.
+        let longer = showing(&PICTURES[..1], 3.0);
+        assert_eq!(compare(3.0, &longer, 3.0, &longer, 10), None);
     }
 
     #[test]

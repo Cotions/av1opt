@@ -226,7 +226,8 @@ pub fn fingerprint(tools: &Tools, path: &Path, info: &MediaInfo) -> Result<Finge
     let hashes: Vec<Frame> = frames.iter().map(|f| f.as_ref().map_or(Frame::Unread, |f| phash::hash(f, bounds).map_or(Frame::Flat, Frame::Picture))).collect();
     let (head, rest) = hashes.split_at(lad.len());
     let (tail, middle) = rest.split_at(lad.len());
-    Ok(Fingerprint { head: head.to_vec(), tail: tail.to_vec(), middle: middle.to_vec(), out_of_time })
+    let frame_s = if info.fps > 0.0 { 1.0 / info.fps } else { 0.0 };
+    Ok(Fingerprint { head: head.to_vec(), tail: tail.to_vec(), middle: middle.to_vec(), frame_s, out_of_time })
 }
 
 /// How much of a file's start, middle and end is compared.

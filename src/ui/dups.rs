@@ -244,9 +244,20 @@ fn move_marked(report: &Report, gone: &HashSet<PathBuf>, paths: &[PathBuf], unch
             if !unchanged(file) {
                 bail!("{} is gone or has changed since the search, so it was left alone; search again", p.display());
             }
-            copies_that_stay(report, gone, &marked, file, unchanged)?;
-            to_trash(p)?;
-            Ok(())
+            let stay = copies_that_stay(report, gone, &marked, file, unchanged)?;
+            let dest = to_trash(p)?;
+            // Device and inode cannot tell a network mount's view of a folder from a second
+            // copy. If the copy that stays went with this one, they were the same file.
+            match stay.iter().find(|copy| !unchanged(copy)) {
+                None => Ok(()),
+                Some(copy) => {
+                    let what = format!("moving {} to the trash took {} with it, so they are one file seen through two paths (a network mount, perhaps)", p.display(), copy.path.display());
+                    match crate::trash::restore(&dest, p) {
+                        Ok(()) => bail!("{what}. It was put back at once"),
+                        Err(e) => bail!("{what}, and it could not be put back: it is at {} ({e:#})", dest.display()),
+                    }
+                }
+            }
         };
         match one() {
             Ok(()) => {
@@ -496,6 +507,41 @@ mod tests {
         assert_eq!(moved.trashed, [p[3].clone()]);
         assert!(only_error(&moved).contains("b.mkv"));
         assert!(p[1].exists() && !p[3].exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_keeper_that_leaves_with_the_spare_brings_the_spare_back() {
+        let (dir, p) = library("one-file", &["keep.mkv", "spare.mkv"]);
+        let (keep, spare) = (&p[0], &p[1]);
+        let report = pair_report(&p);
+        let contents = std::fs::read(spare).unwrap();
+        // The two names are one file on a server: when one goes, so does the other.
+        let moved = move_marked(&report, &HashSet::new(), std::slice::from_ref(spare), &File::unchanged, &|path| {
+            let dest = crate::trash::trash(path)?;
+            std::fs::remove_file(keep).unwrap();
+            Ok(dest)
+        });
+        assert!(moved.trashed.is_empty() && moved.bytes == 0);
+        let error = only_error(&moved);
+        assert!(error.contains("one file seen through two paths") && error.ends_with("put back at once"), "{error}");
+        assert_eq!(std::fs::read(spare).unwrap(), contents);
+        assert_eq!(std::fs::read_dir(dir.join("Trash/files")).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(dir.join("Trash/info")).unwrap().count(), 0);
+
+        // Where it cannot go back the message says where it is.
+        let report = pair_report(&[spare.clone()]);
+        std::fs::write(keep, "again").unwrap();
+        let report = Report { files: vec![seen(keep), report.files[0].clone()], groups: vec![Group { kind: Kind::Same, score: 1.0, members: vec![0, 1], reason: String::new() }], ..Default::default() };
+        let moved = move_marked(&report, &HashSet::new(), std::slice::from_ref(spare), &File::unchanged, &|path| {
+            let dest = crate::trash::trash(path)?;
+            std::fs::remove_file(keep).unwrap();
+            std::fs::write(path, "something new in its place").unwrap();
+            Ok(dest)
+        });
+        let error = only_error(&moved);
+        assert!(error.contains("could not be put back") && error.contains("Trash/files/spare.mkv"), "{error}");
+        assert_eq!(std::fs::read(dir.join("Trash/files/spare.mkv")).unwrap(), contents);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

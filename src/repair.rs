@@ -150,12 +150,20 @@ pub fn survey(tools: &Tools, input: &Path, info: &MediaInfo, output: &Path, thre
     Ok(Some(Survey { scores, times, gops }))
 }
 
-/// Whether the source's frames are shown about as long as each other (see [`Times::steady`]),
-/// read off its packets without decoding. Only then can a one-pass encode be scored along its
-/// whole length and repaired, which the search counts on where it can. A source whose packets
-/// can't be read so counts as steady: the survey decides then.
+/// Whether the survey will go by frames shown at these times, sorted: no two at one time
+/// (what [`Times::parse`] refuses) and about as long as each other (see [`Times::steady`]).
+/// Ten frames sharing a millisecond with their neighbour, in 53,841 of a Matroska file at 60
+/// frames a second, sent a video to spot checks after its search had aimed low.
+fn times_can_be_gone_by(pts: Vec<i64>, tb: (i64, i64)) -> bool {
+    pts.len() < 2 || (pts.windows(2).all(|w| w[1] > w[0]) && Times { pts, tb }.steady())
+}
+
+/// Whether the source's frames can be set against the encode's one for one, as the survey
+/// will ask, read off its packets without decoding. Only then can a one-pass encode be scored
+/// along its whole length and repaired, which the search counts on where it can. A source
+/// whose packets can't be read so counts as steady: the survey decides then.
 pub fn steady_source(tools: &Tools, input: &Path, info: &MediaInfo) -> bool {
-    let mut command = std::process::Command::new(&tools.ffprobe);
+    let mut command = crate::tools::probe_command(&tools.ffprobe);
     command.args(["-v", "error", "-select_streams", &info.video_index.to_string(), "-show_entries", "packet=pts", "-of", "csv=p=0"]).arg(crate::tools::probe_arg(input));
     let Ok(out) = crate::probe::run_ffprobe(command, crate::probe::Reads::all_of(input)) else { return true };
     if !out.status.success() {
@@ -165,7 +173,7 @@ pub fn steady_source(tools: &Tools, input: &Path, info: &MediaInfo) -> bool {
     let mut pts: Vec<i64> = text.lines().filter_map(|l| l.trim().trim_end_matches(',').parse().ok()).collect();
     // Packets are stored in decoding order; a frame is shown in the order of its timestamp.
     pts.sort_unstable();
-    pts.len() < 2 || Times { pts, tb: info.time_base }.steady()
+    times_can_be_gone_by(pts, info.time_base)
 }
 
 /// Seconds from the first frame at which each frame is shown, then the end of the last one.
@@ -1174,6 +1182,25 @@ mod tests {
 
     fn next_crf(known: &[(f64, f64)], floor: f64, lo: f64) -> (Option<f64>, bool) {
         next_try(known, Goal::holding(floor), lo)
+    }
+
+    #[test]
+    fn a_source_is_counted_on_for_repairs_only_when_the_survey_will_take_its_times() {
+        let even: Vec<i64> = (0..1000).map(|i| i * 33).collect();
+        assert!(times_can_be_gone_by(even.clone(), (1, 1000)));
+        assert!(times_can_be_gone_by(vec![7], (1, 1000)));
+        // Two frames at one time: the survey's reading of the times refuses them.
+        let mut doubled = even.clone();
+        doubled[500] = doubled[499];
+        assert!(!times_can_be_gone_by(doubled, (1, 1000)));
+        // 3% of the frames shown twice as long: not steady.
+        let mut held = Vec::new();
+        let mut at = 0;
+        for i in 0..1000 {
+            held.push(at);
+            at += if i % 33 == 0 { 66 } else { 33 };
+        }
+        assert!(!times_can_be_gone_by(held, (1, 1000)));
     }
 
     #[test]

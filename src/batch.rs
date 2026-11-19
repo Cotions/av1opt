@@ -722,7 +722,7 @@ fn done_elsewhere(job: &Job, input: &Path, o: &Options) -> Option<PathBuf> {
         return None;
     }
     let place = job.also_at.as_ref()?.join(output_of(job, o).file_name()?);
-    let made = report_input(&place).filter(|_| place.is_file())?;
+    let made = report_input(&place).filter(|_| std::fs::symlink_metadata(&place).is_ok_and(|m| m.is_file()))?;
     let same = made.source == input && same_sections(&o.remove, &made.removed) && matches!(crate::source::compare(&made.then, input), Verdict::Same);
     same.then_some(place)
 }
@@ -743,6 +743,17 @@ enum Before {
 }
 
 fn before_encoding(output: &Path, clash: Option<&Clash>, input: &Path, o: &Options) -> Before {
+    // Only a plain file can be an encode of av1opt's. A link, a pipe or a folder at the name is
+    // somebody else's doing: it is neither done nor to be replaced, whatever a report says.
+    if let Ok(there) = std::fs::symlink_metadata(output)
+        && !there.is_file()
+    {
+        return Before::Refuse(format!(
+            "{} is {}, not a file av1opt made, so nothing was done; move it away to encode this file there",
+            output.display(),
+            crate::files::kind_of(&there)
+        ));
+    }
     let exists = output.exists();
     let made = if exists { report_input(output) } else { None };
     match clash {
@@ -1277,6 +1288,36 @@ mod tests {
         let replaced = serde_json::json!({"input": source.0.join("x.mkv"), "output": out.0.join("x.mp4"), "source_bytes": 5, "replaced": {"at": 1}});
         std::fs::write(&report, replaced.to_string()).unwrap();
         assert!(reached_the_encode(&source.walk(&out.0, &mkv()).1["x.mkv"]));
+    }
+
+    #[test]
+    fn only_a_plain_file_at_the_outputs_name_counts_as_done() {
+        let source = Folder::new("plain-in", &["c.mkv"]);
+        let out = Folder::new("plain-out", &["elsewhere.mp4"]);
+        let report = || std::fs::write(out.0.join("c.av1opt.json"), serde_json::json!({"input": source.0.join("c.mkv"), "source_bytes": 5}).to_string()).unwrap();
+        report();
+        std::fs::write(out.0.join("c.mp4"), b"video").unwrap();
+        assert_eq!(source.walk(&out.0, &options()).0.already_done, 1);
+        let output = out.0.join("c.mp4");
+        let plant: [(&str, &dyn Fn()); 4] = [
+            ("a link", &|| std::os::unix::fs::symlink(out.0.join("elsewhere.mp4"), &output).unwrap()),
+            ("a link", &|| std::os::unix::fs::symlink(out.0.join("nothing.mp4"), &output).unwrap()),
+            ("a pipe", &|| crate::files::tests::make_pipe(&output)),
+            ("a folder", &|| std::fs::create_dir(&output).unwrap()),
+        ];
+        for (kind, plant) in plant {
+            let _ = std::fs::remove_file(&output);
+            plant();
+            for o in [options(), Options { overwrite: true, ..options() }] {
+                report();
+                let (sum, ends) = source.walk(&out.0, &o);
+                assert_eq!((sum.already_done, sum.failed, sum.ok), (0, 1, 0), "{kind}: {:?}", ends["c.mkv"]);
+                assert!(ends["c.mkv"].1.contains(&format!("c.mp4 is {kind}, not a file av1opt made")), "{:?}", ends["c.mkv"]);
+            }
+            assert!(std::fs::symlink_metadata(&output).is_ok_and(|m| !m.is_file()), "{kind} was taken away");
+            let _ = std::fs::remove_dir(&output);
+        }
+        assert_eq!(std::fs::read(out.0.join("elsewhere.mp4")).unwrap(), b"video");
     }
 
     #[test]

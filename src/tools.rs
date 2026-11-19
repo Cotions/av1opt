@@ -21,36 +21,47 @@ pub struct Capabilities {
     pub vmaf: bool,
 }
 
+/// How long a short question to a tool (its version, its encoders, one black frame) may take.
+/// Each takes well under a second, also on a machine busy with two encodes (0.05 s for the
+/// frame at a load of 17 on 12 threads); a program that hangs, as a wrong path pointing at
+/// something else may, is given up on.
+const QUESTION_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What `command` printed, its output and its errors, if it ended within `limit`. One still
+/// going then is killed, and there is no answer.
+fn answer_within(mut command: Command, limit: std::time::Duration) -> Option<(std::process::ExitStatus, String, String)> {
+    let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().ok()?;
+    let read = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_string(&mut s);
+            }
+            s
+        })
+    };
+    let (stdout, stderr) = (read(child.stdout.take().map(|p| Box::new(p) as _)), read(child.stderr.take().map(|p| Box::new(p) as _)));
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if start.elapsed() < limit => std::thread::sleep(std::time::Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    Some((status, stdout.join().ok()?, stderr.join().ok()?))
+}
+
 impl Capabilities {
     pub fn probe(ffmpeg: &str, ffprobe: &str) -> Self {
-        // A program that hangs (a wrong path pointing at something else) is given up on after 10 s.
         let out = |prog: &str, arg: &str| -> Option<String> {
-            let mut child = Command::new(prog)
-                .args(["-hide_banner", arg])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .ok()?;
-            let mut stdout = child.stdout.take()?;
-            let reader = std::thread::spawn(move || {
-                let mut s = String::new();
-                let _ = stdout.read_to_string(&mut s);
-                s
-            });
-            let start = Instant::now();
-            let status = loop {
-                match child.try_wait() {
-                    Ok(Some(st)) => break st,
-                    Ok(None) if start.elapsed() < std::time::Duration::from_secs(10) => std::thread::sleep(std::time::Duration::from_millis(20)),
-                    _ => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return None;
-                    }
-                }
-            };
-            let text = reader.join().ok()?;
+            let mut command = Command::new(prog);
+            command.args(["-hide_banner", arg]);
+            let (status, text, _) = answer_within(command, QUESTION_LIMIT)?;
             status.success().then_some(text)
         };
         let ffmpeg_version = out(ffmpeg, "-version").and_then(|v| v.lines().next().map(str::to_owned));
@@ -429,18 +440,16 @@ impl Tools {
     /// say). Measurements kept between runs only count for the build that made them.
     pub fn encoder_version(&self) -> &str {
         self.version.get_or_init(|| {
-            let ffmpeg = Command::new(&self.ffmpeg)
-                .args(["-hide_banner", "-version"])
-                .stdin(Stdio::null())
-                .stderr(Stdio::null())
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8_lossy(&o.stdout).lines().next().map(str::to_owned))
-                .unwrap_or_default();
+            let ask = |args: &[&str]| {
+                let mut command = Command::new(&self.ffmpeg);
+                command.args(args);
+                answer_within(command, QUESTION_LIMIT)
+            };
+            let ffmpeg = ask(&["-hide_banner", "-version"]).and_then(|(_, out, _)| out.lines().next().map(str::to_owned)).unwrap_or_default();
             // An ffmpeg that loads the encoder from the system stays the same ffmpeg when
             // the encoder is updated; the encoder names itself when it is started.
             let one_frame = ["-hide_banner", "-f", "lavfi", "-i", "color=black:s=64x64:r=1", "-frames:v", "1", "-c:v", "libsvtav1", "-preset", "13", "-f", "null", "-"];
-            let svt = Command::new(&self.ffmpeg).args(one_frame).stdin(Stdio::null()).stdout(Stdio::null()).output().ok().and_then(|o| svt_version(&String::from_utf8_lossy(&o.stderr)));
+            let svt = ask(&one_frame).and_then(|(_, _, errors)| svt_version(&errors));
             match svt {
                 Some(v) => format!("{ffmpeg} | {v}"),
                 None => ffmpeg,
@@ -980,6 +989,20 @@ mod tests {
         assert!(e.contains("stopped making progress") && e.contains("1 seconds") && e.contains("not been touched"), "{e}");
         let pid = std::fs::read_to_string(dir.join("pid")).unwrap();
         assert!(!Path::new("/proc").join(pid.trim()).exists(), "the stopped ffmpeg is gone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_question_to_a_tool_that_hangs_is_given_up_on() {
+        let dir = room("question");
+        let (answers, hangs) = (dir.join("answers"), dir.join("hangs"));
+        crate::files::write_script(&answers, "echo out; echo errors >&2\n");
+        crate::files::write_script(&hangs, "exec sleep 600\n");
+        let (status, out, errors) = answer_within(Command::new(&answers), Duration::from_secs(10)).unwrap();
+        assert!(status.success() && out == "out\n" && errors == "errors\n");
+        let began = Instant::now();
+        assert!(answer_within(Command::new(&hangs), Duration::from_millis(300)).is_none());
+        assert!(began.elapsed() < Duration::from_secs(5), "waited {:?}", began.elapsed());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

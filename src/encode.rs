@@ -354,11 +354,17 @@ fn claim_output(out_dir: &Path, stem: &str) -> Result<Option<crate::files::Claim
     match crate::files::Claim::take(&path) {
         Ok(Some(claim)) => Ok(Some(claim)),
         Ok(None) => Err(InUse("another av1opt is encoding this now").into()),
-        Err(e) => {
+        Err(e) if crate::files::no_locks_here(&e) => {
             // A filesystem without locks: carry on as a single run would.
             eprintln!("warning: cannot lock {}: {e}; a second run on this folder would not be noticed", path.display());
             Ok(None)
         }
+        // Anything else at the name, put there by someone who can write to the folder, would
+        // otherwise let this run go on unlocked beside another.
+        Err(e) => bail!(
+            "cannot take the lock {} that keeps other runs off this output ({e}), so nothing was encoded; if no av1opt is working on this folder, move or delete it, or choose another output folder",
+            path.display()
+        ),
     }
 }
 
@@ -2554,6 +2560,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_folder_planted_at_the_locks_name_stops_the_file() {
+        let dir = folder_for_test("planted-lock");
+        std::fs::create_dir(dir.join(format!(".av1opt-lock-{:016x}", scenes::fnv1a("clip")))).unwrap();
+        let why = claim_output(&dir, "clip").err().expect("went on without the lock").to_string();
+        assert!(why.contains("cannot take the lock") && why.contains("it is a folder") && why.contains("nothing was encoded"), "{why}");
+        assert!(claim_output(&dir, "other").unwrap().is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

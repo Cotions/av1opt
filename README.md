@@ -447,7 +447,9 @@ two apart: it is counted apart as needing confirmation, not as failed. Deleting 
 encodes the source again. A report too old to
 hold the time goes by the size alone. A file there with no report, or with one that cannot
 be read, says nothing about what it is: it is listed as not verified and left alone, the run
-ends with status 3, and moving or deleting it has the source encoded.
+ends with status 3, and moving or deleting it has the source encoded. Only a plain file counts:
+a link, a pipe or a folder at the output's name is never done, whatever report is beside it,
+and the file fails with a message that says what is there.
 An output is never written where its own source or another
 input of the run is, whatever name leads there (`--overwrite` included): with `-o` the folder
 being walked, `a.mkv` is refused when `a.mp4` is there too, and the rest of the run goes on;
@@ -924,6 +926,13 @@ environment, so set the ffmpeg path once in Settings.
 - Refuses to write to ZFS unless `--allow-zfs` is passed.
 - An output file that appears in the output folder while its encode runs is not written
   over: the finished encode is kept next to it under another name, and the run says where.
+- What av1opt reads in the output folder (`av1opt-log.tsv`, the reports, a work folder's plan)
+  is read only if it is a plain file of a sensible size (8 MiB for a report, 128 MiB for the
+  log); a pipe, a link or a larger file there is passed over with a warning, never waited on.
+- Each output is locked while it is made (`.av1opt-lock-<number>` in the output folder). Something
+  at that name that is not a plain file of yours stops that file with a message: move it away
+  if no av1opt is working there. Only on a filesystem without locks does the run go on, with a
+  warning.
 - Each ffmpeg run gets a memory cap (`--memory-limit`: `12G`, `1.5G`, `800M` or `40%`, shared
   by the chunks `--workers` runs at the same time, or `none` for no cap; default 40% of RAM) and low CPU priority (`--nice 10`), so a 4K encode
   can't freeze the desktop.

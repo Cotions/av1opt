@@ -380,13 +380,29 @@ pub struct Claim {
 }
 
 impl Claim {
-    /// `None` when another run, or another thread of this one, holds it.
+    /// `None` when another run, or another thread of this one, holds it. Something at the name
+    /// that is not a plain file of this user's is refused (with [`ClaimRefused`] inside the
+    /// error): in a folder others can write to, a pipe or a folder put there would otherwise
+    /// let the run go on without the lock, and a file of theirs would let them hold it.
     pub fn take(path: &Path) -> std::io::Result<Option<Claim>> {
         use std::os::fd::AsRawFd;
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let refused = |why: String| std::io::Error::other(ClaimRefused(why));
         loop {
-            // Not through a link: this is a folder others may be able to write to.
-            let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).custom_flags(libc::O_NOFOLLOW).open(path)?;
+            // Not through a link: this is a folder others may be able to write to. Nor waiting
+            // on a pipe.
+            let file = match std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path) {
+                Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(refused("it is a link".into())),
+                Err(e) if e.raw_os_error() == Some(libc::EISDIR) => return Err(refused("it is a folder".into())),
+                opened => opened?,
+            };
+            let found = file.metadata()?;
+            if !found.is_file() {
+                return Err(refused(format!("it is {}", kind_of(&found))));
+            }
+            if found.uid() != my_user() {
+                return Err(refused("it belongs to another user".into()));
+            }
             // SAFETY: flock on a descriptor we own; no memory is involved.
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
                 let e = std::io::Error::last_os_error();
@@ -400,6 +416,24 @@ impl Claim {
             }
         }
     }
+}
+
+/// Why the name of a [`Claim`] is not one av1opt can lock: something else is there.
+#[derive(Debug)]
+pub struct ClaimRefused(pub String);
+
+impl std::fmt::Display for ClaimRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ClaimRefused {}
+
+/// Whether a lock could not be taken because the filesystem has none to give (some network
+/// drives), rather than because of what is at its name.
+pub fn no_locks_here(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::ENOLCK | libc::EOPNOTSUPP | libc::ENOSYS))
 }
 
 impl Drop for Claim {
@@ -815,6 +849,24 @@ pub(crate) mod tests {
         let stopped = whole_digest(&file, size, &AtomicU64::new(0), &AtomicBool::new(true)).unwrap_err();
         assert_eq!(stopped.kind(), std::io::ErrorKind::Interrupted);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn something_planted_at_a_claims_name_is_refused_and_left_there() {
+        let dir = room("claim-planted");
+        let (pipe, folder, link, target) = (dir.join("pipe"), dir.join("folder"), dir.join("link"), dir.join("target"));
+        make_pipe(&pipe);
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(&target, b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        for (path, why) in [(&pipe, "it is a pipe"), (&folder, "it is a folder"), (&link, "it is a link")] {
+            let e = Claim::take(path).err().unwrap_or_else(|| panic!("{} was taken", path.display()));
+            assert_eq!(e.to_string(), why);
+            assert!(e.get_ref().is_some_and(|inner| inner.is::<ClaimRefused>()) && !no_locks_here(&e));
+            assert!(std::fs::symlink_metadata(path).is_ok(), "{} was removed", path.display());
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

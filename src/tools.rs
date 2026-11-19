@@ -385,6 +385,8 @@ pub struct Tools {
     pub hooks: Option<Arc<Hooks>>,
     /// First line of `ffmpeg -version`, asked for once.
     version: std::sync::OnceLock<String>,
+    /// Whether ffmpeg and ffprobe can open files by way of av1opt's descriptors, asked once.
+    reach: std::sync::OnceLock<bool>,
     /// How long a run may go without moving, see [`Watchdog`].
     stall_limit: Duration,
 }
@@ -398,7 +400,7 @@ impl Tools {
             }
             works
         });
-        Tools { ffmpeg, ffprobe, side_by_side_cap: cap.clone(), cap, hooks: None, version: std::sync::OnceLock::new(), stall_limit: STALL_LIMIT }
+        Tools { ffmpeg, ffprobe, side_by_side_cap: cap.clone(), cap, hooks: None, version: std::sync::OnceLock::new(), reach: std::sync::OnceLock::new(), stall_limit: STALL_LIMIT }
     }
 
     /// Sets what each chunk encode gets when several run at once. Every other ffmpeg run is
@@ -419,6 +421,7 @@ impl Tools {
             side_by_side_cap: self.side_by_side_cap.clone(),
             hooks: self.hooks.clone(),
             version: self.version.clone(),
+            reach: self.reach.clone(),
             stall_limit: self.stall_limit,
         })
     }
@@ -454,6 +457,30 @@ impl Tools {
                 Some(v) => format!("{ffmpeg} | {v}"),
                 None => ffmpeg,
             }
+        })
+    }
+
+    /// Whether ffmpeg and ffprobe, started as every run starts them, can open a file in
+    /// `folder`, a path of one of av1opt's descriptors (see [`crate::files::HeldFolder`]). Run
+    /// in another view of the system's processes (a sandbox or a container of their own) they
+    /// find another process or none under that number. Asked once, with a file av1opt writes
+    /// there and the tools read back; a tool that does not answer within the time of a short
+    /// question counts as one that cannot.
+    pub fn reach(&self, folder: &Path) -> bool {
+        *self.reach.get_or_init(|| {
+            let Ok(token) = crate::files::random_text(8) else { return false };
+            let file = folder.join(".av1opt-reach-check");
+            if crate::files::write_new(&file, token.as_bytes()).is_err() {
+                return false;
+            }
+            let read = path_arg(&file);
+            let ffmpeg = self.command_for(&["-v", "error"], &["-f", "data", "-i", &read, "-map", "0", "-c", "copy", "-f", "data", "-"].map(String::from));
+            let ffmpeg_reads = answer_within(ffmpeg, QUESTION_LIMIT).is_some_and(|(status, out, _)| status.success() && out == token);
+            let mut ffprobe = Command::new(&self.ffprobe);
+            ffprobe.args(["-v", "error", "-f", "data", "-show_entries", "format=size", "-of", "csv=p=0"]).arg(&read);
+            let ffprobe_reads = ffmpeg_reads && answer_within(ffprobe, QUESTION_LIMIT).is_some_and(|(status, out, _)| status.success() && out.trim() == token.len().to_string());
+            let _ = std::fs::remove_file(&file);
+            ffprobe_reads
         })
     }
 
@@ -932,7 +959,7 @@ mod tests {
     use super::*;
 
     fn capped(cap: &str, part: &str) -> Tools {
-        Tools { ffmpeg: "ffmpeg".into(), ffprobe: "ffprobe".into(), cap: Some(cap.into()), side_by_side_cap: Some(part.into()), hooks: None, version: Default::default(), stall_limit: STALL_LIMIT }
+        Tools { ffmpeg: "ffmpeg".into(), ffprobe: "ffprobe".into(), cap: Some(cap.into()), side_by_side_cap: Some(part.into()), hooks: None, version: Default::default(), reach: Default::default(), stall_limit: STALL_LIMIT }
     }
 
     fn cap_of(tools: &Tools) -> String {

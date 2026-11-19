@@ -70,17 +70,6 @@ fn make_private(dir: &Path) -> std::io::Result<()> {
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
 }
 
-/// Whether what this user creates in `dir` shows up as belonging to `owner`. Drives that map
-/// owners (sshfs, NFS, CIFS) show a user's own folders under another number, and a small file
-/// is the one proof of that: in another user's closed folder it cannot even be made.
-fn own_files_show_as(dir: &Path, owner: u32) -> bool {
-    let probe = dir.join(format!(".av1opt-owner-check-{}", std::process::id()));
-    let Ok(file) = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&probe) else { return false };
-    let shown = file.metadata().map(|m| m.uid());
-    let _ = std::fs::remove_file(&probe);
-    shown.is_ok_and(|uid| uid == owner)
-}
-
 /// Whether `dir` can be trusted with what is thrown away: a real folder, never a link, that is
 /// user `me`'s and that nobody else can write to. Anyone who could would be able to take the
 /// files out, or put others in their place.
@@ -93,7 +82,7 @@ fn usable_bin(dir: &Path, me: u32) -> std::io::Result<()> {
     if m.mode() & 0o022 != 0 {
         return refused("can be written to by other users; `chmod go-w` on it would make it usable");
     }
-    if m.uid() != me && !own_files_show_as(dir, m.uid()) {
+    if m.uid() != me && !crate::files::own_files_show_as(dir, m.uid()) {
         return refused("is not a folder of this user's");
     }
     Ok(())

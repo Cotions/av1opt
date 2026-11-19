@@ -938,8 +938,8 @@ environment, so set the ffmpeg path once in Settings.
   log); a pipe, a link or a larger file there is passed over with a warning, never waited on.
 - Each output is locked while it is made (`.av1opt-lock-<number>` in the output folder). Something
   at that name that is not a plain file of yours stops that file with a message: move it away
-  if no av1opt is working there. Only on a filesystem without locks does the run go on, with a
-  warning.
+  if no av1opt is working there. When the filesystem gives no lock for any other reason (it has
+  none, or a network drive fails), the run goes on, with a warning.
 - Each ffmpeg run gets a memory cap (`--memory-limit`: `12G`, `1.5G`, `800M` or `40%`, shared
   by the chunks `--workers` runs at the same time, or `none` for no cap; default 40% of RAM) and low CPU priority (`--nice 10`), so a 4K encode
   can't freeze the desktop.
@@ -952,8 +952,12 @@ environment, so set the ffmpeg path once in Settings.
   nothing: the encode is still made, hashed and moved in av1opt's own folder, and nothing in the
   folder the link leads to is written or removed. The encode's SHA-256 is taken before it is put
   in the output folder, and if what has its name there a moment later is another file, nothing
-  is recorded. Without `/proc`, an output folder that others can write to needs the sticky bit
-  (`chmod +t`), or the file is refused.
+  is recorded. Without `/proc`, or with ffmpeg run where it cannot see av1opt's process (a
+  sandbox of its own), the folders are reached by their names, and an output folder that others
+  can write to needs the sticky bit (`chmod +t`), or the file is refused; one that only your own
+  group (the one named after you, with nobody else in it) can write to counts as yours. On a
+  drive that keeps no modes or owners (FAT, exFAT, NTFS, some network drives) nothing can be
+  private: the folders are used by their names, and the run says so once.
 - Output that nobody reads stops no work. When standard error is gone (a `tee` that has ended, a
   terminal closed under a program that outlives it) messages are dropped and the work goes
   on. When standard output is gone, as in `av1opt scan /videos | head`, the command ends

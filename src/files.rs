@@ -162,11 +162,15 @@ fn remove_abandoned_folders_of(parent: &Path, prefix: &str, me: u32) {
 /// The work folder at `path`, kept from an earlier run so that it can go on from it, held open
 /// if it can be believed; None if there is none yet, and otherwise why not. Its name can be
 /// worked out by anyone, and what is in it decides what ends up in the output.
-pub fn check_kept_folder(path: &Path) -> Result<Option<HeldFolder>, String> {
-    check_kept_folder_of(path, my_user())
+///
+/// `tools_reach` says whether ffmpeg and ffprobe can go through a path of the descriptor (see
+/// [`HeldFolder`]); where they cannot, the folder is held by its name, as where there is no
+/// `/proc`.
+pub fn check_kept_folder(path: &Path, tools_reach: bool) -> Result<Option<HeldFolder>, String> {
+    check_kept_folder_of(path, my_user(), tools_reach, &|| shown_in(folder_of(path)))
 }
 
-fn check_kept_folder_of(path: &Path, me: u32) -> Result<Option<HeldFolder>, String> {
+fn check_kept_folder_of(path: &Path, me: u32, tools_reach: bool, shown: &dyn Fn() -> std::io::Result<Shown>) -> Result<Option<HeldFolder>, String> {
     let folder = match open_folder(path) {
         Ok(folder) => folder,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -177,27 +181,161 @@ fn check_kept_folder_of(path: &Path, me: u32) -> Result<Option<HeldFolder>, Stri
     // Folders made by earlier versions follow the umask. One only its owner can write to is
     // as good as a private one, and may hold days of encoding. It is closed by way of the
     // descriptor: by name, a link put there meanwhile would be followed.
-    let mode = folder.metadata().map_err(|e| format!("it cannot be looked at ({e})"))?.mode();
-    let held = HeldFolder::hold(folder, me, 0o022).map_err(|e| e.to_string())?;
+    let found = folder.metadata().map_err(|e| format!("it cannot be looked at ({e})"))?;
+    let held = HeldFolder::hold(folder, path, me, 0o022, &|_| tools_reach, shown).map_err(|e| e.to_string())?;
     let entries = std::fs::read_dir(held.path()).map_err(|e| format!("it cannot be read ({e})"))?;
     for entry in entries {
         let entry = entry.map_err(|e| format!("it cannot be read ({e})"))?;
         let file = std::fs::symlink_metadata(entry.path()).map_err(|e| format!("it cannot be read ({e})"))?;
-        if !file.is_file() || file.uid() != me {
+        // Of the owner the folder was found to have: where the filesystem shows another than
+        // this user for everything, it shows that one for these files too.
+        if !file.is_file() || file.uid() != found.uid() {
             return Err(format!("{} in it is not a plain file of this user's", entry.file_name().to_string_lossy()));
         }
     }
-    if mode & 0o777 != 0o700 {
+    if held.keeps_modes && found.mode() & 0o777 != 0o700 {
         held.folder.set_permissions(std::fs::Permissions::from_mode(0o700)).map_err(|e| format!("it cannot be made private ({e})"))?;
     }
     Ok(Some(held))
 }
 
-/// Makes the folder `path` for work kept between runs, private and new, and holds it. Fails if
-/// something is there already.
-pub fn make_kept_folder(path: &Path) -> std::io::Result<HeldFolder> {
+/// Makes the folder `path` for work kept between runs, private and new, and holds it (see
+/// [`HeldFolder::made`]). Fails if something is there already.
+pub fn make_kept_folder(path: &Path, tools_reach: &dyn Fn(&Path) -> bool) -> std::io::Result<HeldFolder> {
     std::fs::DirBuilder::new().mode(0o700).create(path)?;
-    HeldFolder::open(path)
+    HeldFolder::made(path, tools_reach)
+}
+
+/// What a filesystem shows of a file av1opt has just made there with mode 0600: its owner, and
+/// whether it keeps that mode.
+#[derive(Clone, Copy, Debug)]
+struct Shown {
+    owner: u32,
+    keeps_modes: bool,
+}
+
+/// What `folder`'s filesystem shows of a file made there now. FAT, exFAT and NTFS drives show
+/// every file and folder with the owner and modes they were mounted with, and network drives
+/// may show another owner for all (root, or the user everyone is mapped to). A file made here
+/// with `O_EXCL` and judged on its own descriptor is the one proof of that nobody else can fake:
+/// a folder can be swapped for another between its `mkdir` and its open, this cannot.
+fn shown_in(folder: &Path) -> std::io::Result<Shown> {
+    let probe = folder.join(format!(".av1opt-owner-check-{}-{}", std::process::id(), random_text(4)?));
+    let file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&probe)?;
+    let meta = file.metadata();
+    let _ = std::fs::remove_file(&probe);
+    let meta = meta?;
+    Ok(Shown { owner: meta.uid(), keeps_modes: meta.mode() & 0o077 == 0 })
+}
+
+/// Whether what this user creates in `dir` shows up as belonging to `owner`. Drives that map
+/// owners (sshfs, NFS, CIFS) show a user's own folders under another number, and a small file
+/// is the one proof of that: in another user's closed folder it cannot even be made.
+pub fn own_files_show_as(dir: &Path, owner: u32) -> bool {
+    shown_in(dir).is_ok_and(|shown| shown.owner == owner)
+}
+
+/// Says, once for each folder, that the folders av1opt makes in it cannot be private.
+fn say_no_modes_in(parent: &Path) {
+    static SAID: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> = std::sync::LazyLock::new(Default::default);
+    if SAID.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(parent.to_path_buf()) {
+        eprintln!(
+            "warning: the drive of {} does not keep who owns a file or who may open it (FAT, exFAT and NTFS drives and some network drives do not), so the temporary and work folders av1opt makes there cannot be made private; they are used by their names",
+            parent.display()
+        );
+    }
+}
+
+/// Whether the folder `folder` holds is empty.
+fn is_empty(folder: &std::fs::File) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: openat on a descriptor we own, with a valid NUL-terminated name, gives a
+    // descriptor of its own (and a reading position of its own), which fdopendir takes over
+    // and closedir closes; readdir's entries are only read before the next call.
+    unsafe {
+        let fd = libc::openat(folder.as_raw_fd(), c".".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC);
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let dir = libc::fdopendir(fd);
+        if dir.is_null() {
+            let e = std::io::Error::last_os_error();
+            libc::close(fd);
+            return Err(e);
+        }
+        let mut empty = true;
+        loop {
+            let entry = libc::readdir(dir);
+            if entry.is_null() {
+                break;
+            }
+            let name = std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()).to_bytes();
+            if name != b"." && name != b".." {
+                empty = false;
+                break;
+            }
+        }
+        libc::closedir(dir);
+        Ok(empty)
+    }
+}
+
+/// Whether users other than this one can rename what is in `folder`: it is open to their
+/// writing and lacks the sticky bit, which would keep each to their own names. Writing by the
+/// folder's group counts only when someone else may be in that group: with the umask of 0002
+/// many systems give, every folder can be written by its group, and that group is its user's
+/// own. A folder with an access list may let anyone write, whatever its mode shows.
+fn others_may_rename_in(folder: &Path) -> bool {
+    let Ok(m) = std::fs::metadata(folder) else { return false };
+    if m.mode() & 0o1000 != 0 {
+        return false;
+    }
+    m.mode() & 0o002 != 0 || (m.mode() & 0o020 != 0 && (has_access_list(folder) || !group_is_mine_alone(m.gid())))
+}
+
+/// Whether `folder` has an access list beyond its mode.
+fn has_access_list(folder: &Path) -> bool {
+    let Ok(name) = std::ffi::CString::new(folder.as_os_str().as_bytes()) else { return true };
+    // SAFETY: valid NUL-terminated strings; with no buffer, getxattr only gives the size.
+    let size = unsafe { libc::getxattr(name.as_ptr(), c"system.posix_acl_access".as_ptr(), std::ptr::null_mut(), 0) };
+    size > 0
+}
+
+/// Whether the group `gid` is this user's own and holds nobody else, as far as can be told
+/// cheaply from the system's user and group lists (by way of libc, so that lists kept
+/// elsewhere, as in LDAP, count too): it is this user's own group, named as this user is, and
+/// lists no member but this user. A group some other user has as their own without being listed
+/// in it can only be found by going through every user, which is not done: any other group
+/// counts as shared.
+fn group_is_mine_alone(gid: u32) -> bool {
+    let mut buffer = vec![0 as libc::c_char; 1 << 16];
+    // SAFETY: the structs are filled by the calls from the buffer given, which outlives every
+    // use of the pointers in them; a result of null or an error means nothing was found.
+    unsafe {
+        let mut user: libc::passwd = std::mem::zeroed();
+        let mut found = std::ptr::null_mut();
+        if libc::getpwuid_r(my_user(), &mut user, buffer.as_mut_ptr(), buffer.len(), &mut found) != 0 || found.is_null() || user.pw_gid != gid {
+            return false;
+        }
+        let me = std::ffi::CStr::from_ptr(user.pw_name).to_bytes().to_vec();
+        let mut group_buffer = vec![0 as libc::c_char; 1 << 16];
+        let mut group: libc::group = std::mem::zeroed();
+        let mut found = std::ptr::null_mut();
+        if libc::getgrgid_r(gid, &mut group, group_buffer.as_mut_ptr(), group_buffer.len(), &mut found) != 0 || found.is_null() {
+            return false;
+        }
+        if std::ffi::CStr::from_ptr(group.gr_name).to_bytes() != me {
+            return false;
+        }
+        let mut member = group.gr_mem;
+        while !member.is_null() && !(*member).is_null() {
+            if std::ffi::CStr::from_ptr(*member).to_bytes() != me {
+                return false;
+            }
+            member = member.add(1);
+        }
+        true
+    }
 }
 
 /// The folder at `path`, opened. A link at that name is refused (`ELOOP`) and so is anything
@@ -226,50 +364,110 @@ fn open_folder(path: &Path) -> std::io::Result<std::fs::File> {
 /// one started by `systemd-run --scope` under the memory cap included. Under `/proc/self` the
 /// path would only work for a program that inherited the descriptor, and none does: every
 /// descriptor is closed for the programs av1opt starts.
+///
+/// Where that path does not work (no `/proc`, or ffmpeg run where it does not see this
+/// process), or where the filesystem keeps no modes or owners and so nothing can be private,
+/// the folder is held by its name instead, as before av1opt held folders: the first only in an
+/// output folder where nobody else can rename things.
 #[derive(Debug)]
 pub struct HeldFolder {
     folder: std::fs::File,
     inside: PathBuf,
+    /// Whether `inside` is the folder's name rather than a path of its descriptor.
+    by_name: bool,
+    /// Whether the filesystem shows the folder's own mode, so that making it private means
+    /// something.
+    keeps_modes: bool,
 }
 
 impl HeldFolder {
-    /// Opens the folder at `path`: a real folder (a link there is refused), of this user's,
-    /// that nobody else can enter. Judged on the open descriptor, so that what is judged is
-    /// what is then used.
-    pub fn open(path: &Path) -> std::io::Result<HeldFolder> {
-        Self::open_of(path, my_user())
+    /// Opens the folder at `path`, which av1opt has just made with mode 0700, to hold it: a
+    /// real folder (a link there is refused), empty, of this user's and that nobody else can
+    /// enter. Judged on the open descriptor, so that what is judged is what is then used.
+    /// `tools_reach` is asked, with the path of the descriptor, whether ffmpeg and ffprobe can
+    /// go through it.
+    ///
+    /// When the folder does not show what it was made with, either the filesystem keeps no
+    /// modes or owners of its own, and the folder is held by its name with a warning, or the
+    /// folder is not the one made: someone put another at its name in the moment between.
+    /// Which of the two is told by a file made there now. A folder that is refused for want of
+    /// a way through its descriptor is removed again, if it is still the one made.
+    pub fn made(path: &Path, tools_reach: &dyn Fn(&Path) -> bool) -> std::io::Result<HeldFolder> {
+        Self::made_of(path, my_user(), tools_reach, &|| shown_in(folder_of(path)))
     }
 
-    fn open_of(path: &Path, me: u32) -> std::io::Result<HeldFolder> {
-        Self::hold(open_folder(path)?, me, 0o077)
+    fn made_of(path: &Path, me: u32, tools_reach: &dyn Fn(&Path) -> bool, shown: &dyn Fn() -> std::io::Result<Shown>) -> std::io::Result<HeldFolder> {
+        let folder = open_folder(path)?;
+        let meta = folder.metadata()?;
+        // A folder av1opt has just made holds nothing: one that does is somebody else's, put at
+        // its name, a kept work folder of another video, say.
+        if !is_empty(&folder)? {
+            return Err(std::io::Error::other("it is not the folder av1opt had just made: something was in it at once, so another folder was put at its name"));
+        }
+        let held = Self::hold(folder, path, me, 0o077, tools_reach, shown);
+        if held.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::Unsupported)
+            && std::fs::symlink_metadata(path).is_ok_and(|now| now.is_dir() && (now.dev(), now.ino()) == (meta.dev(), meta.ino()))
+        {
+            let _ = std::fs::remove_dir(path);
+        }
+        held
     }
 
-    /// `folder` held, if it is a folder of user `me` without any of the bits in `refused`.
-    fn hold(folder: std::fs::File, me: u32, refused: u32) -> std::io::Result<HeldFolder> {
+    /// `folder`, found at `path`, held: if it is a folder of user `me` without any of the bits
+    /// in `refused`, or as near to that as its filesystem can show (see [`shown_in`], asked by
+    /// way of `shown` only when the folder shows otherwise). `reach` is asked whether a path of
+    /// the descriptor can be given to ffmpeg and ffprobe.
+    fn hold(folder: std::fs::File, path: &Path, me: u32, refused: u32, reach: &dyn Fn(&Path) -> bool, shown: &dyn Fn() -> std::io::Result<Shown>) -> std::io::Result<HeldFolder> {
         use std::os::fd::AsRawFd;
         let meta = folder.metadata()?;
         if !meta.is_dir() {
             return Err(std::io::Error::other("it is not a folder"));
         }
-        if meta.uid() != me {
-            return Err(std::io::Error::other("it belongs to another user"));
-        }
-        if meta.mode() & refused != 0 {
-            return Err(std::io::Error::other(if meta.mode() & refused & 0o022 != 0 { "other users can write to it" } else { "other users can enter it" }));
+        let mode_refused = || std::io::Error::other(if meta.mode() & refused & 0o022 != 0 { "other users can write to it" } else { "other users can enter it" });
+        if meta.uid() != me || meta.mode() & refused != 0 {
+            // Where the filesystem keeps owners and modes, a new file shows this user and its
+            // mode, and the folder is what it looks like.
+            let shown = shown()?;
+            if meta.uid() != shown.owner {
+                return Err(std::io::Error::other("it belongs to another user"));
+            }
+            if shown.keeps_modes && meta.mode() & refused != 0 {
+                return Err(mode_refused());
+            }
+            // What is shown is what the drive shows of everything on it, and says nothing:
+            // nothing there can be private, so a name is as good as a descriptor.
+            say_no_modes_in(folder_of(path));
+            return Ok(HeldFolder { folder, inside: path.to_path_buf(), by_name: true, keeps_modes: shown.keeps_modes });
         }
         let inside = PathBuf::from(format!("/proc/{}/fd/{}", std::process::id(), folder.as_raw_fd()));
         // Without the system's list of processes (a container without /proc) the descriptor
-        // cannot be gone through by path: the caller is told, and decides.
-        let through = std::fs::metadata(&inside).is_ok_and(|m| (m.dev(), m.ino()) == (meta.dev(), meta.ino()));
-        if !through {
-            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, format!("{} does not lead to the folder (is /proc there?)", inside.display())));
+        // cannot be gone through by path, nor by tools that do not see this process (run in a
+        // sandbox of their own). The name is then gone by, but only where nobody else can
+        // rename the folder.
+        let leads = std::fs::metadata(&inside).is_ok_and(|m| (m.dev(), m.ino()) == (meta.dev(), meta.ino()));
+        if leads && reach(&inside) {
+            return Ok(HeldFolder { folder, inside, by_name: false, keeps_modes: true });
         }
-        Ok(HeldFolder { folder, inside })
+        if !others_may_rename_in(folder_of(path)) {
+            return Ok(HeldFolder { folder, inside: path.to_path_buf(), by_name: true, keeps_modes: true });
+        }
+        let why = if leads {
+            format!("ffmpeg or ffprobe cannot open files through {} (are they run in a sandbox of their own?)", inside.display())
+        } else {
+            format!("{} does not lead to the folder (is /proc there?)", inside.display())
+        };
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, why))
     }
 
-    /// The path that leads into this folder, whatever has become of its name.
+    /// The path that leads into this folder, whatever has become of its name; its name where it
+    /// is held by name.
     pub fn path(&self) -> &Path {
         &self.inside
+    }
+
+    /// Whether the folder is gone into by its name.
+    pub fn by_name(&self) -> bool {
+        self.by_name
     }
 
     /// The device and the number of the folder.
@@ -280,7 +478,7 @@ impl HeldFolder {
     /// Where the folder is now, if it is still there under some name.
     fn location(&self) -> Option<PathBuf> {
         use std::os::fd::AsRawFd;
-        let now = std::fs::read_link(format!("/proc/self/fd/{}", self.folder.as_raw_fd())).ok()?;
+        let now = if self.by_name { self.inside.clone() } else { std::fs::read_link(format!("/proc/self/fd/{}", self.folder.as_raw_fd())).ok()? };
         let identity = self.identity().ok()?;
         std::fs::symlink_metadata(&now).is_ok_and(|m| m.is_dir() && (m.dev(), m.ino()) == identity).then_some(now)
     }
@@ -534,22 +732,38 @@ impl Claim {
     /// error): in a folder others can write to, a pipe or a folder put there would otherwise
     /// let the run go on without the lock, and a file of theirs would let them hold it.
     pub fn take(path: &Path) -> std::io::Result<Option<Claim>> {
+        Self::take_of(path, my_user(), &|| shown_in(folder_of(path)))
+    }
+
+    /// As [`Claim::take`] for user `me`, with `shown` asked what a file just made beside the
+    /// lock shows, when one that was there already shows another owner.
+    fn take_of(path: &Path, me: u32, shown: &dyn Fn() -> std::io::Result<Shown>) -> std::io::Result<Option<Claim>> {
         use std::os::fd::AsRawFd;
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         let refused = |why: String| std::io::Error::other(ClaimRefused(why));
         loop {
             // Not through a link: this is a folder others may be able to write to. Nor waiting
-            // on a pipe.
-            let file = match std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path) {
-                Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(refused("it is a link".into())),
-                Err(e) if e.raw_os_error() == Some(libc::EISDIR) => return Err(refused("it is a folder".into())),
-                opened => opened?,
+            // on a pipe. Made new if it can be, so that it is known to be this run's own.
+            let open = |create: bool| std::fs::OpenOptions::new().read(true).write(true).create_new(create).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC).open(path);
+            let (file, made) = match open(true) {
+                Ok(file) => (file, true),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match open(false) {
+                    // Let go of and removed by its holder in the meantime.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(refused("it is a link".into())),
+                    Err(e) if e.raw_os_error() == Some(libc::EISDIR) => return Err(refused("it is a folder".into())),
+                    opened => (opened?, false),
+                },
+                Err(e) => return Err(e),
             };
             let found = file.metadata()?;
             if !found.is_file() {
                 return Err(refused(format!("it is {}", kind_of(&found))));
             }
-            if found.uid() != my_user() {
+            // One made by this open is this run's whatever owner the drive shows for it; one
+            // that was there has to show the owner a file made by this user there now shows
+            // (another than this user on drives that map owners or keep none).
+            if !made && found.uid() != me && shown()?.owner != found.uid() {
                 return Err(refused("it belongs to another user".into()));
             }
             // SAFETY: flock on a descriptor we own; no memory is involved.
@@ -579,10 +793,10 @@ impl std::fmt::Display for ClaimRefused {
 
 impl std::error::Error for ClaimRefused {}
 
-/// Whether a lock could not be taken because the filesystem has none to give (some network
-/// drives), rather than because of what is at its name.
-pub fn no_locks_here(e: &std::io::Error) -> bool {
-    matches!(e.raw_os_error(), Some(libc::ENOLCK | libc::EOPNOTSUPP | libc::ENOSYS))
+/// Whether a lock could not be taken because of what is at its name, rather than because the
+/// filesystem gave none (some network drives have none, or fail with `EIO` or `ESTALE`).
+pub fn claim_refused(e: &std::io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<ClaimRefused>())
 }
 
 impl Drop for Claim {
@@ -781,7 +995,7 @@ pub(crate) mod tests {
         assert!(m.is_dir() && m.mode() & 0o777 == 0o700, "{:o}", m.mode());
         assert_eq!(run_folder_in_use(name.strip_prefix(".t-").unwrap()), Some(true));
         // A folder that is there is not taken over, whatever it holds.
-        assert_eq!(make_kept_folder(&a).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(make_kept_folder(&a, &|_| true).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -833,32 +1047,63 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// What a filesystem that keeps modes and owners shows of user `me`'s new file, or one that
+    /// keeps neither, as a FAT drive mounted for `me` does.
+    fn shows(owner: u32, keeps_modes: bool) -> impl Fn() -> std::io::Result<Shown> {
+        move || Ok(Shown { owner, keeps_modes })
+    }
+
     #[test]
     fn a_kept_folder_of_another_user_is_not_believed() {
         let dir = room("kept");
         let kept = dir.join("work");
-        make_kept_folder(&kept).unwrap();
+        make_kept_folder(&kept, &|_| true).unwrap();
         assert_eq!(std::fs::metadata(&kept).unwrap().mode() & 0o777, 0o700);
         std::fs::write(kept.join("plan.json"), b"{}").unwrap();
-        assert_eq!(std::fs::read(check_kept_folder(&kept).unwrap().unwrap().path().join("plan.json")).unwrap(), b"{}");
-        assert!(check_kept_folder(&dir.join("none")).unwrap().is_none());
-        assert!(check_kept_folder_of(&kept, my_user() + 1).unwrap_err().contains("another user"));
+        assert_eq!(std::fs::read(check_kept_folder(&kept, true).unwrap().unwrap().path().join("plan.json")).unwrap(), b"{}");
+        assert!(check_kept_folder(&dir.join("none"), true).unwrap().is_none());
+        assert!(check_kept_folder_of(&kept, my_user() + 1, true, &shows(my_user() + 1, true)).unwrap_err().contains("another user"));
         // One an earlier version left open to reading is closed, by way of its descriptor.
         std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(check_kept_folder(&kept).unwrap().is_some());
+        assert!(check_kept_folder(&kept, true).unwrap().is_some());
         assert_eq!(std::fs::metadata(&kept).unwrap().mode() & 0o777, 0o700);
         std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o770)).unwrap();
-        assert!(check_kept_folder(&kept).unwrap_err().contains("can write to it"));
+        assert!(check_kept_folder(&kept, true).unwrap_err().contains("can write to it"));
         std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o700)).unwrap();
         // A link or something other than a folder at the name is never gone through, a pipe
         // included, which would never finish opening.
         std::os::unix::fs::symlink(&kept, dir.join("link")).unwrap();
-        assert_eq!(check_kept_folder(&dir.join("link")).unwrap_err(), "it is a link");
+        assert_eq!(check_kept_folder(&dir.join("link"), true).unwrap_err(), "it is a link");
         make_pipe(&dir.join("pipe"));
-        assert_eq!(check_kept_folder(&dir.join("pipe")).unwrap_err(), "it is not a folder");
+        assert_eq!(check_kept_folder(&dir.join("pipe"), true).unwrap_err(), "it is not a folder");
         // A file nobody made here counts as much as a link.
         std::fs::create_dir(kept.join("sub")).unwrap();
-        assert!(check_kept_folder(&kept).unwrap_err().contains("sub in it"));
+        assert!(check_kept_folder(&kept, true).unwrap_err().contains("sub in it"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_kept_folder_on_a_drive_without_modes_or_owners_is_gone_on_from_by_its_name() {
+        let dir = room("kept-no-modes");
+        let kept = dir.join("work");
+        make_kept_folder(&kept, &|_| true).unwrap();
+        std::fs::write(kept.join("plan.json"), b"{}").unwrap();
+        let me = my_user();
+        // An NTFS drive shows every folder as 0777: nothing can be private there, and nothing
+        // is tried, which such a drive would refuse.
+        std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let held = check_kept_folder_of(&kept, me, true, &shows(me, false)).unwrap().unwrap();
+        assert!(held.by_name() && held.path() == kept);
+        assert_eq!(std::fs::metadata(&kept).unwrap().mode() & 0o777, 0o777);
+        // A drive mounted for root shows root for every file this user makes, and for the
+        // folder: as this test cannot make a folder of root's, "this user" is another number.
+        std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(check_kept_folder_of(&kept, me + 1, true, &shows(me, false)).unwrap().unwrap().by_name());
+        // Where the drive shows another owner for a new file than for the folder, the folder is
+        // somebody else's after all; and where it keeps modes, an open folder is refused.
+        assert!(check_kept_folder_of(&kept, me + 1, true, &shows(me + 2, false)).unwrap_err().contains("another user"));
+        std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(check_kept_folder_of(&kept, me, true, &shows(me, true)).unwrap_err().contains("can write to it"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1018,7 +1263,7 @@ pub(crate) mod tests {
         use std::os::unix::fs::symlink;
         let dir = room("held");
         let (made, moved, theirs) = (dir.join("made"), dir.join("moved"), dir.join("theirs"));
-        let held = make_kept_folder(&made).unwrap();
+        let held = make_kept_folder(&made, &|_| true).unwrap();
         std::fs::create_dir(&theirs).unwrap();
         std::fs::write(theirs.join("partial.mp4"), b"theirs").unwrap();
         // Someone renames the folder and puts a link to one of theirs at its name.
@@ -1056,18 +1301,122 @@ pub(crate) mod tests {
     fn only_a_private_folder_of_this_users_is_held() {
         let dir = room("hold-refused");
         let open = dir.join("open");
+        let me = my_user();
         std::fs::create_dir(&open).unwrap();
         std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(HeldFolder::open(&open).unwrap_err().to_string().contains("enter"));
+        assert!(HeldFolder::made(&open, &|_| true).unwrap_err().to_string().contains("enter"));
         std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o770)).unwrap();
-        assert!(HeldFolder::open(&open).unwrap_err().to_string().contains("write"));
+        assert!(HeldFolder::made(&open, &|_| true).unwrap_err().to_string().contains("write"));
         std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(HeldFolder::open_of(&open, my_user() + 1).unwrap_err().to_string().contains("another user"));
-        assert!(HeldFolder::open(&open).is_ok());
+        assert!(HeldFolder::made_of(&open, me + 1, &|_| true, &shows(me + 1, true)).unwrap_err().to_string().contains("another user"));
+        let held = HeldFolder::made(&open, &|_| true).unwrap();
+        assert!(!held.by_name() && held.path().starts_with("/proc"));
         std::os::unix::fs::symlink(&open, dir.join("link")).unwrap();
-        assert_eq!(HeldFolder::open(&dir.join("link")).err().and_then(|e| e.raw_os_error()), Some(libc::ELOOP));
+        assert_eq!(HeldFolder::made(&dir.join("link"), &|_| true).err().and_then(|e| e.raw_os_error()), Some(libc::ELOOP));
         std::fs::write(dir.join("file"), b"").unwrap();
-        assert_eq!(HeldFolder::open(&dir.join("file")).err().and_then(|e| e.raw_os_error()), Some(libc::ENOTDIR));
+        assert_eq!(HeldFolder::made(&dir.join("file"), &|_| true).err().and_then(|e| e.raw_os_error()), Some(libc::ENOTDIR));
+        // A folder av1opt has just made is empty: one that is not was put at its name.
+        std::fs::write(open.join("chunk00000.obu"), b"of another video").unwrap();
+        assert!(HeldFolder::made(&open, &|_| true).unwrap_err().to_string().contains("was put at its name"));
+        assert!(open.join("chunk00000.obu").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_folder_just_made_on_a_drive_without_modes_or_owners_is_used_by_its_name() {
+        let dir = room("made-no-modes");
+        let made = dir.join("made");
+        let me = my_user();
+        // FAT and exFAT drives mounted for this user show 0755, NTFS ones 0777, whatever the
+        // folder was made with; a file just made shows the same lack.
+        for mode in [0o755, 0o777] {
+            std::fs::create_dir(&made).unwrap();
+            std::fs::set_permissions(&made, std::fs::Permissions::from_mode(mode)).unwrap();
+            let held = HeldFolder::made_of(&made, me, &|_| panic!("the tools were asked"), &shows(me, false)).unwrap();
+            assert!(held.by_name() && held.path() == made);
+            write_new(&held.path().join("x"), b"x").unwrap();
+            held.remove_all().unwrap();
+            assert!(!made.exists());
+        }
+        // A drive that shows root, or the user all are mapped to, for every file.
+        std::fs::create_dir(&made).unwrap();
+        assert!(HeldFolder::made_of(&made, me + 1, &|_| true, &shows(me, false)).unwrap().by_name());
+        // Where the drive keeps modes and owners, a folder that does not show what it was made
+        // with is not the one made.
+        std::fs::set_permissions(&made, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(HeldFolder::made_of(&made, me, &|_| true, &shows(me, true)).unwrap_err().to_string().contains("can write"));
+        assert!(HeldFolder::made_of(&made, me + 1, &|_| true, &shows(me + 1, true)).unwrap_err().to_string().contains("another user"));
+        // And where a new file there shows another owner than the folder, the folder is not ours.
+        assert!(HeldFolder::made_of(&made, me + 1, &|_| true, &shows(me + 2, false)).unwrap_err().to_string().contains("another user"));
+        // The probe itself: this test's own folder keeps modes and owners, and leaves nothing.
+        let shown = shown_in(&dir).unwrap();
+        assert!(shown.owner == me && shown.keeps_modes, "{shown:?}");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn without_a_way_through_its_descriptor_a_folder_is_used_by_name_only_where_nobody_else_can_rename_it() {
+        let dir = room("no-way-through");
+        let made = dir.join("made");
+        let me = my_user();
+        let cannot = |_: &Path| false;
+        let real = shows(me, true);
+        let make = || std::fs::DirBuilder::new().mode(0o700).create(&made).unwrap();
+        // Only this user, or the sticky bit: its name is safe.
+        for mode in [0o700, 0o755, 0o1777] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            make();
+            let held = HeldFolder::made_of(&made, me, &cannot, &real).unwrap();
+            assert!(held.by_name() && held.path() == made, "{mode:o}");
+            held.remove_all().unwrap();
+        }
+        // Anyone can rename it: refused, and the empty folder goes again.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        make();
+        let e = HeldFolder::made_of(&made, me, &cannot, &real).unwrap_err();
+        assert!(e.kind() == std::io::ErrorKind::Unsupported && e.to_string().contains("cannot open files through /proc/"), "{e}");
+        assert!(!made.exists(), "the refused folder was left behind");
+        // Written by its group only, the group being this user's own and nobody else's (the
+        // umask of 0002 makes every folder so): as good as this user's alone.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+        // SAFETY: getegid has no failure mode.
+        let own_group = unsafe { libc::getegid() };
+        std::os::unix::fs::chown(&dir, None, Some(own_group)).unwrap();
+        assert_eq!(others_may_rename_in(&dir), !group_is_mine_alone(own_group));
+        // Another group this user is in may hold others.
+        let mut groups = vec![0 as libc::gid_t; 256];
+        // SAFETY: getgroups writes at most as many numbers as it is told there is room for.
+        let count = unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
+        if let Some(other) = groups[..count.max(0) as usize].iter().copied().find(|g| *g != own_group) {
+            assert!(!group_is_mine_alone(other));
+            std::os::unix::fs::chown(&dir, None, Some(other)).unwrap();
+            assert!(others_may_rename_in(&dir));
+            make();
+            assert_eq!(HeldFolder::made_of(&made, me, &cannot, &real).unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+            std::os::unix::fs::chown(&dir, None, Some(own_group)).unwrap();
+        }
+        assert!(!group_is_mine_alone(0) || me == 0);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_lock_made_by_this_run_is_its_own_and_one_found_there_has_to_show_the_owner_new_files_show() {
+        let dir = room("claim-owner");
+        let me = my_user();
+        let (made, found) = (dir.join("made"), dir.join("found"));
+        // A drive mounted for root shows the lock just made as root's: it is this run's all the same.
+        let claim = Claim::take_of(&made, me + 1, &|| panic!("a new lock was judged by its owner")).unwrap();
+        assert!(claim.is_some());
+        drop(claim);
+        // One left there by somebody else is refused; one that shows the owner every new file
+        // there shows is this user's.
+        std::fs::write(&found, b"").unwrap();
+        let e = Claim::take_of(&found, me + 1, &shows(me + 1, true)).err().expect("another user's lock was taken");
+        assert!(claim_refused(&e) && e.to_string() == "it belongs to another user", "{e}");
+        assert!(found.exists());
+        assert!(Claim::take_of(&found, me + 1, &shows(me, false)).unwrap().is_some());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1082,7 +1431,7 @@ pub(crate) mod tests {
         for (path, why) in [(&pipe, "it is a pipe"), (&folder, "it is a folder"), (&link, "it is a link")] {
             let e = Claim::take(path).err().unwrap_or_else(|| panic!("{} was taken", path.display()));
             assert_eq!(e.to_string(), why);
-            assert!(e.get_ref().is_some_and(|inner| inner.is::<ClaimRefused>()) && !no_locks_here(&e));
+            assert!(claim_refused(&e));
             assert!(std::fs::symlink_metadata(path).is_ok(), "{} was removed", path.display());
         }
         assert_eq!(std::fs::read(&target).unwrap(), b"keep");

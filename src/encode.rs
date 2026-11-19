@@ -536,7 +536,10 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     // 4K VMAF with many threads was part of the memory blow-up in the first pilot.
     let vmaf_threads = if info.width.max(info.height) >= 3200 { threads.min(4) } else { threads };
-    let tuned = o.tuning.as_ref().and_then(|t| t.pick(info.width, info.height));
+    // The command line has already left out what is out of date; a job from the page has not.
+    let saved = o.tuning.as_ref().and_then(|t| t.pick(info.width, info.height));
+    let out_of_date = saved.and_then(|c| c.out_of_date(o.target_vmaf));
+    let tuned = saved.filter(|_| out_of_date.is_none());
     let (preset, svt_params) = tuned.map_or((o.preset, o.svt_params.as_str()), |c| (c.preset, c.params.as_str()));
     let enc = EncodeSettings { preset, pix_fmt_out: "yuv420p10le", params: svt_params.to_string() };
     let model = search::vmaf_model(&info);
@@ -555,9 +558,10 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     }
     if o.tuning.is_some() {
         let class = crate::tuning::Class::of(info.width, info.height).label();
-        notes.push(match tuned {
-            Some(_) => format!("tuned settings for {class}: preset {preset}, {svt_params}"),
-            None => format!("no tuned settings for {class}: preset {preset}, {svt_params}"),
+        notes.push(match (tuned, out_of_date) {
+            (Some(_), _) => format!("tuned settings for {class}: preset {preset}, {svt_params}"),
+            (None, Some(why)) => format!("tuned settings for {class} not used, {why}; `av1opt bench` measures them again: preset {preset}, {svt_params}"),
+            (None, None) => format!("no tuned settings for {class}: preset {preset}, {svt_params}"),
         });
     } else if svt_params != search::DEFAULT_PARAMS {
         notes.push(format!("SVT-AV1 parameters: {svt_params}"));

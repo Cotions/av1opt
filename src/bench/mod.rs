@@ -11,7 +11,7 @@ use crate::probe::MediaInfo;
 use crate::scan;
 use crate::search::{self, EncodeSettings, Sample};
 use crate::tools::{Capabilities, Tools, path_arg};
-use crate::tuning::{Choice, Class};
+use crate::tuning::{Baseline, Choice, Class};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use stats::{Measure, Point, Summary};
@@ -456,13 +456,35 @@ impl Pick {
 
 /// The tuning entry for setting `config` as measured in summary `s`.
 pub fn choice(report: &Report, s: &Summary, config: usize) -> Option<Choice> {
-    let (c, row) = (report.configs.get(config)?, s.rows.iter().find(|r| r.config == config)?);
-    Some(Choice { preset: c.preset, params: c.params.clone(), size: row.size, time: row.time, videos: s.videos, target_vmaf: report.target_vmaf, made: report.made })
+    let (c, row, base) = (report.configs.get(config)?, s.rows.iter().find(|r| r.config == config)?, report.configs.get(report.baseline)?);
+    Some(Choice {
+        preset: c.preset, params: c.params.clone(), size: row.size, time: row.time, videos: s.videos, target_vmaf: report.target_vmaf, made: report.made,
+        baseline: Some(Baseline { preset: base.preset, params: base.params.clone() }),
+    })
 }
 
-/// The chosen pick of every resolution class the report has videos for.
-pub fn tuning_picks(report: &Report, pick: Pick) -> Vec<(Class, Choice)> {
-    report.summaries.iter().filter_map(|s| Some((s.class?, choice(report, s, pick.of(s))?))).collect()
+/// What a benchmark says of the videos of one resolution class.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClassPick {
+    pub class: Class,
+    /// The settings to use; None when the defaults stay, and any earlier entry should go.
+    pub choice: Option<Choice>,
+    /// Why the defaults stay.
+    pub why: String,
+}
+
+/// The chosen pick of every resolution class the report has videos for. The default settings
+/// winning makes no entry: one would keep them when the default moves on.
+pub fn tuning_picks(report: &Report, pick: Pick) -> Vec<ClassPick> {
+    let of = |s: &Summary| {
+        let class = s.class?;
+        let config = pick.of(s);
+        if config == report.baseline {
+            return Some(ClassPick { class, choice: None, why: "nothing measured beats the default settings".into() });
+        }
+        Some(ClassPick { class, choice: Some(choice(report, s, config)?), why: String::new() })
+    };
+    report.summaries.iter().filter_map(of).collect()
 }
 
 fn percent(x: f64) -> String {
@@ -627,11 +649,13 @@ mod tests {
             configs: vec![Config::baseline(), Config { preset: 6, params: "tune=1".into() }], baseline: 0,
             videos: videos.to_vec(), summaries: s, skipped: Vec::new(), elapsed_secs: 1.0, fresh: 0, cached: 0,
         };
-        // 1080p gains 10% at the same time; the others keep the default.
+        // 1080p gains 10% at the same time; the others keep the default, which saves nothing.
         let picks = tuning_picks(&report, Pick::Balanced);
-        assert_eq!(picks.iter().map(|(c, x)| (*c, x.params.as_str())).collect::<Vec<_>>(), [(Class::Sd, "tune=0"), (Class::Hd, "tune=1"), (Class::Uhd, "tune=0")]);
-        assert_eq!(picks[1].1.videos, 2);
-        assert!((picks[1].1.size - 0.9).abs() < 1e-12);
+        assert_eq!(picks.iter().map(|p| (p.class, p.choice.as_ref().map(|c| c.params.as_str()))).collect::<Vec<_>>(), [(Class::Sd, None), (Class::Hd, Some("tune=1")), (Class::Uhd, None)]);
+        let hd = picks[1].choice.as_ref().unwrap();
+        assert_eq!(hd.videos, 2);
+        assert!((hd.size - 0.9).abs() < 1e-12);
+        assert_eq!(hd.baseline, Some(Baseline { preset: search::DEFAULT_PRESET, params: search::DEFAULT_PARAMS.into() }));
         assert!(choice(&report, &report.summaries[0], 7).is_none());
     }
 
@@ -720,10 +744,10 @@ mod tests {
     fn saved_settings_are_the_chosen_winner_of_each_class_and_not_of_the_whole() {
         // Setting 1 is smaller but slow, setting 2 fast at about the same size.
         let r = report(vec![timed_video(Class::Hd, &[(1000.0, 1.0), (800.0, 3.0), (1010.0, 0.5)])], settings(3));
-        let params = |pick| tuning_picks(&r, pick).into_iter().map(|(c, x)| (c, x.params)).collect::<Vec<_>>();
-        assert_eq!(params(Pick::Smallest), [(Class::Hd, "tune=1".to_string())]);
-        assert_eq!(params(Pick::Balanced), [(Class::Hd, "tune=0".to_string())]);
-        assert_eq!(params(Pick::Fastest), [(Class::Hd, "tune=2".to_string())]);
+        let params = |pick| tuning_picks(&r, pick).into_iter().map(|p| (p.class, p.choice.map(|c| c.params))).collect::<Vec<_>>();
+        assert_eq!(params(Pick::Smallest), [(Class::Hd, Some("tune=1".to_string()))]);
+        assert_eq!(params(Pick::Balanced), [(Class::Hd, None)]);
+        assert_eq!(params(Pick::Fastest), [(Class::Hd, Some("tune=2".to_string()))]);
         assert!(tuning_picks(&report(Vec::new(), settings(3)), Pick::Balanced).is_empty());
     }
 

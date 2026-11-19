@@ -1733,14 +1733,28 @@ fn a_benchmark_ranks_settings_remembers_its_encodes_and_tunes_the_encoder() {
     assert!(fresh >= 6 && b["cached"] == 0, "{fresh} fresh, {} cached", b["cached"]);
 
     // A second run measures nothing again, and --save makes `encode --tuned` use the pick.
-    run(&["--save", "fastest"]).ok().has("from earlier runs").has("`av1opt encode --tuned` uses these");
+    run(&["--save", "fastest"]).ok().has("from earlier runs").has("`av1opt encode --tuned` uses");
     let b: Value = serde_json::from_slice(&std::fs::read(&json).unwrap()).unwrap();
     assert_eq!((b["fresh"].as_u64(), b["cached"].as_u64()), (Some(0), Some(fresh)));
-    let tuning: Value = serde_json::from_slice(&std::fs::read(c.dir.join("data/av1opt/tuning.json")).unwrap()).unwrap();
-    let pick = tuning["classes"]["sd"]["preset"].as_u64().unwrap();
-    let r = c.av1opt(&["encode".as_ref(), "-o".as_ref(), c.out().as_os_str(), "--tuned".as_ref(), "--samples".as_ref(), "2".as_ref(), "--sample-secs".as_ref(), "2".as_ref(), c.videos().join("a.mp4").as_os_str()]);
+    let tuning_file = c.dir.join("data/av1opt/tuning.json");
+    let tuning: Value = serde_json::from_slice(&std::fs::read(&tuning_file).unwrap()).unwrap();
+    // A class the default settings win has no entry, and is encoded with the default.
+    let pick = tuning["classes"]["sd"]["preset"].as_u64().unwrap_or(5);
+    let encode = |c: &Case, extra: &str| {
+        let out = c.dir.join(extra);
+        let r = c.av1opt(&["encode".as_ref(), "-o".as_ref(), out.as_os_str(), "--tuned".as_ref(), "--samples".as_ref(), "2".as_ref(), "--sample-secs".as_ref(), "2".as_ref(), c.videos().join("a.mp4").as_os_str()]);
+        let report = c.report_in(&out, "a");
+        (r, report)
+    };
+    let (r, report) = encode(&c, "tuned");
     r.ok().has("encoded 1,");
-    assert_eq!(c.report("a")["preset"].as_u64(), Some(pick));
+    assert_eq!(report["preset"].as_u64(), Some(pick));
+
+    // The default of an earlier version, saved as if it had won: it is passed over, and said so.
+    std::fs::write(&tuning_file, r#"{"format":1,"classes":{"sd":{"preset":6,"params":"tune=0","size":1.0,"time":1.0,"videos":2,"target_vmaf":93.0,"made":1}}}"#).unwrap();
+    let (r, report) = encode(&c, "stale");
+    r.ok().has("encoded 1,").has("tuned settings for 720p and below are not used").has("av1opt bench");
+    assert_eq!(report["preset"].as_u64(), Some(5));
 }
 
 impl Case {

@@ -60,7 +60,22 @@ impl std::str::FromStr for Class {
     }
 }
 
-/// The settings for one class, with where they came from (shown to the user, not used).
+/// The default of the versions that saved no baseline, for telling their entries apart: before
+/// the default moved to preset 5, a benchmark won by the default saved these very settings. Kept
+/// now they would pin preset 6, 6.2% larger than the default.
+const OLD_DEFAULT_PRESET: u8 = 6;
+const OLD_DEFAULT_PARAMS: &str = "tune=0";
+/// How far an encode's VMAF target may be from the one a choice was measured at.
+const TARGET_REACH: f64 = 1.0;
+
+/// The settings a choice was measured against.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Baseline {
+    pub preset: u8,
+    pub params: String,
+}
+
+/// The settings for one class, with where they came from.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Choice {
     pub preset: u8,
@@ -78,6 +93,28 @@ pub struct Choice {
     /// Unix time the choice was saved.
     #[serde(default)]
     pub made: u64,
+    /// What it beat. Absent in files of earlier versions and in entries written by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<Baseline>,
+}
+
+impl Choice {
+    /// Why an encode for `target_vmaf` should not use this choice, if so. Entries written by
+    /// hand say nothing of what they were measured against and stay what they are.
+    pub fn out_of_date(&self, target_vmaf: f64) -> Option<String> {
+        let (preset, params) = (crate::search::DEFAULT_PRESET, crate::search::DEFAULT_PARAMS);
+        match &self.baseline {
+            Some(b) if b.preset != preset || b.params != params => {
+                return Some(format!("it was measured against preset {} with {}, and the default is now preset {preset} with {params}", b.preset, b.params));
+            }
+            None if self.videos > 0 && self.preset == OLD_DEFAULT_PRESET && self.params == OLD_DEFAULT_PARAMS => {
+                return Some(format!("it is the default of an earlier version, and the default is now preset {preset} with {params}"));
+            }
+            _ => {}
+        }
+        (self.target_vmaf > 0.0 && (self.target_vmaf - target_vmaf).abs() > TARGET_REACH)
+            .then(|| format!("it was measured for VMAF {}, and this encode aims at {target_vmaf}", self.target_vmaf))
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -123,6 +160,19 @@ impl Tuning {
         self.classes.get(&Class::of(width, height))
     }
 
+    /// What an encode for `target_vmaf` can use, and each class left out with the reason.
+    pub fn usable_for(mut self, target_vmaf: f64) -> (Tuning, Vec<(Class, String)>) {
+        let mut left_out = Vec::new();
+        self.classes.retain(|class, choice| match choice.out_of_date(target_vmaf) {
+            Some(why) => {
+                left_out.push((*class, why));
+                false
+            }
+            None => true,
+        });
+        (self, left_out)
+    }
+
     /// The preset a video of this size is encoded at: that of its class, if it was tuned.
     pub fn preset_for(&self, width: u32, height: u32, otherwise: u8) -> u8 {
         self.pick(width, height).map_or(otherwise, |c| c.preset)
@@ -151,7 +201,7 @@ mod tests {
     #[test]
     fn file_layout_is_stable() {
         let mut t = Tuning::default();
-        t.classes.insert(Class::Hd, Choice { preset: 4, params: "tune=0:enable-qm=1".into(), size: 0.93, time: 1.8, videos: 5, target_vmaf: 93.0, made: 7 });
+        t.classes.insert(Class::Hd, Choice { preset: 4, params: "tune=0:enable-qm=1".into(), size: 0.93, time: 1.8, videos: 5, target_vmaf: 93.0, made: 7, baseline: None });
         let v = serde_json::to_value(&t).unwrap();
         assert_eq!(v["classes"]["hd"]["preset"], 4);
         assert_eq!(v["classes"]["hd"]["params"], "tune=0:enable-qm=1");
@@ -199,7 +249,7 @@ mod tests {
 
     #[test]
     fn a_video_gets_the_settings_of_its_own_class_only() {
-        let choice = |preset| Choice { preset, params: "tune=0".into(), size: 1.0, time: 1.0, videos: 1, target_vmaf: 93.0, made: 0 };
+        let choice = |preset| Choice { preset, params: "tune=0".into(), size: 1.0, time: 1.0, videos: 1, target_vmaf: 93.0, made: 0, baseline: None };
         let mut t = Tuning::default();
         assert_eq!(t.pick(1920, 1080), None);
         t.classes.insert(Class::Sd, choice(8));
@@ -212,12 +262,61 @@ mod tests {
 
     #[test]
     fn tuning_survives_the_file_and_is_written_smallest_class_first() {
-        let choice = |preset| Choice { preset, params: "tune=0:enable-qm=1".into(), size: 0.9, time: 1.5, videos: 3, target_vmaf: 93.0, made: 12 };
+        let choice = |preset| Choice { preset, params: "tune=0:enable-qm=1".into(), size: 0.9, time: 1.5, videos: 3, target_vmaf: 93.0, made: 12, baseline: None };
         let t = Tuning { format: FORMAT, classes: [(Class::Uhd, choice(4)), (Class::Sd, choice(8)), (Class::Hd, choice(6))].into() };
         let text = serde_json::to_string(&t).unwrap();
         assert_eq!(serde_json::from_str::<Tuning>(&text).unwrap(), t);
         let at = |key: &str| text.find(key).unwrap();
         assert!(at("\"sd\"") < at("\"hd\"") && at("\"hd\"") < at("\"uhd\""), "{text}");
+    }
+
+    fn measured(preset: u8, baseline: Option<(u8, &str)>) -> Choice {
+        Choice {
+            preset, params: "tune=0".into(), size: 0.9, time: 1.0, videos: 4, target_vmaf: 93.0, made: 1,
+            baseline: baseline.map(|(preset, params)| Baseline { preset, params: params.into() }),
+        }
+    }
+
+    #[test]
+    fn a_choice_measured_against_another_default_is_not_used() {
+        let today = (crate::search::DEFAULT_PRESET, crate::search::DEFAULT_PARAMS);
+        assert_eq!(measured(4, Some(today)).out_of_date(93.0), None);
+        let why = measured(4, Some((6, "tune=0"))).out_of_date(93.0).unwrap();
+        assert!(why.contains("preset 6") && why.contains("now preset 5"), "{why}");
+        assert!(measured(4, Some((today.0, "tune=1"))).out_of_date(93.0).is_some());
+    }
+
+    #[test]
+    fn a_choice_is_used_only_near_the_target_it_was_measured_at() {
+        let c = measured(4, None);
+        assert_eq!((c.out_of_date(94.0), c.out_of_date(92.0)), (None, None));
+        let why = c.out_of_date(94.5).unwrap();
+        assert!(why.contains("VMAF 93") && why.contains("94.5"), "{why}");
+        assert!(c.out_of_date(91.9).is_some());
+    }
+
+    #[test]
+    fn an_old_file_holding_the_old_default_is_not_used_and_its_other_choices_are() {
+        // As versions before the stored baseline wrote it, with preset 6 winning at 1080p.
+        let old = r#"{"format":1,"classes":{
+            "sd":{"preset":4,"params":"tune=0:enable-qm=1","size":0.93,"time":1.8,"videos":3,"target_vmaf":93.0,"made":7},
+            "hd":{"preset":6,"params":"tune=0","size":1.0,"time":1.0,"videos":3,"target_vmaf":93.0,"made":7}}}"#;
+        let (usable, left_out) = serde_json::from_str::<Tuning>(old).unwrap().usable_for(93.0);
+        assert_eq!(usable.classes.keys().copied().collect::<Vec<_>>(), [Class::Sd]);
+        assert_eq!(left_out.len(), 1);
+        assert_eq!(left_out[0].0, Class::Hd);
+        assert!(left_out[0].1.contains("earlier version"), "{}", left_out[0].1);
+        // Written by hand it has no numbers, and is what somebody asked for.
+        let by_hand: Tuning = serde_json::from_str(r#"{"format":1,"classes":{"hd":{"preset":6,"params":"tune=0"}}}"#).unwrap();
+        assert_eq!(by_hand.usable_for(90.0).1, []);
+    }
+
+    #[test]
+    fn the_baseline_of_a_choice_survives_the_file_and_is_left_out_when_unknown() {
+        let c = measured(4, Some((5, "tune=0")));
+        let text = serde_json::to_string(&c).unwrap();
+        assert_eq!(serde_json::from_str::<Choice>(&text).unwrap(), c);
+        assert!(!serde_json::to_string(&measured(4, None)).unwrap().contains("baseline"));
     }
 
     #[test]

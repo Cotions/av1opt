@@ -621,11 +621,23 @@ fn run_command(command: Cmd) -> Result<()> {
                         anyhow::bail!("--save: nothing was measured under every setting, so there is nothing to save");
                     }
                     let mut t = tuning::Tuning::load()?;
-                    for (class, c) in picks {
-                        said.push(format!("tuned, {}: preset {}, {} ({} video{})", class.label(), c.preset, c.params, c.videos, if c.videos == 1 { "" } else { "s" }));
-                        t.classes.insert(class, c);
+                    for p in picks {
+                        match p.choice {
+                            Some(c) => {
+                                said.push(format!("tuned, {}: preset {}, {} ({} video{})", p.class.label(), c.preset, c.params, c.videos, if c.videos == 1 { "" } else { "s" }));
+                                t.classes.insert(p.class, c);
+                            }
+                            None => {
+                                said.push(format!("not tuned, {}: {}", p.class.label(), p.why));
+                                t.classes.remove(&p.class);
+                            }
+                        }
                     }
-                    said.push(format!("saved to {}; `av1opt encode --tuned` uses these", t.save()?.display()));
+                    let saved = t.save()?;
+                    said.push(match t.classes.is_empty() {
+                        true => format!("saved to {}; no size is tuned, so `av1opt encode --tuned` uses the default settings", saved.display()),
+                        false => format!("saved to {}; `av1opt encode --tuned` uses these", saved.display()),
+                    });
                 }
                 Ok(())
             })();
@@ -686,8 +698,13 @@ fn run_command(command: Cmd) -> Result<()> {
             let tools = signals::stopping_on_signals(tools::Tools::new(ffmpeg, ffprobe, memory_cap(&memory_limit, 1)).sharing_between_chunks(memory_cap(&memory_limit, workers)));
             let tuning = if tuned {
                 let t = tuning::Tuning::load()?;
-                if t.classes.is_empty() {
+                // A benchmark the defaults won leaves a file with nothing in it.
+                if t.classes.is_empty() && t.format == 0 {
                     anyhow::bail!("--tuned: no tuned settings yet (run `av1opt bench ... --save` first)");
+                }
+                let (t, left_out) = t.usable_for(target_vmaf);
+                for (class, why) in &left_out {
+                    eprintln!("tuned settings for {} are not used: {why}; `av1opt bench <videos> --save` measures them again", class.label());
                 }
                 for (class, c) in &t.classes {
                     eprintln!("tuned, {}: preset {}, {}", class.label(), c.preset, c.params);

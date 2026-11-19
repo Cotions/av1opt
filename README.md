@@ -431,8 +431,12 @@ and marks the ones no other setting beats on both counts. `--csv` writes one row
 setting, `--json` everything including each sample encode.
 
 `--save [balanced|smallest|fastest]` stores the winner of each size class in
-`~/.local/share/av1opt/tuning.json`; `av1opt encode --tuned` then takes preset and parameters from
-there by the video's size (classes without an entry use `--preset` and `--svt-params`).
+`~/.local/share/av1opt/tuning.json`, with the default it beat and the target; a class the default
+wins gets no entry, and loses the one it had. `av1opt encode --tuned` then takes preset and
+parameters from there by the video's size (classes without an entry use `--preset` and
+`--svt-params`). An entry measured against another default than today's, or for a target more
+than 1 VMAF from the encode's, is not used, and the encode says so: `av1opt bench` measures it
+again.
 `av1opt tuning` shows what is stored, `av1opt tuning --clear` forgets it. Without `--tuned`
 nothing changes: `encode --svt-params key=value:key=value` sets parameters by hand.
 

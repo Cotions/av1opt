@@ -551,6 +551,39 @@ pub fn hdr_data(ffprobe: &str, path: &Path, stream: usize) -> Result<(HdrData, H
     Ok((HdrData::from_side_data(&j["streams"][0]["side_data_list"]), HdrData::from_side_data(&j["frames"][0]["side_data_list"])))
 }
 
+/// What the first frames of a video stream carry that ffprobe shows only on frames.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct FrameMarks {
+    /// HDR10+ (SMPTE ST 2094-40) dynamic metadata.
+    pub hdr10_plus: bool,
+    /// Closed captions (ATSC A/53). ffprobe from 2026 no longer prints the stream's
+    /// closed_captions field: measured on an H.264 file with captions in every frame, the
+    /// stream showed nothing and its frames showed "ATSC A53 Part 4 Closed Captions".
+    pub closed_captions: bool,
+}
+
+impl FrameMarks {
+    fn from_frames(frames: &Value) -> FrameMarks {
+        let kinds: Vec<&str> = frames.as_array().into_iter().flatten()
+            .flat_map(|f| f["side_data_list"].as_array().into_iter().flatten())
+            .filter_map(|d| d["side_data_type"].as_str())
+            .collect();
+        FrameMarks {
+            hdr10_plus: kinds.iter().any(|t| t.contains("2094-40")),
+            closed_captions: kinds.iter().any(|t| t.contains("A53") && t.contains("Closed Captions")),
+        }
+    }
+}
+
+/// What the first frames of stream `stream` carry; nothing where it cannot tell.
+pub fn frame_marks(ffprobe: &str, path: &Path, stream: usize) -> FrameMarks {
+    let mut command = crate::tools::probe_command(ffprobe);
+    command.args(["-v", "error", "-select_streams", &stream.to_string(), "-read_intervals", "%+#3", "-show_entries", "frame_side_data=side_data_type", "-of", "json"]).arg(crate::tools::probe_arg(path));
+    let Ok(out) = run_ffprobe(command, Reads::Little) else { return FrameMarks::default() };
+    let j: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    FrameMarks::from_frames(&j["frames"])
+}
+
 fn run_watched(command: Command, mut watch: ReadWatch) -> std::io::Result<Result<Output, String>> {
     run_until(command, |process| watch.stop(bytes_read_by(process)))
 }
@@ -897,6 +930,21 @@ fn clock_secs(s: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn marks_shown_only_on_frames_are_found() {
+        // The side data kinds as ffprobe master printed them for an H.264 file with
+        // captions and for an HEVC file with HDR10+.
+        let frames = serde_json::json!([
+            {"side_data_list": [{"side_data_type": "ATSC A53 Part 4 Closed Captions"}, {"side_data_type": "H.26[45] User Data Unregistered SEI message"}]},
+            {"side_data_list": [{"side_data_type": "ATSC A53 Part 4 Closed Captions"}]},
+        ]);
+        assert_eq!(FrameMarks::from_frames(&frames), FrameMarks { hdr10_plus: false, closed_captions: true });
+        let frames = serde_json::json!([{"side_data_list": [{"side_data_type": "Mastering display metadata"}, {"side_data_type": "HDR Dynamic Metadata SMPTE2094-40 (HDR10+)"}]}]);
+        assert_eq!(FrameMarks::from_frames(&frames), FrameMarks { hdr10_plus: true, closed_captions: false });
+        assert_eq!(FrameMarks::from_frames(&serde_json::json!([{}])), FrameMarks::default());
+        assert_eq!(FrameMarks::from_frames(&Value::Null), FrameMarks::default());
+    }
 
     /// A short Matroska file made by ffmpeg with the picture at `video_at`, and sound from
     /// `sound_at` to the end of the picture if asked for.

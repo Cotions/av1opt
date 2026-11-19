@@ -186,7 +186,21 @@ pub fn source_filters(info: &MediaInfo) -> Vec<String> {
     if info.width % 2 == 1 || info.height % 2 == 1 {
         f.push(format!("crop={}:{}:0:0", info.width & !1, info.height & !1));
     }
+    // RGB is turned into brightness and colour by a matrix, which ffmpeg takes as BT.601 when
+    // it is not told one, and the encode then said none: a browser takes untagged HD as
+    // BT.709 and showed it a little off. Named here, the matrix is what the encode is tagged
+    // with, and the clips VMAF compares are made with the same one.
+    if is_rgb(info) {
+        let matrix = if info.color_primaries == "bt2020" { "bt2020" } else { "bt709" };
+        f.push(format!("scale=out_color_matrix={matrix}:out_range=tv"));
+    }
     f
+}
+
+/// Whether the source's picture is stored as red, green and blue rather than as brightness
+/// and colour.
+pub fn is_rgb(info: &MediaInfo) -> bool {
+    info.color_space == "gbr" || ["gbr", "rgb", "bgr", "argb", "abgr", "0rgb", "0bgr", "x2rgb", "x2bgr"].iter().any(|p| info.pix_fmt.starts_with(p))
 }
 
 /// Score every 3rd frame: ~45% less VMAF time. The mean of a trial's samples stays within
@@ -1651,6 +1665,18 @@ mod tests {
         assert!(source_filters(&i).is_empty());
         (i.width, i.height, i.interlaced) = (641, 361, true);
         assert_eq!(source_filters(&i), ["bwdif=mode=send_frame", "crop=640:360:0:0"]);
+        // RGB is made YUV by the BT.709 matrix, or BT.2020's where its primaries are those.
+        let rgb = |pix_fmt: &str, color_space: &str, color_primaries: &str| MediaInfo {
+            pix_fmt: pix_fmt.into(),
+            color_space: color_space.into(),
+            color_primaries: color_primaries.into(),
+            ..info_with_fps(25.0)
+        };
+        assert_eq!(source_filters(&rgb("gbrp", "gbr", "")), ["scale=out_color_matrix=bt709:out_range=tv"]);
+        assert_eq!(source_filters(&rgb("rgb24", "", "")), ["scale=out_color_matrix=bt709:out_range=tv"]);
+        assert_eq!(source_filters(&rgb("gbrp10le", "gbr", "bt2020")), ["scale=out_color_matrix=bt2020:out_range=tv"]);
+        assert!(source_filters(&rgb("yuv444p", "bt709", "bt709")).is_empty());
+        assert!(source_filters(&rgb("gray", "", "")).is_empty());
     }
 
     #[test]

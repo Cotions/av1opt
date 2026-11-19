@@ -591,11 +591,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     } else if svt_params != search::DEFAULT_PARAMS {
         notes.push(format!("SVT-AV1 parameters: {svt_params}"));
     }
-    if info.hdr {
-        // libvmaf's models are trained on SDR; on PQ/HLG pixels the score still tracks
-        // encoding damage, but its absolute meaning differs from SDR.
-        notes.push(format!("HDR ({}): colour and HDR metadata kept; VMAF measured on the HDR signal", info.color_transfer));
-    }
+    notes.extend(picture_notes(&info, probe::frame_marks(&tools.ffprobe, input, info.video_index)));
     let meta = metadata::resolve(&o.meta, input, &info.tags);
     if !meta.tags.is_empty() {
         let from = meta.info_json.as_ref().and_then(|p| p.file_name()).map(|n| format!(" (from {})", n.to_string_lossy())).unwrap_or_default();
@@ -1629,6 +1625,81 @@ struct Streams {
     sub_sources: Vec<usize>,
     covers: usize,
 }
+
+/// What of the source's picture the output cannot have, and what it keeps of its HDR, as
+/// notes. `marks`: what its first frames carry.
+fn picture_notes(info: &MediaInfo, marks: probe::FrameMarks) -> Vec<String> {
+    let mut notes = Vec::new();
+    if info.interlaced {
+        notes.push(format!("the source is interlaced: the output has {} progressive frames per second, one per pair of fields", search::cfr_label(info)));
+    }
+    if info.closed_captions || marks.closed_captions {
+        notes.push("closed captions inside the picture are lost: they travel in the video stream, which is encoded anew; to keep them, take them out first (ffmpeg -f lavfi -i \"movie=FILE[out+subcc]\" -map 0:1 captions.srt)".into());
+    }
+    let reduced = picture_reduced(info);
+    if !reduced.is_empty() {
+        notes.push(format!("picture made 10-bit 4:2:0, which is what is encoded: {}; keep the original where these matter", reduced.join(", ")));
+    }
+    if info.hdr {
+        // libvmaf's models are trained on SDR; on PQ/HLG pixels the score still tracks
+        // encoding damage, but its absolute meaning differs from SDR.
+        notes.push(if marks.hdr10_plus {
+            // SVT-AV1 through ffmpeg is given no dynamic metadata, and nothing else here
+            // writes it: measured on an HDR10+ HEVC source, the mastering display and light
+            // level came through and the SMPTE 2094-40 frame data did not.
+            format!("HDR ({}): colour, mastering display and light level kept, HDR10+ dynamic metadata lost (screens that use it show the static HDR10); VMAF measured on the HDR signal", info.color_transfer)
+        } else {
+            format!("HDR ({}): colour and HDR metadata kept; VMAF measured on the HDR signal", info.color_transfer)
+        });
+    }
+    notes
+}
+
+/// What a 10-bit 4:2:0 encode loses of the source's picture, in words.
+fn picture_reduced(info: &MediaInfo) -> Vec<String> {
+    let p = info.pix_fmt.as_str();
+    let mut lost = Vec::new();
+    if search::is_rgb(info) {
+        let matrix = if info.color_primaries == "bt2020" { "BT.2020" } else { "BT.709" };
+        lost.push(format!("RGB became YUV by the {matrix} matrix, with a quarter of its colour detail"));
+    } else if p.contains("444") {
+        lost.push("4:4:4 colour became 4:2:0, a quarter of its colour detail".to_string());
+    } else if p.contains("422") || p.contains("440") {
+        lost.push(format!("4:{} colour became 4:2:0, half of its colour detail", if p.contains("422") { "2:2" } else { "4:0" }));
+    } else if p.contains("411") {
+        lost.push("4:1:1 colour became 4:2:0, its colour detail moved from across to down".to_string());
+    }
+    let bits = bit_depth(p);
+    if bits > 10 {
+        lost.push(format!("{bits}-bit became 10-bit"));
+    }
+    let alpha = ["yuva", "gbrap", "rgba", "bgra", "argb", "abgr", "ya8", "ya16"].iter().any(|a| p.starts_with(a));
+    if alpha || info.alpha {
+        lost.push("its transparency (alpha) is dropped".to_string());
+    }
+    lost
+}
+
+/// Bits per sample of an ffmpeg pixel format ("yuv420p12le": 12, "gray10le": 10, "p010le":
+/// 10, "rgb48le": 16), 8 for the rest ("rgb24" and "nv12" name something else by their digits).
+fn bit_depth(pix_fmt: &str) -> u32 {
+    let name = pix_fmt.strip_suffix("le").or_else(|| pix_fmt.strip_suffix("be")).unwrap_or(pix_fmt);
+    if ["rgb48", "bgr48", "rgba64", "bgra64", "ya16"].contains(&name) {
+        return 16;
+    }
+    let head = name.trim_end_matches(|c: char| c.is_ascii_digit());
+    let digits = &name[head.len()..];
+    let bits = if head.ends_with('p') && head.len() > 1 || head.starts_with("gray") {
+        digits.parse().ok()
+    } else if head == "p" && digits.len() == 3 {
+        // p010, p210, p410: the last two digits.
+        digits[1..].parse().ok()
+    } else {
+        None
+    };
+    bits.filter(|b| (9..=16).contains(b)).unwrap_or(8)
+}
+
 
 /// Names a kept track the way its source does, as `-metadata` arguments for output stream
 /// `spec` ("a:1"). Copied tags alone lose it: ffmpeg reads an MP4 track's name as a tag
@@ -2885,6 +2956,33 @@ mod tests {
         source.audio[0].track = probe::Track::default();
         out.audio[0].track = named("Added", false);
         assert_eq!(track_lost(&source, &out, &streams), None);
+    }
+
+    #[test]
+    fn what_the_picture_loses_is_said() {
+        let picture = |pix_fmt: &str| MediaInfo { pix_fmt: pix_fmt.into(), ..info(&[]) };
+        assert!(picture_notes(&picture("yuv420p"), probe::FrameMarks::default()).is_empty());
+        assert!(picture_notes(&picture("yuv420p10le"), probe::FrameMarks::default()).is_empty());
+        assert_eq!(picture_reduced(&picture("yuv422p")), ["4:2:2 colour became 4:2:0, half of its colour detail"]);
+        assert_eq!(picture_reduced(&picture("yuv444p12le")), ["4:4:4 colour became 4:2:0, a quarter of its colour detail", "12-bit became 10-bit"]);
+        assert_eq!(picture_reduced(&MediaInfo { color_space: "gbr".into(), ..picture("gbrp") }), ["RGB became YUV by the BT.709 matrix, with a quarter of its colour detail"]);
+        assert_eq!(picture_reduced(&picture("yuva420p")), ["its transparency (alpha) is dropped"]);
+        // VP9 in WebM keeps its transparency beside a plain 4:2:0 picture.
+        assert_eq!(picture_reduced(&MediaInfo { alpha: true, ..picture("yuv420p") }), ["its transparency (alpha) is dropped"]);
+        assert_eq!(
+            picture_notes(&picture("p010le"), probe::FrameMarks::default()).len() + picture_notes(&picture("nv12"), probe::FrameMarks::default()).len() + picture_notes(&picture("gray"), probe::FrameMarks::default()).len(),
+            0
+        );
+        assert_eq!([bit_depth("yuv420p12le"), bit_depth("gray10le"), bit_depth("p016le"), bit_depth("rgb48le"), bit_depth("rgb24"), bit_depth("nv12")], [12, 10, 16, 16, 8, 8]);
+        let interlaced = MediaInfo { interlaced: true, fps: 25.0, nominal_fps: 25.0, ..picture("yuv420p") };
+        assert_eq!(picture_notes(&interlaced, probe::FrameMarks::default()), ["the source is interlaced: the output has 25 progressive frames per second, one per pair of fields"]);
+        let captions = picture_notes(&MediaInfo { closed_captions: true, ..picture("yuv420p") }, probe::FrameMarks::default());
+        assert!(captions.len() == 1 && captions[0].starts_with("closed captions inside the picture are lost"), "{captions:?}");
+        let from_frames = picture_notes(&picture("yuv420p"), probe::FrameMarks { closed_captions: true, ..Default::default() });
+        assert_eq!(from_frames, captions);
+        let hdr = MediaInfo { hdr: true, color_transfer: "smpte2084".into(), ..picture("yuv420p10le") };
+        assert_eq!(picture_notes(&hdr, probe::FrameMarks::default()), ["HDR (smpte2084): colour and HDR metadata kept; VMAF measured on the HDR signal"]);
+        assert!(picture_notes(&hdr, probe::FrameMarks { hdr10_plus: true, ..Default::default() })[0].contains("mastering display and light level kept, HDR10+ dynamic metadata lost"));
     }
 
     #[test]

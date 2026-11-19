@@ -69,8 +69,11 @@ impl EncodeSettings {
     }
 
     /// SVT-AV1 takes CRF in quarter steps through its own parameters (ffmpeg's -crf is integer).
+    /// The CRF is written first: SVT-AV1 reads the list in order, and on reading `crf` it
+    /// also sets `aq-mode` back to 2, so an `aq-mode` written before it would be dropped
+    /// without a word.
     pub fn video_args(&self, crf: f64) -> Vec<String> {
-        let params = format!("{}:crf={}", self.full_params(), quarter(crf));
+        let params = format!("crf={}:{}", quarter(crf), self.full_params());
         // Stream specifiers keep these off copied cover-art streams.
         ["-c:v:0", "libsvtav1", "-preset:v:0", &self.preset.to_string(), "-pix_fmt:v:0", self.pix_fmt_out, "-svtav1-params:v:0", &params]
             .map(String::from)
@@ -1582,11 +1585,13 @@ mod tests {
             assert!(parse_params(bad).is_err(), "{bad}");
         }
         let enc = |params: &str| EncodeSettings { preset: 6, pix_fmt_out: "yuv420p10le", params: params.into() };
-        assert_eq!(enc("tune=0").video_args(35.3).last().unwrap(), "tune=0:keyint=10s:enable-qm=1:crf=35.25");
+        assert_eq!(enc("tune=0").video_args(35.3).last().unwrap(), "crf=35.25:tune=0:keyint=10s:enable-qm=1");
         // What the user's own parameters name is left alone.
-        assert_eq!(enc("tune=0:keyint=5s").video_args(35.0).last().unwrap(), "tune=0:keyint=5s:enable-qm=1:crf=35");
-        assert_eq!(enc("enable-qm=0:tune=0").video_args(35.0).last().unwrap(), "enable-qm=0:tune=0:keyint=10s:crf=35");
-        assert_eq!(enc("").video_args(35.0).last().unwrap(), "keyint=10s:enable-qm=1:crf=35");
+        assert_eq!(enc("tune=0:keyint=5s").video_args(35.0).last().unwrap(), "crf=35:tune=0:keyint=5s:enable-qm=1");
+        assert_eq!(enc("enable-qm=0:tune=0").video_args(35.0).last().unwrap(), "crf=35:enable-qm=0:tune=0:keyint=10s");
+        assert_eq!(enc("").video_args(35.0).last().unwrap(), "crf=35:keyint=10s:enable-qm=1");
+        // The CRF comes before a parameter it would otherwise set back.
+        assert_eq!(enc("aq-mode=1").video_args(35.0).last().unwrap(), "crf=35:aq-mode=1:keyint=10s:enable-qm=1");
     }
 
     #[test]

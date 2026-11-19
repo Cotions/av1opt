@@ -98,9 +98,9 @@ pub struct Survey {
 }
 
 /// Scores the whole of `output` against `input`. `None` where that can't be gone by: the
-/// two don't hold the same number of frames, the source's timestamps can't be read, or its
-/// frames are not shown about as long as each other (a window of frames would then not be a
-/// window of time; see [`Times::steady`]).
+/// two don't hold the same number of frames, the source's timestamps can't be read, too many
+/// of its frames are shown for unequal times (see [`UNEVEN_STEPS_IN_A_HUNDRED`]), or a GOP
+/// starts where no cut can be made.
 pub fn survey(tools: &Tools, input: &Path, info: &MediaInfo, output: &Path, threads: usize, dir: &Path) -> Result<Option<Survey>> {
     let keys = tools.key_packets(output)?;
     let gops: Vec<usize> = keys.iter().enumerate().filter(|(_, k)| **k).map(|(i, _)| i).collect();
@@ -139,8 +139,13 @@ pub fn survey(tools: &Tools, input: &Path, info: &MediaInfo, output: &Path, thre
     let log = std::fs::read(dir.join(LOG_FILE)).context("libvmaf wrote no log")?;
     let _ = std::fs::remove_file(dir.join(TIMES_FILE));
     let _ = std::fs::remove_file(dir.join(LOG_FILE));
-    let Some(times) = Times::parse(&text, info.time_base) else { return Ok(None) };
-    if times.pts.len() != keys.len() || !times.steady() {
+    let Some(times) = Times::parse_with_shared_times(&text, info.time_base) else { return Ok(None) };
+    if times.pts.len() != keys.len() || !times.uneven_steps_within(UNEVEN_STEPS_IN_A_HUNDRED) {
+        return Ok(None);
+    }
+    // A stretch is cut from the source between the times of two GOP starts: where a GOP
+    // starts on a frame that shares its time with the one before, no cut can part them.
+    if gops.iter().any(|&g| g > 0 && times.pts[g] == times.pts[g - 1]) {
         return Ok(None);
     }
     let scores: Vec<(usize, f64)> = crate::tools::parse_vmaf_frames(&log)?.into_iter().map(|(n, v)| (n as usize, v)).collect();
@@ -150,12 +155,25 @@ pub fn survey(tools: &Tools, input: &Path, info: &MediaInfo, output: &Path, thre
     Ok(Some(Survey { scores, times, gops }))
 }
 
-/// Whether the survey will go by frames shown at these times, sorted: no two at one time
-/// (what [`Times::parse`] refuses) and about as long as each other (see [`Times::steady`]).
-/// Ten frames sharing a millisecond with their neighbour, in 53,841 of a Matroska file at 60
-/// frames a second, sent a video to spot checks after its search had aimed low.
+/// How many steps in a hundred between frames may be uneven (under half the usual step, or
+/// over one and a half times it; two frames at one time count) for a video to be scored
+/// along its whole length. The scores are counted a frame each, not by how long each frame
+/// is shown: with a tenth of the frames shown twice as long, the mean read is off by under a
+/// tenth of what those frames score apart from the rest. Past that (a screen recording that
+/// holds frames for seconds) the frames that matter most to the eye would weigh least, and
+/// spot checks, scored along time, judge instead.
+///
+/// It stood at 1 before, which sent two of three real videos copied into Matroska to spot
+/// checks: one with 3.15% of its frames shown twice as long, one with 10 pairs of frames in
+/// 53,841 sharing a millisecond. Neither was repaired: their lowest 5 seconds read VMAF 87.0
+/// and 84.5 against a floor of 89.
+const UNEVEN_STEPS_IN_A_HUNDRED: usize = 10;
+
+/// Whether the survey will go by frames shown at these times, sorted. What it cannot know
+/// before the encode is where the GOPs start: a video whose GOP starts on a frame sharing
+/// its time with the one before is still sent to spot checks afterwards.
 fn times_can_be_gone_by(pts: Vec<i64>, tb: (i64, i64)) -> bool {
-    pts.len() < 2 || (pts.windows(2).all(|w| w[1] > w[0]) && Times { pts, tb }.steady())
+    pts.len() < 2 || Times { pts, tb }.uneven_steps_within(UNEVEN_STEPS_IN_A_HUNDRED)
 }
 
 /// Whether the source's frames can be set against the encode's one for one, as the survey
@@ -1189,18 +1207,17 @@ mod tests {
         let even: Vec<i64> = (0..1000).map(|i| i * 33).collect();
         assert!(times_can_be_gone_by(even.clone(), (1, 1000)));
         assert!(times_can_be_gone_by(vec![7], (1, 1000)));
-        // Two frames at one time: the survey's reading of the times refuses them.
+        // Two frames at one time, as Matroska's milliseconds leave them: a few are let by.
         let mut doubled = even.clone();
         doubled[500] = doubled[499];
-        assert!(!times_can_be_gone_by(doubled, (1, 1000)));
-        // 3% of the frames shown twice as long: not steady.
-        let mut held = Vec::new();
-        let mut at = 0;
-        for i in 0..1000 {
-            held.push(at);
-            at += if i % 33 == 0 { 66 } else { 33 };
-        }
-        assert!(!times_can_be_gone_by(held, (1, 1000)));
+        assert!(times_can_be_gone_by(doubled, (1, 1000)));
+        // Every `nth` frame shown twice as long: 3 in a hundred pass, 12 in a hundred do not.
+        let held = |nth: i64| {
+            let mut at = 0;
+            (0..1000).map(|i| { at += if i % nth == 0 { 66 } else { 33 }; at }).collect::<Vec<i64>>()
+        };
+        assert!(times_can_be_gone_by(held(33), (1, 1000)));
+        assert!(!times_can_be_gone_by(held(8), (1, 1000)));
     }
 
     #[test]

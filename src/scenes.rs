@@ -247,6 +247,19 @@ impl Times {
     /// seconds printed beside it is taken. `None` when the timestamps can't be gone by: no
     /// frames, two frames at one time or out of order, or neither time base fits.
     pub fn parse(text: &str, stream_tb: (i64, i64)) -> Option<Times> {
+        Times::read(text, stream_tb, false)
+    }
+
+    /// As [`Times::parse`], but two frames next to each other may share a time. Matroska keeps
+    /// milliseconds, so two frames less than one apart in the file they were copied from
+    /// land on the same one: 10 pairs in the 53,841 frames of a 15-minute video at 60 frames
+    /// a second. Frames set against each other by their number are not troubled by that; a
+    /// cut at such a time is (see [`crate::repair::survey`]).
+    pub fn parse_with_shared_times(text: &str, stream_tb: (i64, i64)) -> Option<Times> {
+        Times::read(text, stream_tb, true)
+    }
+
+    fn read(text: &str, stream_tb: (i64, i64), shared: bool) -> Option<Times> {
         let mut pts = Vec::new();
         let mut last_secs = 0.0;
         for l in text.lines().filter(|l| l.starts_with("frame:")) {
@@ -255,7 +268,7 @@ impl Times {
             last_secs = field("pts_time:")?.parse::<f64>().ok()?;
         }
         let last = *pts.last()?;
-        if pts.windows(2).any(|w| w[1] <= w[0]) {
+        if pts.windows(2).any(|w| w[1] < w[0] || (w[1] == w[0] && !shared)) {
             return None;
         }
         // Older ffmpeg prints the seconds with six significant digits.
@@ -276,6 +289,12 @@ impl Times {
     /// matter most to the eye would weigh least: such a video keeps its one pass, whose
     /// samples are scored along time.
     pub fn steady(&self) -> bool {
+        self.uneven_steps_within(1)
+    }
+
+    /// No more than `in_a_hundred` steps in a hundred are under half the usual step or over
+    /// one and a half times it.
+    pub fn uneven_steps_within(&self, in_a_hundred: usize) -> bool {
         let mut steps: Vec<i64> = self.pts.windows(2).map(|w| w[1] - w[0]).collect();
         if steps.is_empty() {
             return true;
@@ -283,7 +302,7 @@ impl Times {
         steps.sort_unstable();
         let usual = steps[steps.len() / 2];
         let odd = steps.iter().filter(|&&s| s * 2 < usual || s * 2 > usual * 3).count();
-        odd * 100 <= steps.len()
+        odd * 100 <= steps.len() * in_a_hundred
     }
 
     /// Frames per second on average, 0 for a single frame.
@@ -873,6 +892,9 @@ mod tests {
         assert_eq!(Times::parse(&printed(&pts, (1, 90000)), (1, 1000)), None);
         assert_eq!(Times::parse(&printed(&pts, (1, 90000)), (0, 0)), None);
         assert_eq!(Times::parse(&printed(&[0, 3000, 3000, 9000], (1, 90000)), (1, 90000)), None);
+        // Two frames at one time are taken where frames are only counted off, never one before.
+        assert_eq!(Times::parse_with_shared_times(&printed(&[0, 3000, 3000, 9000], (1, 90000)), (1, 90000)).unwrap().pts, [0, 3000, 3000, 9000]);
+        assert_eq!(Times::parse_with_shared_times(&printed(&[0, 6000, 3000, 9000], (1, 90000)), (1, 90000)), None);
         assert_eq!(Times::parse(&printed(&[0, 6000, 3000, 9000], (1, 90000)), (1, 90000)), None);
         assert_eq!(Times::parse("", (1, 90000)), None);
         // Two seconds at 24 fps, then every third frame: not frames that count alike. Nor
@@ -881,6 +903,7 @@ mod tests {
         assert!(!Times { pts: screen, tb: (1, 1000) }.steady());
         let gaps = |every: i64| Times { pts: (0..600).filter(|i| i % every != 0).map(|i| i * 3000).collect(), tb: (1, 90000) };
         assert!(!gaps(6).steady() && gaps(100).steady() && !gaps(99).steady());
+        assert!(gaps(11).uneven_steps_within(10) && !gaps(10).uneven_steps_within(10) && gaps(99).uneven_steps_within(10));
         assert!(Times { pts: vec![7], tb: (1, 1000) }.steady());
         assert_eq!(Times::parse("frame:0    pts:0\n", (1, 90000)), None);
     }

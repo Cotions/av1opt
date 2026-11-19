@@ -302,8 +302,9 @@ For each file:
    samples of a second search (the worst sample two points above the line this time) and
    the video is encoded once more at the lower CRF it finds, which the report says; if that
    saves less than `--min-savings` the video is skipped, and a second failure stands.
-   Where frames can't be paired one for one (removed sections, a source whose frames stay
-   for unequal times), in HDR and for videos encoded per scene, it is spot checks at
+   Where frames can't be paired one for one (removed sections, a source in which more than
+   one frame in ten stays on screen much longer or shorter than the rest, as in a screen
+   recording), in HDR and for videos encoded per scene, it is spot checks at
    fixed positions instead (five seconds at 30% and at 70% of the way;
    one for every ten minutes of a video of 25 minutes or more, eight at most; all of a
    video of ten seconds or less, once). So it is where stretches can't be encoded again (no

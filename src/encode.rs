@@ -634,15 +634,15 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     // a few long ones (see `search::MEAN_SAMPLE_SECS`). Clips asked for by number or length
     // are laid out as they always were.
     let mean_only = o.scenes == Scenes::Off && cut.is_none() && !info.hdr && o.samples.is_none() && o.sample_secs.is_none();
-    // Such an encode is scored along its whole length and repaired only where the source's
-    // frames are shown about as long as each other; spot checks judge it otherwise. Only where
-    // repairs will follow does the search count on them: it counts the weak samples as
-    // repaired, and aims low and rounds to the nearest step because the mean is made up after.
-    // (A 15-minute source with 3% of its frames shown twice as long was encoded 0.2 low and
-    // never repaired before this was looked at.)
+    // Such an encode is scored along its whole length and repaired only where no more than
+    // a tenth of the source's frames are shown for unequal times; spot checks judge it
+    // otherwise. Only where repairs will follow does the search count on them: it counts the
+    // weak samples as repaired, and aims low and rounds to the nearest step because the mean
+    // is made up after. (A source that was sent to spot checks was encoded 0.2 low and never
+    // repaired before this was looked at.)
     let repaired_after = mean_only && repair::steady_source(tools, input, &info);
     if mean_only && !repaired_after {
-        eprintln!("the source's frames are shown for unequal times: the encode will get spot checks, and the search aims at the target itself");
+        eprintln!("more than a tenth of the source's frames are shown for unequal times: the encode will get spot checks, and the search aims at the target itself");
     }
     // How far below the target such a search aims (see `search::AIM_LOW`): the scores it hands
     // on are that much below what the video is expected to end at.

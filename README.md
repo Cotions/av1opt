@@ -441,7 +441,13 @@ stretches instead.
 Finished chunks are kept in `.av1opt-work-*` in the output folder, so an interrupted run resumes
 where it stopped (including the search). A chunk is taken over only if its encode has the
 size and SHA-256 its record kept; any other is encoded again, and the run says how many of
-each (chunks of versions that kept no hash are taken over by their size alone, and the run says how many). Chunks are cut and compared at a constant frame
+each (chunks of versions that kept no hash are taken over by their size alone, and the run says how many). The folder is
+gone on from only with the ffmpeg and SVT-AV1 build that made it: another build may set a
+coding tool otherwise in its sequence headers, and such chunks would not join. With another
+build, or with a folder of a version of av1opt that did not note the build, the file starts
+over in a new folder, and the old one is removed when the new plan is made, saying why. A run
+whose ffmpeg does not say in time which build it is goes on from no folder and removes none
+of another build. Chunks are cut and compared at a constant frame
 rate, and a file's header is not taken at its word for having one: the scene pass counts how
 many frames that rate would drop or show twice. Past one in 10,000 the chunks are cut at the
 frames' own timestamps instead, each frame is encoded once, and the joined video is stamped

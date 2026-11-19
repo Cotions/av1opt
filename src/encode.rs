@@ -685,7 +685,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     if o.scenes == Scenes::Always && let Some(why) = one_pass {
         notes.push(format!("{why}: encoded in one pass instead of per scene"));
     }
-    let work = (o.scenes.possible() && one_pass.is_none()).then(|| work_dir(input, out_dir, size, o, preset, svt_params, !tmp.held.by_name(), &mut notes)).transpose()?;
+    let work = (o.scenes.possible() && one_pass.is_none()).then(|| work_dir(input, out_dir, size, o, preset, svt_params, tools.encoder_build(), !tmp.held.by_name(), &mut notes)).transpose()?;
     let saved = work.as_ref().and_then(|w| saved_plan(w, &source));
     if saved.as_ref().is_some_and(|p| p.source_mtime.is_some() && p.source_mtime != source.modified) {
         let n = "the source has another date than when its finished chunks were made, and the same contents where it was sampled, so the chunks are used".to_string();
@@ -1275,6 +1275,9 @@ struct WorkDir {
     /// these settings.
     key_start: String,
     key_end: String,
+    /// What closes the key: the ffmpeg and SVT-AV1 builds the chunks are encoded with (see
+    /// [`build_part`]).
+    key_build: String,
     /// The folder, held open once it is there: everything in it is done by way of this, since
     /// the folder others can write to that it lies in lets them rename it and put a link to
     /// one of theirs at its name.
@@ -1297,8 +1300,9 @@ impl WorkDir {
 
     /// Removes what earlier runs left for this same source and these same settings, which no
     /// run will go on from now that a new plan is begun: chunks of the file as it was when it
-    /// had another size or, under the keys of earlier versions, another date. Only folders of
-    /// this user's that pass the checks for going on from one, and only with a key to show.
+    /// had another size or, under the keys of earlier versions, another date, and chunks
+    /// another encoder build made. Only folders of this user's that pass the checks for going
+    /// on from one, and only with a key to show.
     fn remove_outdated_folders(&self) {
         let Some(parent) = self.path.parent() else { return };
         for entry in std::fs::read_dir(parent).into_iter().flatten().flatten() {
@@ -1308,21 +1312,40 @@ impl WorkDir {
                 continue;
             }
             let Ok(Some(found)) = crate::files::check_kept_folder(&path, !self.tools_cannot_reach) else { continue };
-            if plan_key(found.path()).is_some_and(|key| self.is_same_work(&key)) {
+            if let Some(why) = plan_key(found.path()).and_then(|key| self.outdated(&key)) {
                 match found.remove_all() {
-                    Ok(()) => eprintln!("removed {}: the chunks in it were of an earlier state of this file", path.display()),
+                    Ok(()) => eprintln!("removed {}: the chunks in it were {why}", path.display()),
                     Err(e) => eprintln!("warning: could not remove the outdated work folder {}: {e}", path.display()),
                 }
             }
         }
     }
 
-    /// Whether `key` is that of this source and these settings: between their two parts it holds
-    /// only a size, and in the keys of earlier versions a date as well.
-    fn is_same_work(&self, key: &str) -> bool {
-        let Some(between) = key.strip_prefix(&self.key_start).and_then(|rest| rest.strip_suffix(&self.key_end)) else { return false };
+    /// What the chunks under `key` were, if it is the key of this source and these settings:
+    /// between their two parts it holds only a size, and in the keys of earlier versions a date
+    /// as well; what closes it names an encoder build, or none in the keys of versions before
+    /// builds were noted.
+    fn outdated(&self, key: &str) -> Option<String> {
+        let rest = key.strip_prefix(&self.key_start)?;
+        let (rest, build) = match rest.rfind(BUILD_MARK) {
+            Some(at) => rest.split_at(at),
+            None => (rest, ""),
+        };
+        let between = rest.strip_suffix(&self.key_end)?;
         let numbers: Vec<&str> = between.split('|').collect();
-        numbers.len() <= 2 && numbers.iter().all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        if numbers.len() > 2 || !numbers.iter().all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) {
+            return None;
+        }
+        let same_size = between == self.key[self.key_start.len()..].split('|').next()?;
+        let made_by = if build.is_empty() || not_told(build) { "made by an encoder build that was not noted" } else { "made by another encoder build" };
+        match (build == self.key_build, same_size) {
+            (true, _) => Some("of an earlier state of this file".into()),
+            // A build that did not say what it is may be the one that made them, so they are
+            // left for a run that knows.
+            _ if not_told(&self.key_build) => None,
+            (false, true) => Some(made_by.into()),
+            (false, false) => Some(format!("of an earlier state of this file, {made_by}")),
+        }
     }
 
     /// Readies the folder for a run that has nothing to go on from. What is there was checked
@@ -1395,32 +1418,44 @@ fn plan_fits(plan: &scenes::Plan, now: &Recorded) -> bool {
 /// `tools_reach` says whether ffmpeg and ffprobe can go through a path of the folder's
 /// descriptor (see [`crate::files::HeldFolder`]).
 #[allow(clippy::too_many_arguments)]
-fn work_dir(input: &Path, out_dir: &Path, size: u64, o: &Options, preset: u8, svt_params: &str, tools_reach: bool, notes: &mut Vec<String>) -> Result<WorkDir> {
+fn work_dir(input: &Path, out_dir: &Path, size: u64, o: &Options, preset: u8, svt_params: &str, encoder: Option<&str>, tools_reach: bool, notes: &mut Vec<String>) -> Result<WorkDir> {
     let key_start = format!("v{PLAN_FORMAT}|{}|", std::path::absolute(input)?.display());
     let mut key_end = format!("|{}|{preset}|{}|{}|{}|{}", o.target_vmaf, o.min_crf, o.max_crf, o.samples.map_or("auto".to_string(), |n| n.to_string()), o.sample_secs.unwrap_or(search::SAMPLE_SECS));
     // Only when they differ, so work folders from before this setting existed still resume.
     if svt_params != search::DEFAULT_PARAMS {
         key_end.push_str(&format!("|{svt_params}"));
     }
+    let key_build = build_part(encoder)?;
     let folder_for = |key: &str| out_dir.join(format!("{WORK_PREFIX}{:016x}", scenes::fnv1a(key)));
-    let key = format!("{key_start}{size}{key_end}");
+    let key = format!("{key_start}{size}{key_end}{key_build}");
     // Created only when chunk work starts, so skipped files leave nothing behind.
     let (path, held) = believed_work_path(folder_for(&key), tools_reach, notes)?;
-    let mut work = WorkDir { path, key, key_start, key_end, held, tools_cannot_reach: !tools_reach };
-    // A folder from when the key held the source's date goes on being used, for that same date.
-    if work.held.is_none() && !work.path.exists() {
-        let mtime = std::fs::metadata(input)?.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
-        let earlier_key = format!("{}{size}|{mtime}{}", work.key_start, work.key_end);
-        let earlier = folder_for(&earlier_key);
-        if let Ok(Some(held)) = crate::files::check_kept_folder(&earlier, tools_reach)
-            && plan_key(held.path()).as_deref() == Some(earlier_key.as_str())
-        {
-            work.path = earlier;
-            work.key = earlier_key;
-            work.held = Some(held);
-        }
-    }
-    Ok(work)
+    Ok(WorkDir { path, key, key_start, key_end, key_build, held, tools_cannot_reach: !tools_reach })
+}
+
+/// What begins the part of a work folder's key that names the encoder build.
+const BUILD_MARK: &str = "|built with ";
+
+/// What follows [`BUILD_MARK`] in the key of a run that does not know its encoder build.
+const BUILD_NOT_TOLD: &str = "a build that did not say which, ";
+
+/// The last part of a work folder's key: `encoder` is [`Tools::encoder_build`], the ffmpeg
+/// build and the SVT-AV1 one. Chunks another build encoded may set a coding tool otherwise in
+/// their sequence headers, and the join refuses those (see `sequence_header::joinable`), on
+/// every run that took them over; and nothing says they would look like this build's. So a
+/// folder is gone on from only by the build that made it. Keys from before this part was
+/// there have none: what made their chunks is not known, and they are not gone on from. Nor
+/// is a folder of a run that was not told its build: such a key ends in random text.
+fn build_part(encoder: Option<&str>) -> Result<String> {
+    Ok(match encoder {
+        Some(build) => format!("{BUILD_MARK}{build}"),
+        None => format!("{BUILD_MARK}{BUILD_NOT_TOLD}{}", crate::files::random_text(8)?),
+    })
+}
+
+/// Whether `part`, the last part of a key, is that of a run that was not told its build.
+fn not_told(part: &str) -> bool {
+    part.strip_prefix(BUILD_MARK).is_some_and(|build| build.starts_with(BUILD_NOT_TOLD))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2751,7 +2786,7 @@ mod tests {
         let input = dir.join("a.mkv");
         std::fs::write(&input, b"contents").unwrap();
         set_date(&input, 1_000_000);
-        let folder = |o: &Options| work_dir(&input, &dir, 8, o, 5, search::DEFAULT_PARAMS, true, &mut Vec::new()).unwrap();
+        let folder = |o: &Options| work_dir(&input, &dir, 8, o, 5, search::DEFAULT_PARAMS, BUILD, true, &mut Vec::new()).unwrap();
         let first = folder(&options());
         set_date(&input, 2_000_000);
         let touched = folder(&options());
@@ -2783,24 +2818,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The build the work folders of these tests are encoded with.
+    const BUILD: Option<&str> = Some("ffmpeg version test | v4.2.0");
+
     #[test]
-    fn a_work_folder_from_when_the_key_held_the_date_is_gone_on_from_for_that_date() {
+    fn a_work_folder_is_gone_on_from_only_by_the_encoder_build_that_made_it() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = folder_for_test("work-earlier");
+        let dir = folder_for_test("work-build");
         let input = dir.join("a.mkv");
         std::fs::write(&input, b"contents").unwrap();
         set_date(&input, 1_000_000);
-        let w = work_dir(&input, &dir, 8, &options(), 5, search::DEFAULT_PARAMS, true, &mut Vec::new()).unwrap();
-        let earlier_key = format!("{}8|1000000{}", w.key_start, w.key_end);
-        let earlier = dir.join(format!("{WORK_PREFIX}{:016x}", scenes::fnv1a(&earlier_key)));
-        std::fs::create_dir(&earlier).unwrap();
-        std::fs::set_permissions(&earlier, std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::fs::write(earlier.join("plan.json"), serde_json::json!({ "key": earlier_key }).to_string()).unwrap();
-        let found = work_dir(&input, &dir, 8, &options(), 5, search::DEFAULT_PARAMS, true, &mut Vec::new()).unwrap();
-        assert_eq!((found.path, found.key), (earlier.clone(), earlier_key));
-        // Touched since, it is another date: that folder is then one to clear away.
-        set_date(&input, 2_000_000);
-        assert_eq!(work_dir(&input, &dir, 8, &options(), 5, search::DEFAULT_PARAMS, true, &mut Vec::new()).unwrap().path, w.path);
+        let by = |build: Option<&str>| work_dir(&input, &dir, 8, &options(), 5, search::DEFAULT_PARAMS, build, true, &mut Vec::new()).unwrap();
+        let w = by(BUILD);
+        assert_eq!(w.path, by(BUILD).path);
+        assert!(w.key.ends_with("|built with ffmpeg version test | v4.2.0"), "{}", w.key);
+        assert_ne!(w.path, by(Some("ffmpeg version test | v4.3.0")).path, "another SVT-AV1");
+        assert_ne!(w.path, by(Some("ffmpeg version other | v4.2.0")).path, "another ffmpeg");
+        // Not told which, it may be any: not even another such run goes on from it.
+        assert_ne!(by(None).path, by(None).path);
+        // The keys of earlier versions named no build, with or without the source's date. What
+        // their chunks were made with is not known, so they are not gone on from.
+        for earlier_key in [format!("{}8{}", w.key_start, w.key_end), format!("{}8|1000000{}", w.key_start, w.key_end)] {
+            let earlier = dir.join(format!("{WORK_PREFIX}{:016x}", scenes::fnv1a(&earlier_key)));
+            std::fs::create_dir(&earlier).unwrap();
+            std::fs::set_permissions(&earlier, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::write(earlier.join("plan.json"), serde_json::json!({ "key": earlier_key }).to_string()).unwrap();
+            let found = by(BUILD);
+            assert_eq!((found.path, found.key), (w.path.clone(), w.key.clone()));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2810,7 +2855,7 @@ mod tests {
         let dir = folder_for_test("work-outdated");
         let input = dir.join("a.mkv");
         std::fs::write(&input, b"contents").unwrap();
-        let mut w = work_dir(&input, &dir, 8, &options(), 5, search::DEFAULT_PARAMS, true, &mut Vec::new()).unwrap();
+        let mut w = work_dir(&input, &dir, 8, &options(), 5, search::DEFAULT_PARAMS, BUILD, true, &mut Vec::new()).unwrap();
         let (start, end) = (w.key_start.clone(), w.key_end.clone());
         let keeper = |name: &str, key: Option<String>| {
             let f = dir.join(format!("{WORK_PREFIX}{name}"));
@@ -2821,13 +2866,21 @@ mod tests {
             }
             f
         };
-        let gone = [keeper("other-size", Some(format!("{start}9{end}"))), keeper("with-date", Some(format!("{start}8|1000000{end}")))];
+        let build = w.key_build.clone();
+        let gone = [
+            keeper("other-size", Some(format!("{start}9{end}{build}"))),
+            keeper("other-build", Some(format!("{start}8{end}|built with ffmpeg version test | v4.3.0"))),
+            keeper("other-size-and-build", Some(format!("{start}9{end}|built with ffmpeg version test | v4.3.0"))),
+            keeper("build-not-told", Some(format!("{start}8{end}|built with a build that did not say which, x5Gq2Lw0"))),
+            keeper("no-build", Some(format!("{start}8{end}"))),
+            keeper("with-date", Some(format!("{start}8|1000000{end}"))),
+        ];
         let kept = [
-            keeper("other-settings", Some(format!("{start}8|95|5|20|55|auto|3"))),
-            keeper("other-source", Some(format!("v1|/elsewhere/a.mkv|8{end}"))),
+            keeper("other-settings", Some(format!("{start}8|95|5|20|55|auto|3{build}"))),
+            keeper("other-source", Some(format!("v1|/elsewhere/a.mkv|8{end}{build}"))),
             keeper("no-plan", None),
-            keeper("more-in-between", Some(format!("{start}8|1|2{end}"))),
-            keeper("words-in-between", Some(format!("{start}eight{end}"))),
+            keeper("more-in-between", Some(format!("{start}8|1|2{end}{build}"))),
+            keeper("words-in-between", Some(format!("{start}eight{end}{build}"))),
         ];
         // Not this user's to judge: others can write to it.
         let open = keeper("open", Some(format!("{start}7{end}")));
@@ -2841,6 +2894,18 @@ mod tests {
         for f in kept.iter().chain([&open]) {
             assert!(f.exists(), "{}", f.display());
         }
+        // What the removal says they were.
+        let other = "|built with ffmpeg version test | v4.3.0";
+        assert_eq!(w.outdated(&format!("{start}9{end}{build}")).as_deref(), Some("of an earlier state of this file"));
+        assert_eq!(w.outdated(&format!("{start}8{end}{other}")).as_deref(), Some("made by another encoder build"));
+        assert_eq!(w.outdated(&format!("{start}9{end}{other}")).as_deref(), Some("of an earlier state of this file, made by another encoder build"));
+        assert_eq!(w.outdated(&format!("{start}8{end}")).as_deref(), Some("made by an encoder build that was not noted"));
+        assert_eq!(w.outdated(&format!("{start}8|1000000{end}")).as_deref(), Some("of an earlier state of this file, made by an encoder build that was not noted"));
+        // A run that was not told its build may be of the one that made them: it leaves them.
+        let blind = work_dir(&input, &dir, 8, &options(), 5, search::DEFAULT_PARAMS, None, true, &mut Vec::new()).unwrap();
+        assert_eq!(blind.outdated(&format!("{start}8{end}{other}")), None);
+        assert_eq!(blind.outdated(&format!("{start}8{end}")), None);
+        assert_eq!(blind.outdated(&format!("{start}9{end}{}", blind.key_build)).as_deref(), Some("of an earlier state of this file"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

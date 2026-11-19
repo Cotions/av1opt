@@ -408,7 +408,8 @@ pub struct Tools {
     /// line. None where nothing can stop the run.
     pub hooks: Option<Arc<Hooks>>,
     /// First line of `ffmpeg -version`, asked for once.
-    version: std::sync::OnceLock<String>,
+    /// [`Tools::encoder_version`], and whether a question about it went unanswered.
+    version: std::sync::OnceLock<(String, bool)>,
     /// Whether ffmpeg and ffprobe can open files by way of av1opt's descriptors, asked once.
     reach: std::sync::OnceLock<bool>,
     /// How long a run may go without moving, see [`Watchdog`].
@@ -466,15 +467,26 @@ impl Tools {
     /// Which ffmpeg build this is (the first line of `ffmpeg -version`; empty if it won't
     /// say). Measurements kept between runs only count for the build that made them.
     pub fn encoder_version(&self) -> &str {
+        &self.asked_version().0
+    }
+
+    /// [`Tools::encoder_version`] where every part of it was told in time, for what may only be
+    /// gone on from by the same build: a version short of a part may be any build.
+    pub fn encoder_build(&self) -> Option<&str> {
+        let (version, late) = self.asked_version();
+        (!late).then_some(version.as_str())
+    }
+
+    fn asked_version(&self) -> &(String, bool) {
         self.version.get_or_init(|| {
             let (version, late) = encoder_version_within(&self.ffmpeg, QUESTION_LIMIT);
             if late {
                 eprintln!(
-                    "warning: ffmpeg did not say within {} s which build it is or which SVT-AV1 it encodes with, so the trials kept from earlier runs are not used in this run (they are again once it answers in time)",
+                    "warning: ffmpeg did not say within {} s which build it is or which SVT-AV1 it encodes with, so the trials and the scene chunks kept from earlier runs are not used in this run (they are again once it answers in time)",
                     QUESTION_LIMIT.as_secs()
                 );
             }
-            version
+            (version, late)
         })
     }
 

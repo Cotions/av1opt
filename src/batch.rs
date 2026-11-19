@@ -138,26 +138,37 @@ pub fn folder_out_among(folders: usize, input: &Path, out_dir: &Path) -> PathBuf
 /// Files are used as given; folders are walked and their structure is kept below `out_dir`
 /// (below a folder of their own name there when several are given, see [`folder_out_among`]). A file
 /// reached twice is one job, and the run says so once.
+// Used by the page's queue; the command line wants the unread folders as well.
+#[cfg_attr(not(feature = "ui"), allow(dead_code))]
 pub fn expand(inputs: &[PathBuf], out_dir: &Path, is_video: impl Fn(&Path) -> bool) -> Vec<Job> {
-    let (jobs, repeated) = expand_once(inputs, out_dir, is_video);
+    expand_telling_unread(inputs, out_dir, is_video).0
+}
+
+/// [`expand`], and the folders below the inputs that could not be read, which it warns about.
+pub fn expand_telling_unread(inputs: &[PathBuf], out_dir: &Path, is_video: impl Fn(&Path) -> bool) -> (Vec<Job>, Vec<PathBuf>) {
+    let (jobs, repeated, unread) = expand_once(inputs, out_dir, is_video);
     if let Some(first) = repeated.first() {
         let more = if repeated.len() > 1 { format!(" and {} more", repeated.len() - 1) } else { String::new() };
         eprintln!("note: left out, as the same file was already reached by way of an input before it: {}{more}", first.display());
     }
-    jobs
+    if let Some(note) = crate::scan::unreadable_note(&unread) {
+        eprintln!("warning: {note}");
+    }
+    (jobs, unread)
 }
 
-/// The jobs, and the paths left out for leading to a file that already has one. Files are told
-/// apart by device and inode, as in a scan: one folder given inside another, or a hard link,
-/// would otherwise encode one video twice. The first input to reach a file decides its place.
-fn expand_once(inputs: &[PathBuf], out_dir: &Path, is_video: impl Fn(&Path) -> bool) -> (Vec<Job>, Vec<PathBuf>) {
+/// The jobs, the paths left out for leading to a file that already has one, and the folders that
+/// could not be read. Files are told apart by device and inode, as in a scan: one folder given
+/// inside another, or a hard link, would otherwise encode one video twice. The first input to
+/// reach a file decides its place.
+fn expand_once(inputs: &[PathBuf], out_dir: &Path, is_video: impl Fn(&Path) -> bool) -> (Vec<Job>, Vec<PathBuf>, Vec<PathBuf>) {
     // Folders as the system resolves them: an output folder named through a link or `..`
     // is the same folder, and two strings would not say so.
     let real = |p: &Path| std::fs::canonicalize(p).or_else(|_| std::path::absolute(p)).unwrap_or_else(|_| p.to_path_buf());
     let out_abs = real(out_dir);
     let folders = inputs.iter().filter(|p| p.is_dir()).count();
     let mut seen = HashSet::new();
-    let (mut jobs, mut repeated) = (Vec::new(), Vec::new());
+    let (mut jobs, mut repeated, mut unread) = (Vec::new(), Vec::new(), Vec::new());
     for input in inputs {
         if input.is_dir() {
             let below = folder_out_among(folders, input, out_dir);
@@ -172,7 +183,7 @@ fn expand_once(inputs: &[PathBuf], out_dir: &Path, is_video: impl Fn(&Path) -> b
                     let ours = !inside && e.file_type().is_dir() && real(e.path()).starts_with(&out_abs);
                     !ours && !crate::scan::not_for_videos(e) && !e.file_name().to_string_lossy().starts_with(".av1opt-")
                 })
-                .flatten()
+                .filter_map(|entry| entry.map_err(|e| unread.extend(crate::scan::unread_in_walk(&e, input))).ok())
                 .filter(|e| e.file_type().is_file() && is_video(e.path()))
                 .map(|e| {
                     let inode = e.metadata().ok().map(|m| (m.dev(), m.ino()));
@@ -197,7 +208,7 @@ fn expand_once(inputs: &[PathBuf], out_dir: &Path, is_video: impl Fn(&Path) -> b
             jobs.push(Job { input: input.clone(), out_dir: out_dir.to_path_buf(), also_at: None });
         }
     }
-    (jobs, repeated)
+    (jobs, repeated, unread)
 }
 
 /// Which file of a batch is encoded first.
@@ -1247,7 +1258,10 @@ mod tests {
         std::fs::write(sub.join("x.mkv"), b"video").unwrap();
         std::fs::hard_link(sub.join("x.mkv"), f.0.join("linked.mkv")).unwrap();
         let out = PathBuf::from("/out");
-        let inputs = |names: &[PathBuf]| expand_once(names, &out, a_video);
+        let inputs = |names: &[PathBuf]| {
+            let (jobs, left, _) = expand_once(names, &out, a_video);
+            (jobs, left)
+        };
         let from = |jobs: &[Job]| jobs.iter().map(|j| (j.input.clone(), j.out_dir.clone())).collect::<Vec<_>>();
         let lib = f.0.file_name().unwrap();
 

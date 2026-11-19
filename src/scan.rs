@@ -77,11 +77,23 @@ pub struct Stats {
 impl Stats {
     /// What to tell about the folders that could not be read, if there are any.
     pub fn unreadable_note(&self) -> Option<String> {
-        let (count, named) = (self.unreadable.len(), self.unreadable.iter().take(UNREADABLE_SHOWN));
-        let names = named.map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ");
-        let more = if count > UNREADABLE_SHOWN { format!(" and {} more", count - UNREADABLE_SHOWN) } else { String::new() };
-        (count > 0).then(|| format!("{count} folder{} could not be read, so the videos in {} are not counted: {names}{more}", if count == 1 { "" } else { "s" }, if count == 1 { "it" } else { "them" }))
+        unreadable_note(&self.unreadable)
     }
+}
+
+/// What to tell about folders a walk could not read, if there are any.
+pub fn unreadable_note(folders: &[PathBuf]) -> Option<String> {
+    let (count, named) = (folders.len(), folders.iter().take(UNREADABLE_SHOWN));
+    let names = named.map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ");
+    let more = if count > UNREADABLE_SHOWN { format!(" and {} more", count - UNREADABLE_SHOWN) } else { String::new() };
+    (count > 0).then(|| format!("{count} folder{} could not be read, so the videos in {} are left out: {names}{more}", if count == 1 { "" } else { "s" }, if count == 1 { "it" } else { "them" }))
+}
+
+/// The place a walk under `root` could not read. What went away during the walk was simply not
+/// there to read.
+pub fn unread_in_walk(e: &walkdir::Error, root: &Path) -> Option<PathBuf> {
+    let gone = e.io_error().is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound);
+    e.path().filter(|p| !gone || *p == root).map(Path::to_path_buf)
 }
 
 /// Probes every video under `paths` (absolute) with `jobs` ffprobe processes at once.
@@ -119,11 +131,7 @@ fn collect_with_cache(
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(e) => {
-                    // What went away during the walk was simply not there to read.
-                    let gone = e.io_error().is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound);
-                    if let Some(path) = e.path().filter(|p| !gone || *p == root.as_path()) {
-                        unreadable.push(path.to_path_buf());
-                    }
+                    unreadable.extend(unread_in_walk(&e, root));
                     continue;
                 }
             };

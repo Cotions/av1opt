@@ -106,6 +106,8 @@ pub struct Stats {
     pub spare_bytes: u64,
     /// Videos left out because their paths are not text.
     pub not_text: usize,
+    /// Folders that could not be read, so that what is in them was not compared.
+    pub unreadable_folders: Vec<PathBuf>,
 }
 
 #[derive(Serialize, Clone, Debug, Default)]
@@ -320,7 +322,7 @@ fn mark_identical(media: &mut [Media], linked: &[usize]) {
 pub fn find(paths: &[PathBuf], tools: &Tools, o: &Options, progress: &(dyn Fn(Progress) + Sync)) -> Result<Report> {
     // The verdicts of `scan` aren't used here, so the built-in size model will do.
     let model = Model::fit(&[], 93.0);
-    let (mut found, _) = scan::collect(paths, &tools.ffprobe, o.jobs, 0.2, &model, &|done, total| progress(Progress::Probing { done, total }))?;
+    let (mut found, walked) = scan::collect(paths, &tools.ffprobe, o.jobs, 0.2, &model, &|done, total| progress(Progress::Probing { done, total }))?;
     tools.check_cancel()?;
     let not_text = scan::drop_unnamed(&mut found);
     if not_text > 0 {
@@ -473,7 +475,7 @@ pub fn find(paths: &[PathBuf], tools: &Tools, o: &Options, progress: &(dyn Fn(Pr
     pool.install(|| files.par_iter_mut().for_each(|f| f.digest = crate::files::sample_digest(&f.path, f.size, IDENTICAL_SAMPLE).ok()));
     let same = groups.iter().filter(|g| g.kind == Kind::Same).count();
     let (spare_files, spare_bytes) = spare_copies(&groups, &files);
-    let stats = Stats { videos: found.len(), compared: kept.len(), fresh: fresh.load(Ordering::Relaxed), same_groups: same, partial_groups: groups.len() - same, spare_files, spare_bytes, not_text };
+    let stats = Stats { videos: found.len(), compared: kept.len(), fresh: fresh.load(Ordering::Relaxed), same_groups: same, partial_groups: groups.len() - same, spare_files, spare_bytes, not_text, unreadable_folders: walked.unreadable };
     unreadable.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(Report { files, groups, unreadable, stats })
 }
@@ -503,6 +505,9 @@ pub fn print(r: &Report, top: usize) {
     println!("{} videos, {} compared ({} fingerprinted now, the rest from the cache)", s.videos, s.compared, s.fresh);
     if !r.unreadable.is_empty() {
         println!("{} could not be compared (listed in --json / --csv output)", r.unreadable.len());
+    }
+    if let Some(note) = scan::unreadable_note(&s.unreadable_folders) {
+        println!("warning: {note}");
     }
     println!(
         "{} group{} of the same video: {} spare cop{}, {} | {} pair{} sharing only a start or an ending",

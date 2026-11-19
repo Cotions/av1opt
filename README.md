@@ -397,6 +397,10 @@ there could not be verified and the others were dealt with, and 130 or 143 when 
 SIGTERM stopped it. `dups` ends with 3 when more than half of the videos could not be read: it
 says so after the results, which then mean little.
 
+A path named on the command line that does not exist or cannot be read stops `scan`, `dups`,
+`bench` and `encode` with status 1 before anything is done. A folder further down that cannot be
+read gets a warning, the run goes on without it, and the summary counts it.
+
 ### File names
 
 A name that is not valid UTF-8 can't be passed to ffmpeg. `encode` refuses such a file with a

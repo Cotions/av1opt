@@ -410,3 +410,31 @@ fn the_duplicate_finder_does_not_take_a_broken_ffmpeg_for_broken_videos() {
     c.run(&["dups", "videos"]).ended(3).has("no frame could be read");
     assert!(text(&cache).contains("no frame could be read"));
 }
+
+#[test]
+fn a_path_that_cannot_be_read_is_an_error_and_a_folder_further_down_a_warning() {
+    use std::os::unix::fs::PermissionsExt;
+    let c = Case::new("unread-paths");
+    c.video("a.mkv");
+    c.video("closed/b.mkv");
+    let closed = c.path("videos/closed");
+    let set_mode = |mode| std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(mode)).unwrap();
+
+    let commands: [&[&str]; 4] = [&["scan"], &["dups"], &["bench"], &["encode", "-o", "out"]];
+    for command in commands {
+        let run = |path: &str| c.run(&[command, &[path]].concat());
+        run("no/such/folder").ended(1).has("cannot read").has("no/such/folder").has("No such file");
+        assert!(!c.path("out").exists());
+    }
+
+    set_mode(0o000);
+    for command in commands {
+        c.run(&[command, &["videos/closed"]].concat()).ended(1).has("cannot read").has("videos/closed").has("Permission denied");
+    }
+    let warning = "1 folder could not be read, so the videos in it are left out";
+    c.run(&["scan", "videos"]).ended(0).has(warning);
+    c.run(&["dups", "videos"]).has(warning);
+    c.run(&["bench", "videos"]).has(warning);
+    c.run(&["encode", "videos", "-o", "out"]).has(warning).has("folders not read 1");
+    set_mode(0o755);
+}

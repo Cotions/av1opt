@@ -137,6 +137,10 @@ pub struct Report {
     pub summaries: Vec<Summary>,
     /// Videos found but not used, with the reason (unreadable, too short, over the limit).
     pub skipped: Vec<Skipped>,
+    /// Folders that could not be read, so that what is in them was not considered. Results
+    /// saved before this was noted have none.
+    #[serde(default)]
+    pub unreadable_folders: Vec<PathBuf>,
     pub elapsed_secs: f64,
     /// Sample encodes run now, and taken from earlier runs.
     pub fresh: usize,
@@ -314,7 +318,7 @@ pub fn run(paths: &[PathBuf], tools: &Tools, o: &Options, progress: &(dyn Fn(Pro
 
     // The verdicts of `scan` aren't used here, so the built-in size model will do.
     let model = crate::estimate::Model::fit(&[], 93.0);
-    let (mut found, _) = scan::collect(paths, &tools.ffprobe, o.jobs.max(1), crate::estimate::MIN_SAVINGS, &model, &|done, total| progress(Progress::Probing { done, total }))?;
+    let (mut found, walked) = scan::collect(paths, &tools.ffprobe, o.jobs.max(1), crate::estimate::MIN_SAVINGS, &model, &|done, total| progress(Progress::Probing { done, total }))?;
     tools.check_cancel()?;
     let not_text = scan::drop_unnamed(&mut found);
     if not_text > 0 {
@@ -452,6 +456,7 @@ pub fn run(paths: &[PathBuf], tools: &Tools, o: &Options, progress: &(dyn Fn(Pro
         videos,
         summaries,
         skipped,
+        unreadable_folders: walked.unreadable,
         elapsed_secs: started.elapsed().as_secs_f64(),
         fresh,
         cached,
@@ -565,6 +570,9 @@ pub fn print(r: &Report) {
         "\n{} settings on {} videos at VMAF {} ({} sample encodes, {} from earlier runs, {})",
         r.configs.len(), r.videos.len(), r.target_vmaf, r.fresh + r.cached, r.cached, crate::tools::hms(r.elapsed_secs)
     );
+    if let Some(note) = scan::unreadable_note(&r.unreadable_folders) {
+        println!("warning: {note}");
+    }
     for v in &r.videos {
         if let Some(e) = &v.error {
             println!("not measured: {}: {}", v.path.display(), e.lines().next().unwrap_or("failed"));
@@ -724,7 +732,7 @@ mod tests {
         let report = Report {
             format: REPORT_FORMAT, made: 5, encoder: "ffmpeg".into(), target_vmaf: 93.0, min_crf: 20, max_crf: 55, samples: 2, sample_secs: 6.0,
             configs: vec![Config::baseline(), Config { preset: 6, params: "tune=1".into() }], baseline: 0,
-            videos: videos.to_vec(), summaries: s, skipped: Vec::new(), elapsed_secs: 1.0, fresh: 0, cached: 0,
+            videos: videos.to_vec(), summaries: s, skipped: Vec::new(), unreadable_folders: Vec::new(), elapsed_secs: 1.0, fresh: 0, cached: 0,
         };
         // Every class is too small to go by, and the second setting fails on a video of the
         // whole, so the default stays and nothing is saved.
@@ -749,7 +757,7 @@ mod tests {
         let summaries = summaries(&videos, configs.len(), 0);
         Report {
             format: REPORT_FORMAT, made: 5, encoder: "ffmpeg".into(), target_vmaf: 93.0, min_crf: 20, max_crf: 55, samples: 2, sample_secs: 6.0,
-            configs, baseline: 0, videos, summaries, skipped: Vec::new(), elapsed_secs: 1.0, fresh: 0, cached: 0,
+            configs, baseline: 0, videos, summaries, skipped: Vec::new(), unreadable_folders: Vec::new(), elapsed_secs: 1.0, fresh: 0, cached: 0,
         }
     }
 

@@ -510,11 +510,13 @@ fn run_command(command: Cmd) -> Result<()> {
             let time = estimate::TimeModel::fit(&past, preset);
             // Absolute roots keep cache keys stable however the folder was typed.
             let paths: Vec<PathBuf> = paths.iter().map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone())).collect();
+            check_inputs(&paths)?;
             scan(&paths, &ffprobe, jobs, min_savings, csv.as_deref(), top, &model, &time, sort, hours.map(|h| (h, list)))
         }
         Cmd::Dups { paths, jobs, prefer, avoid, tolerance, refresh, top, csv, json, ffmpeg, ffprobe, memory_limit, nice } => {
             let abs = |p: &PathBuf| std::path::absolute(p).unwrap_or_else(|_| p.clone());
             let paths: Vec<PathBuf> = paths.iter().map(abs).collect();
+            check_inputs(&paths)?;
             check_reports(&[(csv.as_deref(), dups::CSV), (json.as_deref(), Kind::Json)], &paths)?;
             if let Some(p) = tools::Capabilities::probe(&ffmpeg, &ffprobe).cannot_read(&ffmpeg, &ffprobe) {
                 anyhow::bail!("{p} (--ffmpeg / AV1OPT_FFMPEG, --ffprobe / AV1OPT_FFPROBE)");
@@ -569,6 +571,7 @@ fn run_command(command: Cmd) -> Result<()> {
             jobs, ffmpeg, ffprobe, memory_limit, nice,
         } => {
             let paths: Vec<PathBuf> = paths.iter().map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone())).collect();
+            check_inputs(&paths)?;
             check_reports(&[(csv.as_deref(), bench::CSV), (json.as_deref(), Kind::Json)], &paths)?;
             let param_sets = if param_sets.is_empty() { bench::DEFAULT_PARAM_SETS.map(String::from).to_vec() } else { param_sets };
             let configs = bench::matrix(&presets, &param_sets);
@@ -691,6 +694,7 @@ fn run_command(command: Cmd) -> Result<()> {
             if let Some(why) = scenes_value_taken_for_input(&inputs) {
                 Cli::command().error(clap::error::ErrorKind::ValueValidation, why).exit();
             }
+            check_inputs(&inputs)?;
             let meta = metadata::MetaOptions {
                 keep: !strip_metadata,
                 keep_dates,
@@ -733,7 +737,7 @@ fn run_command(command: Cmd) -> Result<()> {
                 container, target_vmaf, preset, svt_params, tuning, min_crf, max_crf, samples: samples.map(|n| n as usize), sample_secs,
                 min_savings, force, overwrite, keep_temp, scenes, workers: workers.into(), meta, remove, audio, fresh_search,
             };
-            let mut jobs = batch::expand(&inputs, &out_dir, is_video);
+            let (mut jobs, unread_folders) = batch::expand_telling_unread(&inputs, &out_dir, is_video);
             if jobs.is_empty() {
                 anyhow::bail!("no video files found in the given inputs");
             }
@@ -748,8 +752,9 @@ fn run_command(command: Cmd) -> Result<()> {
             let s = batch::run(&tools, &jobs, &out_dir, &opts, retry_skipped)?;
             let saved = s.bytes_in.saturating_sub(s.bytes_out) as f64 / 1e9;
             let unverified = if s.unverified > 0 { format!(", not verified {}", s.unverified) } else { String::new() };
+            let unread = if unread_folders.is_empty() { String::new() } else { format!(", folders not read {}", unread_folders.len()) };
             eprintln!(
-                "\nencoded {}, skipped {}, failed {}, already done {}{unverified} | {:.2} GB -> {:.2} GB ({saved:.2} GB saved)",
+                "\nencoded {}, skipped {}, failed {}, already done {}{unverified}{unread} | {:.2} GB -> {:.2} GB ({saved:.2} GB saved)",
                 s.ok, s.skipped, s.failed, s.already_done, s.bytes_in as f64 / 1e9, s.bytes_out as f64 / 1e9
             );
             eprintln!("log: {}", out_dir.join(batch::LOG_NAME).display());
@@ -894,6 +899,23 @@ fn order_jobs(jobs: &mut [batch::Job], inputs: &[PathBuf], ffprobe: &str, o: &en
 }
 
 /// Refuses, before the work, the report files named that could not be written after it.
+/// Stops the run when a path named on the command line cannot be read: left to the walk, what
+/// was asked for would simply be missing from the results.
+fn check_inputs(paths: &[PathBuf]) -> Result<()> {
+    fn readable(path: &Path) -> std::io::Result<()> {
+        let meta = std::fs::metadata(path)?;
+        if meta.is_dir() {
+            std::fs::read_dir(path)?;
+        } else if meta.is_file() {
+            // Regular files only: opening a named pipe would wait for someone to write to it.
+            std::fs::File::open(path)?;
+        }
+        Ok(())
+    }
+    let problems: Vec<String> = paths.iter().filter_map(|p| readable(p).err().map(|e| format!("cannot read {}: {e}", p.display()))).collect();
+    if problems.is_empty() { Ok(()) } else { anyhow::bail!("{}", problems.join("\n")) }
+}
+
 fn check_reports(named: &[(Option<&Path>, Kind)], given: &[PathBuf]) -> Result<()> {
     let reports: Vec<(&Path, Kind)> = named.iter().filter_map(|&(path, kind)| Some((path?, kind))).collect();
     report_file::check_all(&reports, given)

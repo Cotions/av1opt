@@ -142,7 +142,8 @@ pub struct MediaInfo {
     /// types "Stereo 3D" and "Spherical Mapping" (360 degree video).
     #[serde(default)]
     pub view_marks: Vec<String>,
-    /// The layout of a 3D picture as ffprobe says it ("top and bottom"); empty for none.
+    /// The layout of a 3D picture as ffprobe says it ("top and bottom", "side by side
+    /// inverted" where the right eye's picture comes first); empty for none.
     #[serde(default)]
     pub stereo3d: String,
     /// ffprobe's color_space and color_primaries ("bt709", "gbr" for RGB).
@@ -705,9 +706,8 @@ fn probe_within(ffprobe: &str, path: &Path, file_size: u64, limit: Duration) -> 
     let stereo3d = video["side_data_list"]
         .as_array()
         .and_then(|l| l.iter().find(|d| d["side_data_type"] == "Stereo 3D"))
-        .and_then(|d| d["type"].as_str())
-        .unwrap_or("")
-        .to_string();
+        .and_then(|d| Some(format!("{}{}", d["type"].as_str()?, if d["inverted"].as_i64() == Some(1) { " inverted" } else { "" })))
+        .unwrap_or_default();
 
     let main_index = video["index"].as_u64().unwrap_or(0);
     let covers: Vec<Cover> = streams

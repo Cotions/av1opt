@@ -872,8 +872,8 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
 
     let lifted_crf = mean_only.then_some(best.crf);
     let floor_for = |best: &search::Trial| o.target_vmaf.min(best.mean_vmaf) - VERIFY_SLACK;
-    let remux = |video: &Path, out: &Path| -> Result<Vec<String>> {
-        Ok(mux_args(video, false, first_video_time(tools, video)?, input, &info, o.container, o.audio, &covers, &meta, &o.meta, out, &mut Vec::new()).0)
+    let remux = |video: &Path, out: &Path, said: &mut Vec<String>| -> Result<(Vec<String>, Streams)> {
+        Ok(mux_args(video, false, first_video_time(tools, video)?, input, &info, o.container, o.audio, &covers, &meta, &o.meta, out, said))
     };
     // The CRF of a search that counted weak samples as encoded again (see `search::lifted_mean`).
     // The whole video where it can be gone by, spot checks where not.
@@ -1379,7 +1379,19 @@ fn mux_args(
     if let Some(aspect) = display_aspect(info) {
         a.extend(["-aspect:v:0".into(), aspect]);
     }
-    let streams = stream_args(info, 1, container, audio, covers, None, notes);
+    let mut streams = stream_args(info, 1, container, audio, covers, None, notes);
+    // How the picture is shown came with the source's video stream on the one pass; a bare
+    // stream has none of it, and ffmpeg can set the 3D layout but not the 360 degree mapping.
+    if info.view_marks.iter().any(|m| m == "Stereo 3D") {
+        match stereo_layout(&info.stereo3d) {
+            Some(layout) => a.extend(["-stereo3d:v:0".into(), layout.into()]),
+            None => notes.push(format!("the 3D mark ({}) is lost: ffmpeg cannot give it to a video joined from bare streams (after repair or --scenes)", info.stereo3d)),
+        }
+    }
+    if info.view_marks.iter().any(|m| m == "Spherical Mapping") {
+        notes.push("the 360 degree mark (spherical mapping) is lost: ffmpeg cannot give it to a video joined from bare streams (after repair or --scenes), so players show the flat picture".into());
+    }
+    streams.view_marks.retain(|m| m == "Stereo 3D" && stereo_layout(&info.stereo3d).is_some());
     a.extend(metadata::ffmpeg_args(mo, tags, 1));
     // The video's language and marks are the source's video's, not the bare stream's (which
     // has none): a repaired Matroska lost "Main picture", its language and its default mark.
@@ -1624,6 +1636,8 @@ struct Streams {
     /// The source subtitle stream each kept one comes from.
     sub_sources: Vec<usize>,
     covers: usize,
+    /// The marks for how the picture is shown (3D, 360 degree) the output must have.
+    view_marks: Vec<String>,
 }
 
 /// What of the source's picture the output cannot have, and what it keeps of its HDR, as
@@ -1700,7 +1714,6 @@ fn bit_depth(pix_fmt: &str) -> u32 {
     bits.filter(|b| (9..=16).contains(b)).unwrap_or(8)
 }
 
-
 /// What subtitle track `i`, of `codec`, becomes in `container`: the codec it is written with
 /// ("copy" for as it is) or None for left out, and a note where something of it is lost.
 fn plan_subtitle(i: usize, codec: &str, container: Container) -> (Option<&'static str>, Option<String>) {
@@ -1725,6 +1738,19 @@ fn plan_subtitle(i: usize, codec: &str, container: Container) -> (Option<&'stati
         // MP4-style text subtitles can't be stored in Matroska; convert them to SRT.
         (Container::Mkv, "mov_text") => (Some("srt"), None),
         (Container::Mkv, _) => (Some("copy"), None),
+    }
+}
+
+/// The `-stereo3d` layout for ffprobe's name of a 3D picture's layout (see
+/// `MediaInfo::stereo3d`); None for one ffmpeg cannot set.
+fn stereo_layout(layout: &str) -> Option<&'static str> {
+    match layout {
+        "2D" => Some("2d"),
+        "side by side" => Some("sbs"),
+        "side by side inverted" => Some("sbsl"),
+        "top and bottom" => Some("tb"),
+        "top and bottom inverted" => Some("tbl"),
+        _ => None,
     }
 }
 
@@ -1877,8 +1903,14 @@ fn stream_args(
     }
     if container == Container::Mp4 {
         a.extend(["-movflags", "+faststart"].map(String::from));
+        // ffmpeg writes the 3D and 360 degree boxes (st3d, sv3d) into MP4 only when told it may
+        // go past the standard. Compared on a file with Opus, AAC, mov_text and a cover, the
+        // flag added those boxes and Apple's vexu and nothing else: every packet the same.
+        if !info.view_marks.is_empty() {
+            a.extend(["-strict", "unofficial"].map(String::from));
+        }
     }
-    Streams { args: a, meta_from, audio: info.audio.len(), subs: kept_subs, sub_sources, covers }
+    Streams { args: a, meta_from, audio: info.audio.len(), subs: kept_subs, sub_sources, covers, view_marks: info.view_marks.clone() }
 }
 
 /// Inputs for an encode that leaves sections out: retimed copies of the text subtitles and
@@ -2029,6 +2061,10 @@ fn check_layout(tools: &Tools, info: &MediaInfo, out: &Path, streams: &Streams, 
     }
     if let Some(what) = track_lost(info, &out_info, streams) {
         bail!("the finished file's {what}; {NOT_WRITTEN}");
+    }
+    let lost: Vec<&str> = streams.view_marks.iter().filter(|m| !out_info.view_marks.contains(m)).map(String::as_str).collect();
+    if !lost.is_empty() {
+        bail!("the finished video lacks its source's marks for how it is shown ({}); {NOT_WRITTEN}", lost.join(", "));
     }
     if let Some(off) = sound_moved(info, &out_info, streams, cut) {
         bail!(
@@ -2210,7 +2246,7 @@ const JOIN_SLACK: f64 = 3.0;
 /// the whole video can't be gone by, for the spot checks to decide.
 ///
 /// `remux` gives the ffmpeg arguments that put a bare video stream together with the
-/// source's other streams.
+/// source's other streams, and what the result holds; it says what it cannot keep.
 #[allow(clippy::too_many_arguments)]
 fn verify_whole(
     tools: &Tools,
@@ -2224,7 +2260,7 @@ fn verify_whole(
     min_crf: u8,
     threads: usize,
     tmp: &Path,
-    remux: &dyn Fn(&Path, &Path) -> Result<Vec<String>>,
+    remux: &dyn Fn(&Path, &Path, &mut Vec<String>) -> Result<(Vec<String>, Streams)>,
     notes: &mut Vec<String>,
 ) -> Result<Option<(Vec<f64>, MediaInfo, repair::Summary)>> {
     let took = tools.stopwatch();
@@ -2263,10 +2299,18 @@ fn verify_whole(
     if let Some(video) = &outcome.video {
         tools.emit(Event::Phase { phase: "muxing".into(), detail: format!("joining {} stretches encoded again", s.stretches.len()) });
         let joined = tmp.join(format!("repaired.{}", out.extension().map_or("mp4".into(), |e| e.to_string_lossy())));
-        tools.run(&remux(video, &joined)?)?;
+        let mut said = Vec::new();
+        let (args, joined_streams) = remux(video, &joined, &mut said)?;
+        tools.run(&args)?;
         let _ = std::fs::remove_file(video);
         std::fs::rename(&joined, out)?;
-        out_info = check_layout(tools, info, out, streams, Some(frames), None)?;
+        out_info = check_layout(tools, info, out, &joined_streams, Some(frames), None)?;
+        // The one pass said the rest already; what is new is what the second mux lost.
+        for n in said {
+            if !notes.contains(&n) {
+                notes.push(n);
+            }
+        }
         // The stretches were scored by themselves. Read once more where they now are, the
         // first and the last say whether every frame sits where it should.
         let mut ends = vec![&s.stretches[0]];
@@ -3019,6 +3063,33 @@ mod tests {
     }
 
     #[test]
+    fn marks_for_how_the_picture_is_shown_are_kept_where_ffmpeg_can_write_them() {
+        let mut source = info(&[]);
+        source.view_marks = vec!["Stereo 3D".into(), "Spherical Mapping".into()];
+        source.stereo3d = "top and bottom".into();
+        let mut notes = Vec::new();
+        // The one pass keeps both; MP4 has to be let past the standard for them.
+        let streams = stream_args(&source, 0, Container::Mp4, Audio::Keep, &[], None, &mut notes);
+        assert!(streams.args.windows(2).any(|w| w == ["-strict", "unofficial"]));
+        assert_eq!(streams.view_marks, source.view_marks);
+        let streams = stream_args(&source, 0, Container::Mkv, Audio::Keep, &[], None, &mut notes);
+        assert!(!streams.args.iter().any(|a| a == "-strict"));
+        assert!(notes.is_empty(), "{notes:?}");
+        assert!(!stream_args(&info(&[]), 0, Container::Mp4, Audio::Keep, &[], None, &mut notes).args.iter().any(|a| a == "-strict"));
+        // A bare stream can be given the 3D layout and not the 360 degree mapping, which is said.
+        let (args, streams) = mux_args(Path::new("v.ivf"), false, 0.0, Path::new("in.mp4"), &source, Container::Mp4, Audio::Keep, &[], &Resolved::default(), &MetaOptions::default(), Path::new("o.mp4"), &mut notes);
+        assert!(args.windows(2).any(|w| w == ["-stereo3d:v:0", "tb"]), "{args:?}");
+        assert_eq!(streams.view_marks, ["Stereo 3D"]);
+        assert!(notes.len() == 1 && notes[0].starts_with("the 360 degree mark (spherical mapping) is lost"), "{notes:?}");
+        assert_eq!([stereo_layout("side by side inverted"), stereo_layout("2D"), stereo_layout("checkerboard")], [Some("sbsl"), Some("2d"), None]);
+        source.stereo3d = "frame alternate".into();
+        notes.clear();
+        let (_, streams) = mux_args(Path::new("v.ivf"), false, 0.0, Path::new("in.mp4"), &source, Container::Mkv, Audio::Keep, &[], &Resolved::default(), &MetaOptions::default(), Path::new("o.mkv"), &mut notes);
+        assert!(streams.view_marks.is_empty());
+        assert!(notes[0].starts_with("the 3D mark (frame alternate) is lost"), "{notes:?}");
+    }
+
+    #[test]
     fn what_the_picture_loses_is_said() {
         let picture = |pix_fmt: &str| MediaInfo { pix_fmt: pix_fmt.into(), ..info(&[]) };
         assert!(picture_notes(&picture("yuv420p"), probe::FrameMarks::default()).is_empty());
@@ -3053,7 +3124,7 @@ mod tests {
             audio_streams: 1,
             ..info(&[])
         };
-        let streams = |audio| Streams { args: Vec::new(), meta_from: Vec::new(), audio, subs: 0, sub_sources: Vec::new(), covers: 0 };
+        let streams = |audio| Streams { args: Vec::new(), meta_from: Vec::new(), audio, subs: 0, sub_sources: Vec::new(), covers: 0, view_marks: Vec::new() };
         // The 0.28 s a joined TS lost, both ways; what Opus and AAC delays differ by is not.
         let source = sound_at(1.4, 1.6787);
         assert!(sound_moved(&source, &sound_at(0.0, 0.0), &streams(1), None).is_some_and(|m| (m + 0.2787).abs() < 1e-6));

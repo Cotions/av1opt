@@ -161,7 +161,7 @@ test("a refusal is told in the server's words", () => {
 });
 
 test("a remembered preset of 0 stays 0, and what is no number gives the usual one", () => {
-  cases(page.presetFrom, [[0, 0], ["0", 0], [8, 8], ["8", 8], ["", 5], ["  ", 5], [null, 5], [undefined, 5], ["fast", 5], [2.5, 5]]);
+  cases(page.presetFrom, [[0, 0], ["0", 0], [8, 8], ["8", 8], ["", 4], ["  ", 4], [null, 4], [undefined, 4], ["fast", 4], [2.5, 4]]);
 });
 
 test("names sort as people count, and rows without a value come last both ways", () => {

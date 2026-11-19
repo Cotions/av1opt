@@ -28,9 +28,13 @@ pub struct Trial {
 /// SVT-AV1 preset used when none is given. Against 6, at equal VMAF, 5 was 6.0%, 5.5% and
 /// 4.9% smaller on three sets of clips (every clip, and by VMAF NEG, XPSNR and SSIMULACRA2
 /// alike) for 28% more processor time in the encode; a real 15-minute video came to
-/// 191 MB instead of 205 MB. Preset 4 takes 8 to 10% off for about 60% more time, preset 3
-/// 16% (on one set of clips) for three times the time.
-pub const DEFAULT_PRESET: u8 = 5;
+/// 191 MB instead of 205 MB. Preset 4 is a further 3.3%, 4.4% and 3.4% smaller than 5 on
+/// those sets (every clip, all four measures) for 22 to 29% more processor time in the
+/// encode, about a fifth more for a whole run, since search, check and repairs cost the
+/// same at either: the default since 2026-11-19, by the owner's choice of bytes over time.
+/// The one clip at 60 frames a second gained only 1% from that step. Preset 3 takes 16% off
+/// preset 6 (on one set of clips) for three times its time.
+pub const DEFAULT_PRESET: u8 = 4;
 
 /// SVT-AV1 parameters used when none are given. SVT-AV1's own default is tune=1 (PSNR).
 pub const DEFAULT_PARAMS: &str = "tune=0";

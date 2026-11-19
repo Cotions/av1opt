@@ -280,7 +280,7 @@ mod tests {
         let today = (crate::search::DEFAULT_PRESET, crate::search::DEFAULT_PARAMS);
         assert_eq!(measured(4, Some(today)).out_of_date(93.0), None);
         let why = measured(4, Some((6, "tune=0"))).out_of_date(93.0).unwrap();
-        assert!(why.contains("preset 6") && why.contains("now preset 5"), "{why}");
+        assert!(why.contains("preset 6") && why.contains("now preset 4"), "{why}");
         assert!(measured(4, Some((today.0, "tune=1"))).out_of_date(93.0).is_some());
     }
 

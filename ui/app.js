@@ -149,7 +149,7 @@ function refusalText(status, statusText, type, text, json) {
 
 // The preset remembered from the encode dialog. 0 is a preset like the others: only what is
 // no whole number at all gives way to the usual one.
-function presetFrom(remembered, usual = 5) {
+function presetFrom(remembered, usual = 4) {
   const text = String(remembered ?? "").trim();
   return text !== "" && Number.isInteger(Number(text)) ? Number(text) : usual;
 }
@@ -541,7 +541,7 @@ function scenesMode(v) {
 
 function defaultOptions() {
   return Object.assign({
-    container: "mp4", target_vmaf: 93, preset: 5, svt_params: "", tuned: false, scenes: "off", workers: 1, min_savings: 0.15, force: false, retry_skipped: false,
+    container: "mp4", target_vmaf: 93, preset: 4, svt_params: "", tuned: false, scenes: "off", workers: 1, min_savings: 0.15, force: false, retry_skipped: false,
     keep_metadata: true, keep_dates: false, info_json: true, meta_preset: "", meta_tags: [], shrink_audio: false,
   }, prefs.get("encodeOptions", {}));
 }
@@ -951,7 +951,7 @@ function encodeDialog(inputs, roots = [], watch = false, files = null) {
           h("h3", {}, "Settings"),
           h("div", { class: "form-grid" },
             setting("Target VMAF", vmaf, "Quality to match: 93 looks like the source, higher keeps more and saves less"),
-            setting("Preset", preset, "0–13: lower makes smaller files but encodes slower. Measured at the same quality, against 5: 6 is about 6% larger for a fifth less processor time, 4 about 4% smaller for a quarter more, 3 about 10% smaller and 2.5 times slower"),
+            setting("Preset", preset, "0–13: lower makes smaller files but encodes slower. Measured at the same quality, against 4: 5 is about 4% larger for a fifth less processor time, 6 about 10% larger for two fifths less, 3 about 7% smaller and twice as slow"),
             setting("Encoder parameters", svtParams, "SVT-AV1 options as name=value:name=value; the Benchmark page finds good ones"),
             tuning.length ? setting("Tuned settings", h("label", { class: "check" }, tuned, "Use the benchmark's settings by video size"),
               tuning.map((x) => `${x.label}: ${configLabel(x.choice)}`).join("; ") + ". Other sizes use the preset and parameters above") : null,
@@ -1604,7 +1604,7 @@ views.bench = (root) => {
   const progText = h("span", { class: "dim" });
   const out = h("div");
   const ui = { tab: prefs.get("benchTab", "all"), video: 0, sort: "size", dir: 1, stopChart: null, reload: () => load() };
-  let base = { preset: 5, params: "tune=0" };
+  let base = { preset: 4, params: "tune=0" };
   let defaults = null;
   let running = false;
   let seenVideos = -1;

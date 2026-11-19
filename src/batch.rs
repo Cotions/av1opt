@@ -1084,7 +1084,7 @@ mod tests {
 
     fn options() -> Options {
         Options {
-            container: encode::Container::Mp4, target_vmaf: 93.0, preset: 5, svt_params: crate::search::DEFAULT_PARAMS.into(), tuning: None,
+            container: encode::Container::Mp4, target_vmaf: 93.0, preset: crate::search::DEFAULT_PRESET, svt_params: crate::search::DEFAULT_PARAMS.into(), tuning: None,
             min_crf: 20, max_crf: 55, samples: None, sample_secs: None, min_savings: 0.15, force: false, overwrite: false, keep_temp: false,
             scenes: encode::Scenes::Off, workers: 1, meta: Default::default(), remove: Vec::new(), audio: encode::Audio::Keep, fresh_search: false,
             out_dir_must_exist: false,
@@ -1616,7 +1616,7 @@ mod tests {
     #[test]
     fn a_skip_is_keyed_by_what_it_turned_on() {
         // The key of the logs there are: a skip made with the defaults still counts.
-        assert_eq!(settings_key(&options()), "vmaf=93 preset=5 crf=20-55 min_savings=0.15 force=false");
+        assert_eq!(settings_key(&options()), "vmaf=93 preset=4 crf=20-55 min_savings=0.15 force=false");
         let other = [
             Options { scenes: encode::Scenes::Auto, ..options() },
             Options { scenes: encode::Scenes::Always, ..options() },
@@ -1625,7 +1625,7 @@ mod tests {
             Options { sample_secs: Some(8.0), ..options() },
             Options { remove: vec![(10.0, 20.0)], ..options() },
             Options { svt_params: "tune=0:enable-qm=0".into(), ..options() },
-            Options { preset: 4, ..options() },
+            Options { preset: 6, ..options() },
         ];
         let mut keys: Vec<String> = other.iter().map(settings_key).chain([settings_key(&options())]).collect();
         keys.sort();

@@ -274,7 +274,7 @@ enum Cmd {
         /// Mean VMAF the samples must reach. 93 is hard to tell apart from an already-lossy source.
         #[arg(long, default_value_t = 93.0, value_parser = parse_target)]
         target_vmaf: f64,
-        /// SVT-AV1 preset: lower is slower and smaller (6 is about 6% larger than 5, for a fifth less processor time).
+        /// SVT-AV1 preset: lower is slower and smaller (5 is about 4% larger than 4 for a fifth less processor time, 6 about 10% larger for two fifths less).
         #[arg(long, default_value_t = search::DEFAULT_PRESET, value_parser = clap::value_parser!(u8).range(0..=13))]
         preset: u8,
         /// SVT-AV1 parameters besides the CRF, as key=value:key=value. Replaces the default

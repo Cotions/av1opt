@@ -143,12 +143,17 @@ impl Server {
     }
 
     pub fn raw(&self, request: &str) -> Resp {
-        let mut s = TcpStream::connect(("127.0.0.1", self.port)).unwrap();
+        self.try_raw(request).unwrap_or_else(|e| panic!("no answer from the server: {e}"))
+    }
+
+    /// [`Server::raw`] for a server that may be gone by the time it answers.
+    pub fn try_raw(&self, request: &str) -> std::io::Result<Resp> {
+        let mut s = TcpStream::connect(("127.0.0.1", self.port))?;
         // For a server that hangs: a busy machine can take a while over a long answer.
-        s.set_read_timeout(Some(Duration::from_secs(120))).unwrap();
-        s.write_all(request.as_bytes()).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(120)))?;
+        s.write_all(request.as_bytes())?;
         let mut buf = Vec::new();
-        s.read_to_end(&mut buf).unwrap();
+        s.read_to_end(&mut buf)?;
         let end = buf.windows(4).position(|w| w == b"\r\n\r\n").map_or(buf.len(), |i| i + 4);
         let (head, body) = buf.split_at(end);
         let head = String::from_utf8_lossy(head).trim_end().to_string();
@@ -156,7 +161,7 @@ impl Server {
         // A long answer comes in pieces.
         let chunked = head.to_ascii_lowercase().contains("transfer-encoding: chunked");
         let body = if chunked { unchunked(body) } else { body.to_vec() };
-        Resp { status, headers: head, body: String::from_utf8_lossy(&body).into_owned() }
+        Ok(Resp { status, headers: head, body: String::from_utf8_lossy(&body).into_owned() })
     }
 
     pub fn request(&self, method: &str, path: &str, extra: &[(&str, &str)], body: Option<&str>) -> Resp {

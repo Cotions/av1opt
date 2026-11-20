@@ -1984,6 +1984,49 @@ fn hanging_process(hung: &Path) -> String {
     }
 }
 
+/// A job the server said yes to is in the saved queue, however the server ends: killed at any
+/// moment, even half way through writing the queue, what it leaves is a whole queue.
+#[test]
+fn every_job_taken_is_in_the_queue_a_killed_server_leaves() {
+    let (ffmpeg, ffprobe) = stand_in_tools("killed-saving", A_VIDEO);
+    for round in 0..5 {
+        let mut s = Server::start_with_tools(&format!("killed-saving-{round}"), &ffmpeg, &ffprobe, |d| {
+            paused(d);
+            for i in 0..2000 {
+                std::fs::write(d.join(format!("videos/v{i}.mp4")), b"xx").unwrap();
+            }
+        });
+        let taken = std::thread::scope(|scope| {
+            let poster = scope.spawn(|| {
+                let mut taken = Vec::new();
+                for i in 0..2000 {
+                    let input = s.dir.join(format!("videos/v{i}.mp4"));
+                    let body = json!({ "inputs": [&input], "out_dir": s.dir.join("out") }).to_string();
+                    let request = format!("POST /api/jobs HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\nCookie: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", s.port, s.cookie(), body.len());
+                    match s.try_raw(&request) {
+                        Ok(r) if r.status == 200 => taken.push(input),
+                        Ok(r) if r.status == 0 => break,
+                        Ok(r) => panic!("{} {}", r.status, r.body),
+                        Err(_) => break,
+                    }
+                }
+                taken
+            });
+            // A different moment each round, a good while into the posting.
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos();
+            std::thread::sleep(Duration::from_millis(150 + u64::from(nanos % 300)));
+            unsafe { libc::kill(s.child.id() as i32, libc::SIGKILL) };
+            poster.join().unwrap()
+        });
+        s.child.wait().unwrap();
+        assert!(taken.len() > 1, "round {round}: only {} jobs were taken before the kill", taken.len());
+        let saved: Value = serde_json::from_slice(&std::fs::read(s.data("ui-queue.json")).unwrap()).unwrap_or_else(|e| panic!("round {round}: the queue is not whole: {e}"));
+        let inputs: std::collections::HashSet<PathBuf> = saved["jobs"].as_array().unwrap().iter().flat_map(|j| j["inputs"].as_array().unwrap().iter().map(|i| PathBuf::from(i.as_str().unwrap()))).collect();
+        let lost: Vec<&PathBuf> = taken.iter().filter(|t| !inputs.contains(*t)).collect();
+        assert!(lost.is_empty(), "round {round}: {} of {} jobs taken are not saved: {lost:?}", lost.len(), taken.len());
+    }
+}
+
 /// A job held by the pause keeps its ffmpeg stopped, holding its memory. A server killed
 /// outright cannot end it, so the system has to: nobody would find it afterwards.
 #[test]

@@ -7,7 +7,18 @@ use std::path::{Path, PathBuf};
 
 const ZFS_SUPER_MAGIC: i64 = 0x2fc12fc1;
 
+#[cfg(test)]
+thread_local! {
+    /// Folders this thread takes to be on ZFS, with all below them, for the tests of what is
+    /// refused there: no test may write to a pool that is.
+    pub(crate) static ZFS_IN_TESTS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn fs_magic(path: &Path) -> Option<i64> {
+    #[cfg(test)]
+    if ZFS_IN_TESTS.with_borrow(|z| z.iter().any(|d| path.starts_with(d))) {
+        return Some(ZFS_SUPER_MAGIC);
+    }
     let c = CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
     // SAFETY: `c` is a valid NUL-terminated path and `st` is a properly sized out-parameter.

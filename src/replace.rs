@@ -2138,6 +2138,52 @@ mod tests {
         assert_eq!(undo(&report, false).unwrap_err().to_string(), "this original has not been replaced, so there is nothing to put back");
     }
 
+    /// Every file under `dir` and what it holds.
+    fn everything_in(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut found = Vec::new();
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            if e.file_type().unwrap().is_dir() {
+                found.extend(everything_in(&e.path()));
+            } else {
+                found.push((e.path(), std::fs::read(e.path()).unwrap()));
+            }
+        }
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn nothing_on_zfs_is_replaced_or_put_back_unless_that_is_allowed() {
+        let f = Fix::new("zfs");
+        let report = f.encode("pool.mp4", "pool.mkv", 1000, 400);
+        let home = f.dir.join("Trash");
+        let to_trash = |p: &Path| trash::trash_with(p, Some(&home), 1000, "2026-11-10T22:15:03".into());
+        let zfs = |dirs: &[&str]| crate::fsguard::ZFS_IN_TESTS.set(dirs.iter().map(|d| f.dir.join(d)).collect());
+
+        // The original's folder on ZFS: neither replacing nor the command that lists and
+        // replaces moves anything.
+        zfs(&["lib"]);
+        let before = everything_in(&f.dir);
+        let e = apply_with(&report, false, &to_trash).unwrap_err().to_string();
+        assert!(e.contains("the original is on ZFS"), "{e}");
+        assert_eq!(everything_in(&f.dir), before);
+        run_watched(&[f.dir.join("out"), f.dir.join("lib")], true, false, false, false, false, &|| {}).unwrap();
+        assert_eq!(everything_in(&f.dir), before);
+        apply_with(&report, true, &to_trash).unwrap();
+
+        // Putting it back writes to the original's folder, and to the output's.
+        let replaced = everything_in(&f.dir);
+        for (on, refused) in [("lib", f.dir.join("lib")), ("out", f.dir.join("out"))] {
+            zfs(&[on]);
+            let e = undo(&report, false).unwrap_err().to_string();
+            assert!(e.contains(&format!("{} is on ZFS", refused.display())), "{on}: {e}");
+            assert_eq!(everything_in(&f.dir), replaced, "{on}");
+        }
+        undo(&report, true).unwrap();
+        assert_eq!(std::fs::read(f.lib("pool.mp4")).unwrap(), vec![b's'; 1000]);
+        zfs(&[]);
+    }
+
     #[test]
     fn one_run_at_a_time_per_report() {
         use std::os::fd::AsRawFd;

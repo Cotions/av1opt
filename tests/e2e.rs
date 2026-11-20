@@ -325,6 +325,25 @@ fn a_source_changed_during_its_encode_leaves_no_output() {
     assert_eq!(c.report("a")["source_mtime"].as_u64(), Some(seconds));
 }
 
+/// The scores a report's verification gave. A report without any was not verified, and every
+/// test that looks at them would pass over an empty list.
+fn verify_scores(report: &Value) -> Vec<f64> {
+    let scores: Vec<f64> = report["verify_vmaf"].as_array().unwrap_or_else(|| panic!("no verify_vmaf: {report}")).iter().map(|v| v.as_f64().unwrap()).collect();
+    assert!(!scores.is_empty(), "not verified: {report}");
+    scores
+}
+
+/// The mean VMAF the trials (CRF, mean) give `crf`: one measured there, or the line between
+/// the nearest measured either side. None where no trial is on one side of it.
+fn expected_mean(trials: &[(f64, f64)], crf: f64) -> Option<f64> {
+    if let Some(t) = trials.iter().find(|t| t.0 == crf) {
+        return Some(t.1);
+    }
+    let below = trials.iter().filter(|t| t.0 < crf).max_by(|a, b| a.0.total_cmp(&b.0))?;
+    let above = trials.iter().filter(|t| t.0 > crf).min_by(|a, b| a.0.total_cmp(&b.0))?;
+    Some(below.1 + (above.1 - below.1) * (crf - below.0) / (above.0 - below.0))
+}
+
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn a_video_is_encoded_checked_reported_and_not_done_twice() {
@@ -354,11 +373,17 @@ fn a_video_is_encoded_checked_reported_and_not_done_twice() {
     assert_eq!(r["source_bytes"].as_u64(), Some(before.len() as u64));
     let crf = r["crf"].as_f64().unwrap();
     assert!((20.0..=55.0).contains(&crf) && (crf * 4.0).fract() == 0.0, "crf {crf}");
-    // The CRF chosen was measured (or lies between two that were), and met the target.
-    let trials = r["search"].as_array().unwrap();
-    assert!(!trials.is_empty());
-    assert!(trials.iter().any(|t| t["mean_vmaf"].as_f64().unwrap() >= 93.0), "{trials:?}");
-    assert!(!r["verify_vmaf"].as_array().unwrap().is_empty());
+    // The CRF the search chose meets the target by its trials (measured there, or read off
+    // the line between the two either side of it), and the encode met it by its own measure.
+    let trials: Vec<(f64, f64)> = r["search"].as_array().unwrap().iter().map(|t| (t["crf"].as_f64().unwrap(), t["mean_vmaf"].as_f64().unwrap())).collect();
+    let first = r["first_crf"].as_f64().unwrap_or(crf);
+    assert!(first >= crf, "{r}");
+    let expected = expected_mean(&trials, first).unwrap_or_else(|| panic!("CRF {first} is not among or between the trials {trials:?}"));
+    assert!(expected >= 92.95, "CRF {first} was expected to score {expected:.2}: {trials:?}");
+    assert!(r["mean_vmaf"].as_f64().unwrap() >= 92.95, "{r}");
+    // Verified, every score at or above the floor that verification holds the encode to.
+    let floor = r["whole"]["floor"].as_f64().unwrap();
+    assert!(verify_scores(&r).iter().all(|v| *v >= floor), "{r}");
 
     // Only the output, its report and the log are left; the source is untouched.
     assert_eq!(c.outputs(), ["a.av1opt.json", "a.mp4", "av1opt-log.tsv"]);
@@ -1131,8 +1156,8 @@ fn a_video_that_starts_late_is_measured_and_cut_from_where_it_starts() {
         assert_eq!(frames(&out), want, "{stem}");
         assert!((duration(&out) - 4.0).abs() < 0.2, "{stem}: {}", duration(&out));
         // Read as 9 s long, its samples and checks would lie past the end of the picture.
-        let checks = c.report(stem)["verify_vmaf"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect::<Vec<_>>();
-        assert!(!checks.is_empty() && checks.iter().all(|v| *v > 80.0), "{stem}: {checks:?}");
+        let checks = verify_scores(&c.report(stem));
+        assert!(checks.iter().all(|v| *v > 80.0), "{stem}: {checks:?}");
     }
 }
 
@@ -1153,8 +1178,8 @@ fn a_stream_whose_seeks_land_late_is_cut_at_the_frames_asked_for() {
     c.encode(&[&src], &["--scenes=always"]).ok().has("encoded 1, skipped 0, failed 0");
     let report = c.report("gop");
     assert!(report["chunks"].as_array().unwrap().len() > 1, "{report}");
-    let checks: Vec<f64> = report["verify_vmaf"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
-    assert!(!checks.is_empty() && checks.iter().all(|v| *v > 80.0), "{checks:?}");
+    let checks = verify_scores(&report);
+    assert!(checks.iter().all(|v| *v > 80.0), "{checks:?}");
     assert_eq!(frames(&c.out().join("gop.mp4")), 576);
 }
 
@@ -1187,7 +1212,7 @@ fn a_picture_inside_longer_sound_keeps_its_place_in_every_container() {
             assert_eq!(frames(&out), 192, "{name} to {container}");
             let lead = |p: &Path| first_packet(p, "v:0") - first_packet(p, "a:0");
             assert!((lead(&out) - lead(&src)).abs() < 0.03, "{name} to {container}: the sound led by {:.3} s, now by {:.3} s", lead(&src), lead(&out));
-            assert!(c.report_in(&out_dir, "inside")["verify_vmaf"].as_array().unwrap().iter().all(|v| v.as_f64().unwrap() > 80.0), "{name} to {container}");
+            assert!(verify_scores(&c.report_in(&out_dir, "inside")).iter().all(|v| *v > 80.0), "{name} to {container}");
         }
     }
 }
@@ -1675,7 +1700,7 @@ fn scenes_are_encoded_apart_only_where_the_samples_disagree() {
     assert!(worst < 0.00002, "a frame is {worst:.6} s from its place");
     assert_in_step(&own.join("drift.mp4"), &drift, "1");
     assert_eq!(packets_md5(&own.join("drift.mp4"), "0:a:0"), packets_md5(&drift, "0:a:0"));
-    assert!(rep["verify_vmaf"].as_array().unwrap().iter().all(|v| v.as_f64().unwrap() >= 89.0), "{rep}");
+    assert!(verify_scores(&rep).iter().all(|v| *v >= 89.0), "{rep}");
     assert!(entries(&own, ".av1opt-").is_empty());
 
     // Three hard seconds between the two samples (at 5.5 s and 16.5 s) and inside the spot
@@ -1695,7 +1720,7 @@ fn scenes_are_encoded_apart_only_where_the_samples_disagree() {
     let rep = c.report_in(&again, "hidden");
     assert_eq!(rep["mode"], "whole");
     assert!(notes(&rep).contains("encoded a second time, after a spot check at"), "{rep}");
-    assert!(rep["verify_vmaf"].as_array().unwrap().iter().all(|v| v.as_f64().unwrap() >= 89.0), "{rep}");
+    assert!(verify_scores(&rep).iter().all(|v| *v >= 89.0), "{rep}");
     // The CRF in the report is the one of the encode that was kept, and among its trials.
     let chosen = rep["crf"].as_f64().unwrap();
     let first: f64 = r.err.split("chose crf ").nth(1).and_then(|t| t.split_whitespace().next()?.parse().ok()).unwrap();

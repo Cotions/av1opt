@@ -600,6 +600,12 @@ impl TrialCache {
     /// have thrown away with them.
     pub fn open(input: &Path, size: u64, positions: &[(f64, f64)], encoder: &str, reuse: bool, lift_to: Option<f64>, full_range: bool) -> Self {
         let Ok(dir) = crate::bench::cache_dir() else { return Self::off() };
+        Self::open_in(&dir, input, size, positions, encoder, reuse, lift_to, full_range)
+    }
+
+    /// [`TrialCache::open`] with the cache in `dir`.
+    #[allow(clippy::too_many_arguments)]
+    fn open_in(dir: &Path, input: &Path, size: u64, positions: &[(f64, f64)], encoder: &str, reuse: bool, lift_to: Option<f64>, full_range: bool) -> Self {
         let mut encoder = match lift_to {
             Some(mark) => format!("{encoder}|lifted to {mark}"),
             None => encoder.to_string(),
@@ -1596,10 +1602,26 @@ mod tests {
         assert!(fresh.get(&enc, 35.0).is_none());
         fresh.put(&enc, Trial { crf: 35.0, mean_vmaf: 94.6, min_vmaf: 92.0, size_ratio: 0.4 });
         assert_eq!(open(&clips, "ffmpeg 1", true).get(&enc, 35.0).unwrap().mean_vmaf, 94.6);
-        // A file that changed is another file.
+        // A file that changed is another file: at the same size with another date, or at
+        // another size.
+        let set_date = |secs| std::fs::File::options().write(true).open(&video).unwrap().set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)).unwrap();
+        set_date(1_700_000_000);
+        let mut dated = open(&clips, "ffmpeg 1", true);
+        dated.put(&enc, Trial { crf: 35.0, mean_vmaf: 94.6, min_vmaf: 92.0, size_ratio: 0.4 });
+        assert!(open(&clips, "ffmpeg 1", true).get(&enc, 35.0).is_some());
+        set_date(1_700_000_900);
+        assert!(open(&clips, "ffmpeg 1", true).get(&enc, 35.0).is_none());
         std::fs::write(&video, b"123456").unwrap();
         assert!(TrialCache::open_at(store.clone(), &video, 6, &clips, "ffmpeg 1", true).get(&enc, 35.0).is_none());
-        // A cache that can't be written still works for the run.
+        // A cache that can't be written still works for the run, and so does none at all.
+        use std::os::unix::fs::PermissionsExt;
+        let shut = dir.join("shut");
+        std::fs::create_dir(&shut).unwrap();
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let mut unwritable = TrialCache::open_at(shut.join("trials-v2.jsonl"), &video, 6, &clips, "ffmpeg 1", true);
+        unwritable.put(&enc, Trial { crf: 30.0, mean_vmaf: 96.0, min_vmaf: 95.0, size_ratio: 0.6 });
+        assert_eq!(unwritable.get(&enc, 30.0).unwrap().mean_vmaf, 96.0);
+        assert!(!shut.join("trials-v2.jsonl").exists());
         let mut off = TrialCache::off();
         off.put(&enc, Trial { crf: 30.0, mean_vmaf: 96.0, min_vmaf: 95.0, size_ratio: 0.6 });
         assert!(off.get(&enc, 30.0).is_some());
@@ -1953,15 +1975,24 @@ mod tests {
         assert_eq!(lifted_mean(&[], Some(90.0)), 0.0);
         // A mean counted that way is not taken for a plain one from an earlier run.
         let dir = std::env::temp_dir().join(format!("av1opt-lift-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let video = dir.join("v.mkv");
         std::fs::write(&video, b"12345").unwrap();
         let enc = EncodeSettings { preset: 6, pix_fmt_out: "yuv420p10le", params: "tune=0".into(), keyint_frames: None };
         let clips = [(1.0, 1.0)];
-        let mut plain = TrialCache::open_at(dir.join("t.jsonl"), &video, 5, &clips, "ffmpeg 1", true);
-        plain.put(&enc, Trial { crf: 35.0, mean_vmaf: 92.0, min_vmaf: 85.0, size_ratio: 0.4 });
-        assert!(TrialCache::open_at(dir.join("t.jsonl"), &video, 5, &clips, "ffmpeg 1", true).get(&enc, 35.0).is_some());
-        assert!(TrialCache::open_at(dir.join("t.jsonl"), &video, 5, &clips, "ffmpeg 1|lifted to 90.5", true).get(&enc, 35.0).is_none());
+        // Opened as a run opens it, in this test's folder.
+        let open = |lift_to, full_range| TrialCache::open_in(&dir, &video, 5, &clips, "ffmpeg 1", true, lift_to, full_range);
+        open(None, false).put(&enc, Trial { crf: 35.0, mean_vmaf: 92.0, min_vmaf: 85.0, size_ratio: 0.4 });
+        open(Some(90.5), false).put(&enc, Trial { crf: 36.0, mean_vmaf: 92.0, min_vmaf: 85.0, size_ratio: 0.4 });
+        assert!(open(None, false).get(&enc, 35.0).is_some());
+        assert!(open(Some(90.5), false).get(&enc, 35.0).is_none());
+        assert!(open(Some(90.5), false).get(&enc, 36.0).is_some());
+        // Nor for a mean lifted to another mark, or for one of the plain mean.
+        assert!(open(Some(91.0), false).get(&enc, 36.0).is_none());
+        assert!(open(None, false).get(&enc, 36.0).is_none());
+        // Clips of a full-range source scored as they are now are kept apart the same way.
+        assert!(open(None, true).get(&enc, 35.0).is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

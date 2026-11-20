@@ -657,6 +657,42 @@ mod tests {
         assert!(matches!(compare_for_list(&samples_only, &f.0), Verdict::CannotTell));
         assert!(matches!(compare(&then, &f.0), Verdict::Changed));
         assert!(matches!(compare(&samples_only, &f.0), Verdict::Changed));
+        // Nor do the reads made for an act. Each of them meets a file looked at, and so
+        // remembered, before it was rewritten and its time set back.
+        let rewritten = |name: &str| {
+            let f = Sample::new(name, 5000);
+            let then = f.encoded();
+            f.set_time(1_700_000_900);
+            assert!(matches!(compare(&then, &f.0), Verdict::Same));
+            f.write_at(0, b"x");
+            f.set_time(1_700_000_900);
+            (f, then)
+        };
+        let (f, then) = rewritten("set-back-remembering");
+        assert!(matches!(compare_remembering(&then, &f.0, &WholeReads::default()), Verdict::Changed));
+        let (f, then) = rewritten("set-back-to-act");
+        assert!(matches!(compare_to_act(&then, &f.0, &WholeReads::default()).0, Verdict::Changed));
+        // What one act found is kept for it, but only for a file whose change time, which
+        // nobody can set back, is the same.
+        let f = Sample::new("set-back-in-one-act", 5000);
+        let then = f.encoded();
+        f.set_time(1_700_000_900);
+        let reads = WholeReads::default();
+        assert!(matches!(compare_remembering(&then, &f.0, &reads), Verdict::Same));
+        // The system keeps that time in steps of a few milliseconds, and a write in the same
+        // step as the read leaves it as it was: written to until it moves.
+        let change_time = || {
+            use std::os::unix::fs::MetadataExt;
+            let m = std::fs::metadata(&f.0).unwrap();
+            (m.ctime(), m.ctime_nsec())
+        };
+        let read_at = change_time();
+        while change_time() == read_at {
+            std::thread::sleep(Duration::from_millis(1));
+            f.write_at(0, b"x");
+            f.set_time(1_700_000_900);
+        }
+        assert!(matches!(compare_to_act(&then, &f.0, &reads).0, Verdict::Changed));
     }
 
     /// Runs `work` where a hang shows as a failure and not as a test that never ends.

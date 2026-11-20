@@ -255,6 +255,23 @@ fn jobs_wait_while_tools_are_missing_and_survive_a_restart() {
     assert_eq!(s3.get("/api/jobs/heads").json()["jobs"][0]["status"], "cancelled");
     let q: Value = serde_json::from_slice(&std::fs::read(s3.data("ui-queue.json")).unwrap()).unwrap();
     assert!(q["jobs"].as_array().unwrap().is_empty(), "{q}");
+    drop(s3);
+
+    // Held for the tools and nothing else: tools that can encode start it. (The wait above
+    // cannot show that the worker looked at the job in that time; this shows the worker there,
+    // and the job let go by what was holding it.)
+    std::fs::write(s.data("ui-queue.json"), saved.to_string()).unwrap();
+    let s4 = Server::start_in(&s.dir, "false", "false");
+    assert_eq!(s4.get("/api/jobs/heads").json()["jobs"][0]["status"], "queued");
+    let (ffmpeg, ffprobe) = stand_in_tools("jobs-fixed", "exit 1");
+    let r = s4.post("/api/settings/tools", &json!({ "ffmpeg": ffmpeg, "ffprobe": ffprobe }));
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(r.json()["problem"].is_null(), "{}", r.body);
+    let started = Instant::now();
+    while s4.get("/api/jobs/heads").json()["jobs"][0]["status"] == "queued" {
+        assert!(started.elapsed() < Duration::from_secs(60), "the job did not start once the tools were there");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]
@@ -2078,6 +2095,10 @@ fn saved_queue_stopped_on_its_way_back_loses_nothing(jobs: usize) -> bool {
         std::fs::remove_dir_all(d).unwrap();
         std::fs::rename(&keep, d).unwrap();
     });
+    // Seen still on its way back just before the kill, or this was no kill half way.
+    if s.get("/api/jobs/heads").json()["restoring"] == 0 {
+        return false;
+    }
     drop(s);
     let s = Server::start_in(&dir, "false", "false");
     assert_eq!(heads(&s).len(), jobs - 1);
@@ -2976,13 +2997,27 @@ fn what_a_command_was_asked_to_write_is_written_though_nobody_reads_its_output()
     };
     let run = |what: &str, name: &str, args: &[&str], files: &[&str]| {
         let (mut command, dir) = command(what, name, args);
+        let video = dir.join("videos/a.mkv");
+        if what == "scan" {
+            // Large for its minute, so that it is worth encoding and goes on the list. It
+            // takes no room: nothing is in it.
+            std::fs::File::options().write(true).open(&video).unwrap().set_len(400_000_000).unwrap();
+        }
         for f in files {
             command.arg(dir.join(f));
         }
         let out = command.stdout(closed()).output().unwrap();
         assert_eq!(out.status.signal(), Some(libc::SIGPIPE), "{what}: {out:?}");
+        // Written whole: what is in a file is what the run found, the video among it.
         for f in files {
-            assert!(dir.join(f).is_file(), "{what}: {f} was not written: {}", String::from_utf8_lossy(&out.stderr));
+            let text = std::fs::read_to_string(dir.join(f)).unwrap_or_else(|e| panic!("{what}: {f} was not written ({e}): {}", String::from_utf8_lossy(&out.stderr)));
+            if f.ends_with(".json") {
+                let v: Value = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{what}: {f} is not whole ({e}): {text}"));
+                let named = [&v["videos"][0]["path"], &v["unreadable"][0]["path"]];
+                assert!(named.iter().any(|p| p.as_str() == video.to_str()), "{what}: {f}: {text}");
+            } else {
+                assert!(text.ends_with('\n') && text.lines().any(|l| l.contains(video.to_str().unwrap())), "{what}: {f}: {text:?}");
+            }
         }
     };
     run("scan", "unread-scan", &["--csv"], &["list.csv"]);

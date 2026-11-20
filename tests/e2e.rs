@@ -2187,9 +2187,8 @@ fn a_memory_cap_reaches_ffmpeg_as_written_and_a_bad_one_is_refused() {
         args.extend(extra);
         let r = c.encode(&[&src], &args);
         assert!(!r.err.contains("a memory cap is"), "{cap}: {}", r.err);
-        if r.err.contains("systemd-run --user unavailable") {
-            continue;
-        }
+        // Without systemd-run there is no cap to check, and passing would say it was checked.
+        assert!(!r.err.contains("systemd-run --user unavailable"), "this test needs systemd-run --user: {}", r.err);
         // Not there: systemd-run turned the value down and ffmpeg never started.
         let held = std::fs::read_to_string(&seen).unwrap_or_else(|e| panic!("{cap} did not reach ffmpeg ({e}):\n{}", r.err));
         let held: f64 = held.trim().parse().unwrap_or_else(|_| panic!("{cap}: the cap in force is {held:?}"));

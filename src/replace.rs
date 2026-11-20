@@ -2601,6 +2601,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&out);
     }
 
+    /// A copy that cannot be made, or comes up short, leaves both files where they were and no
+    /// part of a copy behind.
+    #[test]
+    fn a_copy_that_fails_changes_nothing() {
+        let f = Fix::new("copy-fails");
+        // One that comes up short: the file it is made from is shorter than it should be.
+        let from = f.out("short.mkv");
+        std::fs::write(&from, vec![b'o'; 1000]).unwrap();
+        let to = f.lib(".av1opt-short.mkv.part");
+        let e = copy_new(&OpenFile::open(&from, 1000).unwrap(), &to, 2000).err().unwrap();
+        assert!(format!("{e:#}").contains("copied 1000 bytes of 2000"), "{e:#}");
+        assert!(!to.exists());
+
+        // One across drives into a folder that cannot be written to.
+        let skip = |why: &str| crate::tools::skipped("a_copy_that_fails_changes_nothing", why);
+        let shm = Path::new("/dev/shm");
+        let (Ok(a), Ok(b)) = (std::fs::metadata(shm), std::fs::metadata(&f.dir)) else { return skip("/dev/shm is not there") };
+        if a.dev() == b.dev() {
+            return skip("/dev/shm is on the drive of the temporary folder");
+        }
+        let out = shm.join(format!("av1opt-replace-copy-fails-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        if let Err(e) = std::fs::create_dir_all(&out) {
+            return skip(&format!("nothing can be made in /dev/shm: {e}"));
+        }
+        let report = f.encode("far.mp4", "far.mkv", 5000, 2000);
+        let o = out.join("far.mkv");
+        std::fs::rename(f.out("far.mkv"), f.dir.join("far.mkv")).unwrap();
+        std::fs::copy(f.dir.join("far.mkv"), &o).unwrap();
+        let mut r: Value = serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+        r["output"] = json!(o);
+        std::fs::remove_file(&report).unwrap();
+        let report = out.join("far.av1opt.json");
+        std::fs::write(&report, serde_json::to_vec(&r).unwrap()).unwrap();
+        let Check::Ready(plan) = check(&report) else { panic!() };
+        assert!(plan.copy);
+        let before = (everything_in(&f.dir), everything_in(&out));
+        std::fs::set_permissions(f.dir.join("lib"), std::os::unix::fs::PermissionsExt::from_mode(0o555)).unwrap();
+        let e = f.apply(&report);
+        std::fs::set_permissions(f.dir.join("lib"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let after = (everything_in(&f.dir), everything_in(&out));
+        let _ = std::fs::remove_dir_all(&out);
+        assert!(format!("{:#}", e.err().unwrap()).contains("cannot copy"));
+        assert_eq!(after, before);
+    }
+
     #[test]
     fn reports_are_found_from_folders_reports_and_outputs() {
         let f = Fix::new("find");

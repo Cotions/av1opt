@@ -52,10 +52,21 @@ const TRIES: usize = 3;
 /// Times the video is gone over: a stretch encoded again can leave a window that lies
 /// across its edge short, which the next round sees.
 const ROUNDS: usize = 3;
+/// Rounds more for the stretches still further below the floor than [`NEAR`] after those,
+/// while they are few (see [`MOST_LEFT_LOW`]): their tries ran out on the way up, and a few
+/// more are cheaper than the second search of the whole video they would be sent to.
+const MORE_ROUNDS: usize = 3;
 /// After the last round, windows this far below the floor at most are let be: the video is
-/// kept with them and the report says so. Anything lower sends the video to a second
-/// search, which lowers the CRF of all of it or gives it up as not worth encoding.
+/// kept with them and the report says so.
 const NEAR: f64 = 1.0;
+/// Stretches lower than that get [`MORE_ROUNDS`], and what stays low after them is kept too,
+/// each at the best encode its tries gave it, and named in the report, as long as it comes to
+/// no more than this share of the video. A
+/// second search lowers the CRF of all of it to lift them, or gives the video up as not worth
+/// encoding: that is for a video weak throughout, not for a few stretches the tries ran out on.
+/// A twentieth is three minutes of an hour: more than that kept a point or more under the
+/// floor is no longer a few stretches but a video that looks worse than was asked for.
+const MOST_LEFT_LOW: f64 = 0.05;
 /// GOPs longer than this are not cut out: their lossless reference would be too large.
 const MAX_GOP_SECS: f64 = 30.0;
 /// Where the imitation of a repair puts a stretch: this far above the floor it was encoded
@@ -448,6 +459,10 @@ pub struct Summary {
     /// nearer to it, and that stays as the one pass made it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub left: Vec<f64>,
+    /// Stretches further below the floor than [`NEAR`] when the rounds ran out, kept as they
+    /// came out because they are few (see [`MOST_LEFT_LOW`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub still_low: Vec<LowStretch>,
     /// Mean VMAF of the whole video before anything was encoded again.
     pub mean_before: f64,
     /// What was done beyond the floor to bring the mean to the target.
@@ -468,6 +483,84 @@ pub struct TopUp {
     pub secs: f64,
     /// What they added to the file.
     pub bytes: i64,
+}
+
+/// A stretch of the video that stays below the floor: windows that do, run together.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct LowStretch {
+    /// Seconds from the first frame, and how long.
+    pub start_secs: f64,
+    pub secs: f64,
+    /// Its lowest five seconds.
+    pub vmaf: f64,
+}
+
+/// Stretches named in a note; the report has them all.
+const NAMED_IN_NOTE: usize = 8;
+
+impl Summary {
+    /// What the report says of the stretches kept far below the floor, if there are any.
+    pub fn still_low_note(&self) -> Option<String> {
+        let count = self.still_low.len();
+        if count == 0 {
+            return None;
+        }
+        let named: Vec<String> = self.still_low.iter().take(NAMED_IN_NOTE).map(|s| format!("{} for {:.0} s (VMAF {:.1})", hms(s.start_secs), s.secs, s.vmaf)).collect();
+        let more = if count > NAMED_IN_NOTE { format!(" and {} more", count - NAMED_IN_NOTE) } else { String::new() };
+        Some(format!(
+            "{count} stretch{} could not be brought up to VMAF {:.0}: {}{more}; the video is kept with {} at the best encode tried rather than searched and encoded again whole",
+            if count == 1 { "" } else { "es" },
+            self.floor,
+            named.join(", "),
+            if count == 1 { "it" } else { "them" }
+        ))
+    }
+}
+
+/// What the windows left below the floor (start, length, VMAF) come to.
+#[derive(Debug, PartialEq)]
+struct Remaining {
+    /// Windows within [`NEAR`] of the floor that lie in no stretch going lower.
+    near: usize,
+    /// The stretches that go lower than that.
+    still_low: Vec<LowStretch>,
+}
+
+impl Remaining {
+    fn of(still: &[(f64, f64, f64)], floor: f64) -> Remaining {
+        let mut by_time = still.to_vec();
+        by_time.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut stretches: Vec<(LowStretch, usize)> = Vec::new();
+        for (start, secs, vmaf) in by_time {
+            match stretches.last_mut() {
+                Some((s, n)) if start <= s.start_secs + s.secs + 1e-9 => {
+                    s.secs = s.secs.max(start + secs - s.start_secs);
+                    s.vmaf = s.vmaf.min(vmaf);
+                    *n += 1;
+                }
+                _ => stretches.push((LowStretch { start_secs: start, secs, vmaf }, 1)),
+            }
+        }
+        let is_far = |s: &LowStretch| s.vmaf < floor - NEAR;
+        let near = stretches.iter().filter(|(s, _)| !is_far(s)).map(|(_, n)| n).sum();
+        Remaining { near, still_low: stretches.into_iter().map(|(s, _)| s).filter(is_far).collect() }
+    }
+
+    /// Whether the stretches far below the floor take up so much of a video `length` seconds
+    /// long that it is better searched and encoded again whole (see [`MOST_LEFT_LOW`]).
+    fn too_much(&self, length: f64) -> bool {
+        self.still_low.iter().map(|s| s.secs).sum::<f64>() > MOST_LEFT_LOW * length
+    }
+}
+
+/// Whether, after [`ROUNDS`], the windows `low` below the floor get another round (only for
+/// those further below it than [`NEAR`]): while there are such windows and they are few, as
+/// more than that goes to a second search anyway. Windows over a `held` stretch count for
+/// nothing.
+fn more_rounds_for(low: &[Window], held: &[Run], secs: &[f64], floor: f64) -> bool {
+    let still: Vec<(f64, f64, f64)> = low.iter().filter(|w| !held.iter().any(|s| s.overlaps(w.start, w.end))).map(|w| (secs[w.start], secs[w.end] - secs[w.start], w.vmaf)).collect();
+    let rest = Remaining::of(&still, floor);
+    !rest.still_low.is_empty() && !rest.too_much(secs[secs.len() - 1])
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -530,7 +623,8 @@ impl Outcome {
     }
 }
 
-/// Windows that stay below the floor although more bits would have helped: the tries ran out.
+/// Windows that stay below the floor although more bits would have helped, the tries having
+/// run out, over too much of the video to keep it so (see [`MOST_LEFT_LOW`]).
 #[derive(Debug)]
 pub struct StillLow {
     /// (seconds from the first frame, length in seconds, VMAF)
@@ -833,9 +927,9 @@ fn room_to_repair(output_bytes: u64) -> u64 {
     (output_bytes as f64 * 2.2) as u64 + 1_000_000_000 + 500_000_000
 }
 
-/// Looks for stretches of `output` below the floor and encodes them again. Fails with
-/// [`StillLow`] where stretches stay short that more tries could have helped; a stretch no
-/// CRF brings up is kept at the best it was given. Where the mean of the video is then below
+/// Looks for stretches of `output` below the floor and encodes them again. A stretch no CRF
+/// brings up is kept at the best it was given, and so is one the tries ran out on, which the
+/// report names; fails with [`StillLow`] where those come to too much of the video. Where the mean of the video is then below
 /// the target, the lowest GOPs not yet touched are encoded again as well, each as far as it
 /// takes (see [`top_up`]); what was repaired stays as it landed.
 pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
@@ -853,7 +947,7 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
         if low_count > 0 { format!(", {low_count} of {} stretches below {:.0}", all.len(), c.floor) } else { String::new() }
     );
     if low_count == 0 && mean_before >= c.target {
-        let summary = Summary { mean_vmaf: mean_before, lowest_vmaf: lowest_before, lowest_before, floor: c.floor, stretches: Vec::new(), near: 0, left: Vec::new(), mean_before, top_up: None, secs: 0.0 };
+        let summary = Summary { mean_vmaf: mean_before, lowest_vmaf: lowest_before, lowest_before, floor: c.floor, stretches: Vec::new(), near: 0, left: Vec::new(), still_low: Vec::new(), mean_before, top_up: None, secs: 0.0 };
         return Ok(Outcome { summary, video: None, scores, secs, differences: Vec::new() });
     }
 
@@ -880,7 +974,15 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
     // The stretches among them that stay as the one pass made them.
     let mut left: Vec<Run> = Vec::new();
     let mut serial = 0;
-    for round in 0..ROUNDS {
+    for round in 0..ROUNDS + MORE_ROUNDS {
+        // Whether there are more rounds is decided on the video as the usual ones left it.
+        if round >= ROUNDS {
+            let held: Vec<Run> = settled.iter().map(|s| s.0).collect();
+            let low: Vec<Window> = windows(&secs, &Scores::new(&scores), 0, frames).into_iter().filter(|w| w.vmaf < c.floor).collect();
+            if !more_rounds_for(&low, &held, &secs, c.floor) {
+                break;
+            }
+        }
         // A stretch given up beside frames that have since been replaced is looked at
         // afresh: what it was judged among is no longer there.
         let stale = |s: &(Run, usize)| replaced.iter().any(|r| r.1 > s.1 && (r.0.end == s.0.start || r.0.start == s.0.end));
@@ -891,7 +993,10 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
         settled.retain(|s| !stale(s));
         let held: Vec<Run> = settled.iter().map(|s| s.0).collect();
         let sc = Scores::new(&scores);
-        let low: Vec<Window> = windows(&secs, &sc, 0, frames).into_iter().filter(|w| w.vmaf < c.floor).collect();
+        let mut low: Vec<Window> = windows(&secs, &sc, 0, frames).into_iter().filter(|w| w.vmaf < c.floor).collect();
+        if round >= ROUNDS {
+            low.retain(|w| w.vmaf < c.floor - NEAR);
+        }
         let todo = runs(&blame(&low, &units, frames, &sc, c.floor, &held), &units, frames, &secs, max_secs);
         if todo.is_empty() {
             break;
@@ -947,7 +1052,10 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
         after.iter().filter(|w| w.vmaf < c.floor && !settled.iter().any(|s| s.overlaps(w.start, w.end))).map(|w| (secs[w.start], secs[w.end] - secs[w.start], w.vmaf)).collect()
     };
     let still = short_of_floor(&windows(&secs, &Scores::new(&scores), 0, frames));
-    if still.iter().any(|w| w.2 < c.floor - NEAR) {
+    // A few stretches the tries ran out on keep what was made for them, which is nearer the
+    // floor than what the one pass gave them: throwing it all away for a second search lowers
+    // the CRF of the whole video for their sake.
+    if Remaining::of(&still, c.floor).too_much(secs[frames]) {
         // What was made here is of no use to the search and the encode that follow.
         let _ = std::fs::remove_file(&plain);
         for f in &fixed {
@@ -956,7 +1064,8 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
         return Err(StillLow { windows: still }.into());
     }
 
-    // The floor holds. What the mean still lacks comes from GOPs nothing was done to yet.
+    // The floor holds, but for what was just let be. What the mean still lacks comes from
+    // GOPs nothing was done to yet.
     let mean_from = mean(&scores);
     let mut level = None;
     if mean_from < c.target {
@@ -985,14 +1094,14 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
     // among windows that hold, once its neighbours were encoded again.
     let lowest_at = |run: &Run| after.iter().filter(|w| run.overlaps(w.start, w.end)).map(|w| w.vmaf).fold(f64::INFINITY, f64::min);
     let left: Vec<f64> = left.iter().map(lowest_at).filter(|&v| v < c.floor).collect();
+    let Remaining { near, still_low } = Remaining::of(&short_of_floor(&after), c.floor);
     // Nothing was put in place of anything: the encode stays as it is.
     if fixed.is_empty() {
         let _ = std::fs::remove_file(&plain);
-        let summary = Summary { mean_vmaf: mean(&scores), lowest_vmaf: lowest_before, lowest_before, floor: c.floor, stretches: Vec::new(), near: 0, left, mean_before, top_up: None, secs: 0.0 };
+        let summary = Summary { mean_vmaf: mean(&scores), lowest_vmaf: lowest_before, lowest_before, floor: c.floor, stretches: Vec::new(), near: 0, left, still_low, mean_before, top_up: None, secs: 0.0 };
         return Ok(Outcome { summary, video: None, scores, secs, differences: Vec::new() });
     }
 
-    let still = short_of_floor(&after);
     let video = c.dir.join("repaired.ivf");
     let differences = splice(&plain, &head, &index, &fixed, &video)?;
     let _ = std::fs::remove_file(&plain);
@@ -1024,7 +1133,7 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
             bytes: lifted().map(|s| s.bytes as i64 - s.bytes_before as i64).sum(),
         }
     });
-    let summary = Summary { mean_vmaf: mean(&scores), lowest_vmaf: lowest_of(&after), lowest_before, floor: c.floor, stretches, near: still.len(), left, mean_before, top_up, secs: 0.0 };
+    let summary = Summary { mean_vmaf: mean(&scores), lowest_vmaf: lowest_of(&after), lowest_before, floor: c.floor, stretches, near, left, still_low, mean_before, top_up, secs: 0.0 };
     Ok(Outcome { summary, video: Some(video), scores, secs, differences })
 }
 
@@ -1803,9 +1912,80 @@ mod tests {
     }
 
     #[test]
+    fn a_few_stretches_left_far_below_the_floor_keep_their_repairs() {
+        // Floor 89: two windows run together at 10 s, far below; one just
+        // under the floor at 40 s. Before, any window more than a point under the floor sent
+        // the video to a second search.
+        let still = [(11.0, 5.0, 85.5), (10.0, 5.0, 86.0), (40.0, 5.0, 88.5)];
+        let left = Remaining::of(&still, 89.0);
+        assert_eq!(left, Remaining { near: 1, still_low: vec![LowStretch { start_secs: 10.0, secs: 6.0, vmaf: 85.5 }] });
+        assert!(!left.too_much(200.0));
+        // In a video of 100 s those 6 s are more than a twentieth of it.
+        assert!(left.too_much(100.0));
+    }
+
+    #[test]
+    fn what_stays_far_below_the_floor_decides_between_keeping_and_searching_again() {
+        let row = |n: usize, vmaf: f64| (0..n).map(|i| (i as f64, 5.0, vmaf)).collect::<Vec<_>>();
+        // Windows a second apart: 21 of them run together over 25 s, a twentieth of 500 s, kept;
+        // 22 over 26 s are more.
+        let kept = Remaining::of(&row(21, 85.0), 89.0);
+        assert_eq!(kept, Remaining { near: 0, still_low: vec![LowStretch { start_secs: 0.0, secs: 25.0, vmaf: 85.0 }] });
+        assert!(!kept.too_much(500.0));
+        assert!(Remaining::of(&row(22, 85.0), 89.0).too_much(500.0));
+        // Windows just under the floor are let be however many there are.
+        let near = Remaining::of(&row(60, 88.5), 89.0);
+        assert_eq!(near, Remaining { near: 60, still_low: vec![] });
+        assert!(!near.too_much(100.0));
+        // Stretches apart add up; one only just under the floor is not named, and a window
+        // just under it beside one far under belongs to that stretch.
+        let apart = [(0.0, 5.0, 85.0), (20.0, 5.0, 88.5), (40.0, 5.0, 87.0), (44.0, 5.0, 88.9)];
+        let kept = Remaining::of(&apart, 89.0);
+        assert_eq!(kept.near, 1);
+        assert_eq!(kept.still_low.iter().map(|s| (s.start_secs, s.secs)).collect::<Vec<_>>(), [(0.0, 5.0), (40.0, 9.0)]);
+        assert!(!kept.too_much(280.0) && kept.too_much(279.0));
+        assert_eq!(Remaining::of(&[], 89.0), Remaining { near: 0, still_low: vec![] });
+    }
+
+    #[test]
+    fn stretches_left_far_below_the_floor_get_more_rounds_while_they_are_few() {
+        // 200 s at 10 fps: a frame a tenth of a second.
+        let secs: Vec<f64> = (0..=2000).map(|i| i as f64 / 10.0).collect();
+        let w = |at: usize, vmaf: f64| Window { start: at * 10, end: at * 10 + 50, vmaf };
+        // Two windows far below the floor, run together over 6 s, and one just under it.
+        let low = vec![w(10, 85.0), w(11, 85.5), w(40, 88.5)];
+        assert!(more_rounds_for(&low, &[], &secs, 89.0));
+        // Windows just under the floor are let be after the usual rounds.
+        assert!(!more_rounds_for(&[w(40, 88.5)], &[], &secs, 89.0));
+        // Low over more than a twentieth of the video: it is searched again instead.
+        let wide: Vec<Window> = (0..30).map(|i| w(i, 85.0)).collect();
+        assert!(!more_rounds_for(&wide, &[], &secs, 89.0));
+        // A stretch given up on holds its windows down, and they ask for nothing more.
+        let held = [Run { start: 100, end: 160 }];
+        assert!(!more_rounds_for(&low, &held, &secs, 89.0));
+    }
+
+    #[test]
+    fn the_note_names_the_stretches_kept_far_below_the_floor() {
+        let summary = |still_low: Vec<LowStretch>| Summary {
+            mean_vmaf: 0.0, lowest_vmaf: 0.0, lowest_before: 0.0, floor: 89.0, stretches: Vec::new(), near: 0, left: Vec::new(), still_low, mean_before: 0.0, top_up: None, secs: 0.0,
+        };
+        assert_eq!(summary(Vec::new()).still_low_note(), None);
+        let one = summary(vec![LowStretch { start_secs: 725.0, secs: 8.0, vmaf: 85.96 }]).still_low_note().unwrap();
+        assert_eq!(one, "1 stretch could not be brought up to VMAF 89: 0:12:05 for 8 s (VMAF 86.0); the video is kept with it at the best encode tried rather than searched and encoded again whole");
+        let many: Vec<LowStretch> = (0..10).map(|i| LowStretch { start_secs: i as f64 * 60.0, secs: 5.0, vmaf: 86.0 }).collect();
+        let note = summary(many).still_low_note().unwrap();
+        assert!(note.starts_with("10 stretches could not") && note.contains("0:07:00 for 5 s") && !note.contains("0:08:00") && note.contains(" and 2 more;"), "{note}");
+        // The report lists them all.
+        let json = serde_json::to_value(summary(vec![LowStretch { start_secs: 1.0, secs: 5.0, vmaf: 86.0 }])).unwrap();
+        assert_eq!(json["still_low"][0]["vmaf"], 86.0);
+        assert!(serde_json::to_value(summary(Vec::new())).unwrap().get("still_low").is_none());
+    }
+
+    #[test]
     fn outcome_reads_any_stretch() {
         let o = Outcome {
-            summary: Summary { mean_vmaf: 0.0, lowest_vmaf: 0.0, lowest_before: 0.0, floor: 89.0, stretches: Vec::new(), near: 0, left: Vec::new(), mean_before: 0.0, top_up: None, secs: 0.0 },
+            summary: Summary { mean_vmaf: 0.0, lowest_vmaf: 0.0, lowest_before: 0.0, floor: 89.0, stretches: Vec::new(), near: 0, left: Vec::new(), still_low: Vec::new(), mean_before: 0.0, top_up: None, secs: 0.0 },
             video: None,
             scores: scored(900, |i| if i < 300 { 90.0 } else { 96.0 }),
             secs: secs(900),
@@ -2016,7 +2196,7 @@ mod tests {
 
     fn kept(frames: usize) -> Outcome {
         Outcome {
-            summary: Summary { mean_vmaf: 0.0, lowest_vmaf: 0.0, lowest_before: 0.0, floor: 89.0, stretches: Vec::new(), near: 0, left: Vec::new(), mean_before: 0.0, top_up: None, secs: 0.0 },
+            summary: Summary { mean_vmaf: 0.0, lowest_vmaf: 0.0, lowest_before: 0.0, floor: 89.0, stretches: Vec::new(), near: 0, left: Vec::new(), still_low: Vec::new(), mean_before: 0.0, top_up: None, secs: 0.0 },
             video: None,
             scores: scored(frames, |_| 90.0),
             secs: secs(frames),

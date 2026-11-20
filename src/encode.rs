@@ -2624,9 +2624,14 @@ fn verify_whole(
         tools.emit(Event::Note { text: n.clone() });
         notes.push(n);
     }
+    if let Some(n) = s.still_low_note() {
+        eprintln!("note: {n}");
+        tools.emit(Event::Note { text: n.clone() });
+        notes.push(n);
+    }
     if s.near > 0 {
         let n = format!(
-            "{} of the video's {:.0} s windows stay{} just under VMAF {floor:.0} after three rounds of encoding again (lowest of the video: {:.1}): kept as {}",
+            "{} of the video's {:.0} s windows stay{} just under VMAF {floor:.0} after being encoded again (lowest of the video: {:.1}): kept as {}",
             s.near,
             repair::WINDOW_SECS,
             if s.near == 1 { "s" } else { "" },

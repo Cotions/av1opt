@@ -137,10 +137,15 @@ For each file:
    line, the whole video is encoded once more at a CRF moved by the difference, once per
    video. (That much over the target is about a tenth more file than it needs; the second
    encode takes that off for up to twice the time on that video. Less is left as it is.) Windows left less than a point under the line after three
-   rounds are kept and noted; stretches further short become
-   samples of a second search (the worst sample two points above the line this time) and
-   the video is encoded once more at the lower CRF it finds, which the report says; if that
-   saves less than `--min-savings` the video is skipped, and a second failure stands.
+   rounds are kept and noted. Stretches further short get up to three rounds more, by
+   themselves; what is still that far short after them is kept as well, at the best encode
+   its tries gave it, and the report names each such stretch, as long as they come to no
+   more than a twentieth of the video. Past that the video is weak throughout: its weakest
+   stretches become samples of a second search, which they hold to its worst sample (two
+   points above the line this time) and not to its mean, which goes by the usual samples;
+   the video is encoded once more at the lower CRF that search finds, which the report
+   says; if that saves less than `--min-savings` the video is skipped, and a second failure
+   stands.
    Where frames can't be paired one for one (removed sections, a source in which more than
    one frame in ten stays on screen much longer or shorter than the rest, as in a screen
    recording), in HDR and for videos encoded per scene, it is spot checks at

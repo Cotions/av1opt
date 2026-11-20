@@ -2827,6 +2827,10 @@ mod tests {
         std::fs::set_permissions(&report, std::fs::Permissions::from_mode(0o644)).unwrap();
         let why = done.report_behind.unwrap();
         assert!(why.contains("still says that nothing was replaced") && why.contains("av1opt replace --undo --apply"), "{why}");
+        // Where both files are, which the report no longer can say.
+        assert_eq!((std::fs::read(&done.trash).unwrap(), std::fs::read(f.lib("a.mkv")).unwrap()), (vec![b's'; 1000], vec![b'o'; 400]));
+        let at = format!("the original is in the trash at {} and the AV1 file at {}", done.trash.display(), f.lib("a.mkv").display());
+        assert!(why.contains(&at), "{why}");
         undo(&report, true).unwrap();
         assert!(f.lib("a.mp4").exists() && f.out("a.mkv").exists() && !says_replaced(&report));
 

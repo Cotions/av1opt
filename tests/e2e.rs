@@ -1761,8 +1761,11 @@ fn a_stopped_encode_leaves_nothing_half_done_and_its_trials_are_remembered() {
 
     // The next run clears the leftovers away, reuses the trials and finishes.
     let r = c.av1opt(&args(&[]));
-    r.ok().has("encoded 1, skipped 0, failed 0").has("(measured earlier)");
-    assert!(!r.err.lines().any(|l| l.trim_start().starts_with("crf ") && !l.contains("measured earlier")), "a trial was measured again:\n{}", r.err);
+    r.ok().has("encoded 1, skipped 0, failed 0");
+    // Trials are found by how they are shown: if no line looked like one, this would pass
+    // having checked nothing.
+    let trials: Vec<&str> = r.err.lines().filter(|l| l.trim_start().starts_with("crf ")).collect();
+    assert!(!trials.is_empty() && trials.iter().all(|l| l.contains("(measured earlier)")), "a trial was measured again:\n{}", r.err);
     assert_eq!(c.outputs(), ["av1opt-log.tsv", "s.av1opt.json", "s.mp4"]);
     assert_eq!(frames(&c.out().join("s.mp4")), 576);
     assert_in_step(&c.out().join("s.mp4"), &src, "1");

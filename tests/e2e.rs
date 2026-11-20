@@ -821,31 +821,38 @@ fn an_encode_never_lands_on_its_source_and_a_changed_source_is_noticed() {
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn folders_are_mirrored_and_same_names_do_not_collide_silently() {
     let c = Case::new("layout");
-    let one = c.clip("one.mp4", "320x180", 4);
-    for d in ["show/season 1", "show/season 2", "other"] {
-        std::fs::create_dir_all(c.videos().join(d)).unwrap();
+    // Each a different length, so an output made from the wrong one shows.
+    let (s1, s2, other) = (c.videos().join("show/season 1/e1.mp4"), c.videos().join("show/season 2/e1.mp4"), c.videos().join("other/e1.mp4"));
+    for (secs, to) in [(2, &s1), (3, &s2), (4, &other)] {
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        std::fs::rename(c.clip("clip.mp4", "320x180", secs), to).unwrap();
     }
-    std::fs::copy(&one, c.videos().join("show/season 1/e1.mp4")).unwrap();
-    std::fs::copy(&one, c.videos().join("show/season 2/e1.mp4")).unwrap();
-    std::fs::copy(&one, c.videos().join("other/e1.mp4")).unwrap();
     std::fs::write(c.videos().join("show/notes.txt"), "not a video").unwrap();
-    std::fs::remove_file(&one).unwrap();
+    let made_from = |out: &Path, src: &Path| {
+        let report: Value = serde_json::from_slice(&std::fs::read(out.with_extension("av1opt.json")).unwrap()).unwrap();
+        assert_eq!(report["input"].as_str().map(Path::new), Some(std::fs::canonicalize(src).unwrap().as_path()), "{}", out.display());
+        assert_eq!(frames(out), frames(src), "{}", out.display());
+    };
 
     c.encode(&[&c.videos().join("show")], &[]).ok().has("encoded 2, skipped 0, failed 0");
-    assert!(c.out().join("season 1/e1.mp4").exists() && c.out().join("season 2/e1.mp4").exists());
+    made_from(&c.out().join("season 1/e1.mp4"), &s1);
+    made_from(&c.out().join("season 2/e1.mp4"), &s2);
     assert!(!c.out().join("notes.txt").exists());
 
-    // Two files named alike, given one by one, would land on one output: the second says so.
+    // Two files named alike, given one by one, would land on one output: the second says so,
+    // and the first one's output is left as it was.
     let flat = c.dir.join("out-flat");
-    let r = c.encode_into(&flat, &[&c.videos().join("show/season 1/e1.mp4"), &c.videos().join("other/e1.mp4")], &[]);
+    let r = c.encode_into(&flat, &[&s1, &other], &[]);
     assert_eq!(r.code, Some(3), "{}", r.err);
     r.has("encoded 1, skipped 0, failed 1").has("output name collision");
+    made_from(&flat.join("e1.mp4"), &s1);
 
     // The folders they sit in, given together, each keep their name: nothing collides.
     let apart = c.dir.join("out-apart");
     let r = c.encode_into(&apart, &[&c.videos().join("show/season 1"), &c.videos().join("other")], &[]);
     r.ok().has("encoded 2, skipped 0, failed 0");
-    assert!(apart.join("season 1/e1.mp4").exists() && apart.join("other/e1.mp4").exists(), "{:?}", c.outputs_in(&apart));
+    made_from(&apart.join("season 1/e1.mp4"), &s1);
+    made_from(&apart.join("other/e1.mp4"), &other);
 }
 
 /// The first video stream as ffprobe sees it (covers left out).

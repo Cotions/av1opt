@@ -1,0 +1,79 @@
+# replace
+
+```
+av1opt replace ~/av1opt-out                # lists what would happen, changes nothing
+av1opt replace ~/av1opt-out --apply        # does it
+av1opt replace ~/av1opt-out --undo [--apply]
+```
+
+`encode` leaves the library as it was: outputs go to their own folder, so no space is saved
+yet. `replace` is the second half, for when you have looked at the
+results: each original is moved to the trash and its AV1 file gets its name (with the
+output's extension) in its folder. Name output folders, single reports (`.av1opt.json`) or
+single output files.
+
+- Without `--apply` it only lists: what can be replaced with sizes, what stays and why, and what
+  was replaced earlier.
+- An output is only used while its report still matches both files: the original and the
+  output must be there with the sizes the encode recorded, and the output must be the smaller
+  one. An original with another modification time is judged as when `encode` resumes: one only
+  touched or copied is replaced, while one rewritten, one that cannot be read and one whose
+  report has no fingerprint to tell by are refused, unless you say that only the date changed
+  (`--accept-changed-date`, or **Replace original…** on the Compare page, which first says what
+  cannot be checked). A report that holds nothing of the original but its size and date (one
+  written before 2026-11-18) cannot tell it from another file of that size and date, so its
+  original stays where it is whatever its date, unless you say the same. Originals that are
+  links, reports without full paths (very old ones) and a new name that is already taken in the
+  original's folder are refused too.
+- An output with sections removed takes its original's place like any other, and the list
+  says so. The removed sections are then only in the original in the trash.
+- A report is a file like any other, so it is only followed where `encode` writes one: next
+  to its output, under the output's name. Both files it names have to be videos. A report
+  that turns up in some other folder and points at files elsewhere moves nothing.
+- av1opt keeps a private record of what it made and moved, `ledger.jsonl` in its data folder
+  (`~/.local/share/av1opt`, for your user only): a line for each finished encode (output, report,
+  original, what tells the original from another file, a SHA-256 of the output) and for each
+  replacement and undo. A report on record is followed wherever its original is, because the
+  record vouches for that path. Any other report is followed only to originals inside the folders
+  you name, so name the originals' folder as well or add `--anywhere`.
+- Outputs that are not on record, such as those made before it began, are taken onto it by
+  [`av1opt adopt`](adopt.md).
+- Nothing is deleted and no file is written over. The original goes to the trash of the drive
+  it is on (as in the duplicates view), and the space is freed when you empty the trash. If the
+  output can't be put in place after that, the original is taken back out of the trash. An
+  original whose name is near the file system's limit gets a shortened name in the trash and
+  still comes back under its own with `--undo`.
+- An output on another drive than the original is copied next to it under a hidden name
+  first (after a look at the free space), so a copy that fails leaves the original alone; the
+  file in the output folder is removed once the copy has its final name. On the same drive it
+  is a rename and takes no time.
+- The new file gets the original's permissions and keeps the output's date. Subtitles, covers
+  and other files next to the original are not touched: they still match by name, unless a
+  player wants the extension to be the same.
+- The report stays in the output folder and records where both files went (`replaced`: the
+  time, the output's old path, the place in the trash). `--undo` uses that to put things back
+  while the original is still in the trash: the AV1 file returns to the output folder, the
+  original to its place. After the trash is emptied there is nothing to undo. The trash has
+  to agree: a file goes back only if the trash's own record says it came from that place, and
+  only if all of it is still what was recorded of the original (read whole against its hash, or
+  against its samples where a report has only those), whatever its date says.
+- av1opt's own record notes each replacement and undo before the report is rewritten. A
+  report left behind (the disk was full, or the run was killed in between) is set right by
+  the next `replace`, `--undo` or the page, once the record, the trash and the files (read
+  whole) all show what happened; a replacement whose report could not be written ends with
+  an error that says where both files are and what puts them back.
+- Originals on ZFS are left alone unless `--allow-zfs` is given, and are put back there by
+  `--undo` only with it.
+- A later `encode` or `scan` over the library sees the replaced files as AV1 and skips them.
+
+## `replace` options
+
+`av1opt replace <paths>...`: output folders, the folders of the originals, reports or output files.
+
+| Option | Default | What it does |
+|---|---|---|
+| `--apply` | off | Do it; without it the command only lists. |
+| `--undo` | off | Take replaced originals back out of the trash and return the AV1 files (acts only with `--apply`). |
+| `--allow-zfs` | off | Also replace originals stored on ZFS. |
+| `--accept-changed-date` | off | Take an original whose date changed as the file that was encoded, where its report cannot tell; originals seen to differ are still refused. |
+| `--anywhere` | off | Follow reports to originals wherever they are, not only in the folders named. |

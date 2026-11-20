@@ -1800,6 +1800,8 @@ mod tests {
     #[test]
     fn several_folders_each_keep_a_folder_of_their_own() {
         let dir = std::env::temp_dir().join(format!("av1opt-foldertest-{}", std::process::id()));
+        // Left by an earlier run whose process had this number, its files would be walked too.
+        let _ = std::fs::remove_dir_all(&dir);
         for d in ["in/Kay/old", "in/Sofia", "out"] {
             std::fs::create_dir_all(dir.join(d)).unwrap();
         }
@@ -1823,6 +1825,8 @@ mod tests {
     #[test]
     fn a_name_with_a_tab_or_line_break_stays_its_own_in_the_log() {
         let dir = std::env::temp_dir().join(format!("av1opt-oddlog-{}", std::process::id()));
+        // Left by an earlier run whose process had this number, its log would have more lines.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let log = dir.join(LOG_NAME);
         let names = ["/v/a\tb.mkv", "/v/c\nd.mkv", "/v/e\rf.mkv", "/v/back\\slash.mkv", "/v/lit\\tab.mkv"];

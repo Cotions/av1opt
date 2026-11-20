@@ -1300,22 +1300,26 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("av1opt-repair-room-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // A file with nothing in it that says it holds 15 TiB: twice that is free nowhere here.
+        // An encode of a gigabyte, on a drive said to have a gigabyte and a half free: less
+        // than two copies and a stretch.
         let output = dir.join("out.mp4");
-        let file = std::fs::File::create(&output).unwrap();
-        if file.set_len(15 << 40).is_err() {
-            return;
-        }
+        std::fs::File::create(&output).unwrap().set_len(1_000_000_000).unwrap();
+        crate::encode::FREE_IN_TESTS.set(Some(1_500_000_000));
         let tools = Tools::new("false".into(), "false".into(), None);
         let (info, enc) = (MediaInfo::default(), EncodeSettings { preset: 8, pix_fmt_out: "yuv420p10le", params: String::new(), keyint_frames: None });
         let c = Ctx { tools: &tools, input: &dir.join("in.mkv"), info: &info, enc: &enc, crf: 30.0, floor: 90.0, target: 70.0, min_crf: 20, threads: 1, dir: &dir };
         let survey = Survey { scores: scored(300, |_| 70.0), times: Times { pts: (0..300).collect(), tb: (1, 30) }, gops: vec![0] };
         let why = repair(&c, &output, &survey).err().expect("no room").to_string();
         // One line: it ends up in the note that says the stretches were left as they are.
-        assert!(why.starts_with("not enough free space in ") && why.lines().count() == 1, "{why}");
+        assert_eq!(why, format!("not enough free space in {}: 1.5 GB free, ~3.7 GB needed", dir.display()));
         // With nothing to encode again, no room is asked for.
         let fine = Survey { scores: scored(300, |_| 95.0), times: Times { pts: (0..300).collect(), tb: (1, 30) }, gops: vec![0] };
         assert!(repair(&c, &output, &fine).is_ok_and(|o| o.video.is_none()));
+        // With the room there, the repair goes on to its first ffmpeg, which here cannot run.
+        crate::encode::FREE_IN_TESTS.set(Some(room_to_repair(1_000_000_000)));
+        let past = repair(&c, &output, &survey).err().expect("no ffmpeg").to_string();
+        assert!(!past.contains("free space"), "{past}");
+        crate::encode::FREE_IN_TESTS.set(None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

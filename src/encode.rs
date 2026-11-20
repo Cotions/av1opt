@@ -2683,8 +2683,18 @@ pub(crate) fn require_room(dir: &Path, free: Option<u64>, need: u64) -> Result<(
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// What [`free_bytes`] says on this thread, in the tests of what too little room stops.
+    pub(crate) static FREE_IN_TESTS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 pub(crate) fn free_bytes(dir: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
+    #[cfg(test)]
+    if let Some(free) = FREE_IN_TESTS.get() {
+        return Some(free);
+    }
     let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: valid NUL-terminated path and a properly sized out-parameter.

@@ -36,6 +36,39 @@ struct Run {
     err: String,
 }
 
+/// An av1opt a test started and talks to while it runs. However the test ends, it is stopped
+/// then: one left behind by a failed assert would go on encoding. Asked first, as Ctrl-C asks,
+/// so that it stops its ffmpeg too.
+struct Running(std::process::Child);
+
+impl std::ops::Deref for Running {
+    type Target = std::process::Child;
+    fn deref(&self) -> &std::process::Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Running {
+    fn deref_mut(&mut self) -> &mut std::process::Child {
+        &mut self.0
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        if !matches!(self.0.try_wait(), Ok(None)) {
+            return;
+        }
+        unsafe { libc::kill(self.0.id() as i32, libc::SIGTERM) };
+        let asked = std::time::Instant::now();
+        while matches!(self.0.try_wait(), Ok(None)) && asked.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 impl Run {
     fn ok(&self) -> &Run {
         assert_eq!(self.code, Some(0), "av1opt failed:\n{}", self.err);
@@ -291,7 +324,7 @@ fn mtime(path: &Path) -> std::time::SystemTime {
 fn a_source_changed_during_its_encode_leaves_no_output() {
     let c = Case::new("source-changed");
     let src = c.clip("a.mp4", "320x180", 6);
-    let mut child = c.command().arg("encode").arg("-o").arg(c.out()).args(FAST).arg(&src).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut child = c.command().arg("encode").arg("-o").arg(c.out()).args(FAST).arg(&src).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().map(Running).unwrap();
     let mut stderr = child.stderr.take().unwrap();
     let reader = std::thread::spawn(move || {
         let mut text = String::new();
@@ -1377,7 +1410,7 @@ fn a_finished_chunk_swapped_for_another_stream_is_encoded_again_on_resuming() {
         a.push(src.clone().into());
         a
     };
-    let mut child = c.command().args(args()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let mut child = c.command().args(args()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(Running).unwrap();
     wait_until("the first finished chunk", 180, || entries(&c.out(), ".av1opt-work-").iter().any(|w| w.join("chunk00000.obu").exists()));
     child.kill().unwrap();
     child.wait().unwrap();
@@ -1490,7 +1523,7 @@ fn scenes_get_their_own_crf_and_a_killed_run_goes_on_where_it_stopped() {
         a.push(src.clone().into());
         a
     };
-    let mut child = c.command().args(args()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let mut child = c.command().args(args()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(Running).unwrap();
     wait_until("the first finished chunk", 180, || entries(&c.out(), ".av1opt-work-").iter().any(|w| w.join("chunk00000.obu").exists()));
     // Killed outright, as by a power cut or the out-of-memory killer: its ffmpeg goes too.
     child.kill().unwrap();
@@ -1556,7 +1589,7 @@ fn scenes_cut_by_the_frames_own_times_survive_a_kill_two_workers_matroska_and_fi
         a.push(src.clone().into());
         a
     };
-    let mut child = c.command().args(args()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let mut child = c.command().args(args()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(Running).unwrap();
     wait_until("the first finished chunk", 180, || entries(&c.out(), ".av1opt-work-").iter().any(|w| w.join("chunk00000.obu").exists()));
     child.kill().unwrap();
     child.wait().unwrap();
@@ -1753,7 +1786,7 @@ fn a_stopped_encode_leaves_nothing_half_done_and_its_trials_are_remembered() {
         a.push(src.clone().into());
         a
     };
-    let mut child = c.command().args(args(&[])).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let mut child = c.command().args(args(&[])).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(Running).unwrap();
     let this_run = format!(".av1opt-tmp-{}-", child.id());
     wait_until("the encode to start writing", 180, || entries(&c.out(), &this_run).iter().any(|tmp| std::fs::metadata(tmp.join("partial.mp4")).is_ok_and(|m| m.len() > 0)));
     // Ctrl-C in a terminal reaches av1opt and ffmpeg alike; `kill` reaches av1opt only.

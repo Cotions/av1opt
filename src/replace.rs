@@ -2404,11 +2404,17 @@ mod tests {
         let f = Fix::new("left-behind");
         let dest = f.lib("film.mkv");
         std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
-        // A process number no process can have, and this very process.
-        let dead = u32::MAX;
+        // A process number no process can have, this very process, and another one that is
+        // running (the one that started the tests), as another replace at work would be.
+        let (dead, alive) = (u32::MAX, std::os::unix::process::parent_id());
         let ours = staging_name(&dest);
         let others = [".av1opt-film.mkv.part".to_string(), format!(".av1opt-film.mkv.{dead}.3.part"), format!(".av1opt-film.{dead}.3.part")];
-        let keep = [format!(".av1opt-other.mkv.{dead}.3.part"), ".av1opt-film.mkv.notes".to_string(), "film.mkv.part".to_string()];
+        let keep = [
+            format!(".av1opt-film.mkv.{alive}.3.part"),
+            format!(".av1opt-other.mkv.{dead}.3.part"),
+            ".av1opt-film.mkv.notes".to_string(),
+            "film.mkv.part".to_string(),
+        ];
         std::fs::write(&ours, b"being written").unwrap();
         for name in others.iter().chain(&keep) {
             std::fs::write(f.lib(name), b"x").unwrap();
@@ -2416,7 +2422,7 @@ mod tests {
         clear_left_behind(&dest);
         assert!(ours.exists(), "the copy of this run stays");
         assert!(others.iter().all(|n| !f.lib(n).exists()), "copies of runs that are gone");
-        assert!(keep.iter().all(|n| f.lib(n).exists()), "files that are something else");
+        assert!(keep.iter().all(|n| f.lib(n).exists()), "copies of a run at work, and files that are something else");
     }
 
     #[test]

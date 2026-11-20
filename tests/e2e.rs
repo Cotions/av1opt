@@ -2556,6 +2556,10 @@ mod queue {
         assert_eq!((pick(0.0).status, s.post("/api/scans/999/pick", &json!({ "hours": 8 })).status), (400, 404));
 
         // Looked at again, nothing is queued twice; the one being written is still waited for.
+        // It is written to again first: the encode and the scan can take longer than a file
+        // has to stay untouched to count as finished.
+        let f = std::fs::File::options().write(true).open(dir.join("new/arriving.mp4")).unwrap();
+        f.set_modified(std::time::SystemTime::now()).unwrap();
         let w = look(&s);
         assert_eq!(counts(&w), [1, 1, 1, 1], "{w}");
         assert_eq!(jobs(&s).len(), 1);

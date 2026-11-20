@@ -862,6 +862,13 @@ fn kept_when_stopped(out_dir: &Path, o: &Options) -> Vec<PathBuf> {
     kept
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The name of a file whose encode meets a bug in av1opt (panics), in the tests of a run
+    /// that has to go on past it.
+    static BUG_IN_TESTS: std::cell::RefCell<Option<std::ffi::OsString>> = const { std::cell::RefCell::new(None) };
+}
+
 pub fn run(tools: &Tools, jobs: &[Job], out_dir: &Path, o: &Options, retry_skipped: bool) -> Result<Summary> {
     run_placed(tools, jobs, out_dir, None, o, retry_skipped)
 }
@@ -967,7 +974,13 @@ pub fn run_placed(tools: &Tools, jobs: &[Job], out_dir: &Path, place: Option<&Ou
         }
 
         encode::clean_stale_temp(&job.out_dir);
-        match guarded(|| encode::optimize(tools, &job.input, &job.out_dir, &may_write, o)) {
+        match guarded(|| {
+            #[cfg(test)]
+            if BUG_IN_TESTS.with_borrow(|on| on.as_deref() == job.input.file_name()) {
+                panic!("a bug met on {}", job.input.display());
+            }
+            encode::optimize(tools, &job.input, &job.out_dir, &may_write, o)
+        }) {
             Ok(out) => {
                 let out_size = std::fs::metadata(&out).map_or(0, |m| m.len());
                 sum.ok += 1;
@@ -1077,16 +1090,27 @@ mod tests {
 
     #[test]
     fn a_bug_fails_one_file_not_the_run() {
-        let quiet = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
+        // (The panics below print their message into this test's captured output, shown only
+        // if it fails: the hook that prints them is the whole process's, and other tests' too.)
         let by_text = guarded(|| -> Result<()> { panic!("index {} out of range", 7) });
         let by_unwrap = guarded(|| -> Result<u8> { Ok([1u8][std::hint::black_box(4)]) });
-        std::panic::set_hook(quiet);
         let e = by_text.unwrap_err().to_string();
         assert!(e.starts_with("av1opt itself went wrong here") && e.ends_with("index 7 out of range"), "{e}");
         assert!(by_unwrap.is_err());
         assert_eq!(guarded(|| Ok(3)).unwrap(), 3);
         assert_eq!(guarded(|| -> Result<()> { anyhow::bail!("plain") }).unwrap_err().to_string(), "plain");
+
+        // In a run: the first of two files meets the bug, and the second is still encoded.
+        let f = Folder::new("bug", &["a.mkv", "b.mkv"]);
+        let out = f.0.join("out");
+        BUG_IN_TESTS.set(Some("a.mkv".into()));
+        let (sum, ends) = f.walk(&out, &options());
+        BUG_IN_TESTS.set(None);
+        let bug = &ends["a.mkv"];
+        assert_eq!(bug.0, "error");
+        assert!(bug.1.starts_with("av1opt itself went wrong here") && bug.1.ends_with(&format!("a bug met on {}", f.0.join("a.mkv").display())), "{bug:?}");
+        assert!(reached_the_encode(&ends["b.mkv"]) && !ends["b.mkv"].1.contains("went wrong"), "{:?}", ends["b.mkv"]);
+        assert_eq!((sum.failed, sum.ok, sum.cancelled), (2, 0, false));
     }
 
     fn options() -> Options {

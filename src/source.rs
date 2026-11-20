@@ -732,10 +732,19 @@ mod tests {
 
     #[test]
     fn a_file_that_cannot_be_looked_at_is_not_called_changed() {
+        use std::os::unix::fs::PermissionsExt;
         let f = Sample::new("gone", 10);
-        let then = f.recorded();
+        let then = f.encoded();
+        let samples_only = Recorded { whole: None, ..then.clone() };
+        // There, at another time, and not to be read: only reading it could tell, and that fails.
+        f.set_time(1_700_000_900);
+        std::fs::set_permissions(&f.0, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = |v: Verdict| matches!(v, Verdict::Unreadable(e) if e.kind() == ErrorKind::PermissionDenied);
+        assert!(denied(compare(&then, &f.0)));
+        assert!(denied(compare(&samples_only, &f.0)));
+        assert!(denied(compare_to_act(&then, &f.0, &WholeReads::default()).0));
         std::fs::remove_file(&f.0).unwrap();
-        assert!(matches!(compare(&then, &f.0), Verdict::Unreadable(_)));
+        assert!(matches!(compare(&then, &f.0), Verdict::Unreadable(e) if e.kind() == ErrorKind::NotFound));
     }
 
     #[test]

@@ -1949,8 +1949,10 @@ fn connections_held_open_are_cut_to_the_limit_and_the_server_goes_on() {
 }
 
 /// A stand-in ffmpeg that writes its output, except for a file with `hang` in its name: there
-/// it notes its process number beside itself and never ends.
-const HANGS_ON_ONE_FILE: &str = "case \"$*\" in\n*hang*) echo $$ > \"$(dirname \"$0\")/hung\"; exec sleep 600;;\nesac\nfor last; do :; done\nprintf x > \"$last\"";
+/// it notes its process number beside itself and never ends. (An output of `-` is the standard
+/// output, which the check of what a capped ffmpeg can reach asks for: no file of that name
+/// is made in the folder the tests run in.)
+const HANGS_ON_ONE_FILE: &str = "case \"$*\" in\n*hang*) echo $$ > \"$(dirname \"$0\")/hung\"; exec sleep 600;;\nesac\nfor last; do :; done\n[ \"$last\" = - ] || printf x > \"$last\"";
 
 const A_VIDEO: &str = r#"echo '{"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":64,"height":64,"pix_fmt":"yuv420p","r_frame_rate":"25/1","avg_frame_rate":"25/1","duration":"9"}],"format":{"format_name":"mov","duration":"9","size":"2"}}'"#;
 

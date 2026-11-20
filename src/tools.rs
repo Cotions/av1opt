@@ -1001,6 +1001,32 @@ mod tests {
         Tools { ffmpeg: "ffmpeg".into(), ffprobe: "ffprobe".into(), cap: Some(cap.into()), side_by_side_cap: Some(part.into()), hooks: None, version: Default::default(), reach: Default::default(), stall_limit: STALL_LIMIT }
     }
 
+    #[test]
+    fn time_spent_paused_is_left_out_of_a_stopwatch() {
+        let hooks = Arc::new(crate::events::Hooks::new(|_| {}));
+        let tools = Tools { hooks: Some(hooks.clone()), ..Tools::new("ffmpeg".into(), "ffprobe".into(), None) };
+        // A pause before the count began is not taken off it.
+        hooks.pause();
+        std::thread::sleep(Duration::from_millis(600));
+        hooks.resume();
+        let watch = tools.stopwatch();
+        std::thread::sleep(Duration::from_millis(100));
+        hooks.pause();
+        std::thread::sleep(Duration::from_millis(800));
+        hooks.resume();
+        std::thread::sleep(Duration::from_millis(100));
+        let secs = watch.secs(&tools);
+        // About 0.2 s worked; the 0.8 s held, or the 0.6 s before, would take it past 0.55.
+        assert!((0.2..0.55).contains(&secs), "{secs}");
+        // Held still: the count stands. The two clocks are read a moment apart, so it may
+        // even seem to go back a little.
+        hooks.pause();
+        std::thread::sleep(Duration::from_millis(300));
+        let held = watch.secs(&tools);
+        assert!((secs - 0.01..secs + 0.15).contains(&held), "{held} after {secs}");
+        hooks.resume();
+    }
+
     fn cap_of(tools: &Tools) -> String {
         let c = tools.command_for(&[], &[]);
         assert_eq!(c.get_program(), "systemd-run");

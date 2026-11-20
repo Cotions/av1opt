@@ -1685,11 +1685,11 @@ fn queue_pause_and_hours_are_kept_and_checked() {
         assert_eq!(r.status, 400, "{bad}: {}", r.body);
     }
     // Hours that leave out the present minute whenever the test runs: they begin in twelve hours.
-    let minute = {
+    let (minute, minute_began) = {
         let t = unsafe { libc::time(std::ptr::null_mut()) };
         let mut tm: libc::tm = unsafe { std::mem::zeroed() };
         unsafe { libc::localtime_r(&t, &mut tm) };
-        (tm.tm_hour * 60 + tm.tm_min) as u32
+        ((tm.tm_hour * 60 + tm.tm_min) as u32, (t - tm.tm_sec as libc::time_t) as u64)
     };
     let clock = |m: u32| format!("{:02}:{:02}", m / 60 % 24, m % 60);
     let (from, to) = (clock(minute + 12 * 60), clock(minute + 13 * 60));
@@ -1708,9 +1708,10 @@ fn queue_pause_and_hours_are_kept_and_checked() {
     // Resumed: the hours hold it now, until they begin.
     let r = s2.post("/api/queue/pause", &json!({ "paused": false })).json();
     assert_eq!(r["hold"]["why"], "hours", "{r}");
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    let wait = r["hold"]["opens"].as_u64().unwrap() - now;
-    assert!((12 * 3600 - 120..=12 * 3600).contains(&wait), "{wait}");
+    // Twelve hours from the start of the minute they were set from, however long the
+    // restart took. The clock is read twice for it, so a second either way.
+    let opens = r["hold"]["opens"].as_u64().unwrap();
+    assert!(opens.abs_diff(minute_began + 12 * 3600) <= 1, "opens at {opens}, the minute began at {minute_began}");
     // "Run now" lifts it; saving the hours again brings it back; switching them off ends it.
     assert_eq!(s2.post("/api/queue/run-now", &json!({})).json()["hold"], Value::Null);
     assert_eq!(s2.get("/api/jobs/heads").json()["queue"]["hold"], Value::Null);

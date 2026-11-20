@@ -971,14 +971,23 @@ fn svt_version(log: &str) -> Option<String> {
     (!v.is_empty()).then(|| v.to_string())
 }
 
+/// Says that a test did not check what it is for, where whoever runs the tests sees it: what a
+/// test prints is shown only when it fails, and a test that skips passes.
+#[cfg(test)]
+pub(crate) fn skipped(test: &str, why: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{test}: SKIPPED, {why}");
+}
+
 /// A real ffmpeg and ffprobe for a test that needs them (`AV1OPT_FFMPEG`, `AV1OPT_FFPROBE`).
-/// Without them such a test says so and passes: the plain `cargo test` needs no ffmpeg.
+/// Without them such a test says so, where it is seen, and passes: the plain `cargo test`
+/// needs no ffmpeg.
 #[cfg(test)]
 pub(crate) fn real_tools(test: &str) -> Option<Tools> {
     match (std::env::var("AV1OPT_FFMPEG"), std::env::var("AV1OPT_FFPROBE")) {
         (Ok(ffmpeg), Ok(ffprobe)) => Some(Tools::new(ffmpeg, ffprobe, None)),
         _ => {
-            eprintln!("{test}: skipped, AV1OPT_FFMPEG and AV1OPT_FFPROBE are not set");
+            skipped(test, "AV1OPT_FFMPEG and AV1OPT_FFPROBE are not set");
             None
         }
     }

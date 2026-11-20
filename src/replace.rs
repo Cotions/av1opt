@@ -2503,15 +2503,19 @@ mod tests {
     }
 
     /// An output on another filesystem is copied over. `/dev/shm` is the one other filesystem
-    /// a test can count on; where it isn't one, there is nothing to check.
+    /// a test can count on; where it isn't one, there is nothing to check, and that is said.
     #[test]
     fn outputs_on_another_drive_are_copied_then_removed() {
         let f = Fix::new("copy");
         let shm = Path::new("/dev/shm");
-        let (Ok(a), Ok(b)) = (std::fs::metadata(shm), std::fs::metadata(&f.dir)) else { return };
+        let skip = |why: &str| crate::tools::skipped("outputs_on_another_drive_are_copied_then_removed", why);
+        let (Ok(a), Ok(b)) = (std::fs::metadata(shm), std::fs::metadata(&f.dir)) else { return skip("/dev/shm is not there") };
         let out = shm.join(format!("av1opt-replace-test-{}", std::process::id()));
-        if a.dev() == b.dev() || std::fs::create_dir_all(&out).is_err() {
-            return;
+        if a.dev() == b.dev() {
+            return skip("/dev/shm is on the drive of the temporary folder");
+        }
+        if let Err(e) = std::fs::create_dir_all(&out) {
+            return skip(&format!("nothing can be made in /dev/shm: {e}"));
         }
         let report = f.encode("far.mp4", "far.mkv", 5000, 2000);
         let o = out.join("far.mkv");

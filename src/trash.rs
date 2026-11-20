@@ -719,15 +719,17 @@ mod tests {
         let home_dir = scratch("drive");
         let home = home_dir.join("Trash");
         let shm = Path::new("/dev/shm");
-        let (Ok(a), Ok(b)) = (std::fs::metadata(shm), std::fs::metadata(&home_dir)) else { return };
-        if a.dev() == b.dev() {
-            return;
-        }
         // A made-up user number keeps the test's trash apart from a real one.
         let uid = 3_000_000_000 + std::process::id() % 1_000_000;
         let dir = shm.join(format!("av1opt-trash-test-{}", std::process::id()));
-        if std::fs::create_dir_all(dir.join("sub")).is_err() {
-            return;
+        let (Ok(a), Ok(b)) = (std::fs::metadata(shm), std::fs::metadata(&home_dir)) else {
+            return crate::tools::skipped("other_drives_use_their_own_trash", "/dev/shm is not there");
+        };
+        if a.dev() == b.dev() {
+            return crate::tools::skipped("other_drives_use_their_own_trash", "/dev/shm is on the drive of the temporary folder");
+        }
+        if let Err(e) = std::fs::create_dir_all(dir.join("sub")) {
+            return crate::tools::skipped("other_drives_use_their_own_trash", &format!("nothing can be made in /dev/shm: {e}"));
         }
         let f = dir.join("sub/clip.mp4");
         std::fs::write(&f, b"x").unwrap();

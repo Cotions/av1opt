@@ -457,7 +457,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         // SAFETY: a plain query of this process's user.
         if unsafe { libc::geteuid() } == 0 {
-            return eprintln!("skipped: root can read every folder");
+            return crate::tools::skipped("a_folder_that_cannot_be_read_is_reported_and_what_is_known_of_it_stays", "root can read every folder");
         }
         let dir = std::env::temp_dir().join(format!("av1opt-scan-unreadable-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

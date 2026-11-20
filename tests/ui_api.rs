@@ -3295,7 +3295,10 @@ fn a_scan_says_which_folders_it_could_not_read() {
     use std::os::unix::fs::PermissionsExt;
     // SAFETY: a plain query of this process's user.
     if unsafe { libc::geteuid() } == 0 {
-        return eprintln!("skipped: root can read every folder");
+        // Not eprintln: the test harness keeps that from whoever runs the tests.
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "a_scan_says_which_folders_it_could_not_read: SKIPPED, root can read every folder");
+        return;
     }
     let s = Server::start("scan-unreadable", |d| {
         for i in 0..7 {

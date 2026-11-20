@@ -17,7 +17,8 @@
     "electron-builder": "^26.18.0"
   },
   "author": "Cotions",
-  "homepage": "https://av1opt.invalid",
+  "license": "MIT",
+  "homepage": "https://github.com/Cotions/av1opt",
   "build": {
     "appId": "local.av1opt.desktop",
     "productName": "av1opt",

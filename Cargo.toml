@@ -2,6 +2,8 @@
 name = "av1opt"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/Cotions/av1opt"
 
 [dependencies]
 anyhow = "1.0.104"

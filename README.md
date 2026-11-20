@@ -1337,3 +1337,7 @@ every subset, and on 30,000 videos), what a watched folder makes of the videos i
 output with the original's own extension, an output on another drive, every refusal (and that a
 refusal moves nothing), a trash that fails, a name taken at the last moment, two runs on one
 report at once.
+
+## Licence
+
+MIT; see [LICENSE](LICENSE).

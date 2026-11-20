@@ -1041,7 +1041,7 @@ fn fix(c: &Ctx, goal: Goal, times: &Times, secs: &[f64], all: &[(usize, f64)], r
         scores: Vec<(usize, f64)>,
     }
     let at = hms(secs[run.start]);
-    let lo = (c.crf - CRF_SPREAD).max(c.min_crf as f64);
+    let lo = lowest_try(c.crf, c.min_crf);
     // Nothing to try (it stands at the lowest CRF already): nothing to cut from the source.
     if next_try(&[(from_crf, now)], goal, lo).0.is_none() {
         return Ok(None);
@@ -1085,22 +1085,9 @@ fn fix(c: &Ctx, goal: Goal, times: &Times, secs: &[f64], all: &[(usize, f64)], r
         tries.push(Try { crf, score, safe, file, scores });
     };
     let _ = std::fs::remove_file(&reference);
-    // The smallest encode that meets the goal. Failing that, the best one, for the next round
-    // to go on from; or, where the goal is out of reach, the smallest within half a point of
-    // the best, which can be what stands there already: bits past it buy nothing.
     let holds = |t: &Try| t.safe && t.score >= goal.holds_from;
-    let best = tries.iter().filter(|t| t.safe).map(|t| t.score).fold(f64::NEG_INFINITY, f64::max);
-    let by_crf = |a: &usize, b: &usize| tries[*a].crf.total_cmp(&tries[*b].crf);
-    let pick = (0..tries.len()).filter(|&i| holds(&tries[i])).max_by(by_crf).or_else(|| {
-        if out_of_reach {
-            let stays = now >= best - LEVEL_OFF;
-            (0..tries.len()).filter(|&i| !stays && tries[i].safe && tries[i].score >= best - LEVEL_OFF).max_by(by_crf)
-        } else {
-            // (For the mean, only what adds to it is worth its bytes.)
-            (0..tries.len()).filter(|&i| tries[i].safe && (!goal.by_mean || tries[i].score > now)).max_by(|&a, &b| tries[a].score.total_cmp(&tries[b].score))
-        }
-    });
-    let Some(pick) = pick else {
+    let seen: Vec<(f64, f64, bool)> = tries.iter().map(|t| (t.crf, t.score, t.safe)).collect();
+    let Some(pick) = try_to_keep(&seen, goal, now, out_of_reach) else {
         for t in &tries {
             let _ = std::fs::remove_file(&t.file);
         }
@@ -1113,6 +1100,33 @@ fn fix(c: &Ctx, goal: Goal, times: &Times, secs: &[f64], all: &[(usize, f64)], r
     let bytes = ivf_index(&kept.file)?.1.iter().map(|f| f.size as u64).sum();
     let out_of_reach = out_of_reach && !holds(&kept);
     Ok(Some(Fixed { run, crf: kept.crf, file: kept.file, scores: kept.scores, before, bytes, out_of_reach, for_mean: false }))
+}
+
+/// The lowest CRF a stretch of a video encoded at `crf` is tried at.
+fn lowest_try(crf: f64, min_crf: u8) -> f64 {
+    (crf - CRF_SPREAD).max(min_crf as f64)
+}
+
+/// Which of the encodes of a stretch to keep, by its place in `tries`: (CRF, score, and whether
+/// it leaves the windows over the stretch no worse than the floor allows) of each. `now` is the
+/// score of what stands there; `out_of_reach`, that the tries found the goal to be.
+///
+/// The smallest encode that meets the goal. Failing that, the best one, for the next round to go
+/// on from; or, where the goal is out of reach, the smallest within half a point of the best,
+/// which can be what stands there already: bits past it buy nothing.
+fn try_to_keep(tries: &[(f64, f64, bool)], goal: Goal, now: f64, out_of_reach: bool) -> Option<usize> {
+    let holds = |&(_, score, safe): &(f64, f64, bool)| safe && score >= goal.holds_from;
+    let best = tries.iter().filter(|t| t.2).map(|t| t.1).fold(f64::NEG_INFINITY, f64::max);
+    let by_crf = |a: &usize, b: &usize| tries[*a].0.total_cmp(&tries[*b].0);
+    (0..tries.len()).filter(|&i| holds(&tries[i])).max_by(by_crf).or_else(|| {
+        if out_of_reach {
+            let stays = now >= best - LEVEL_OFF;
+            (0..tries.len()).filter(|&i| !stays && tries[i].2 && tries[i].1 >= best - LEVEL_OFF).max_by(by_crf)
+        } else {
+            // (For the mean, only what adds to it is worth its bytes.)
+            (0..tries.len()).filter(|&i| tries[i].2 && (!goal.by_mean || tries[i].1 > now)).max_by(|&a, &b| tries[a].1.total_cmp(&tries[b].1))
+        }
+    })
 }
 
 /// Where a frame's bytes are in an IVF file, and its timestamp.
@@ -1287,6 +1301,30 @@ mod tests {
         };
         assert!(times_can_be_gone_by(held(33), (1, 1000)));
         assert!(!times_can_be_gone_by(held(8), (1, 1000)));
+    }
+
+    #[test]
+    fn the_smallest_try_that_holds_is_kept_and_short_of_that_what_is_worth_its_bytes() {
+        let floor = Goal::holding(89.0);
+        // Above, at and below the floor: the highest CRF of those that hold it.
+        assert_eq!(try_to_keep(&[(36.0, 91.0, true), (35.0, 92.0, true), (37.0, 89.3, true), (38.0, 88.5, true)], floor, 85.0, false), Some(2));
+        // Just short of where an encode counts as holding it: none does, so the best.
+        assert_eq!(try_to_keep(&[(37.0, 89.2, true), (36.0, 89.1, true)], floor, 85.0, false), Some(0));
+        // Out of reach: the smallest within half a point of the best...
+        assert_eq!(try_to_keep(&[(34.0, 87.0, true), (32.0, 87.4, true), (30.0, 87.8, true)], floor, 85.0, true), Some(1));
+        // ...unless what stands there is that close already.
+        assert_eq!(try_to_keep(&[(34.0, 87.0, true), (32.0, 87.4, true)], floor, 87.0, true), None);
+        // A try that would leave a window below the floor is never the one kept, however it scores.
+        assert_eq!(try_to_keep(&[(36.0, 88.9, false), (37.0, 88.0, true)], floor, 85.0, false), Some(1));
+        assert_eq!(try_to_keep(&[(34.0, 87.0, true), (36.0, 87.0, false)], floor, 85.0, true), Some(0));
+        // For the mean, a try that would leave a window below the floor does not count however
+        // well it scores, and one that does not add to the mean is not worth its bytes.
+        let mean = Goal::mean(93.0);
+        assert_eq!(try_to_keep(&[(32.0, 93.2, false), (31.0, 92.9, true)], mean, 92.0, false), Some(1));
+        assert_eq!(try_to_keep(&[(31.0, 91.5, true)], mean, 92.0, false), None);
+        assert_eq!(try_to_keep(&[], floor, 85.0, false), None);
+        // Never more than 16 below the video's CRF, nor below the lowest allowed.
+        assert_eq!((lowest_try(38.0, 20), lowest_try(30.0, 20)), (22.0, 20.0));
     }
 
     #[test]

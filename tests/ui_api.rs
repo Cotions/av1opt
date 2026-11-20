@@ -1984,6 +1984,35 @@ fn hanging_process(hung: &Path) -> String {
     }
 }
 
+/// A job held by the pause keeps its ffmpeg stopped, holding its memory. A server killed
+/// outright cannot end it, so the system has to: nobody would find it afterwards.
+#[test]
+fn a_held_ffmpeg_goes_with_a_server_that_is_killed() {
+    let (ffmpeg, ffprobe) = stand_in_tools_running("held-killed", A_VIDEO, HANGS_ON_ONE_FILE);
+    let hung = Path::new(&ffmpeg).with_file_name("hung");
+    let mut s = Server::start_with_tools("held-killed", &ffmpeg, &ffprobe, |d| std::fs::write(d.join("videos/hang.mp4"), b"xx").unwrap());
+    let r = s.post("/api/jobs", &json!({ "inputs": [s.dir.join("videos/hang.mp4")], "out_dir": s.dir.join("out") }));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let pid = hanging_process(&hung);
+    let proc = Path::new("/proc").join(&pid);
+    // Should this fail, what it found is not left stopped for ever.
+    struct Leftover<'a>(&'a str);
+    impl Drop for Leftover<'_> {
+        fn drop(&mut self) {
+            if let Ok(pid) = self.0.parse::<i32>() {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+    }
+    let _leftover = Leftover(&pid);
+    assert_eq!(s.post("/api/queue/pause", &json!({ "paused": true })).status, 200);
+    let state = || std::fs::read_to_string(proc.join("stat")).ok().and_then(|st| st[st.rfind(')')? + 2..].chars().next());
+    soon("ffmpeg to be held", || state() == Some('T'));
+    unsafe { libc::kill(s.child.id() as i32, libc::SIGKILL) };
+    s.child.wait().unwrap();
+    soon("the held ffmpeg to go with the server", || matches!(state(), None | Some('Z')));
+}
+
 #[test]
 fn a_preview_that_hangs_is_killed_and_holds_up_no_other() {
     let (s, hangs, fine, hung) = server_with_a_clip_that_hangs("hung-preview", "4");

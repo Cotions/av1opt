@@ -1425,10 +1425,15 @@ mod tests {
         assert!(path.exists(), "a save in normal times writes the file");
         std::fs::remove_file(&path).unwrap();
         std::thread::scope(|s| {
-            // The save gets past its first check and waits for the one in progress.
+            // The save gets past its first check and waits for the one in progress; only then
+            // does the server begin to stop.
             let held = queue.saves.hold();
             let saving = s.spawn(|| queue.save(&path));
-            std::thread::sleep(Duration::from_millis(50));
+            let started = std::time::Instant::now();
+            while queue.saves.at_the_gate.load(Ordering::SeqCst) < 2 {
+                assert!(started.elapsed() < Duration::from_secs(60), "the save never got to the gate");
+                std::thread::sleep(Duration::from_millis(1));
+            }
             queue.shutting_down.store(true, Ordering::SeqCst);
             drop(held);
             saving.join().unwrap();

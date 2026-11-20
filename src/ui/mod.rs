@@ -261,12 +261,17 @@ fn one_at_a_time<T>(gate: &Mutex<()>, take: impl FnOnce() -> T, write: impl FnOn
 pub struct Saves {
     gate: Mutex<()>,
     failing: AtomicBool,
+    /// Saves that have got as far as the gate, for the tests of what happens behind it.
+    #[cfg(test)]
+    pub at_the_gate: std::sync::atomic::AtomicUsize,
 }
 
 impl Saves {
     /// Writes what `take` returns to `path`, if it returns anything. `take` runs with the other
     /// saves held off, so that the last to take its copy is the last to write.
     pub fn write(&self, what: &str, path: &Path, take: impl FnOnce() -> Option<Vec<u8>>) {
+        #[cfg(test)]
+        self.at_the_gate.fetch_add(1, Ordering::SeqCst);
         one_at_a_time(&self.gate, take, |data| {
             let Some(data) = data else { return };
             let saved = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| crate::files::replace_with(path, &data));

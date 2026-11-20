@@ -1013,8 +1013,11 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
         verified = check(&best, &mut notes);
         encode_secs += t.secs(tools);
     }
-    // A stretch the samples missed: now that it is known, it is a sample. One CRF found
-    // with it, one more encode; a second failure stands.
+    // A stretch the samples missed: now that it is known, the CRF has to hold it. One CRF
+    // found with it, one more encode; a second failure stands. It was picked for being weak,
+    // so it says nothing of the video's mean: it counts for the worst sample only. Averaged
+    // in, up to eight such stretches pulled the mean the search goes by under what the rest
+    // of the video scores, for a CRF lower than the mean asks for.
     if let Err(e) = &verified
         && let Some(low) = e.downcast_ref::<LowSpot>()
         && chunks.is_none()
@@ -1029,9 +1032,12 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
         eprintln!("spot check at {} scored VMAF {lowest:.2}, a stretch the samples missed: searching again with it as a sample", hms(at));
         tools.emit(Event::Phase { phase: "searching".into(), detail: format!("again, with the stretch at {} (VMAF {lowest:.2}) as a sample", hms(at)) });
         let mut pos = pos.clone();
+        let for_the_mean = pos.len();
         pos.extend(apart(&low.windows, AGAIN_SAMPLES).iter().map(|w| (w.0, w.1)));
-        let cache = search::TrialCache::open(input, size, &pos, tools.encoder_version(), !o.fresh_search, None, search::full_range(&info));
-        let mut lab = search::Lab::new(tools, input, &info, &tmp.path, pos, vmaf_threads, cache);
+        // (A mean counted this way is another number from one over all the clips.)
+        let measured_as = format!("{}|mean of the first {for_the_mean} clips", tools.encoder_version());
+        let cache = search::TrialCache::open(input, size, &pos, &measured_as, !o.fresh_search, None, search::full_range(&info));
+        let mut lab = search::Lab::new(tools, input, &info, &tmp.path, pos, vmaf_threads, cache).mean_of_first(for_the_mean);
         let start_crf = (best.crf - ((aim - lowest) / search::VMAF_PER_CRF).max(1.0)).floor().max(o.min_crf as f64) as u8;
         let (found, all) = search::search(&mut lab, &enc, &SearchParams { worst_sample: Some(aim), start_crf, ..params })?;
         lab.discard_samples();

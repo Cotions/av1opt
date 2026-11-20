@@ -13,6 +13,9 @@ pub struct Sample {
     pub secs: f64,
     /// Frames in the reference.
     pub frames: u64,
+    /// Counts in a trial's mean. A stretch a check found weak is there for the worst sample
+    /// only (see [`Lab::mean_of_first`]).
+    pub in_mean: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -524,7 +527,7 @@ pub fn extract_samples(tools: &Tools, input: &Path, info: &MediaInfo, tmp: &Path
                     let reference = tmp.join(format!("sample{i}.ref.mkv"));
                     eprintln!("  sample {}/{n} at {} ({secs:.0}s)", i + 1, crate::tools::hms(start));
                     tools.emit(crate::events::Event::Phase { phase: "sampling".into(), detail: format!("sample {}/{n} at {}", i + 1, crate::tools::hms(start)) });
-                    let cut = extract_reference(tools, input, info, true, first, info.start_time, start, secs, &reference).map(|frames| Sample { reference, secs, frames });
+                    let cut = extract_reference(tools, input, info, true, first, info.start_time, start, secs, &reference).map(|frames| Sample { reference, secs, frames, in_mean: true });
                     if cut.is_err() {
                         failed.store(true, Ordering::SeqCst);
                     }
@@ -693,17 +696,26 @@ pub struct Lab<'a> {
     shown: std::collections::HashSet<u32>,
     /// Samples below this count as this in a trial's mean (see [`lifted_mean`]).
     lift_to: Option<f64>,
+    /// How many of the positions, from the first, count in a trial's mean: all where `None`.
+    mean_of: Option<usize>,
 }
 
 impl<'a> Lab<'a> {
     pub fn new(tools: &'a Tools, input: &'a Path, info: &'a MediaInfo, tmp: &'a Path, positions: Vec<(f64, f64)>, vmaf_threads: usize, cache: TrialCache) -> Self {
-        Lab { tools, info, input, tmp, positions, samples: Vec::new(), vmaf_threads, cache, shown: Default::default(), lift_to: None }
+        Lab { tools, info, input, tmp, positions, samples: Vec::new(), vmaf_threads, cache, shown: Default::default(), lift_to: None, mean_of: None }
     }
 
     /// Trials whose mean is the one expected after the weak stretches are encoded again.
     /// The cache has to have been opened for the same mark ([`TrialCache::open`]).
     pub fn lifting(mut self, lift_to: Option<f64>) -> Self {
         self.lift_to = lift_to;
+        self
+    }
+
+    /// Trials whose mean goes by the first `n` positions alone; those after them count for the
+    /// worst sample only. The cache has to be kept apart from trials measured otherwise.
+    pub fn mean_of_first(mut self, n: usize) -> Self {
+        self.mean_of = Some(n);
         self
     }
 
@@ -714,6 +726,7 @@ impl<'a> Lab<'a> {
         }
         if self.samples.is_empty() {
             self.samples = extract_samples(self.tools, self.input, self.info, self.tmp, self.positions.clone())?;
+            leave_out_of_mean(&mut self.samples, self.mean_of);
         }
         let t = trial(self.tools, self.info, &self.samples, self.tmp, enc, crf, self.vmaf_threads, self.info.video_bitrate / 8.0, self.lift_to)?;
         self.cache.put(enc, t);
@@ -1115,10 +1128,24 @@ pub fn trial(
         None => trial_each(tools, info, samples, tmp, enc, crf, threads)?,
     };
     let secs: f64 = samples.iter().map(|s| s.secs).sum();
-    let mean = lifted_mean(&scores, lift_to);
-    let min = scores.iter().copied().fold(f64::INFINITY, f64::min);
+    let (mean, min) = mean_and_worst(&scores, samples, lift_to);
     let ratio = if source_bps > 0.0 { bytes as f64 / secs / source_bps } else { 1.0 };
     Ok(Trial { crf, mean_vmaf: mean, min_vmaf: min, size_ratio: ratio })
+}
+
+/// Marks the samples after the first `mean_of` as counting for the worst score only.
+fn leave_out_of_mean(samples: &mut [Sample], mean_of: Option<usize>) {
+    if let Some(n) = mean_of {
+        samples.iter_mut().skip(n).for_each(|s| s.in_mean = false);
+    }
+}
+
+/// A trial's mean, over the samples that count in it (all of them, were none to), and its
+/// worst score, over every sample.
+fn mean_and_worst(scores: &[f64], samples: &[Sample], lift_to: Option<f64>) -> (f64, f64) {
+    let counted: Vec<f64> = scores.iter().zip(samples).filter(|(_, s)| s.in_mean).map(|(v, _)| *v).collect();
+    let mean = lifted_mean(if counted.is_empty() { scores } else { &counted }, lift_to);
+    (mean, scores.iter().copied().fold(f64::INFINITY, f64::min))
 }
 
 /// How far above the floor of the whole-video check a sample is counted when it scores
@@ -1514,6 +1541,33 @@ mod tests {
         let mean = counts.iter().sum::<usize>() as f64 / counts.len() as f64;
         eprintln!("trials: {mean:.2} ({} cases), at most {}", counts.len(), counts.iter().max().unwrap());
         assert!(mean <= 3.2 && counts.iter().all(|n| *n <= 5));
+    }
+
+    #[test]
+    fn stretches_found_weak_count_for_the_worst_sample_and_not_for_the_mean() {
+        let sample = || Sample { reference: PathBuf::new(), secs: 4.0, frames: 96, in_mean: true };
+        let mut samples: Vec<Sample> = (0..6).map(|_| sample()).collect();
+        leave_out_of_mean(&mut samples, Some(4));
+        assert_eq!(samples.iter().map(|s| s.in_mean).collect::<Vec<_>>(), [true, true, true, true, false, false]);
+        // Four samples at 93 to 95, and two stretches a check found at 86 and 87.
+        let scores = [93.0, 94.0, 95.0, 94.0, 86.0, 87.0];
+        let (mean, worst) = mean_and_worst(&scores, &samples, None);
+        assert_eq!((mean, worst), (94.0, 86.0));
+        // Counted in the mean as well they pull it 2.5 under, for a CRF lower than the mean
+        // asks for: the two would be paid for by the whole video.
+        assert!((lifted_mean(&scores, None) - 91.5).abs() < 1e-9);
+        // The worst of them still holds the CRF down, through the search's score.
+        let trial = Trial { crf: 34.0, mean_vmaf: mean, min_vmaf: worst, size_ratio: 0.3 };
+        let p = SearchParams { target_vmaf: 93.0, min_crf: 20, max_crf: 55, start_crf: 30, max_size_ratio: None, worst_sample: Some(91.0), landing: Landing::SafeSide };
+        assert_eq!(p.score(&trial), 88.0);
+        assert_eq!(p.score(&Trial { min_vmaf: 92.0, ..trial }), 94.0);
+        // Without such samples every score counts, and so it does with none left to count.
+        assert_eq!(mean_and_worst(&scores[..2], &samples[..2], None), (93.5, 93.0));
+        let mut none: Vec<Sample> = (0..2).map(|_| sample()).collect();
+        leave_out_of_mean(&mut none, Some(0));
+        assert_eq!(mean_and_worst(&[90.0, 92.0], &none, None), (91.0, 90.0));
+        leave_out_of_mean(&mut samples, None);
+        assert!(!samples[5].in_mean, "no count given leaves the marks as they are");
     }
 
     #[test]

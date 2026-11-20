@@ -3084,23 +3084,89 @@ mod tests {
         assert_eq!(e, "not enough free space in /out: 1.0 GB free, ~8.0 GB needed");
     }
 
+    /// A stand-in ffprobe that answers with what `answer` holds, and counts the frames
+    /// `frames` holds: the finished file `check_layout` looks at is whatever a test says.
+    struct StandIn {
+        dir: PathBuf,
+        tools: Tools,
+        out: PathBuf,
+    }
+
+    impl StandIn {
+        fn new(name: &str) -> StandIn {
+            let dir = folder_for_test(name);
+            let (ffprobe, out) = (dir.join("ffprobe"), dir.join("out.mp4"));
+            std::fs::write(&out, b"av1").unwrap();
+            let (answer, frames) = (dir.join("answer"), dir.join("frames"));
+            crate::files::write_script(
+                &ffprobe,
+                &format!("case \"$*\" in *-count_packets*) cat '{}';; *) cat '{}';; esac\n", frames.display(), answer.display()),
+            );
+            let tools = Tools::new("false".into(), ffprobe.to_str().unwrap().into(), None);
+            StandIn { dir, tools, out }
+        }
+
+        /// What ffprobe says of a file: (format, picture) seconds, its video codec, whether it
+        /// has a sound track, its picture's transfer and whether it has a cover.
+        fn says(&self, (file_s, video_s): (f64, f64), codec: &str, sound: bool, transfer: &str, cover: bool) -> MediaInfo {
+            let mut streams = vec![serde_json::json!({"index": 0, "codec_type": "video", "codec_name": codec, "width": 64, "height": 64,
+                "pix_fmt": "yuv420p10le", "r_frame_rate": "25/1", "avg_frame_rate": "25/1", "duration": video_s.to_string(), "color_transfer": transfer})];
+            if sound {
+                streams.push(serde_json::json!({"index": 1, "codec_type": "audio", "codec_name": "opus", "channels": 2}));
+            }
+            if cover {
+                streams.push(serde_json::json!({"index": 2, "codec_type": "video", "codec_name": "mjpeg", "disposition": {"attached_pic": 1}}));
+            }
+            let answer = serde_json::json!({"streams": streams, "format": {"format_name": "mov,mp4", "duration": file_s.to_string(), "size": "3"}});
+            std::fs::write(self.dir.join("answer"), answer.to_string()).unwrap();
+            probe::probe(self.tools.ffprobe.as_str(), &self.out, 3).unwrap()
+        }
+
+        fn frames(&self, n: u64) {
+            std::fs::write(self.dir.join("frames"), format!("{n}\n")).unwrap();
+        }
+
+        /// `check_layout` of the output the stand-in now describes against `source`, which
+        /// has one sound track, no subtitle and no cover.
+        fn check(&self, source: &MediaInfo, frames: Option<u64>, cut: Option<&Sections>) -> Result<MediaInfo> {
+            let streams = Streams { args: vec![], meta_from: vec![], audio: 1, subs: 0, sub_sources: vec![], covers: 0, view_marks: vec![] };
+            check_layout(&self.tools, source, &self.out, &streams, frames, cut)
+        }
+    }
+
+    impl Drop for StandIn {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
     #[test]
     fn a_finished_file_is_measured_by_its_picture() {
-        let media = |duration_s, video_s| MediaInfo { duration_s, video_s, ..info(&[]) };
-        let fits = |source: &MediaInfo, out: &MediaInfo, cut: Option<&Sections>| {
-            let (length, expected) = lengths_to_compare(source, out, cut);
-            (length - expected).abs() <= (expected * 0.005).clamp(1.0, 5.0)
+        let s = StandIn::new("measured");
+        let source = |lengths| MediaInfo { codec: "h264".into(), ..s.says(lengths, "h264", true, "", false) };
+        let fits = |source: &MediaInfo, out| {
+            s.says(out, "av1", true, "", false);
+            s.check(source, None, None).map(|_| ()).map_err(|e| e.to_string())
         };
         // An image subtitle track runs an hour past the picture and does not go into MP4.
-        assert!(fits(&media(7200.0, 3600.0), &media(3600.0, 3600.0), None));
+        assert_eq!(fits(&source((7200.0, 3600.0)), (3600.0, 3600.0)), Ok(()));
         // Sound that runs on is kept, and does not count either.
-        assert!(fits(&media(130.0, 100.0), &media(130.0, 100.0), None));
+        assert_eq!(fits(&source((130.0, 100.0)), (130.0, 100.0)), Ok(()));
         // A container's length that is only an estimate.
-        assert!(fits(&media(5400.0, 5000.0), &media(5000.0, 5000.0), None));
+        assert_eq!(fits(&source((5400.0, 5000.0)), (5000.0, 5000.0)), Ok(()));
+        // A source that understates its picture: the output is longer, the whole files agree.
+        assert_eq!(fits(&source((130.0, 100.0)), (130.0, 120.0)), Ok(()));
         // A film that lost its end does not pass for any of these reasons.
-        assert!(!fits(&media(7200.0, 3600.0), &media(3500.0, 3500.0), None));
-        assert!(!fits(&media(130.0, 100.0), &media(130.0, 90.0), None));
+        let lost = fits(&source((7200.0, 3600.0)), (3500.0, 3500.0)).unwrap_err();
+        assert!(lost.starts_with("the finished video lasts 3500.0 seconds where it should last 3600.0") && lost.contains(NOT_WRITTEN), "{lost}");
+        assert!(fits(&source((130.0, 100.0)), (130.0, 90.0)).unwrap_err().contains("lasts 90.0 seconds"));
+        // A cut that was not made is longer, and the whole files agreeing does not let it by.
+        let (cut, before) = (Sections::new(&[(10.0, 20.0)], 130.0).unwrap(), source((130.0, 100.0)));
+        s.says((130.0, 100.0), "av1", true, "", false);
+        let e = s.check(&before, None, Some(&cut)).unwrap_err().to_string();
+        assert!(e.contains("lasts 100.0 seconds where it should last 90.0"), "{e}");
 
+        let media = |duration_s, video_s| MediaInfo { duration_s, video_s, ..info(&[]) };
         // What a cut removes comes off, and past the end of the picture it removes nothing.
         let cut = Sections::new(&[(10.0, 20.0), (110.0, f64::INFINITY)], 130.0).unwrap();
         assert_eq!(lengths_to_compare(&media(130.0, 100.0), &media(90.0, 90.0), Some(&cut)), (90.0, 90.0));
@@ -3112,6 +3178,38 @@ mod tests {
         assert_eq!(lengths_to_compare(&media(600.0, 0.0), &media(599.0, 599.0), None), (599.0, 600.0));
         assert_eq!(lengths_to_compare(&media(130.0, 100.0), &media(130.0, 0.0), None), (130.0, 130.0));
         assert_eq!(lengths_to_compare(&media(130.0, 0.0), &media(100.0, 0.0), Some(&cut)), (100.0, cut.kept()));
+    }
+
+    #[test]
+    fn a_finished_file_unlike_its_source_is_refused_and_one_like_it_is_kept() {
+        let s = StandIn::new("refused");
+        let source = MediaInfo { codec: "h264".into(), ..s.says((10.0, 10.0), "h264", true, "", false) };
+        let hdr = MediaInfo { codec: "hevc".into(), ..s.says((10.0, 10.0), "hevc", true, "smpte2084", false) };
+        assert!(hdr.hdr);
+        s.frames(250);
+        let refused = |source: &MediaInfo, frames| {
+            let e = s.check(source, frames, None).unwrap_err().to_string();
+            assert!(e.contains(NOT_WRITTEN), "{e}");
+            e
+        };
+        // As it should be, with its frames counted: kept.
+        s.says((10.0, 10.0), "av1", true, "", false);
+        assert_eq!(s.check(&source, Some(250), None).unwrap().codec, "av1");
+        assert!(refused(&source, Some(251)).starts_with("the finished video has 250 frames where it should have 251"));
+        s.says((10.0, 10.0), "h264", true, "", false);
+        assert!(refused(&source, None).starts_with("the finished video is h264 where it should be AV1"));
+        s.says((10.0, 8.0), "av1", true, "", false);
+        assert!(refused(&source, None).starts_with("the finished video lasts 8.0 seconds where it should last 10.0"));
+        s.says((10.0, 10.0), "av1", false, "", false);
+        assert!(refused(&source, None).starts_with("the finished file has 0 audio and 0 subtitle streams where it should have 1 and 0"));
+        s.says((10.0, 10.0), "av1", true, "", true);
+        assert!(refused(&source, None).starts_with("the finished file has 1 cover images where it should have 0"));
+        // HDR in, HDR out; a picture that lost it is refused, and one that never had it is not.
+        s.says((10.0, 10.0), "av1", true, "smpte2084", false);
+        assert!(s.check(&hdr, None, None).is_ok());
+        s.says((10.0, 10.0), "av1", true, "bt709", false);
+        assert!(refused(&hdr, None).starts_with("the finished video lost its HDR signalling (its transfer is 'bt709', the source's is 'smpte2084')"));
+        assert!(s.check(&source, None, None).is_ok());
     }
 
     #[test]

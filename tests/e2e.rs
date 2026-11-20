@@ -2026,6 +2026,13 @@ fn a_benchmark_ranks_settings_remembers_its_encodes_and_tunes_the_encoder() {
     let (r, report) = encode(&c, "tuned");
     r.ok().has("encoded 1,");
     assert_eq!(report["preset"].as_u64(), Some(pick));
+    // The pick above may well be the default, which an encode not told --tuned uses too: a
+    // tuning written by hand, unlike the default in both preset and parameters, shows that
+    // --tuned takes both from it.
+    std::fs::write(&tuning_file, r#"{"format":1,"classes":{"sd":{"preset":9,"params":"tune=0:enable-qm=1","size":1.0,"time":0.5,"videos":2,"target_vmaf":93.0,"made":1}}}"#).unwrap();
+    let (r, report) = encode(&c, "by-hand");
+    r.ok().has("encoded 1,");
+    assert_eq!((report["preset"].as_u64(), report["svt_params"].as_str()), (Some(9), Some("tune=0:enable-qm=1")), "{report}");
 
     // The default of an earlier version, saved as if it had won: it is passed over, and said so.
     std::fs::write(&tuning_file, r#"{"format":1,"classes":{"sd":{"preset":6,"params":"tune=0","size":1.0,"time":1.0,"videos":2,"target_vmaf":93.0,"made":1}}}"#).unwrap();

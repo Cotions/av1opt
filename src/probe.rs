@@ -1317,9 +1317,15 @@ mod tests {
         let e = probe_within(ffprobe.to_str().unwrap(), &dir.join("a.mkv"), 1, Duration::from_millis(300)).unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
         assert!(left_unjudged(&e) && e.to_string().contains("took too long"), "{e}");
-        // Killed and reaped: not even a zombie stays behind. On a busy machine the limit can
-        // come before the script has got as far as saying who it is.
-        if let Some(pid) = std::fs::read_to_string(&pid_file).ok().filter(|p| p.ends_with('\n')) {
+        // Killed and reaped, with what it started: not even a zombie stays behind. (The script
+        // outlives the end of what it started.) A limit in time can come before the script has
+        // said who it is, so this one is stopped once it has.
+        let (kid_file, said) = (dir.join("kid"), |file: &Path| std::fs::read_to_string(file).ok().filter(|p| p.ends_with('\n')));
+        crate::files::write_script(&ffprobe, &format!("sleep 60 &\necho $! > '{}'\necho $$ > '{}'\nwait\nexec sleep 60\n", kid_file.display(), pid_file.display()));
+        let _ = std::fs::remove_file(&pid_file);
+        let stopped = run_until(Command::new(&ffprobe), |_| said(&pid_file).map(|_| "said who it is".to_string())).unwrap();
+        assert_eq!(stopped.unwrap_err(), "said who it is");
+        for pid in [said(&pid_file).unwrap(), said(&kid_file).unwrap()] {
             let process = PathBuf::from(format!("/proc/{}", pid.trim()));
             let waited = Instant::now();
             while process.exists() {

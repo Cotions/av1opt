@@ -1152,9 +1152,7 @@ mod tests {
         // ffprobe behind a script that counts its runs.
         let runs = dir.join("runs");
         let counting = dir.join("ffprobe");
-        std::fs::write(&counting, format!("#!/bin/sh\necho run >> '{}'\nexec '{}' \"$@\"\n", runs.display(), tools.ffprobe)).unwrap();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut std::fs::metadata(&counting).unwrap().permissions(), 0o755);
-        std::fs::set_permissions(&counting, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        crate::files::write_script(&counting, &format!("echo run >> '{}'\nexec '{}' \"$@\"\n", runs.display(), tools.ffprobe));
         let read = |path: &Path| {
             let _ = std::fs::remove_file(&runs);
             let info = probe(&counting.to_string_lossy(), path, std::fs::metadata(path).unwrap().len()).unwrap();

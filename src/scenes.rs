@@ -1071,20 +1071,25 @@ mod tests {
 
     #[test]
     fn estimate_lands_near_answer_in_few_probes() {
-        for slope in [0.25, 0.4, 0.7] {
-            for offset in [80.0, 95.0, 105.0, 115.0] {
-                let f = |c: u8| offset - slope * c as f64;
-                let target = 93.0;
-                let exact = (offset - target) / slope;
-                if !(20.0..=55.0).contains(&exact) {
-                    continue;
-                }
+        // Scores that fall in a straight line, at slopes from flat to steep, with the answer
+        // anywhere in the range: every case is run.
+        let target = 93.0;
+        for slope in [0.15, 0.25, 0.4, 0.7, 1.0, 1.5] {
+            for exact in [20.0, 22.6, 27.3, 35.0, 38.9, 41.6, 48.0, 52.2, 55.0] {
+                let f = |c: u8| target + slope * (exact - c as f64);
                 let Estimate { crf, probes, out_of_reach } = estimate_crf(35, 20, 55, 20, target, 3, |c| Ok(f(c))).unwrap();
-                assert!(probes.len() <= 3);
-                assert!(!out_of_reach, "slope {slope} offset {offset}");
-                // Never above the true answer (quality first), at most 1 below.
-                assert!((crf - exact).abs() <= 0.5,
-                    "slope {slope} offset {offset}: crf {crf}, exact {exact:.2}, probes {probes:?}");
+                let case = format!("slope {slope} exact {exact}: crf {crf}, probes {probes:?}");
+                assert!(probes.len() <= 3, "{case}");
+                assert!(!out_of_reach, "{case}");
+                if probes.iter().any(|p| p.1 < target) && probes.iter().any(|p| p.1 >= target) {
+                    // A probe on each side: the line between them is the answer, to the
+                    // nearest quarter step.
+                    assert!((crf - exact).abs() <= 0.125 + 1e-9, "{case}");
+                } else {
+                    // Only probes that pass: the highest of them, never above the answer
+                    // (quality first) and less than one step below it.
+                    assert!(crf <= exact + 1e-9 && exact - crf < 1.0, "{case}");
+                }
             }
         }
     }

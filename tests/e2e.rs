@@ -99,8 +99,12 @@ impl Case {
     }
 
     fn command(&self) -> Command {
+        // A home of its own, so that nothing av1opt finds there by default is the user's.
+        std::fs::create_dir_all(self.dir.join("home")).unwrap();
         let mut c = Command::new(env!("CARGO_BIN_EXE_av1opt"));
         c.current_dir(&self.dir)
+            .env("HOME", self.dir.join("home"))
+            .env("XDG_CONFIG_HOME", self.dir.join("config"))
             .env("XDG_DATA_HOME", self.dir.join("data"))
             .env("XDG_CACHE_HOME", self.dir.join("cache"))
             .env("AV1OPT_HISTORY", self.dir.join("data/av1opt/history.jsonl"))

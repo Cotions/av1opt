@@ -88,7 +88,9 @@ fn state_reports_versions_and_tools() {
     let st = s.get("/api/state").json();
     assert_eq!(st["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(st["api"], 1, "API_VERSION changed: update desktop/main.js (API_VERSION) too");
-    assert!(st["home"].is_string());
+    // The tests' servers have a home of their own: a job sent without an output folder lands
+    // in the test's folder, not in the user's.
+    assert_eq!((&st["home"], &st["default_out_dir"]), (&json!(s.dir.join("home")), &json!(s.dir.join("home/av1opt-out"))));
     // `false` is no ffmpeg; the page shows why encodes are off.
     assert!(st["tools"]["problem"].is_string(), "{}", st["tools"]);
 }
@@ -2946,7 +2948,8 @@ fn scan_command(name: &str) -> std::process::Command {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("videos")).unwrap();
     let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_av1opt"));
-    c.arg("scan").arg(dir.join("videos")).env("XDG_DATA_HOME", dir.join("data")).env("XDG_CACHE_HOME", dir.join("cache")).env("AV1OPT_HISTORY", dir.join("history.jsonl"));
+    std::fs::create_dir_all(dir.join("home")).unwrap();
+    c.arg("scan").arg(dir.join("videos")).env("HOME", dir.join("home")).env("XDG_CONFIG_HOME", dir.join("config")).env("XDG_DATA_HOME", dir.join("data")).env("XDG_CACHE_HOME", dir.join("cache")).env("AV1OPT_HISTORY", dir.join("history.jsonl"));
     c.stdin(std::process::Stdio::null());
     c
 }
@@ -2988,7 +2991,7 @@ fn what_a_command_was_asked_to_write_is_written_though_nobody_reads_its_output()
         std::fs::write(dir.join("videos/a.mkv"), b"xx").unwrap();
         let video_args: Vec<_> = c.get_args().skip(1).map(|a| a.to_owned()).collect();
         let mut command = std::process::Command::new(c.get_program());
-        command.envs(c.get_envs().filter_map(|(k, v)| Some((k.to_owned(), v?.to_owned())))).env("XDG_CONFIG_HOME", dir.join("config"));
+        command.envs(c.get_envs().filter_map(|(k, v)| Some((k.to_owned(), v?.to_owned()))));
         command.arg(what).args(video_args).args(["--ffprobe", &ffprobe]);
         if what != "scan" {
             command.args(["--ffmpeg", &ffmpeg]);

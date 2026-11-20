@@ -64,8 +64,13 @@ impl Server {
 
     /// The command that starts a server on the folders below `dir`.
     pub fn command(dir: &Path, ffmpeg: &str, ffprobe: &str) -> Command {
+        // A home of its own: what the server offers by default (an output folder in the home
+        // folder, the folders to browse) then lies in the test's folder, not the user's.
+        std::fs::create_dir_all(dir.join("home")).unwrap();
         let mut c = Command::new(env!("CARGO_BIN_EXE_av1opt"));
         c.args(["ui", "--port", "0", "--no-open"])
+            .env("HOME", dir.join("home"))
+            .env("XDG_CONFIG_HOME", dir.join("config"))
             .env("XDG_DATA_HOME", dir.join("data"))
             .env("XDG_CACHE_HOME", dir.join("cache"))
             .env("AV1OPT_HISTORY", dir.join("data/av1opt/history.jsonl"))

@@ -132,10 +132,10 @@ For each file:
    round allowed to lift them half a point higher if the mean is still more than 0.05
    short; the report says how much was encoded again for the mean, at what cost, and whether
    it stayed short. The scores foretell all this by imitating the repairs before any is
-   made: if the mean could not be brought up within that quarter, or would end more than 0.5
+   made: if the mean could not be brought up within that quarter, or would end more than 0.7
    above the target while no more than a quarter of the video is to be encoded again below the
    line, the whole video is encoded once more at a CRF moved by the difference, once per
-   video. (Half a point over the target is about 6% more file than it needs; the second encode
+   video. (That much over the target is 4 to 6% more file than it needs; the second encode
    takes that off for up to twice the time on that video.) Windows left less than a point under the line after three
    rounds are kept and noted; stretches further short become
    samples of a second search (the worst sample two points above the line this time) and

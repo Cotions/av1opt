@@ -59,8 +59,11 @@ const NEAR: f64 = 1.0;
 /// GOPs longer than this are not cut out: their lossless reference would be too large.
 const MAX_GOP_SECS: f64 = 30.0;
 /// Where the imitation of a repair puts a stretch: this far above the floor it was encoded
-/// again for. Real stretches landed 0.6 to 1.1 above it.
-const IMITATED_LANDING: f64 = 0.75;
+/// again for. The 57 stretches of three videos ended 1.3 to 1.5 above it on average in their
+/// lowest five seconds, and their means rose more than an even rise toward 100 gives for that;
+/// counted as 1.75 the mean foretold was within 0.03 of the mean each video ended with, where
+/// 0.75 foretold 0.15 to 0.24 too little.
+const IMITATED_LANDING: f64 = 1.75;
 /// The share of a video that may be encoded again to bring its mean up, on top of the repairs
 /// below the floor. Past that a lower CRF for the whole video is the cheaper way there.
 const MOST_TOPPED_UP: f64 = 0.25;
@@ -70,9 +73,9 @@ pub const MEAN_SLACK: f64 = 0.05;
 /// How much higher GOPs may be lifted in the one further round a mean still short gets.
 const LEVEL_RAISE: f64 = 0.5;
 /// How far above the target the mean foretold after the repairs may lie before the video is
-/// encoded again at a higher CRF. Such a file is about 6% larger than it needs to be, which is
+/// encoded again at a higher CRF. Such a file is 4 to 6% larger than it needs to be, which is
 /// worth one more encode; less is not.
-const MOST_OVER: f64 = 0.5;
+const MOST_OVER: f64 = 0.7;
 /// The least a GOP is lifted for the mean: about what a quarter step of CRF gives, so that an
 /// encode is not spent on less than it can deliver.
 const LEAST_LIFT: f64 = 0.25;
@@ -1643,9 +1646,9 @@ mod tests {
     #[test]
     fn repairs_are_imitated_on_the_scores() {
         let (s, scores, gops) = gops_scoring(&[94.0, 86.0, 94.0, 94.0, 94.0, 94.0]);
-        // The weak GOP alone is blamed, and rises to 0.75 above the floor.
+        // The weak GOP alone is blamed, and rises to where repairs land above the floor.
         let done = imitate(&s, &scores, &gops, 89.0, 20.0);
-        assert!((average(&done.scores) - (94.0 * 5.0 + 89.75) / 6.0).abs() < 1e-6, "{}", average(&done.scores));
+        assert!((average(&done.scores) - (94.0 * 5.0 + 89.0 + IMITATED_LANDING) / 6.0).abs() < 1e-6, "{}", average(&done.scores));
         assert_eq!((done.repaired.clone(), done.secs.round()), (vec![gop(1)], 10.0));
         // Nothing below the floor: nothing changes.
         let done = imitate(&s, &scores, &gops, 85.0, 20.0);
@@ -1664,7 +1667,7 @@ mod tests {
         let done = imitate(&s, &scores, &gops, 89.0, 20.0);
         assert!((done.secs - 30.0).abs() < 1e-9, "{}", done.secs);
         assert_eq!(done.repaired, vec![Run { start: 0, end: 600 }, gop(2)]);
-        assert!((average(&done.scores) - (89.75 * 3.0 + 94.0) / 4.0).abs() < 1e-6, "{}", average(&done.scores));
+        assert!((average(&done.scores) - ((89.0 + IMITATED_LANDING) * 3.0 + 94.0) / 4.0).abs() < 1e-6, "{}", average(&done.scores));
     }
 
     #[test]
@@ -1701,12 +1704,12 @@ mod tests {
 
     #[test]
     fn repaired_stretches_stay_out_of_the_plan_for_the_mean() {
-        // The GOP below the floor is repaired, to 89.75; the mean is still short, and what makes
+        // The GOP below the floor is repaired, to its landing; the mean is still short, and what makes
         // it up are the next-lowest GOPs, not the repaired one.
         let by_gop = [86.0, 92.0, 92.4, 93.7, 93.7, 93.7, 93.7, 93.7];
         let (s, scores, gops) = gops_scoring(&by_gop);
         let plan = plan_from(&s, &scores, &gops, 89.0, 93.0, 20.0);
-        assert!((plan.mean - (89.75 + 92.0 + 92.4 + 93.7 * 5.0) / 8.0).abs() < 1e-6, "{plan:?}");
+        assert!((plan.mean - (89.0 + IMITATED_LANDING + 92.0 + 92.4 + 93.7 * 5.0) / 8.0).abs() < 1e-6, "{plan:?}");
         let lifts = plan.top_up.clone().expect("short of the target");
         assert!(lifts.reaches && !lifts.runs.contains(&gop(0)), "{plan:?}");
         assert_eq!(lifts.runs[0], gop(1), "{plan:?}");

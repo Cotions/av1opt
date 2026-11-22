@@ -73,9 +73,10 @@ pub const MEAN_SLACK: f64 = 0.05;
 /// How much higher GOPs may be lifted in the one further round a mean still short gets.
 const LEVEL_RAISE: f64 = 0.5;
 /// How far above the target the mean foretold after the repairs may lie before the video is
-/// encoded again at a higher CRF. Such a file is 4 to 6% larger than it needs to be, which is
-/// worth one more encode; less is not.
-const MOST_OVER: f64 = 0.7;
+/// encoded again at a higher CRF. Such a file is about a tenth larger than it needs to be, which
+/// is worth one more encode. Less is not: at 0.7 the second encode took 4 to 6% off for twice the
+/// time on that video, where the same time spent on the next video saves many times that.
+const MOST_OVER: f64 = 1.5;
 /// The least a GOP is lifted for the mean: about what a quarter step of CRF gives, so that an
 /// encode is not spent on less than it can deliver.
 const LEAST_LIFT: f64 = 0.25;
@@ -1778,21 +1779,22 @@ mod tests {
     #[test]
     fn the_whole_video_is_encoded_again_only_where_stretches_will_not_do() {
         let rules = MeanRules { target: 93.0, slope: 0.5, crf: 38.0, min_crf: 20.0, max_crf: 55.0, may_encode_again: true };
-        // On target after the repairs, or a little above: nothing more.
+        // On target after the repairs, or above by less than a second encode is worth: nothing more.
         assert_eq!(encode_again_at(&plan(93.1, 100.0, None), &rules), None);
         assert_eq!(encode_again_at(&plan(93.4, 100.0, None), &rules), None);
+        assert_eq!(encode_again_at(&plan(94.4, 100.0, None), &rules), None);
         // Short, and the GOPs can make it up.
         assert_eq!(encode_again_at(&plan(92.8, 100.0, Some((92.0, true))), &rules), None);
         // Short beyond what they can: the CRF moves by what is missing.
         assert_eq!(encode_again_at(&plan(92.8, 100.0, Some((93.0, false))), &rules), Some(37.5));
         assert_eq!(encode_again_at(&plan(92.0, 100.0, None), &rules), Some(36.0));
         // Well over the target: a higher CRF.
-        assert_eq!(encode_again_at(&plan(93.8, 100.0, None), &rules), Some(39.5));
+        assert_eq!(encode_again_at(&plan(94.8, 100.0, None), &rules), Some(41.5));
         // Not when much of the video is being repaired: its CRF hardly moves that mean.
-        assert_eq!(encode_again_at(&plan(94.3, 800.0, None), &rules), None);
+        assert_eq!(encode_again_at(&plan(95.3, 800.0, None), &rules), None);
         // Once only.
         let late = MeanRules { may_encode_again: false, ..rules };
-        assert_eq!(encode_again_at(&plan(93.8, 100.0, None), &late), None);
+        assert_eq!(encode_again_at(&plan(94.8, 100.0, None), &late), None);
         assert_eq!(encode_again_at(&plan(92.0, 100.0, None), &late), None);
         // A correction too small to change the CRF is no reason for an encode.
         assert_eq!(encode_again_at(&plan(92.95, 100.0, None), &rules), None);

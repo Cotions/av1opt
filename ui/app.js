@@ -2926,7 +2926,8 @@ views.history = (root) => {
           : x.input_exists === false ? h("span", { class: "pill warn", title: "source no longer at this path" }, "source gone") : null,
         x.output_exists === false ? h("span", { class: "pill bad" }, "output gone") : null,
         stateOf(x) === "not_recorded" ? h("span", { class: "pill", title: x.replace.why }, "not made here") : null,
-        stateOf(x) === "needs_confirming" ? h("span", { class: "pill warn", title: x.replace.why }, "date changed") : null),
+        stateOf(x) === "needs_confirming" ? h("span", { class: "pill warn", title: x.replace.why }, "date changed") : null,
+        stateOf(x) === "stopped" ? h("span", { class: "pill bad", title: x.replace.why }, "stopped half-way") : null),
       h("td", {}, x.mode === "scenes" ? `scenes (${x.chunks})` : oneCrfText(x).mode === "one CRF" ? "whole" : "whole, encoded again"),
       x.mode === "scenes" ? h("td", { class: "num" }, x.crf) : h("td", { class: "num", title: oneCrfText(x).crf }, oneCrfText(x).short),
       h("td", { class: "num" }, x.target_vmaf),
@@ -3457,6 +3458,19 @@ function comparePlayer(root, r) {
         try { await act("/api/replace", { report: r.report_path, allow_zfs: !!rp.zfs, accept_changed_date: true }, "Original replaced; it is in the trash"); }
         finally { btn.disabled = false; }
       } }, "Replace original…"))]
+    : rp.state === "stopped" ? [
+      h("p", { class: rp.can_put_right ? "warn" : "bad" }, `${rp.why}.`),
+      rp.can_put_right ? h("div", { class: "row" }, h("button", { onclick: async (e) => {
+        const btn = e.currentTarget;
+        if (rp.zfs && !await confirmDialog({
+          title: "Put the files right on ZFS?",
+          action: "Put right",
+          body: [h("p", { class: "warn" }, "Putting these files right writes to a folder on ZFS, which av1opt writes to only when asked. Putting them right here is asking.")],
+        })) return;
+        btn.disabled = true;
+        try { await act("/api/replace/put-right", { report: r.report_path, allow_zfs: !!rp.zfs }, "Put right"); }
+        finally { btn.disabled = false; }
+      } }, "Put right")) : null]
     : rp.state === "not_recorded" ? h("p", { class: "dim" }, `${rp.why}.`)
     : h("p", { class: "dim" }, `The AV1 file can't take the original's place: ${rp.why}.`));
 

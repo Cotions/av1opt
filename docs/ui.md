@@ -108,7 +108,11 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
   the source; MKV outputs the browser won't open are remuxed to MP4 there too. The **Original**
   panel replaces this one original by its output (after a confirmation that shows the new
   path), and puts it back afterwards for as long as it is in the trash; the comparison then
-  plays the copy in the trash.
+  plays the copy in the trash. A replacement or undo that was stopped half-way (killed, or
+  the power went) is shown as such, with where the files are and what putting them right
+  does, and a **Put right** button that does it (the rules of [replace](replace.md)); nothing
+  is moved before that is pressed, and files no longer where that run would have left them
+  get no button.
 - **Benchmark**: the `bench` comparison with progress and a Stop button, results while it
   runs, and a chart of size against encode time per size class (hover a dot for its numbers;
   the table below has them all). "Use for…" on a row makes that setting the tuned one for the
@@ -123,7 +127,8 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
   [replace](replace.md)), all ticked but those whose output leaves sections of the original out
   (marked, and said above the list): those are replaced only when ticked one by one, and
   **All / none** leaves them alone. It works through the ticked ones one by one and keeps the ones
-  that failed on screen with the reason. Replaced encodes carry a "replaced" mark. An original
+  that failed on screen with the reason. Replaced encodes carry a "replaced" mark, and pairs
+  stopped half-way a "stopped half-way" one. An original
   that is still in the encode queue is refused. The page acts only on outputs in av1opt's private
   record (see `replace`). Others are marked "not made here" until `av1opt adopt` has been run on
   their folder in a terminal.
@@ -219,8 +224,8 @@ environment, so set the ffmpeg path once in Settings.
 
 ## Safety
 
-- `encode` never modifies, moves or deletes an input. Only `replace` (and the two buttons for
-  it in the UI) moves originals, and only to the trash.
+- `encode` never modifies, moves or deletes an input. Only `replace` (and its buttons in the UI)
+  moves originals, and only to the trash.
 - Refuses to write to ZFS unless `--allow-zfs` is passed.
 - An output file that appears in the output folder while its encode runs is not written
   over: the finished encode is kept next to it under another name, and the run says where.

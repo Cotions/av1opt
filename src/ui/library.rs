@@ -502,6 +502,11 @@ fn shown_path(report: &Path, p: &str, same_dir: bool) -> PathBuf {
 /// What `replace` would do with a report, for the history table and the compare view. A report
 /// of an output not on record is not looked into: its paths are only somebody's claim.
 fn replace_state(ledger: &Ledger, report: &Path, on_record: bool) -> Value {
+    // av1opt's own line on record names the files of a replacement or undo stopped half-way,
+    // whether or not the pair is on record otherwise.
+    if let Some(s) = replace::stopped_for_list(report, ledger) {
+        return json!({ "state": "stopped", "why": s.told, "can_put_right": s.can_put_right, "zfs": s.zfs });
+    }
     if !on_record {
         return json!({ "state": "not_recorded", "why": ledger.refusal() });
     }
@@ -686,6 +691,15 @@ pub fn restore_original(app: &App, body: &Value) -> Result<Value> {
     refuse_unless_on_record(&app.ledger.current(), &report)?;
     let d = replace::undo_if(&report, r.allow_zfs, &|d| app.ledger.current().check_replaced(d))?;
     Ok(json!({ "source": d.source, "output": d.from }))
+}
+
+/// Puts right the files of a replacement or an undo of one report that was stopped half-way,
+/// once the person has asked for it. What it moves is named by av1opt's own line on record.
+pub fn put_right_stopped(app: &App, body: &Value) -> Result<Value> {
+    let r: ReplaceRequest = serde_json::from_value(body.clone())?;
+    let report = known_report(app, &r.report)?;
+    let done = replace::put_right_stopped(&report, r.allow_zfs)?;
+    Ok(json!({ "done": done }))
 }
 
 pub fn media_info(app: &App, p: &Path) -> Value {

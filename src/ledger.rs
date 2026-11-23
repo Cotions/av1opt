@@ -356,6 +356,12 @@ impl Ledger {
         self.under_way.get(source)
     }
 
+    /// Whether any replacement or undo was under way when the record was last written to.
+    #[cfg(any(feature = "ui", test))]
+    pub fn any_under_way(&self) -> bool {
+        !self.under_way.is_empty()
+    }
+
     /// Why the record on disk is not being used, if it is not.
     pub fn problem(&self) -> Option<&str> {
         self.problem.as_deref()

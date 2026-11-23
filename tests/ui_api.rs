@@ -1451,6 +1451,99 @@ fn a_pair_whose_report_was_left_behind_is_set_right_by_the_record() {
     assert!(placed.exists() && !original.exists() && std::fs::read(&report).unwrap() == not_replaced);
 }
 
+/// A replacement as one killed after the AV1 file took the original's place leaves it: the
+/// original in the trash, the report not yet saying replaced, and on record the line written
+/// before the first move and the original's name in the trash.
+fn stopped_once_placed(d: &Path) {
+    let (original, output, placed) = (d.join("videos/movie.mp4"), d.join("out/movie.mkv"), d.join("videos/movie.mkv"));
+    std::fs::write(&original, vec![b's'; 3000]).unwrap();
+    std::fs::create_dir_all(d.join("out")).unwrap();
+    std::fs::write(&output, vec![b'o'; 1000]).unwrap();
+    let encoded = encoded_line(&original, &output);
+    let report = knowing(&original, json!({ "format": 1, "input": original, "output": output, "source_bytes": 3000, "output_bytes": 1000 }));
+    write_report(&d.join("out/movie.av1opt.json"), report.clone());
+    let replacing = json!({
+        "format": 1, "time": 2, "event": "replacing", "source": original, "from": output, "output": placed, "source_bytes": 3000,
+        "source_mtime": report["source_mtime"], "source_fingerprint": report["source_fingerprint"], "output_bytes": 1000, "output_sha256": encoded["output_sha256"],
+    });
+    let trash = in_the_trash(d, &original, 3000);
+    std::fs::remove_file(&original).unwrap();
+    std::fs::rename(&output, &placed).unwrap();
+    write_record(d, &[encoded, replacing, json!({ "format": 1, "time": 3, "event": "trashing", "source": original, "trash": trash })]);
+}
+
+#[test]
+fn a_pair_stopped_half_way_is_shown_so_and_put_right_only_when_asked() {
+    let s = Server::start("stopped", stopped_once_placed);
+    add_history_folder(&s, "out");
+    let (original, output, placed, report) = (s.dir.join("videos/movie.mp4"), s.dir.join("out/movie.mkv"), s.dir.join("videos/movie.mkv"), s.dir.join("out/movie.av1opt.json"));
+    let trash = s.dir.join("data/Trash/files/movie.mp4");
+    let files = || [&original, &output, &placed, &trash, &report].map(|p| std::fs::read(p).ok());
+    let as_stopped = files();
+    let state = || s.get("/api/history").json()["reports"][0]["replace"].clone();
+
+    // Listed, in the history and in the compare view, and nothing moved for it.
+    let st = state();
+    assert_eq!(st["state"], "stopped", "{st}");
+    assert_eq!(st["can_put_right"], true);
+    assert_eq!(st["zfs"], false);
+    assert!(st["why"].as_str().unwrap().contains("stopped half-way"), "{st}");
+    let shown = s.get(&format!("/api/report?path={}", report.display())).json();
+    assert_eq!(shown["replace"]["state"], "stopped", "{shown}");
+    assert!(files() == as_stopped, "a listing moved files");
+
+    // Only a report in a history folder is put right.
+    let r = s.post("/api/replace/put-right", &json!({ "report": placed }));
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert!(files() == as_stopped);
+
+    let r = s.post("/api/replace/put-right", &json!({ "report": report }));
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(r.json()["done"].as_str().unwrap().contains("as they were before"), "{}", r.body);
+    assert_eq!(std::fs::read(&original).unwrap(), vec![b's'; 3000]);
+    assert_eq!(std::fs::read(&output).unwrap(), vec![b'o'; 1000]);
+    assert!(!placed.exists() && nothing_in_the_trash(&s));
+    assert_eq!(state()["state"], "ready", "{}", state());
+    // There is nothing left to put right.
+    let r = s.post("/api/replace/put-right", &json!({ "report": report }));
+    assert!(r.status == 400 && r.body.contains("nothing of this pair was stopped half-way"), "{}", r.body);
+}
+
+#[test]
+fn a_pair_stopped_half_way_whose_files_changed_since_stays_as_it_is() {
+    let s = Server::start("stopped-moved", |d| {
+        stopped_once_placed(d);
+        // The AV1 file changed since, at another size.
+        std::fs::write(d.join("videos/movie.mkv"), vec![b'x'; 999]).unwrap();
+    });
+    add_history_folder(&s, "out");
+    let report = s.dir.join("out/movie.av1opt.json");
+    let names = ["videos/movie.mp4", "out/movie.mkv", "videos/movie.mkv", "data/Trash/files/movie.mp4", "out/movie.av1opt.json"];
+    let files = || names.map(|n| std::fs::read(s.dir.join(n)).ok());
+    let routes = ["/api/replace/put-right", "/api/replace", "/api/replace/undo"];
+    // A list reads sizes: that one has no button, and nothing is moved for it.
+    let as_stopped = files();
+    let st = s.get("/api/history").json()["reports"][0]["replace"].clone();
+    assert!(st["state"] == "stopped" && st["can_put_right"] == false, "{st}");
+    assert!(st["why"].as_str().unwrap().contains("leaves them as they are"), "{st}");
+    for route in routes {
+        let r = s.post(route, &json!({ "report": report }));
+        assert_eq!(r.status, 400, "{route}: {}", r.body);
+        assert!(files() == as_stopped, "{route} moved files");
+    }
+    // Changed at its size, it has a button, and pressing it reads the files whole and moves
+    // nothing either.
+    std::fs::write(s.dir.join("videos/movie.mkv"), vec![b'x'; 1000]).unwrap();
+    let as_stopped = files();
+    let st = s.get("/api/history").json()["reports"][0]["replace"].clone();
+    assert!(st["state"] == "stopped" && st["can_put_right"] == true, "{st}");
+    for route in routes {
+        let r = s.post(route, &json!({ "report": report }));
+        assert_eq!(r.status, 400, "{route}: {}", r.body);
+        assert!(files() == as_stopped, "{route} moved files");
+    }
+}
+
 #[test]
 fn a_report_that_holds_only_sizes_and_dates_sends_nothing_to_the_trash_unless_asked() {
     let (dir, original, output) = command_folder("ui-replace-sizes-only");

@@ -309,6 +309,44 @@ fn set_right(report: &Path, allow_zfs: bool, held: &mut Vec<Lock>) -> Result<Opt
     Ok(done)
 }
 
+/// What a page says of a pair whose replacement or undo was stopped half-way (see [`CutOff`]),
+/// looked at as for a list: nothing is moved, and nothing is read whole.
+#[cfg(any(feature = "ui", test))]
+pub struct Stopped {
+    /// Where the files are, and what putting them right does.
+    pub told: String,
+    /// The files are where a step of that run leaves them, so they can be put right.
+    pub can_put_right: bool,
+    /// Putting them right writes to a folder on ZFS.
+    pub zfs: bool,
+}
+
+/// [`Stopped`] of `report`, if it is a pair stopped with something moved.
+#[cfg(any(feature = "ui", test))]
+pub fn stopped_for_list(report: &Path, ledger: &crate::ledger::Ledger) -> Option<Stopped> {
+    if !ledger.any_under_way() {
+        return None;
+    }
+    let r = read_report(report).ok()?;
+    let r = stranded(report, &r, ledger, false).map_or(r, |(fixed, _)| fixed);
+    let cut = CutOff::of(report, &r, ledger, false)?;
+    Some(Stopped { told: cut.told()?, can_put_right: cut.left != Left::Unknown, zfs: cut.on_zfs() })
+}
+
+/// Puts right a pair whose replacement or undo was stopped half-way (see [`CutOff`]), reading in
+/// full what that rests on, as `replace --apply` does first: for the page's button, which is
+/// the only thing on the page that does it. Says what was done.
+#[cfg(any(feature = "ui", test))]
+pub fn put_right_stopped(report: &Path, allow_zfs: bool) -> Result<String> {
+    let mut held = vec![lock(report)?];
+    let r = read_report(report).map_err(anyhow::Error::msg)?;
+    let ledger = crate::ledger::load();
+    let r = stranded(report, &r, &ledger, true).map_or(r, |(fixed, _)| fixed);
+    let cut = CutOff::of(report, &r, &ledger, true).context("nothing of this pair was stopped half-way")?;
+    set_right(report, allow_zfs, &mut held)?;
+    Ok(cut.done().unwrap_or_else(|| "av1opt had been stopped before it moved anything of this pair; its record says so now".to_string()))
+}
+
 /// A pair whose replacement or undo was stopped between two of its moves (killed, or the power
 /// went): the line av1opt writes before the first move of each is the last on record for the
 /// original, and the report is the one that run worked from. What it was stopped at is told by
@@ -3674,29 +3712,49 @@ mod tests {
         assert_eq!(done, Ok(()));
     }
 
-    /// What the page shows of the other half-finished states: it has a button only for `ready`
-    /// and for `replaced` with `can_undo` (ui/app.js), so these pairs can be put right from the
-    /// command line alone, and the page says of an original that is in the trash that it is gone.
+    /// Every file under the pair's folders and its trash, with its contents.
+    fn files_of(p: &Pair) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut found = Vec::new();
+        let mut dirs = vec![p.f.dir.join("lib"), p.out.clone(), p.f.dir.join("Trash")];
+        while let Some(dir) = dirs.pop() {
+            for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                if e.file_type().unwrap().is_dir() {
+                    dirs.push(e.path());
+                } else {
+                    found.push((e.path(), std::fs::read(e.path()).unwrap()));
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    /// The half-finished states as the page sees them: each is listed as stopped half-way, with
+    /// what putting it right does, and listing it (the page's history and compare view, a
+    /// `replace` without `--apply`) moves nothing; the page's button then puts it right.
     #[test]
-    #[ignore = "review proof: fails on crash-points aa34f6e until the fault is fixed"]
-    fn proof_the_page_has_a_way_to_put_right_what_was_stopped_half_way() {
-        let mut stuck = Vec::new();
+    fn a_pair_stopped_half_way_is_listed_as_such_with_nothing_moved_and_put_right_on_request() {
         for (step, undoing) in [("replace:trashed", false), ("replace:placed", false), ("undo:moved", true), ("undo:restored", true)] {
-            let p = Pair::new(&format!("proof-page-{}", step.replace(':', "-")), false, "a.mkv").unwrap();
+            let p = Pair::new(&format!("page-stopped-{}", step.replace(':', "-")), false, "a.mkv").unwrap();
             if undoing {
                 p.f.apply(&p.report).unwrap();
             }
             stopped_at(step, || drop(if undoing { undo(&p.report, true).map(drop) } else { p.f.apply(&p.report).map(drop) }));
+            p.as_if_its_run_had_ended();
+            let as_stopped = files_of(&p);
             let ledger = crate::ledger::load();
-            match check_for_list_on_record(&p.report, &ledger) {
-                Check::Ready(_) => {}
-                Check::Replaced(d) if d.can_undo => {}
-                Check::Replaced(_) => stuck.push(format!("{step}: listed as replaced and not to be undone")),
-                Check::No(why) => stuck.push(format!("{step}: listed as \"{why}\"")),
-            }
+            let seen = stopped_for_list(&p.report, &ledger).unwrap_or_else(|| panic!("{step}: not listed as stopped"));
+            assert!(seen.can_put_right && !seen.zfs && seen.told.contains("stopped half-way"), "{step}: {}", seen.told);
+            let _ = check_for_list_on_record(&p.report, &ledger);
+            run_watched(&[p.out.clone(), p.f.dir.join("lib")], false, undoing, true, false, false, &|| {}).unwrap();
+            assert!(files_of(&p) == as_stopped, "{step}: a listing moved files");
+            let done = put_right_stopped(&p.report, false);
+            assert!(done.as_ref().is_ok_and(|d| d.contains("had been stopped half-way")), "{step}: {done:?}");
+            p.as_before();
+            assert!(stopped_for_list(&p.report, &crate::ledger::load()).is_none(), "{step}");
+            assert!(put_right_stopped(&p.report, false).is_err(), "{step}: put right twice");
         }
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
-        assert!(stuck.is_empty(), "{stuck:#?}");
     }
 
     /// The output folder is the original's own folder, reached by a second path (a folder

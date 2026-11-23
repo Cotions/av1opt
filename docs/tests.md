@@ -35,4 +35,4 @@ videos, picks, spreading the test videos), the pick for a number of hours (again
 every subset, and on 30,000 videos), what a watched folder makes of the videos it finds, and `replace`: the round trip with `--undo`, an
 output with the original's own extension, an output on another drive, every refusal (and that a
 refusal moves nothing), a trash that fails, a name taken at the last moment, two runs on one
-report at once, and a replacement or an undo stopped between each two of its moves (on one drive and across two) and then run again either way.
+report at once, and a replacement or an undo stopped between each two of its moves (on one drive and across two) and then run again either way, and `adopt --apply` stopped between two outputs.

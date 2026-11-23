@@ -1570,6 +1570,7 @@ fn adopt_one(report: &Path, reads: &WholeReads, held: &mut crate::ledger::Held, 
             held.note_adopted(Adoption { output: &d.dest, report, source: &d.source, source_bytes: d.source_bytes, original: &encoded, output_bytes: d.output_bytes, output_sha256, replaced })?;
         }
     }
+    crate::signals::stop_point("adopt:noted");
     Ok(true)
 }
 
@@ -2944,6 +2945,29 @@ mod tests {
         change(b'x');
         adopt(&named, true, false).unwrap();
         assert!(std::fs::read_to_string(&record).unwrap().contains("\"adopted\""));
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
+
+    #[test]
+    fn an_adoption_stopped_after_its_first_output_takes_the_others_on_the_next_run() {
+        let f = Fix::new("adopt-stopped");
+        let record = record_in(&f);
+        let ready = f.encode("a.mp4", "a.mkv", 30, 10);
+        let replaced = f.encode("b.mp4", "b.mkv", 30, 10);
+        f.apply(&replaced).unwrap();
+        std::fs::remove_file(&record).unwrap();
+        let named = [f.dir.join("out"), f.dir.join("lib")];
+        let adopted = || std::fs::read_to_string(&record).unwrap_or_default().lines().filter(|l| l.contains("\"adopted\"")).count();
+        stopped_at("adopt:noted", || drop(adopt(&named, true, false)));
+        assert_eq!(adopted(), 1);
+        adopt(&named, true, false).unwrap();
+        assert_eq!(adopted(), 2);
+        // Each once: a third run finds both there already.
+        adopt(&named, true, false).unwrap();
+        assert_eq!(adopted(), 2);
+        let ledger = crate::ledger::load();
+        assert!(ledger.entry(&f.out("a.mkv"), &f.lib("a.mp4")).is_some_and(|e| e.made.is_some() && e.replaced.is_none()), "{ready:?}");
+        assert!(ledger.entry(&f.lib("b.mkv"), &f.lib("b.mp4")).is_some_and(|e| e.replaced.is_some()));
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
     }
 

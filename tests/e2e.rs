@@ -722,6 +722,15 @@ fn sections_ending_between_two_frames_leave_the_rest_where_it_is_looked_for() {
     assert!((t[100] - 100.0 / 24.0).abs() < 0.002, "the last part starts at {:.4} s", t[100]);
     let a = streams(&probe(&out), "audio")[0]["duration"].as_str().unwrap().parse::<f64>().unwrap();
     assert!((a - 292.0 / 24.0).abs() < 0.03, "sound {a:.3} s, picture {:.3} s", 292.0 / 24.0);
+    // The report holds the parts as they were cut, each ending with its last frame: the
+    // page's Compare finds the source's frame for a moment of the output by them.
+    let r = c.report("talk");
+    let parts: Vec<(f64, f64)> = r["kept"].as_array().unwrap().iter().map(|p| (p[0].as_f64().unwrap(), p[1].as_f64().unwrap())).collect();
+    let cut = [(0.0, 25.0 / 24.0), (2.0, 73.0 / 24.0), (4.0, 121.0 / 24.0), (6.0, 169.0 / 24.0), (8.0, 16.0)];
+    assert_eq!(parts.len(), cut.len(), "{parts:?}");
+    for (got, want) in parts.iter().zip(&cut) {
+        assert!((got.0 - want.0).abs() < 1e-3 && (got.1 - want.1).abs() < 1e-3, "{parts:?}");
+    }
 }
 
 #[test]

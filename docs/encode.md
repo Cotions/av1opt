@@ -241,7 +241,7 @@ that remove all of it, or all but a moment, are refused before the encode starts
 refuses them when they are queued. A Dolby Vision file is skipped all the same, and sections
 can't be removed from a file whose sound or subtitles run more than a second past its picture. Per-scene
 mode isn't combined with cuts (one pass instead).
-The report lists the removed sections; an existing output with other sections removed is only
+The report lists the removed sections and the parts kept, as cut on the frames; an existing output with other sections removed is only
 overwritten with `--overwrite`. In the web UI, **Choose sections to remove…** in the encode dialog (one file) has
 a player with Mark start / Mark end (keys I and O), frame stepping, and playback that skips the
 marked parts; Compare maps the cut output back onto the source.

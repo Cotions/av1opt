@@ -226,6 +226,11 @@ struct Report<'a> {
     /// Source sections left out of the output, (start, end) seconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     removed: Option<&'a [(f64, f64)]>,
+    /// The parts of the source the output is made of, (start, end) seconds, as the encode cut
+    /// them: each starts and ends on a frame. The page's Compare shows the source's frame for
+    /// a moment of the output by these.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kept: Option<&'a [(f64, f64)]>,
     /// Tags av1opt wrote on top of (or instead of) the source's.
     tags: std::collections::BTreeMap<&'a str, &'a str>,
     /// The yt-dlp info file the tags were filled from.
@@ -1225,6 +1230,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
         chunks: chunks.as_deref(),
         verify_vmaf: &verify_vmaf,
         removed: cut.as_ref().map(Sections::removed),
+        kept: cut.as_ref().map(Sections::keep),
         tags: meta.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect(),
         info_json: meta.info_json.as_deref(),
         search_secs,

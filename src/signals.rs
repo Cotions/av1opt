@@ -88,17 +88,25 @@ thread_local! {
 
 /// A named moment between two of the steps that change the disk when an encode is finished or
 /// files are moved for `replace`, where the tests stop a run to see what the next one makes of
-/// what is left. With `AV1OPT_STOP_AT` set to its name the process kills itself there, as a
-/// power cut or `kill -9` would end it: nothing is cleaned up. In the unit tests, the step in
-/// [`STOP_AT`] panics instead, which leaves the files as a kill would where nothing that is
-/// dropped on the way out changes the disk.
+/// what is left. In a build with the `stop-points` feature, which only the end-to-end tests
+/// use, the process kills itself there when `AV1OPT_STOP_AT` names the step, as a power cut or
+/// `kill -9` would end it: nothing is cleaned up. It says so on stderr first, so that a variable
+/// left in an environment does not end runs without a word. In a build without the feature the
+/// variable is not read at all. In the unit tests, the step in [`STOP_AT`] panics instead,
+/// which leaves the files as a kill would where nothing that is dropped on the way out changes
+/// the disk.
+#[cfg_attr(not(any(test, feature = "stop-points")), inline(always))]
 pub fn stop_point(step: &str) {
     #[cfg(test)]
     if STOP_AT.get() == Some(step) {
         std::panic::panic_any(format!("stopped at {step}"));
     }
+    #[cfg(feature = "stop-points")]
     if std::env::var_os("AV1OPT_STOP_AT").is_some_and(|s| s == step) {
+        eprintln!("stopped at {step}: AV1OPT_STOP_AT is set");
         // SAFETY: kill with this process's own number ends it; no memory is involved.
         unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
     }
+    #[cfg(not(any(test, feature = "stop-points")))]
+    let _ = step;
 }

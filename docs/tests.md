@@ -1,6 +1,6 @@
 # Tests
 
-`cargo test --test e2e -- --ignored` runs the real program with a real ffmpeg on clips
+`cargo test --features ui,stop-points --test e2e -- --ignored` runs the real program with a real ffmpeg on clips
 generated on the spot (a few seconds of test patterns, mostly 320x180; the whole set takes
 a little over a minute): a plain encode and its report, the frames of the output against the source's one by one
 (so a frame dropped, doubled or out of place is seen), subtitles, chapters, languages and
@@ -10,7 +10,7 @@ rotated, odd-sized, 4:4:4, wide-pixel and full-range sources, cover art in every
 can be, sound and picture offsets, AVI, WebM, MOV, MPEG and transport streams at six frame
 rates, very short videos, awkward file and folder names, skips, failures and name
 collisions, a scene-mode run killed half-way and resumed, an encode stopped half-way (nothing
-left behind, no ffmpeg left running, trials remembered), an encode killed at each step of finishing it (the output moved out, its report, the record, the history, the log) and run again, `--scenes=auto` on an even and an
+left behind, no ffmpeg left running, trials remembered), an encode killed at each step of finishing it (the output moved out, its report, the record, the history, the log) and run again (these need `--features stop-points`, which lets `AV1OPT_STOP_AT` kill the program at a named step), `--scenes=auto` on an even and an
 uneven video and the stretches of an uneven one that are encoded again without it (frame
 times, sound and frame order of the joined file against the source), `replace` with `--undo` on a
 real output, `scan` on a folder with a candidate, an AV1 file and a broken one (nothing in

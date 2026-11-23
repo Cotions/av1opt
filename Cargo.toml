@@ -20,3 +20,6 @@ tiny_http = { version = "0.12", optional = true }
 default = []
 # Local web UI (`av1opt ui`). Off by default so the CLI build stays lean.
 ui = ["dep:tiny_http"]
+# Lets `AV1OPT_STOP_AT` kill a run at a named step, for the end-to-end tests of what a stop at
+# the worst moment leaves. Never in a build for use: without it the variable is not read.
+stop-points = []

@@ -494,3 +494,38 @@ fn progress_written_to_a_file_is_plain_lines() {
     run.ended(0).has("probed 1/1\n");
     assert!(!run.said.contains('\r'), "{:?}", run.said);
 }
+
+/// A pair `replace` can take: an original in `videos`, its "output" in `out` and the report, all
+/// of bytes of their own (`replace` looks at no pictures).
+fn pair_to_replace(c: &Case) -> PathBuf {
+    let source = c.video("a.mp4");
+    std::fs::create_dir_all(c.path("out")).unwrap();
+    let output = c.path("out/a.mkv");
+    std::fs::write(&output, "av1").unwrap();
+    let mtime = std::fs::metadata(&source).unwrap().modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let r = serde_json::json!({ "format": 1, "input": source, "output": output, "source_bytes": text(&source).len(), "source_mtime": mtime, "output_bytes": 3, "crf": 30.0 });
+    std::fs::write(c.path("out/a.av1opt.json"), serde_json::to_vec(&r).unwrap()).unwrap();
+    source
+}
+
+#[cfg(not(feature = "stop-points"))]
+#[test]
+fn a_stop_point_named_in_the_environment_does_nothing_in_a_build_for_use() {
+    let c = Case::new("stop-at-ignored");
+    pair_to_replace(&c);
+    let run = Run::of(c.command(&["replace", "out", "videos", "--apply", "--accept-changed-date"]).env("AV1OPT_STOP_AT", "replace:trashed").output().unwrap());
+    run.ended(0).has("1 original replaced").lacks("stopped at");
+    assert_eq!(text(&c.path("videos/a.mkv")), "av1");
+}
+
+#[cfg(feature = "stop-points")]
+#[test]
+fn a_stop_point_named_in_the_environment_says_so_before_it_kills_the_run() {
+    use std::os::unix::process::ExitStatusExt;
+    let c = Case::new("stop-at-said");
+    let source = pair_to_replace(&c);
+    let o = c.command(&["replace", "out", "videos", "--apply", "--accept-changed-date"]).env("AV1OPT_STOP_AT", "replace:trashed").output().unwrap();
+    assert_eq!(o.status.signal(), Some(libc::SIGKILL));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("stopped at replace:trashed: AV1OPT_STOP_AT is set"), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(!source.exists());
+}

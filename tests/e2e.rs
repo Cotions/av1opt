@@ -13,6 +13,7 @@
 mod common;
 
 use serde_json::Value;
+#[cfg(feature = "stop-points")]
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -2965,6 +2966,7 @@ fn chapters_stay_in_place_after_a_cut_wherever_the_file_starts() {
 
 /// An encode of a short clip into `out` with the run killed at `step` (see `AV1OPT_STOP_AT`),
 /// as a power cut would end it there: nothing is cleaned up.
+#[cfg(feature = "stop-points")]
 fn encode_killed_at(name: &str, step: &str) -> (Case, PathBuf) {
     use std::os::unix::process::ExitStatusExt;
     let c = Case::new(name);
@@ -2978,17 +2980,20 @@ fn encode_killed_at(name: &str, step: &str) -> (Case, PathBuf) {
 }
 
 /// The lines of av1opt's own record and of the encode history.
+#[cfg(feature = "stop-points")]
 fn record_lines(c: &Case) -> (usize, usize) {
     let lines = |name: &str| std::fs::read_to_string(c.dir.join("data/av1opt").join(name)).map_or(0, |t| t.lines().count());
     (lines("ledger.jsonl"), lines("history.jsonl"))
 }
 
 /// What the run left in the output folder that is its own and hidden.
+#[cfg(feature = "stop-points")]
 fn left_hidden(c: &Case) -> Vec<String> {
     c.outputs().into_iter().filter(|n| n.starts_with(".av1opt-tmp-") || n.starts_with(".av1opt-work-")).collect()
 }
 
 /// Replacing the original with the output, which needs a whole output and its report.
+#[cfg(feature = "stop-points")]
 fn replaces(c: &Case) {
     let output = std::fs::read(c.out().join("a.mp4")).unwrap();
     let r = c.av1opt(&[OsStr::new("replace"), c.out().as_os_str(), c.videos().as_os_str(), OsStr::new("--apply")]);
@@ -2996,6 +3001,7 @@ fn replaces(c: &Case) {
     assert!(std::fs::read(c.videos().join("a.mp4")).unwrap() == output && !c.out().join("a.mp4").exists());
 }
 
+#[cfg(feature = "stop-points")]
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn an_encode_killed_before_its_output_left_the_temporary_folder_is_encoded_again() {
@@ -3009,6 +3015,7 @@ fn an_encode_killed_before_its_output_left_the_temporary_folder_is_encoded_again
     replaces(&c);
 }
 
+#[cfg(feature = "stop-points")]
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn an_encode_killed_with_its_output_in_place_and_no_report_is_not_taken_for_done() {
@@ -3027,6 +3034,7 @@ fn an_encode_killed_with_its_output_in_place_and_no_report_is_not_taken_for_done
     replaces(&c);
 }
 
+#[cfg(feature = "stop-points")]
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn an_encode_killed_once_its_report_was_written_is_done_and_can_replace_its_original() {
@@ -3040,6 +3048,7 @@ fn an_encode_killed_once_its_report_was_written_is_done_and_can_replace_its_orig
     replaces(&c);
 }
 
+#[cfg(feature = "stop-points")]
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn an_encode_killed_once_on_record_is_done_and_can_replace_its_original() {
@@ -3049,6 +3058,7 @@ fn an_encode_killed_once_on_record_is_done_and_can_replace_its_original() {
     replaces(&c);
 }
 
+#[cfg(feature = "stop-points")]
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn an_encode_killed_once_in_the_history_is_done_and_can_replace_its_original() {
@@ -3059,6 +3069,7 @@ fn an_encode_killed_once_in_the_history_is_done_and_can_replace_its_original() {
     replaces(&c);
 }
 
+#[cfg(feature = "stop-points")]
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn an_encode_killed_before_its_line_in_the_log_is_done_and_leaves_only_an_empty_folder() {
@@ -3073,6 +3084,7 @@ fn an_encode_killed_before_its_line_in_the_log_is_done_and_leaves_only_an_empty_
     replaces(&c);
 }
 
+#[cfg(feature = "stop-points")]
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn an_encode_killed_once_its_line_was_in_the_log_is_done_and_can_replace_its_original() {

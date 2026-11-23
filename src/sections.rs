@@ -20,6 +20,9 @@ pub const MIN_OUTPUT: f64 = 1.0;
 pub struct Sections {
     keep: Vec<(f64, f64)>,
     removed: Vec<(f64, f64)>,
+    /// A quarter of a frame where the kept parts begin and end where frames do (see
+    /// [`Sections::on_frames`]), 0 where they don't.
+    quarter: f64,
 }
 
 /// Parses "1:20-2:05", "80-125.5", "1:02:03.5-1:05:00" or "50:00-end" (also "50:00-").
@@ -118,7 +121,42 @@ impl Sections {
         if kept < MIN_OUTPUT {
             bail!("the sections leave {} of the video; at least {MIN_OUTPUT} s has to stay", fmt_time(kept));
         }
-        Ok(Sections { keep, removed: merged })
+        Ok(Sections { keep, removed: merged, quarter: 0.0 })
+    }
+
+    /// Moves the ends of the kept parts onto the frames of a picture whose frames come `rate`
+    /// a second, the first of them at `first`: a part then starts with its first frame and
+    /// ends where its last one does, which are the frames it held before. Its sound is cut
+    /// there too. A part used to end where the section asked for began, with its last frame
+    /// shown up to a frame longer than that, and the join puts the next part after the
+    /// longest of picture and sound: four parts ending a millisecond after a frame put the
+    /// last part four frames later than where the timeline had it, and a spot check there
+    /// set every frame against one four frames off (VMAF 33.7) and threw a good encode away.
+    pub fn on_frames(mut self, rate: f64, first: f64) -> Result<Self> {
+        if !(rate > 0.0 && rate.is_finite()) {
+            return Ok(self);
+        }
+        // The first frame at or after `t`; before the first frame, `t` itself.
+        let frame_at = |t: f64| if t <= first { t } else { first + ((t - first) * rate - 1e-6).ceil() / rate };
+        let last = self.keep.len() - 1;
+        let keep: Vec<(f64, f64)> = self
+            .keep
+            .iter()
+            .enumerate()
+            .map(|(i, &(a, b))| (frame_at(a), if i == last && self.open_end(b) { b } else { frame_at(b) }))
+            .filter(|&(a, b)| b - a >= 0.5 / rate)
+            .collect();
+        if keep.is_empty() {
+            bail!("the parts left between the sections hold no frame of the picture");
+        }
+        self.keep = keep;
+        self.quarter = 0.25 / rate;
+        Ok(self)
+    }
+
+    /// Whether a part ending at `b` runs on to the end of the file.
+    fn open_end(&self, b: f64) -> bool {
+        self.removed.last().is_none_or(|&(_, end)| b > end)
     }
 
     pub fn removed(&self) -> &[(f64, f64)] {
@@ -191,8 +229,13 @@ impl Sections {
         for (k, &(a, b)) in self.keep.iter().enumerate() {
             // Leave the last part open: the container's duration can be a little short of
             // the streams' last frame or sample.
-            let end = if b >= duration - 1e-3 { String::new() } else { format!(":end={b:.6}") };
-            let _ = write!(g, "[0:{video}]trim=start={a:.6}{end},setpts=PTS-{a:.6}/TB[v{k}];");
+            let open = b >= duration - 1e-3;
+            let end = if open { String::new() } else { format!(":end={b:.6}") };
+            // Parts on the frames are cut for the picture a quarter of a frame before a frame,
+            // whatever the last digit of its timestamp (see `search::snap_seek`).
+            let (va, vb) = ((a - self.quarter).max(0.0), b - self.quarter);
+            let vend = if open { String::new() } else { format!(":end={vb:.6}") };
+            let _ = write!(g, "[0:{video}]trim=start={va:.6}{vend},setpts=PTS-{a:.6}/TB[v{k}];");
             let _ = write!(joined, "[v{k}]");
             for i in 0..audio {
                 let _ = write!(g, "[0:a:{i}]atrim=start={a:.6}{end},asetpts=PTS-{a:.6}/TB[a{i}_{k}];");
@@ -409,6 +452,31 @@ mod tests {
         );
         let g = s.filter_graph(0, 0, &["bwdif=mode=send_frame".into()], 30.0);
         assert!(g.ends_with("[v0][v1]concat=n=2:v=1:a=0[vcat];[vcat]bwdif=mode=send_frame[vout]"), "{g}");
+    }
+
+    #[test]
+    fn parts_on_the_frames_end_where_their_last_frame_does() {
+        // At 24 fps a part ending a millisecond after frame 24 ends with that frame, 25 frames
+        // in; the next starts with frame 48, where the section ends.
+        let s = Sections::new(&[(1.001, 2.0), (3.001, 4.0)], 10.0).unwrap().on_frames(24.0, 0.0).unwrap();
+        let want = [(0.0, 25.0 / 24.0), (2.0, 73.0 / 24.0), (4.0, 10.0)];
+        assert!(s.keep().iter().zip(want).all(|(&(a, b), (x, y))| close(a, x) && close(b, y)), "{:?}", s.keep());
+        assert!(close(s.to_out(4.0), 50.0 / 24.0));
+        // The report keeps the sections asked for.
+        assert_eq!(s.removed(), &[(1.001, 2.0), (3.001, 4.0)]);
+        // The picture is cut a quarter of a frame before each frame, the sound on it.
+        let g = s.filter_graph(0, 1, &[], 10.0);
+        assert!(g.starts_with("[0:0]trim=start=0.000000:end=1.031250,setpts=PTS-0.000000/TB[v0];[0:a:0]atrim=start=0.000000:end=1.041667,"), "{g}");
+        assert!(g.contains("[0:0]trim=start=1.989583:end=3.031250,setpts=PTS-2.000000/TB[v1];"), "{g}");
+        assert!(g.contains("[0:0]trim=start=3.989583,setpts=PTS-4.000000/TB[v2];[0:a:0]atrim=start=4.000000,"), "{g}");
+        // A section beginning on a frame removes it, wherever the picture starts.
+        let s = Sections::new(&[(2.5, 3.0)], 10.0).unwrap().on_frames(2.0, 0.5).unwrap();
+        assert_eq!(s.keep(), &[(0.0, 2.5), (3.0, 10.0)]);
+        // A part with no frame in it goes.
+        let s = Sections::new(&[(0.0, 1.1), (1.5, 10.0)], 12.0).unwrap();
+        assert!(s.clone().on_frames(1.0, 0.0).unwrap().keep().iter().all(|&(a, _)| a >= 10.0), "{:?}", s.keep());
+        let s = Sections::new(&[(0.0, 1.1), (2.3, 12.0)], 12.0).unwrap();
+        assert!(s.on_frames(0.4, 0.0).is_err());
     }
 
     #[test]

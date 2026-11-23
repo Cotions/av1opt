@@ -206,7 +206,9 @@ Leaves those parts out of the output (one input file only). Times are `h:mm:ss`,
 seconds, with decimals; `end` (or nothing after the dash) means the end of the video. Sections
 may overlap and come in any order. The video is re-encoded anyway, so the cuts are
 frame-accurate: the kept parts are trimmed from the decoded source and joined (ffmpeg
-`trim`/`concat`). Audio is cut the same way and re-encoded to Opus; text subtitles and chapters
+`trim`/`concat`). A frame is removed if it is shown from inside a section; a kept part ends
+where its last frame does, picture and sound alike, so that the parts after it stay where the
+timeline puts them (a variable-rate source is cut at the times given). Audio is cut the same way and re-encoded to Opus; text subtitles and chapters
 are moved to their new times (lines and chapters inside removed parts go); image subtitles
 (PGS, DVD) and TTML are dropped. Sample clips and spot checks are taken from kept parts only. A cut is
 never skipped for being AV1 already or saving too little, and if the VMAF target is out of reach

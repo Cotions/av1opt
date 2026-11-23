@@ -705,6 +705,27 @@ fn removed_sections_are_gone_to_the_frame() {
 
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn sections_ending_between_two_frames_leave_the_rest_where_it_is_looked_for() {
+    let c = Case::new("remove-between");
+    let src = c.clip("talk.mp4", "320x180", 16);
+    // Each kept part ends a millisecond after one of its frames, which is then shown for
+    // nearly a whole frame more than the part lasts: four such parts put the last one
+    // nearly four frames later than its place on the timeline, where the spot checks cut it.
+    let r = c.encode(&[&src], &["--remove", "1.001-2", "--remove", "3.001-4", "--remove", "5.001-6", "--remove", "7.001-8"]);
+    r.ok().has("encoded 1,");
+    let out = c.out().join("talk.mp4");
+    let kept = "lte(n,24)+between(n,48,72)+between(n,96,120)+between(n,144,168)+gte(n,192)";
+    assert_eq!(frames(&out), 4 * 25 + 192);
+    assert_in_step(&out, &src, kept);
+    // The last part's first frame is where the timeline says, and so is its sound.
+    let t = frame_times(&out);
+    assert!((t[100] - 100.0 / 24.0).abs() < 0.002, "the last part starts at {:.4} s", t[100]);
+    let a = streams(&probe(&out), "audio")[0]["duration"].as_str().unwrap().parse::<f64>().unwrap();
+    assert!((a - 292.0 / 24.0).abs() < 0.03, "sound {a:.3} s, picture {:.3} s", 292.0 / 24.0);
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn tags_are_kept_dropped_set_and_filled_from_info_files() {
     let c = Case::new("meta");
     c.clip("plain.mp4", "320x180", 6);

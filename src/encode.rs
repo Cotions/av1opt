@@ -594,7 +594,10 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     }
     // Removing sections is an edit the user asked for, so the output is wanted even when the
     // re-encode alone wouldn't be worth it.
-    let cut = if o.remove.is_empty() { None } else { Some(Sections::new(&o.remove, info.duration_s)?) };
+    // On the frames' constant grid where there is one; frames that keep times of their own are
+    // cut where the sections say.
+    let on_frames = |s: Sections| if info.vfr { Ok(s) } else { s.on_frames(search::cfr_value(&info), info.picture_start()) };
+    let cut = if o.remove.is_empty() { None } else { Some(on_frames(Sections::new(&o.remove, info.duration_s)?)?) };
     // (The parts kept are counted along the whole file; samples and checks taken where there
     // is sound and no picture would have nothing in them.)
     if cut.is_some() && info.duration_s - info.picture_end() > 1.0 {

@@ -64,7 +64,8 @@ single output files.
   an error that says where both files are and what puts them back.
 - A replacement or an undo stopped between two of its moves (killed, or the power went) is
   put right the same way, by the record and the files and never by the report's word: a
-  replacement stopped once the original was in the trash is put back as it was before it
+  replacement stopped once the original was in the trash (also with the AV1 file already in
+  the original's own name) is put back as it was before it
   (the original back in its place, the AV1 file back in the output folder, a copy of it on
   another drive removed), and an undo stopped while the original was still in the trash goes
   back to the replacement; an undo that had both files back is finished. `--apply` then does

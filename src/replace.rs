@@ -365,8 +365,11 @@ impl CutOff {
             return cut.then(|| CutOff { source, from, dest, trash, at_from, at_dest, undoing: true, restored, source_bytes: moved.original.source_bytes(), output_bytes, original });
         }
         let from = full_path(r, "output").ok()?;
-        // Only an original that is gone can have been on its way to the trash.
-        if std::fs::symlink_metadata(&source).is_ok() || !beside(report, &from) || r["superseded"].as_bool() == Some(true) {
+        let dest = source.with_extension(from.extension()?);
+        // Only an original that is gone can have been on its way to the trash. An AV1 file that
+        // takes the original's very name can be there in its place.
+        let something_there = std::fs::symlink_metadata(&source).is_ok();
+        if (something_there && dest != source) || !beside(report, &from) || r["superseded"].as_bool() == Some(true) {
             return None;
         }
         let entry = ledger.entry(&from, &source).filter(|e| e.replaced.is_none())?;
@@ -375,7 +378,9 @@ impl CutOff {
         if !made.original.has_contents_of(&Recorded::in_report(r)) || made.output_bytes != output_bytes {
             return None;
         }
-        let dest = source.with_extension(from.extension()?);
+        if something_there && !is_output(&source, Some(hash)) {
+            return None;
+        }
         let original = made.original.as_recorded();
         let holds = |t: &Path| if full { trash::holds(t, &source, &original) } else { trash::holds_for_list(t, &source, &original) };
         let trash = trash::entries_from(&source).into_iter().find(|t| holds(t))?;
@@ -3089,19 +3094,21 @@ mod tests {
     }
 
     /// A pair as `encode` leaves it, on a record of the fixture's own: `a.mp4` in the library and
-    /// `a.mkv` with its report in `out`, the fixture's output folder or, when `far`, one in
-    /// `/dev/shm` (another drive). None where `/dev/shm` is no other drive.
+    /// the AV1 file `av1` (`a.mkv`, or `a.mp4` to take the original's very name) with its report
+    /// in `out`, the fixture's output folder or, when `far`, one in `/dev/shm` (another drive).
+    /// None where `/dev/shm` is no other drive.
     struct Pair {
         f: Fix,
         report: PathBuf,
         out: PathBuf,
+        av1: &'static str,
     }
 
     impl Pair {
-        fn new(name: &str, far: bool) -> Option<Pair> {
+        fn new(name: &str, far: bool, av1: &'static str) -> Option<Pair> {
             let f = Fix::new(name);
             record_in(&f);
-            let mut report = f.encode("a.mp4", "a.mkv", 1000, 400);
+            let mut report = f.encode("a.mp4", av1, 1000, 400);
             let mut out = f.dir.join("out");
             if far {
                 let shm = Path::new("/dev/shm");
@@ -3111,16 +3118,16 @@ mod tests {
                 out = shm.join(format!("av1opt-replace-{name}-{}", std::process::id()));
                 let _ = std::fs::remove_dir_all(&out);
                 std::fs::create_dir_all(&out).ok()?;
-                std::fs::copy(f.out("a.mkv"), out.join("a.mkv")).unwrap();
-                std::fs::remove_file(f.out("a.mkv")).unwrap();
+                std::fs::copy(f.out(av1), out.join(av1)).unwrap();
+                std::fs::remove_file(f.out(av1)).unwrap();
                 let mut r = read_report(&report).unwrap();
-                r["output"] = json!(out.join("a.mkv"));
+                r["output"] = json!(out.join(av1));
                 std::fs::remove_file(&report).unwrap();
                 report = out.join("a.av1opt.json");
                 std::fs::write(&report, serde_json::to_vec(&r).unwrap()).unwrap();
             }
             on_record(&report);
-            Some(Pair { f, report, out })
+            Some(Pair { f, report, out, av1 })
         }
 
         /// `replace --apply`, or with `back` `replace --undo --apply`, on the two folders.
@@ -3152,7 +3159,7 @@ mod tests {
             let original = vec![b's'; 1000];
             assert!(std::fs::read(self.f.lib("a.mp4")).ok().as_ref() == Some(&original) || self.in_trash().contains(&original), "the original is nowhere");
             let av1 = Some(vec![b'o'; 400]);
-            assert!(std::fs::read(self.f.lib("a.mkv")).ok() == av1 || std::fs::read(self.out.join("a.mkv")).ok() == av1, "the AV1 file is nowhere");
+            assert!(std::fs::read(self.f.lib(self.av1)).ok() == av1 || std::fs::read(self.out.join(self.av1)).ok() == av1, "the AV1 file is nowhere");
         }
 
         /// As the encode left it, with nothing in the trash. A hidden copy on its way to the
@@ -3160,18 +3167,19 @@ mod tests {
         /// went to the trash: it is only ever a copy, and the next replacement clears it away.
         fn as_before(&self) {
             assert_eq!(std::fs::read(self.f.lib("a.mp4")).unwrap(), vec![b's'; 1000]);
-            assert_eq!(std::fs::read(self.out.join("a.mkv")).unwrap(), vec![b'o'; 400]);
-            assert!(!self.f.lib("a.mkv").exists() && !says_replaced(&self.report));
+            assert_eq!(std::fs::read(self.out.join(self.av1)).unwrap(), vec![b'o'; 400]);
+            assert!(self.av1 == "a.mp4" || !self.f.lib(self.av1).exists());
+            assert!(!says_replaced(&self.report));
             assert!(self.in_trash().is_empty());
             let lib: Vec<String> = std::fs::read_dir(self.f.dir.join("lib")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
-            assert!(lib.iter().all(|n| n == "a.mp4" || staging_left_behind(n.as_ref(), &self.f.lib("a.mkv"))), "{lib:?}");
+            assert!(lib.iter().all(|n| n == "a.mp4" || staging_left_behind(n.as_ref(), &self.f.lib(self.av1))), "{lib:?}");
             assert!(matches!(check(&self.report), Check::Ready(_)), "{:?}", check(&self.report));
         }
 
         /// Replaced, the report and the record both saying so, and able to come back.
         fn as_replaced(&self) {
-            assert_eq!(std::fs::read(self.f.lib("a.mkv")).unwrap(), vec![b'o'; 400]);
-            assert!(!self.f.lib("a.mp4").exists() && !self.out.join("a.mkv").exists());
+            assert_eq!(std::fs::read(self.f.lib(self.av1)).unwrap(), vec![b'o'; 400]);
+            assert!((self.av1 == "a.mp4" || !self.f.lib("a.mp4").exists()) && !self.out.join(self.av1).exists());
             assert_eq!(self.in_trash(), vec![vec![b's'; 1000]]);
             assert_eq!(std::fs::read_dir(self.f.dir.join("lib")).unwrap().count(), 1);
             let Check::Replaced(d) = check(&self.report) else { panic!("{:?}", check(&self.report)) };
@@ -3193,9 +3201,14 @@ mod tests {
     /// `replace --apply` leaves the pair replaced and `--undo --apply` as it was, and then the
     /// other one turns it round again. The original is whole somewhere all along.
     fn goes_on_after(step: &'static str, undoing: bool, far: bool) {
+        goes_on_after_as(step, undoing, far, "a.mkv");
+    }
+
+    /// As [`goes_on_after`], for an AV1 file called `av1`.
+    fn goes_on_after_as(step: &'static str, undoing: bool, far: bool, av1: &'static str) {
         for back in [false, true] {
-            let name = format!("{}-{back}-{far}", step.replace(':', "-"));
-            let Some(p) = Pair::new(&name, far) else { return crate::tools::skipped(&name, "/dev/shm is not another drive here") };
+            let name = format!("{}-{back}-{far}-{av1}", step.replace(':', "-"));
+            let Some(p) = Pair::new(&name, far, av1) else { return crate::tools::skipped(&name, "/dev/shm is not another drive here") };
             if undoing {
                 p.f.apply(&p.report).unwrap();
                 p.as_replaced();
@@ -3284,5 +3297,29 @@ mod tests {
     #[test]
     fn an_undo_to_another_drive_stopped_with_both_files_back_but_not_on_record_is_done_or_taken_back_the_next_time() {
         goes_on_after("undo:restored", true, true);
+    }
+
+    #[test]
+    fn a_replacement_in_the_originals_own_name_stopped_at_each_step_is_done_or_taken_back_the_next_time() {
+        for step in ["trash:info", "replace:trashed", "replace:placed", "replace:noted", "replace:report"] {
+            goes_on_after_as(step, false, false, "a.mp4");
+        }
+    }
+
+    #[test]
+    fn an_undo_of_a_replacement_in_the_originals_own_name_stopped_at_each_step_is_done_or_taken_back_the_next_time() {
+        for step in ["undo:moved", "undo:restored", "undo:noted"] {
+            goes_on_after_as(step, true, false, "a.mp4");
+        }
+    }
+
+    #[test]
+    fn a_replacement_in_the_originals_own_name_from_another_drive_stopped_at_each_step_is_done_or_taken_back_the_next_time() {
+        for step in ["replace:staged", "trash:info", "replace:trashed", "replace:placed", "replace:noted", "replace:report"] {
+            goes_on_after_as(step, false, true, "a.mp4");
+        }
+        for step in ["move:copied", "undo:moved", "undo:restored", "undo:noted"] {
+            goes_on_after_as(step, true, true, "a.mp4");
+        }
     }
 }

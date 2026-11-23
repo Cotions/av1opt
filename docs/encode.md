@@ -123,7 +123,16 @@ For each file:
    No stretch goes more than 16 CRF below the video's.
    One that more bits don't lift (noise the metric reads as damage, mostly) keeps the
    smallest encode within half a point of the best it got, which can be the one it had
-   already. The report lists each
+   already. A scored frame more than 25 VMAF under the median of the scored frames within a
+   second either side of it marks its group of pictures as well, whatever its windows come
+   to: a hard scene pulls the frames around it down too, and a frame that far down by
+   itself was wrecked on the way (a decoder of the check handing over broken pictures, or
+   the encode holding them; see [lessons](lessons.md)). One such frame takes a point and a
+   half off its windows, which most do not show. That group is first encoded again at the
+   CRF it had, which mends a fault for no more bytes, then once five steps lower; a frame
+   that scores no better there is how the picture is, and the group stays as it was. The
+   log and the report say where such frames were found and how many stayed. A low stretch
+   of a second or less cannot be told from them and goes the same way. The report lists each
    stretch with its CRF, score and bytes before and after, and the mean and the lowest five
    seconds of the whole video. The mean is checked too. Where it is under the target after
    the repairs, the lowest groups of pictures not yet touched are encoded again, lowest

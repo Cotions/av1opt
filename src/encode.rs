@@ -2811,7 +2811,7 @@ fn verify_whole(
             }
         }
         // (What was encoded again for the mean has its own note.)
-        let below: Vec<&repair::Stretch> = s.stretches.iter().filter(|x| !x.for_mean).collect();
+        let below: Vec<&repair::Stretch> = s.stretches.iter().filter(|x| !x.for_mean && !x.for_frames).collect();
         if !below.is_empty() {
             let (count, total) = (below.len(), below.iter().map(|x| x.secs).sum::<f64>());
             let (lo, hi) = below.iter().fold((f64::INFINITY, 0.0_f64), |(lo, hi), x| (lo.min(x.crf), hi.max(x.crf)));
@@ -2830,6 +2830,11 @@ fn verify_whole(
             tools.emit(Event::Note { text: n.clone() });
             notes.push(n);
         }
+    }
+    if let Some(n) = s.far_below_note() {
+        eprintln!("note: {n}");
+        tools.emit(Event::Note { text: n.clone() });
+        notes.push(n);
     }
     let short: Vec<f64> = s.stretches.iter().filter(|x| x.out_of_reach).map(|x| x.vmaf).chain(s.left.iter().copied()).collect();
     if let Some(lowest) = short.iter().copied().min_by(f64::total_cmp) {

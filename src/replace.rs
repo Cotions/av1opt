@@ -407,7 +407,9 @@ impl CutOff {
     /// `full` reads the files compared in full, which acting on it needs; without it this is the
     /// look of a list, by sizes and samples.
     fn of(report: &Path, r: &Value, ledger: &crate::ledger::Ledger, full: bool) -> Option<CutOff> {
-        let source = full_path(r, "input").ok()?;
+        // Read as the run that wrote the line read them, with their folders resolved: a
+        // report whose folder is reached through a link is still the report of that run.
+        let source = file_path(r, "input").ok()?;
         let u = ledger.under_way(&source)?;
         if r["output_bytes"].as_u64() != Some(u.output_bytes) {
             return None;
@@ -415,14 +417,14 @@ impl CutOff {
         // The report has to be the one that run worked from, as it left it.
         match r.get("replaced").filter(|d| d.is_object()) {
             Some(done) if u.undoing => {
-                let recorded = full_path(done, "from").ok()?;
+                let recorded = file_path(done, "from").ok()?;
                 let from = if beside(report, &recorded) { Some(recorded) } else { place_beside_aside(report, &recorded) };
-                if from.as_ref() != Some(&u.from) || full_path(r, "output").ok()? != u.dest || u.trash.as_ref() != Some(&full_path(done, "trash").ok()?) {
+                if from.as_ref() != Some(&u.from) || file_path(r, "output").ok()? != u.dest || u.trash.as_ref() != Some(&full_path(done, "trash").ok()?) {
                     return None;
                 }
             }
             None if !u.undoing => {
-                let from = full_path(r, "output").ok()?;
+                let from = file_path(r, "output").ok()?;
                 if from != u.from || !beside(report, &from) || r["superseded"].as_bool() == Some(true) || source.with_extension(from.extension()?) != u.dest {
                     return None;
                 }
@@ -1422,7 +1424,7 @@ fn undo_watched(report: &Path, allow_zfs: bool, accept: Accept<Replaced>, before
 /// Whether av1opt's record has a replacement or an undo of the original of `report` under way:
 /// its line was written before its first move, and nothing after it says it ended.
 fn under_way(report: &Path) -> bool {
-    let source = read_report(report).ok().and_then(|r| full_path(&r, "input").ok());
+    let source = read_report(report).ok().and_then(|r| file_path(&r, "input").ok());
     source.is_some_and(|s| crate::ledger::load().under_way(&s).is_some())
 }
 
@@ -1594,16 +1596,17 @@ fn admitted_back(d: &Replaced, ledger: &crate::ledger::Ledger, named: &NamedFold
 /// of each: av1opt cannot tell which of two is the encode, and the other may be anybody's.
 /// One original named by two paths (a second mount of its folder, say) is the same original.
 fn named_twice(plans: &[&Plan]) -> std::collections::HashMap<PathBuf, String> {
-    let mut by_source: Vec<(&Path, Vec<&Path>)> = Vec::new();
+    let mut by_source: Vec<(&Path, crate::files::OneFile, Vec<&Path>)> = Vec::new();
     for p in plans {
-        let same = |s: &&mut (&Path, Vec<&Path>)| crate::files::may_be_same_name(s.0, &p.source) && crate::files::same_file(s.0, &p.source);
-        match by_source.iter_mut().find(|s| same(s)) {
-            Some((_, reports)) => reports.push(&p.report),
-            None => by_source.push((&p.source, vec![&p.report])),
+        // Whatever the two are called: see `crate::files::OneFile`.
+        let file = crate::files::OneFile::of(&p.source);
+        match by_source.iter_mut().find(|s| s.0 == p.source || s.1.is(&file)) {
+            Some((_, _, reports)) => reports.push(&p.report),
+            None => by_source.push((&p.source, file, vec![&p.report])),
         }
     }
     let mut out = std::collections::HashMap::new();
-    for (source, reports) in by_source.into_iter().filter(|(_, r)| r.len() > 1) {
+    for (source, _, reports) in by_source.into_iter().filter(|(_, _, r)| r.len() > 1) {
         for report in &reports {
             let others: Vec<String> = reports.iter().filter(|r| *r != report).map(|r| r.display().to_string()).collect();
             out.insert(
@@ -4484,6 +4487,31 @@ mod tests {
         let why = crate::ledger::load().judges(&p, None).expect("the record holds this original").unwrap_err();
         assert!(why.contains(&format!("was encoded to {}, not to this output", f.out("a.mkv").display())), "{why}");
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
+
+    #[test]
+    fn an_original_on_record_reached_by_a_name_other_than_its_own_is_held_to_the_record() {
+        // A drive that folds names by more than letter case (Unicode normalisation on ZFS or
+        // with ext4 casefold, an SMB share of a macOS server, 8.3 short names) reaches one file
+        // by names that differ by more than case. A hard link under another name stands in
+        // for that here: the same device and file number, another name.
+        for (name, mode, trust_reports) in [("other-name-own", 0o755, false), ("other-name-trust", 0o777, true)] {
+            let f = Fix::new(name);
+            record_in(&f);
+            let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+            on_record(&report);
+            std::fs::hard_link(f.lib("a.mp4"), f.lib("b.mp4")).unwrap();
+            let planted = plant(&f, &report, &f.lib("b.mp4"), &f.out("0.mkv"));
+            set_mode(&f.dir.join("out"), mode);
+            let Check::Ready(p) = check(&planted) else { panic!("{:?}", check(&planted)) };
+            let judged = crate::ledger::load().judges(&p, None);
+            assert!(judged.as_ref().is_some_and(|j| j.is_err()), "{name}: the record says {judged:?}");
+            assert!(matches!(crate::ledger::load().adopting(&p), crate::ledger::Standing::Refused(_)), "{name}: adopt would take it");
+            replace_named(&f, trust_reports).unwrap();
+            assert_eq!(std::fs::read(f.out("0.mkv")).unwrap(), vec![b'e'; 400], "{name}: the planted output was moved");
+            set_mode(&f.dir.join("out"), 0o755);
+            crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        }
     }
 
     #[test]

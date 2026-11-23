@@ -278,6 +278,9 @@ pub struct Ledger {
     problem: Option<String>,
     /// By original.
     under_way: HashMap<PathBuf, UnderWay>,
+    /// The paths on record as the drive has them, each asked of it once for as long as this
+    /// reading of the record is held: a path a report gives is compared with every one of them.
+    seen: std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<crate::files::OneFile>>>,
 }
 
 impl Ledger {
@@ -349,24 +352,34 @@ impl Ledger {
         self.outputs.get(output).filter(|e| e.made.is_some() || e.replaced.is_some())
     }
 
+    /// The file at a path on record (see `seen`).
+    fn recorded(&self, path: &Path) -> std::sync::Arc<crate::files::OneFile> {
+        let mut seen = self.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        seen.entry(path.to_path_buf()).or_insert_with(|| std::sync::Arc::new(crate::files::OneFile::of(path))).clone()
+    }
+
     /// What is recorded of whatever output is at `output`, under that path or under another
-    /// path of the same file (see [`crate::files::same_file`]): a report can name a file by any
-    /// of its paths, and the record holds one. Other paths are looked for among the outputs of
-    /// the same name, letter case aside; a second link under another name is not found.
+    /// path of the same file (see [`crate::files::OneFile`]): a report can name a file by any
+    /// of its paths, and the record holds one. Every output on record is compared, whatever it
+    /// is called: on a drive that takes two spellings of a name for one, the other path of a
+    /// file can differ from the recorded one by more than letter case.
     fn known_as(&self, output: &Path) -> Option<&Entry> {
-        let other_path = || self.outputs.iter().find(|(o, e)| (e.made.is_some() || e.replaced.is_some()) && crate::files::may_be_same_name(o, output) && crate::files::same_file(o, output));
+        let other_path = || {
+            let given = crate::files::OneFile::of(output);
+            self.outputs.iter().find(|(o, e)| (e.made.is_some() || e.replaced.is_some()) && self.recorded(o).is(&given))
+        };
         self.known_at(output).or_else(|| other_path().map(|(_, e)| e))
     }
 
     /// Whether `e` is of the original at `source`, by any of its paths.
-    fn of_source(e: &Entry, source: &Path) -> bool {
-        e.source == source || (crate::files::may_be_same_name(&e.source, source) && crate::files::same_file(&e.source, source))
+    fn of_source(&self, e: &Entry, source: &Path) -> bool {
+        e.source == source || self.recorded(&e.source).is(&crate::files::OneFile::of(source))
     }
 
     /// What is recorded of the output at `output`, if it was made from `source` or took its
     /// place. An output put back by the command line that av1opt never saw made is not one.
     pub fn entry(&self, output: &Path, source: &Path) -> Option<&Entry> {
-        self.known_as(output).filter(|e| Self::of_source(e, source))
+        self.known_as(output).filter(|e| self.of_source(e, source))
     }
 
     /// The replacement or undo of `source` that was under way when the record was last
@@ -409,7 +422,7 @@ impl Ledger {
                 )),
             },
             // A report must not be able to give a file on record another past.
-            Some(e) if !Self::of_source(e, source) => Standing::Refused(format!("av1opt's record says this output came from another original, {}", e.source.display())),
+            Some(e) if !self.of_source(e, source) => Standing::Refused(format!("av1opt's record says this output came from another original, {}", e.source.display())),
             Some(_) => agrees().map_or_else(Standing::Refused, |()| Standing::OnRecord),
         }
     }
@@ -461,7 +474,7 @@ impl Ledger {
     /// it with, so that the file itself has to show the rest, and why not otherwise.
     pub fn judges(&self, p: &Plan, output: Option<&OpenFile>) -> Option<Result<bool, String>> {
         if let Some(e) = self.known_as(&p.output) {
-            if !Self::of_source(e, &p.source) {
+            if !self.of_source(e, &p.source) {
                 return Some(Err(format!("av1opt's record says this output was made from another original, {}", e.source.display())));
             }
             let hashed = e.made.as_ref().is_some_and(|m| m.output_sha256.is_some());
@@ -474,7 +487,9 @@ impl Ledger {
     /// The outputs on record made from the original at `source` or put in its place, by any of
     /// its paths, as they are told; None if there are none.
     fn outputs_of(&self, source: &Path) -> Option<String> {
-        let mut others: Vec<String> = self.outputs.iter().filter(|(_, e)| (e.made.is_some() || e.replaced.is_some()) && Self::of_source(e, source)).map(|(o, _)| o.display().to_string()).collect();
+        let given = crate::files::OneFile::of(source);
+        let of_it = |e: &Entry| e.source == source || self.recorded(&e.source).is(&given);
+        let mut others: Vec<String> = self.outputs.iter().filter(|(_, e)| (e.made.is_some() || e.replaced.is_some()) && of_it(e)).map(|(o, _)| o.display().to_string()).collect();
         others.sort();
         (!others.is_empty()).then(|| others.join(" and "))
     }
@@ -487,7 +502,7 @@ impl Ledger {
         if self.known_as(&d.dest).is_none() && self.outputs_of(&d.source).is_none() {
             return None;
         }
-        if let Some(e) = self.known_as(&d.dest).filter(|e| !Self::of_source(e, &d.source)) {
+        if let Some(e) = self.known_as(&d.dest).filter(|e| !self.of_source(e, &d.source)) {
             return Some(Err(format!("av1opt's record says the file at {} came from another original, {}, so this report is not followed", d.dest.display(), e.source.display())));
         }
         if self.entry(&d.dest, &d.source).is_none_or(|e| e.replaced.is_none()) {

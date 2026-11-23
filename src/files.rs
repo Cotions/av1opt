@@ -882,26 +882,32 @@ pub fn in_real_folder(path: &Path) -> PathBuf {
     real.map_or_else(|| path.to_path_buf(), |(d, name)| d.join(name))
 }
 
-/// Whether `a` and `b` name the same file: one path once their folders are resolved (see
-/// [`in_real_folder`]), or, where both are there, one file on the drive. A second mount of a
-/// folder, a drive that does not tell letter case apart, or a second (hard) link gives one
-/// file other paths, which only the file's own number shows. A link at either name is taken
-/// as itself, not as what it leads to.
-pub fn same_file(a: &Path, b: &Path) -> bool {
-    if a == b || in_real_folder(a) == in_real_folder(b) {
-        return true;
+/// What tells one file from another whatever path names it: its path with the folder
+/// resolved (see [`in_real_folder`]) and, where it is there, its number on its drive. A second
+/// mount of a folder, a second (hard) link, or a drive that takes two spellings of a name for
+/// one (letter case; accents written as one character or as two; the short names of a Windows
+/// share) gives one file other paths, and only the file's own number shows that. A link at the
+/// name is taken as itself, not as what it leads to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OneFile {
+    real: PathBuf,
+    number: Option<(u64, u64)>,
+}
+
+impl OneFile {
+    pub fn of(path: &Path) -> OneFile {
+        OneFile { real: in_real_folder(path), number: std::fs::symlink_metadata(path).ok().map(|m| (m.dev(), m.ino())) }
     }
-    match (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) {
-        (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
-        _ => false,
+
+    /// Whether the two are one file: one path, or, where both are there, one file on the drive.
+    pub fn is(&self, other: &OneFile) -> bool {
+        self.real == other.real || (self.number.is_some() && self.number == other.number)
     }
 }
 
-/// Whether two names could name the same file on some drive: the same once letter case is set
-/// aside. What is compared by [`same_file`] where comparing everything would be slow.
-pub fn may_be_same_name(a: &Path, b: &Path) -> bool {
-    let lower = |p: &Path| p.file_name().map(|n| n.to_string_lossy().to_lowercase());
-    lower(a).is_some() && lower(a) == lower(b)
+/// Whether `a` and `b` name the same file (see [`OneFile`]).
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    a == b || OneFile::of(a).is(&OneFile::of(b))
 }
 
 /// The end of a name no other save has: this process's number and a count of its saves, and

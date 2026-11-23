@@ -40,10 +40,11 @@ single output files.
   is not followed (if both are encodes you made, keep the one on record and remove the other
   output and its report). A report cannot
   get past the record by naming a file another way (through a link to its folder, or
-  `/proc/self/root`): paths are compared with their folders resolved, and an output or
-  original of the same name is also compared by the file itself, so a second mount of a
-  folder or a drive that ignores letter case does not make one file two. `--trust-reports`
-  never counts against the record.
+  `/proc/self/root`): paths are compared with their folders resolved, and every output and
+  original on record is also compared by the file itself, so a second mount of a folder, a
+  second link, or a drive that takes two spellings of a name for one (letter case, accents
+  written two ways) does not make one file two. `--trust-reports` never counts against the
+  record.
 - A report the record knows nothing of is followed only to originals inside the folders you
   name (name the originals' folder as well, or add `--anywhere`), and only if it and its output
   are your own files in a folder nobody else can write to, or one with the sticky bit, which

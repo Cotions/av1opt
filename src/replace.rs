@@ -3322,4 +3322,214 @@ mod tests {
             goes_on_after_as(step, true, true, "a.mp4");
         }
     }
+
+    // ---- Proofs for the review of `crash-points` -------------------------------------------
+    // Each of these states the behaviour a reviewer expects and FAILS on `crash-points` as it
+    // stands (aa34f6e). They are ignored so that the suite stays green; run them with
+    // `cargo test --release --features ui --lib proof_ -- --ignored --test-threads 1`.
+
+    fn hand_trash(f: &Fix, name: &str) -> PathBuf {
+        trash::trash_with(&f.lib(name), Some(&f.dir.join("Trash")), 1000, "2026-11-20T10:00:00".into()).unwrap()
+    }
+
+    /// No run of av1opt was stopped: the person threw the original away with the file manager
+    /// and kept the AV1 file in the output folder. A listing says av1opt was stopped half-way,
+    /// and any `--apply` over these folders takes the file back out of the trash.
+    #[test]
+    #[ignore = "review proof: fails on crash-points aa34f6e until the fault is fixed"]
+    fn proof_an_original_the_person_threw_away_is_not_a_replacement_stopped_half_way() {
+        let p = Pair::new("proof-hand-trashed", false, "a.mkv").unwrap();
+        let trashed = hand_trash(&p.f, "a.mp4");
+        let r = read_report(&p.report).unwrap();
+        let seen = CutOff::of(&p.report, &r, &crate::ledger::load(), false);
+        // `replace --undo --apply`, meant for other pairs under these folders.
+        p.command(true);
+        let back = p.f.lib("a.mp4").exists();
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        assert!(seen.is_none(), "a listing says: {}", seen.unwrap().told());
+        assert!(!back && trashed.exists(), "the original the person threw away is back in the library");
+    }
+
+    /// The same, with plain `replace --apply`: the file thrown away comes back, and then goes
+    /// to the trash again with the AV1 file moved out of the output folder into the library.
+    #[test]
+    #[ignore = "review proof: fails on crash-points aa34f6e until the fault is fixed"]
+    fn proof_an_output_whose_original_was_thrown_away_stays_in_the_output_folder() {
+        let p = Pair::new("proof-hand-trashed-apply", false, "a.mkv").unwrap();
+        hand_trash(&p.f, "a.mp4");
+        p.command(false);
+        let (in_out, in_lib) = (p.out.join("a.mkv").exists(), p.f.lib("a.mkv").exists());
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        assert!(in_out && !in_lib, "the AV1 file left the output folder for the library: before this branch the pair stayed as it was (\"the original is gone\")");
+    }
+
+    /// Two encodes of one original, in two output folders and two containers. The first
+    /// replaced the original, start to finish. The second's report then reads as a replacement
+    /// stopped half-way, and the original is taken out of the first one's trash entry: the
+    /// first replacement can no longer be undone.
+    #[test]
+    #[ignore = "review proof: fails on crash-points aa34f6e until the fault is fixed"]
+    fn proof_a_second_output_of_an_original_leaves_the_replacement_by_the_first_alone() {
+        let f = Fix::new("proof-two-outputs");
+        record_in(&f);
+        let first = f.encode("a.mp4", "a.mkv", 1000, 400);
+        on_record(&first);
+        let out2 = f.dir.join("out2");
+        std::fs::create_dir_all(&out2).unwrap();
+        std::fs::write(out2.join("a.mp4"), vec![b'p'; 300]).unwrap();
+        let mut r = read_report(&first).unwrap();
+        r["output"] = json!(out2.join("a.mp4"));
+        r["output_bytes"] = json!(300);
+        let second = out2.join("a.av1opt.json");
+        std::fs::write(&second, serde_json::to_vec(&r).unwrap()).unwrap();
+        on_record(&second);
+        f.apply(&first).unwrap();
+        assert!(matches!(check(&first), Check::Replaced(d) if d.can_undo && crate::ledger::load().check_replaced(&d).is_ok()));
+        // `replace --undo --apply` on the second output's folder and the library.
+        run_watched(&[out2.clone(), f.dir.join("lib")], true, true, true, false, false, &|| {}).unwrap();
+        let first_now = check(&first);
+        let original_back = f.lib("a.mp4").exists();
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        assert!(!original_back, "the original left the trash entry of a replacement that had gone through");
+        assert!(matches!(first_now, Check::Replaced(ref d) if d.can_undo), "{first_now:?}");
+    }
+
+    /// A replacement on ZFS (made with --allow-zfs) was stopped. The next `replace --apply`
+    /// without --allow-zfs moves a file into the folder on ZFS all the same.
+    #[test]
+    #[ignore = "review proof: fails on crash-points aa34f6e until the fault is fixed"]
+    fn proof_nothing_is_put_back_on_zfs_without_allow_zfs() {
+        let p = Pair::new("proof-zfs", false, "a.mkv").unwrap();
+        stopped_at("replace:trashed", || drop(p.f.apply(&p.report)));
+        assert!(!p.f.lib("a.mp4").exists());
+        crate::fsguard::ZFS_IN_TESTS.with_borrow_mut(|z| z.push(p.f.dir.join("lib")));
+        let _ = run_watched(&[p.out.clone(), p.f.dir.join("lib")], true, false, false, false, false, &|| {});
+        crate::fsguard::ZFS_IN_TESTS.with_borrow_mut(Vec::clear);
+        let back = p.f.lib("a.mp4").exists();
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        assert!(!back, "a file was moved into a folder on ZFS by a run without --allow-zfs");
+    }
+
+    /// The same for an undo stopped half-way: the AV1 file is moved (across drives: written)
+    /// into the folder on ZFS by a run without --allow-zfs.
+    #[test]
+    #[ignore = "review proof: fails on crash-points aa34f6e until the fault is fixed"]
+    fn proof_no_av1_file_is_moved_onto_zfs_without_allow_zfs() {
+        let p = Pair::new("proof-zfs-undo", false, "a.mkv").unwrap();
+        p.f.apply(&p.report).unwrap();
+        stopped_at("undo:moved", || drop(undo(&p.report, true)));
+        assert!(!p.f.lib("a.mkv").exists() && p.out.join("a.mkv").exists());
+        crate::fsguard::ZFS_IN_TESTS.with_borrow_mut(|z| z.push(p.f.dir.join("lib")));
+        let _ = run_watched(&[p.out.clone(), p.f.dir.join("lib")], true, true, false, false, false, &|| {});
+        crate::fsguard::ZFS_IN_TESTS.with_borrow_mut(Vec::clear);
+        let moved_in = p.f.lib("a.mkv").exists();
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        assert!(!moved_in, "the AV1 file was moved into a folder on ZFS by a run without --allow-zfs");
+    }
+
+    /// What the page calls for "Put the original back" is `undo_if` on that one report. An undo
+    /// to another drive that was stopped once its copy was made is still listed as one that can
+    /// be undone, and the page's undo then fails every time: only the command line sets it right.
+    #[test]
+    #[ignore = "review proof: fails on crash-points aa34f6e until the fault is fixed"]
+    fn proof_the_pages_undo_finishes_an_undo_stopped_after_its_copy() {
+        let Some(p) = Pair::new("proof-page-undo", true, "a.mkv") else { return crate::tools::skipped("proof-page-undo", "/dev/shm is not another drive here") };
+        p.f.apply(&p.report).unwrap();
+        stopped_at("move:copied", || drop(undo(&p.report, true)));
+        p.as_if_its_run_had_ended();
+        let ledger = crate::ledger::load();
+        assert!(matches!(check_for_list_on_record(&p.report, &ledger), Check::Replaced(d) if d.can_undo), "the page offers the undo");
+        let done = undo_if(&p.report, true, &|d| crate::ledger::load().check_replaced(d)).map(drop).map_err(|e| format!("{e:#}"));
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        assert_eq!(done, Ok(()));
+    }
+
+    /// What the page shows of the other half-finished states: it has a button only for `ready`
+    /// and for `replaced` with `can_undo` (ui/app.js), so these pairs can be put right from the
+    /// command line alone, and the page says of an original that is in the trash that it is gone.
+    #[test]
+    #[ignore = "review proof: fails on crash-points aa34f6e until the fault is fixed"]
+    fn proof_the_page_has_a_way_to_put_right_what_was_stopped_half_way() {
+        let mut stuck = Vec::new();
+        for (step, undoing) in [("replace:trashed", false), ("replace:placed", false), ("undo:moved", true), ("undo:restored", true)] {
+            let p = Pair::new(&format!("proof-page-{}", step.replace(':', "-")), false, "a.mkv").unwrap();
+            if undoing {
+                p.f.apply(&p.report).unwrap();
+            }
+            stopped_at(step, || drop(if undoing { undo(&p.report, true).map(drop) } else { p.f.apply(&p.report).map(drop) }));
+            let ledger = crate::ledger::load();
+            match check_for_list_on_record(&p.report, &ledger) {
+                Check::Ready(_) => {}
+                Check::Replaced(d) if d.can_undo => {}
+                Check::Replaced(_) => stuck.push(format!("{step}: listed as replaced and not to be undone")),
+                Check::No(why) => stuck.push(format!("{step}: listed as \"{why}\"")),
+            }
+        }
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        assert!(stuck.is_empty(), "{stuck:#?}");
+    }
+
+    /// The output folder is the original's own folder, reached by a second path (a folder
+    /// mounted twice; here a link, on a record line written by hand, since `encode` resolves
+    /// links). `from` and `dest` are then one file under two names, it passes for "a copy of
+    /// the one that stays", and the only AV1 file is removed.
+    #[test]
+    #[ignore = "review proof: fails on crash-points aa34f6e until the fault is fixed"]
+    fn proof_the_only_av1_file_is_not_removed_as_a_copy_of_itself() {
+        let f = Fix::new("proof-one-file-two-names");
+        record_in(&f);
+        let made = f.encode("a.mp4", "a.mkv", 1000, 400);
+        std::fs::rename(f.out("a.mkv"), f.lib("a.mkv")).unwrap();
+        std::os::unix::fs::symlink(f.dir.join("lib"), f.dir.join("way")).unwrap();
+        let mut r = read_report(&made).unwrap();
+        r["output"] = json!(f.dir.join("way/a.mkv"));
+        std::fs::remove_file(&made).unwrap();
+        let report = f.lib("a.av1opt.json");
+        std::fs::write(&report, serde_json::to_vec(&r).unwrap()).unwrap();
+        on_record(&report);
+        hand_trash(&f, "a.mp4");
+        let _ = run_watched(&[f.dir.join("lib")], true, true, true, false, false, &|| {});
+        let av1 = std::fs::read(f.lib("a.mkv")).ok();
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        assert_eq!(av1, Some(vec![b'o'; 400]), "the AV1 file is gone: it was removed as a copy of itself");
+    }
+
+    /// `replace` on the command line takes pairs that are not on av1opt's record (reports from
+    /// before the record, never adopted), and such a replacement can be stopped half-way like
+    /// any other. Nothing puts it right, and nothing says where the original is: the list has
+    /// "the original is gone", as before this branch.
+    #[test]
+    #[ignore = "review proof: fails on crash-points aa34f6e until the fault is fixed"]
+    fn proof_a_replacement_of_a_pair_not_on_record_stopped_half_way_is_at_least_told() {
+        let f = Fix::new("proof-not-on-record");
+        record_in(&f);
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        stopped_at("replace:trashed", || drop(f.apply(&report)));
+        assert!(!f.lib("a.mp4").exists());
+        let named = [f.dir.join("out"), f.dir.join("lib")];
+        run_watched(&named, true, true, true, false, false, &|| {}).unwrap();
+        let back = f.lib("a.mp4").exists();
+        let listed = check(&report);
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        assert!(back || matches!(&listed, Check::No(why) if why.contains("trash")), "the original is in the trash and the list says only: {listed:?}");
+    }
+
+    /// Not a fault: the recovery is itself stopped (at the one stop point it passes, after its
+    /// copy across drives) and run again, and nothing is lost. The branch has no test of this.
+    #[test]
+    fn a_recovery_that_is_itself_stopped_after_its_copy_is_finished_by_the_next_run() {
+        let Some(p) = Pair::new("recovery-stopped", true, "a.mkv") else { return crate::tools::skipped("recovery-stopped", "/dev/shm is not another drive here") };
+        p.f.apply(&p.report).unwrap();
+        stopped_at("undo:moved", || drop(undo(&p.report, true)));
+        p.as_if_its_run_had_ended();
+        // The run that puts it right copies the AV1 file back to the library, and is killed.
+        stopped_at("move:copied", || p.command(true));
+        p.nothing_lost();
+        p.as_if_its_run_had_ended();
+        p.command(true);
+        p.as_before();
+        p.command(false);
+        p.as_replaced();
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
 }

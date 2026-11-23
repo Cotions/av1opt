@@ -52,7 +52,11 @@ single output files.
   stated size beside it. A folder shared with a group (mode `2775`, say) counts as one others
   can write to; the list names the group, and either `chmod +t` on the folder (where everyone
   who uses it only renames or removes their own files) or `--trust-reports` (if you trust
-  everyone in the group) lets the pairs through. `--trust-reports` takes such reports at their word all the same. On
+  everyone in the group) lets the pairs through. A group counts as yours alone only if it is
+  your own, lists nobody else, and no other user in `/etc/passwd` has it as their own (users
+  kept in LDAP and the like are not looked through). A file or folder on an NFSv4 drive with an
+  access list counts as one others may write to whatever its mode, since av1opt does not read
+  such lists: there too `--trust-reports` is the way for pairs not on record. `--trust-reports` takes such reports at their word all the same. On
   a drive that keeps no owners or permissions of its own it is the only way: FAT, exFAT and
   NTFS drives, SMB (Windows) shares and FUSE drives (ntfs-3g, rclone, sshfs and the like) show
   every file as the mount says, often as your own in a private folder, whoever put it there,

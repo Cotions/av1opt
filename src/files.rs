@@ -310,18 +310,37 @@ fn has_access_list_open(file: &std::fs::File) -> bool {
     size > 0
 }
 
+/// Whether the open file or folder `file` has an NFSv4 access list. Such a list can let other
+/// users write whatever the mode shows, and it is not read here: having one at all counts.
+fn has_nfs4_access_list(file: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    // SAFETY: as in has_access_list_open.
+    let size = unsafe { libc::fgetxattr(file.as_raw_fd(), c"system.nfs4_acl".as_ptr(), std::ptr::null_mut(), 0) };
+    size > 0
+}
+
 /// Who besides this user may write to the open file or folder `file`, of mode `mode` and group
 /// `gid`, as [`others_may_rename_in`] judges a folder's group, sticky bit aside; told the way a
 /// person can act on it: everyone, the members of its group (named), or those its access list
 /// names. None if nobody.
 fn who_else_may_write(file: &std::fs::File, mode: u32, gid: u32) -> Option<String> {
+    who_else_may_write_with(mode, gid, has_access_list_open(file), has_nfs4_access_list(file))
+}
+
+/// [`who_else_may_write`], with whether the file has a POSIX access list (`posix_list`) and an
+/// NFSv4 one (`nfs4_list`) passed in. A POSIX list lets nobody write past the group bits of the
+/// mode, which stand for the most it grants; an NFSv4 list is not bound by the mode at all.
+fn who_else_may_write_with(mode: u32, gid: u32, posix_list: bool, nfs4_list: bool) -> Option<String> {
+    if nfs4_list {
+        return Some("whoever its NFSv4 access list lets, which av1opt does not read".into());
+    }
     if mode & 0o002 != 0 {
         return Some("every user".into());
     }
     if mode & 0o020 == 0 {
         return None;
     }
-    if has_access_list_open(file) {
+    if posix_list {
         return Some("the users its access list names".into());
     }
     (!group_is_mine_alone(gid)).then(|| match group_name(gid) {
@@ -478,10 +497,21 @@ fn owners_kept_by(magic: u64) -> Owners {
 /// Whether the group `gid` is this user's own and holds nobody else, as far as can be told
 /// cheaply from the system's user and group lists (by way of libc, so that lists kept
 /// elsewhere, as in LDAP, count too): it is this user's own group, named as this user is, and
-/// lists no member but this user. A group some other user has as their own without being listed
-/// in it can only be found by going through every user, which is not done: any other group
-/// counts as shared.
+/// lists no member but this user, and no other user in `/etc/passwd` has it as their own group,
+/// which makes them a member without being listed in it. (Users kept elsewhere, as in LDAP, who
+/// have it as their own are not found: going through every one of them is not done.)
 fn group_is_mine_alone(gid: u32) -> bool {
+    let theirs_too = std::fs::read_to_string("/etc/passwd").map_or(true, |passwd| others_have_as_their_own(&passwd, gid, my_user()));
+    !theirs_too && listed_as_mine_alone(gid)
+}
+
+/// Whether a user other than `me` in the text of `/etc/passwd` has `gid` as their own group.
+fn others_have_as_their_own(passwd: &str, gid: u32, me: u32) -> bool {
+    passwd.lines().map(|l| l.split(':').collect::<Vec<&str>>()).filter(|f| f.len() >= 4).any(|f| f[2].parse() != Ok(me) && f[3].parse() == Ok(gid))
+}
+
+/// The part of [`group_is_mine_alone`] that the system's lists, by way of libc, can tell.
+fn listed_as_mine_alone(gid: u32) -> bool {
     let mut buffer = vec![0 as libc::c_char; 1 << 16];
     // SAFETY: the structs are filled by the calls from the buffer given, which outlives every
     // use of the pointers in them; a result of null or an error means nothing was found.
@@ -1227,6 +1257,33 @@ pub(crate) mod tests {
         // getegid has no failure mode.
         let (count, own) = unsafe { (libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()), libc::getegid()) };
         groups[..count.max(0) as usize].iter().copied().find(|g| *g != own && !group_is_mine_alone(*g))
+    }
+
+    #[test]
+    fn a_group_another_user_has_as_their_own_is_shared_though_its_list_names_nobody() {
+        let passwd = "root:x:0:0:root:/root:/bin/sh\nme:x:1000:1000::/home/me:/bin/sh\nyou:x:1001:1000::/home/you:/bin/sh\n";
+        assert!(others_have_as_their_own(passwd, 1000, 1000));
+        assert!(!others_have_as_their_own(passwd, 1001, 1000) && others_have_as_their_own(passwd, 1000, 1001));
+        assert!(!others_have_as_their_own("me:x:1000:1000::/home/me:/bin/sh\nyou:x:1001:1001::/home/you:/bin/sh\n", 1000, 1000));
+        // On this machine, this user's own group, if it is theirs alone.
+        // SAFETY: getegid has no failure mode.
+        let own = unsafe { libc::getegid() };
+        let passwd = std::fs::read_to_string("/etc/passwd").unwrap();
+        if others_have_as_their_own(&passwd, own, my_user()) {
+            assert!(!group_is_mine_alone(own));
+        }
+    }
+
+    #[test]
+    fn a_file_with_an_nfs4_access_list_may_be_written_by_others_whatever_its_mode() {
+        for mode in [0o600, 0o644, 0o755, 0o700] {
+            let who = who_else_may_write_with(mode, 0, false, true).unwrap();
+            assert!(who.contains("NFSv4 access list"), "{who}");
+        }
+        assert_eq!(who_else_may_write_with(0o644, 0, false, false), None);
+        // A POSIX list grants no more than the group bits.
+        assert_eq!(who_else_may_write_with(0o644, 0, true, false), None);
+        assert_eq!(who_else_may_write_with(0o664, 0, true, false).as_deref(), Some("the users its access list names"));
     }
 
     #[test]

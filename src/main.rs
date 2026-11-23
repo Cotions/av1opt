@@ -169,8 +169,8 @@ enum Cmd {
         anywhere: bool,
         /// Take reports av1opt has no record of at their word even where others could have
         /// put them there or changed them: in a folder other users can write to, files of
-        /// another user's, or a drive that shows one owner for every file (FAT, exFAT, NTFS,
-        /// some network drives). Whoever can write there can make an original go to the trash
+        /// another user's, or a drive that keeps no owners of its own (FAT, exFAT, NTFS, SMB
+        /// shares, FUSE drives), where this is the only way. Whoever can write there can make an original go to the trash
         /// for a file of theirs: use this only where you trust everyone who can.
         #[arg(long)]
         trust_reports: bool,

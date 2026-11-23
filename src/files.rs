@@ -326,12 +326,19 @@ fn others_may_write(file: &std::fs::File, mode: u32, gid: u32) -> bool {
 /// A drive that keeps no owners or modes of its own (FAT, exFAT, NTFS, and network drives that
 /// show one owner for everything) shows what it was mounted with, and that is what is judged:
 /// files shown as another user's, or as open to everyone, cannot be told to be this user's.
+///
+/// So a file on a drive known not to keep owners and modes at all is never taken to be this
+/// user's alone, however it is shown: on a FAT stick or a network share mounted with `uid=`
+/// every file shows as the user's own in a private folder, whoever put it there.
 pub fn others_may_have_written(path: &Path, file: &std::fs::File) -> Option<String> {
-    others_may_have_written_of(path, file, my_user())
+    others_may_have_written_of(path, file, my_user(), owners_kept_on(path, file))
 }
 
-fn others_may_have_written_of(path: &Path, file: &std::fs::File, me: u32) -> Option<String> {
+fn others_may_have_written_of(path: &Path, file: &std::fs::File, me: u32, owners: Owners) -> Option<String> {
     use std::os::fd::AsRawFd;
+    if let Owners::NotKept(drive) = owners {
+        return Some(format!("it is on {drive}, which does not keep who owns a file or who may write to it, so nothing there can say whose the file is"));
+    }
     let meta = match file.metadata() {
         Ok(meta) => meta,
         Err(e) => return Some(format!("it cannot be looked at ({e})")),
@@ -377,6 +384,57 @@ fn others_may_have_written_of(path: &Path, file: &std::fs::File, me: u32) -> Opt
         return Some(format!("other users can write to its folder {}, which has no sticky bit to keep them from renaming files of yours there", dir.display()));
     }
     None
+}
+
+/// Whether a drive keeps who owns each file and who may write to it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Owners {
+    Kept,
+    /// It shows every file with the owner and modes it was mounted with, or with one owner for
+    /// all: what kind of drive it is, as told to the person.
+    NotKept(&'static str),
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Folders this thread takes to be on a FAT drive, with all below them: there is no such
+    /// drive to test on, and mounting one takes root.
+    pub(crate) static OWNERLESS_IN_TESTS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// What the drive of `file`, opened from `path`, keeps of owners, by the kind of drive the
+/// system says it is.
+fn owners_kept_on(path: &Path, file: &std::fs::File) -> Owners {
+    use std::os::fd::AsRawFd;
+    #[cfg(test)]
+    if OWNERLESS_IN_TESTS.with_borrow(|d| d.iter().any(|d| path.starts_with(d))) {
+        return owners_kept_by(0x4d44);
+    }
+    let _ = path;
+    // SAFETY: fstatfs on a descriptor we own fills the struct it is given and nothing else.
+    let magic = unsafe {
+        let mut st: libc::statfs = std::mem::zeroed();
+        (libc::fstatfs(file.as_raw_fd(), &mut st) == 0).then_some(st.f_type)
+    };
+    // The kind is a 32-bit number, held in a wider signed one on some systems.
+    magic.map_or(Owners::Kept, |m| owners_kept_by(m as u64 & 0xffff_ffff))
+}
+
+/// What a drive of the kind `magic` (statfs's `f_type`) keeps of owners. FAT, exFAT and NTFS
+/// keep none, and Linux shows what they were mounted with. An SMB share shows the owner and
+/// modes it was mounted with unless the server speaks Unix extensions, which cannot be told
+/// from here, and a FUSE drive (ntfs-3g, exFAT and rclone among them) shows whatever its program
+/// says: both count as keeping none, so that what anyone else put there is never taken for
+/// this user's own.
+fn owners_kept_by(magic: u64) -> Owners {
+    match magic {
+        0x4d44 => Owners::NotKept("a FAT drive"),
+        0x2011_bab0 => Owners::NotKept("an exFAT drive"),
+        0x5346_544e | 0x7366_746e => Owners::NotKept("an NTFS drive"),
+        0xff53_4d42 | 0xfe53_4d42 | 0x517b => Owners::NotKept("an SMB (Windows) network share"),
+        0x6573_5546 => Owners::NotKept("a FUSE drive (ntfs-3g, exFAT, rclone or the like)"),
+        _ => Owners::Kept,
+    }
 }
 
 /// Whether the group `gid` is this user's own and holds nobody else, as far as can be told
@@ -1099,7 +1157,7 @@ pub(crate) mod tests {
         let set = |p: &Path, mode: u32| std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
         set(&dir, 0o755);
         set(&path, 0o644);
-        let judged = |me: u32| others_may_have_written_of(&path, &std::fs::File::open(&path).unwrap(), me);
+        let judged = |me: u32| others_may_have_written_of(&path, &std::fs::File::open(&path).unwrap(), me, Owners::Kept);
         assert_eq!(judged(my_user()), None);
         // A file and a folder that look like another user's.
         assert_eq!(judged(my_user() + 1).as_deref(), Some("it belongs to another user"));
@@ -1121,6 +1179,30 @@ pub(crate) mod tests {
         std::fs::rename(&path, dir.join("moved")).unwrap();
         std::fs::write(&path, b"{}").unwrap();
         assert!(others_may_have_written(&path, &opened).is_some_and(|why| why.contains("moved or replaced")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_on_a_drive_that_keeps_no_owners_is_never_taken_for_this_users_alone() {
+        let dir = room("ownerless");
+        let path = dir.join("a.av1opt.json");
+        std::fs::write(&path, b"{}").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // As a FAT stick or an SMB share mounted with `uid=` shows it: the user's own file, in a
+        // folder only they can write to.
+        let file = std::fs::File::open(&path).unwrap();
+        assert_eq!(others_may_have_written_of(&path, &file, my_user(), Owners::Kept), None);
+        for magic in [0x4d44, 0x2011_bab0, 0x7366_746e, 0xff53_4d42, 0xfe53_4d42, 0x6573_5546] {
+            let Owners::NotKept(drive) = owners_kept_by(magic) else { panic!("{magic:x} keeps owners") };
+            let why = others_may_have_written_of(&path, &file, my_user(), Owners::NotKept(drive)).unwrap();
+            assert!(why.contains(drive) && why.contains("does not keep who owns a file"), "{why}");
+        }
+        // Linux drives, and the drive these tests run on, keep them.
+        for magic in [0xef53, 0x9123_683e, 0x5846_5342, 0x0102_1994, 0x6969] {
+            assert_eq!(owners_kept_by(magic), Owners::Kept, "{magic:x}");
+        }
+        assert_eq!(owners_kept_on(&path, &file), Owners::Kept);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1249,7 +1249,7 @@ fn outside_named(source: &Path) -> String {
 const NOT_YOURS: &str = "av1opt has no record of this pair, and naming its folders vouches only for a report and an output that are your own files, in a folder nobody else can write to (or one with the sticky bit)";
 
 /// What is said after the reason: the way through.
-const TRUST_REPORTS: &str = "if you trust this report all the same, add --trust-reports (on drives that show the same owner and permissions for every file, such as FAT, exFAT, NTFS and some network drives, that is the only way)";
+const TRUST_REPORTS: &str = "if you trust this report all the same, add --trust-reports";
 
 /// Why naming the folders does not vouch for the pair of `p`, which the record holds nothing
 /// of, if it does not: its report and its output have to be this user's own files in a folder
@@ -3721,6 +3721,26 @@ mod tests {
         let planted = plant(&f, &report, &f.lib("a.mp4"), &f.out("0.mkv"));
         let why = admitted_named(&f, &planted, false).unwrap_err();
         assert!(!why.contains("av1opt adopt") && why.contains("keep the one on record and remove the other and its report"), "{why}");
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
+
+    #[test]
+    fn a_pair_not_on_record_on_a_drive_that_keeps_no_owners_needs_trust_reports() {
+        let f = Fix::new("ownerless");
+        record_in(&f);
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        // The output folder on a FAT drive: the files show as the user's own in a private
+        // folder, as on any drive mounted so, whoever put them there.
+        crate::files::OWNERLESS_IN_TESTS.with_borrow_mut(|d| d.push(f.dir.join("out")));
+        let why = admitted_named(&f, &report, false).unwrap_err();
+        assert!(why.contains(&format!("{} is not one: it is on a FAT drive, which does not keep who owns a file", report.display())) && why.contains("add --trust-reports"), "{why}");
+        replace_named(&f, false).unwrap();
+        assert_eq!(std::fs::read(f.lib("a.mp4")).unwrap(), vec![b's'; 1000]);
+        adopt(&[f.dir.join("out"), f.dir.join("lib")], true, false, false).unwrap();
+        assert!(crate::ledger::load().entry(&f.out("a.mkv"), &f.lib("a.mp4")).is_none());
+        replace_named(&f, true).unwrap();
+        assert_eq!(std::fs::read(f.lib("a.mkv")).unwrap(), vec![b'o'; 400]);
+        crate::files::OWNERLESS_IN_TESTS.with_borrow_mut(Vec::clear);
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
     }
 }

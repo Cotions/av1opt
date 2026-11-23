@@ -49,10 +49,13 @@ single output files.
   are your own files in a folder nobody else can write to, or one with the sticky bit, which
   keeps everyone to their own files. Anyone who can put files in the output folder can copy a
   genuine report there, fingerprint of the original and all, and put a file of their own of the
-  stated size beside it. `--trust-reports` takes such reports at their word all the same; on
-  drives that show the same owner and permissions for every file (FAT, exFAT, NTFS, some
-  network drives) it is the only way. On a network drive what is shown is what the mount says,
-  and users of other machines may be able to write there whatever it shows.
+  stated size beside it. `--trust-reports` takes such reports at their word all the same. On
+  a drive that keeps no owners or permissions of its own it is the only way: FAT, exFAT and
+  NTFS drives, SMB (Windows) shares and FUSE drives (ntfs-3g, rclone, sshfs and the like) show
+  every file as the mount says, often as your own in a private folder, whoever put it there,
+  so av1opt does not take a report there for yours. On other network drives (NFS) what is
+  shown is what the server says, and users of other machines may be able to write there
+  whatever it shows.
 - Two reports the record knows nothing of that name the same original are both refused, each
   naming the other: one of them is not what it says. Remove the one you do not want.
 - Outputs that are not on record, such as those made before it began, are taken onto it by
@@ -104,4 +107,4 @@ single output files.
 | `--allow-zfs` | off | Also replace originals stored on ZFS. |
 | `--accept-changed-date` | off | Take an original whose date changed as the file that was encoded, where its report cannot tell; originals seen to differ are still refused. |
 | `--anywhere` | off | Follow reports to originals wherever they are, not only in the folders named. |
-| `--trust-reports` | off | Take reports that are not on record at their word where others could have put them there or changed them: in a folder others can write to, files of another user's, or a drive that shows one owner for every file. |
+| `--trust-reports` | off | Take reports that are not on record at their word where others could have put them there or changed them: in a folder others can write to, files of another user's, or a drive that keeps no owners of its own (FAT, exFAT, NTFS, SMB, FUSE). |

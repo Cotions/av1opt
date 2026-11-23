@@ -10,7 +10,7 @@ rotated, odd-sized, 4:4:4, wide-pixel and full-range sources, cover art in every
 can be, sound and picture offsets, AVI, WebM, MOV, MPEG and transport streams at six frame
 rates, very short videos, awkward file and folder names, skips, failures and name
 collisions, a scene-mode run killed half-way and resumed, an encode stopped half-way (nothing
-left behind, no ffmpeg left running, trials remembered), `--scenes=auto` on an even and an
+left behind, no ffmpeg left running, trials remembered), an encode killed at each step of finishing it (the output moved out, its report, the record, the history, the log) and run again, `--scenes=auto` on an even and an
 uneven video and the stretches of an uneven one that are encoded again without it (frame
 times, sound and frame order of the joined file against the source), `replace` with `--undo` on a
 real output, `scan` on a folder with a candidate, an AV1 file and a broken one (nothing in
@@ -35,4 +35,4 @@ videos, picks, spreading the test videos), the pick for a number of hours (again
 every subset, and on 30,000 videos), what a watched folder makes of the videos it finds, and `replace`: the round trip with `--undo`, an
 output with the original's own extension, an output on another drive, every refusal (and that a
 refusal moves nothing), a trash that fails, a name taken at the last moment, two runs on one
-report at once.
+report at once, and a replacement or an undo stopped between each two of its moves (on one drive and across two) and then run again either way.

@@ -7,6 +7,7 @@ ignored, as the XDG specification says, and the default under the home folder is
 |---|---|
 | `AV1OPT_FFMPEG`, `AV1OPT_FFPROBE` | The programs used where `--ffmpeg` and `--ffprobe` are not given. |
 | `AV1OPT_HISTORY` | The file of past encodes the estimates learn from, instead of `~/.local/share/av1opt/history.jsonl`. It has to name a file: a folder is said once and no history is used. |
+| `AV1OPT_STOP_AT` | For the tests: the name of a step of finishing an encode or of moving files for `replace` (`encode:moved`, `replace:trashed`, …, in the source as `stop_point`) at which the process kills itself, as a power cut would stop it. |
 | `AV1OPT_DEBUG` | Any value prints every ffmpeg command. |
 | `AV1OPT_UI_TOKEN` | The sign-in token of `av1opt ui`, at least 16 letters or digits, for a wrapper that loads the page itself. |
 | `AV1OPT_UI_EXIT_WITH_STDIN` | `1` makes `av1opt ui` stop when its standard input closes, so that it ends with the program that started it. |

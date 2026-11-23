@@ -13,6 +13,7 @@
 mod common;
 
 use serde_json::Value;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -2960,4 +2961,124 @@ fn chapters_stay_in_place_after_a_cut_wherever_the_file_starts() {
             assert!((s - ws).abs() < 0.05 && (e - we).abs() < 0.05 && t == wt, "{name}: {got:?}");
         }
     }
+}
+
+/// An encode of a short clip into `out` with the run killed at `step` (see `AV1OPT_STOP_AT`),
+/// as a power cut would end it there: nothing is cleaned up.
+fn encode_killed_at(name: &str, step: &str) -> (Case, PathBuf) {
+    use std::os::unix::process::ExitStatusExt;
+    let c = Case::new(name);
+    let src = c.clip("a.mp4", "320x180", 3);
+    let mut args: Vec<std::ffi::OsString> = vec!["encode".into(), "-o".into(), c.out().into()];
+    args.extend(FAST.iter().map(Into::into));
+    args.push(src.clone().into());
+    let o = c.command().env("AV1OPT_STOP_AT", step).args(&args).output().unwrap();
+    assert_eq!(o.status.signal(), Some(libc::SIGKILL), "not killed at {step}:\n{}", String::from_utf8_lossy(&o.stderr));
+    (c, src)
+}
+
+/// The lines of av1opt's own record and of the encode history.
+fn record_lines(c: &Case) -> (usize, usize) {
+    let lines = |name: &str| std::fs::read_to_string(c.dir.join("data/av1opt").join(name)).map_or(0, |t| t.lines().count());
+    (lines("ledger.jsonl"), lines("history.jsonl"))
+}
+
+/// What the run left in the output folder that is its own and hidden.
+fn left_hidden(c: &Case) -> Vec<String> {
+    c.outputs().into_iter().filter(|n| n.starts_with(".av1opt-tmp-") || n.starts_with(".av1opt-work-")).collect()
+}
+
+/// Replacing the original with the output, which needs a whole output and its report.
+fn replaces(c: &Case) {
+    let output = std::fs::read(c.out().join("a.mp4")).unwrap();
+    let r = c.av1opt(&[OsStr::new("replace"), c.out().as_os_str(), c.videos().as_os_str(), OsStr::new("--apply")]);
+    r.ok().has("1 original replaced");
+    assert!(std::fs::read(c.videos().join("a.mp4")).unwrap() == output && !c.out().join("a.mp4").exists());
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn an_encode_killed_before_its_output_left_the_temporary_folder_is_encoded_again() {
+    let (c, src) = encode_killed_at("killed-ready", "encode:ready");
+    assert!(!c.out().join("a.mp4").exists() && !c.out().join("a.av1opt.json").exists());
+    assert_eq!(record_lines(&c), (0, 0));
+    assert_eq!(left_hidden(&c).len(), 1, "{:?}", c.outputs());
+    c.encode(&[&src], &[]).ok().has("encoded 1, skipped 0, failed 0, already done 0");
+    assert!(left_hidden(&c).is_empty(), "{:?}", c.outputs());
+    assert_eq!(record_lines(&c), (1, 1));
+    replaces(&c);
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn an_encode_killed_with_its_output_in_place_and_no_report_is_not_taken_for_done() {
+    let (c, src) = encode_killed_at("killed-moved", "encode:moved");
+    let output = std::fs::read(c.out().join("a.mp4")).unwrap();
+    assert!(!c.out().join("a.av1opt.json").exists());
+    // Nothing tells it from a file somebody put there: it is left as it is, and said to be.
+    c.encode(&[&src], &[]).has("not verified, left alone (it has no report)").has("already done 0");
+    assert_eq!(std::fs::read(c.out().join("a.mp4")).unwrap(), output);
+    assert!(!c.out().join("a.av1opt.json").exists());
+    assert_eq!(record_lines(&c), (0, 0));
+    c.av1opt(&[OsStr::new("replace"), c.out().as_os_str(), c.videos().as_os_str(), OsStr::new("--apply")]).has("no av1opt reports");
+    assert!(src.exists());
+    std::fs::remove_file(c.out().join("a.mp4")).unwrap();
+    c.encode(&[&src], &[]).ok().has("encoded 1,");
+    replaces(&c);
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn an_encode_killed_once_its_report_was_written_is_done_and_can_replace_its_original() {
+    let (c, src) = encode_killed_at("killed-reported", "encode:reported");
+    assert!(c.out().join("a.mp4").exists() && c.out().join("a.av1opt.json").exists());
+    assert_eq!(record_lines(&c), (0, 0));
+    c.encode(&[&src], &[]).ok().has("encoded 0, skipped 0, failed 0, already done 1");
+    // Not on av1opt's record, so the page leaves it; named here, the report is vouched for.
+    c.av1opt(&[OsStr::new("adopt"), c.out().as_os_str(), c.videos().as_os_str(), OsStr::new("--apply")]).ok().has("1 output taken on record");
+    assert_eq!(record_lines(&c), (1, 0));
+    replaces(&c);
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn an_encode_killed_once_on_record_is_done_and_can_replace_its_original() {
+    let (c, src) = encode_killed_at("killed-recorded", "encode:recorded");
+    assert_eq!(record_lines(&c), (1, 0));
+    c.encode(&[&src], &[]).ok().has("encoded 0, skipped 0, failed 0, already done 1");
+    replaces(&c);
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn an_encode_killed_once_in_the_history_is_done_and_can_replace_its_original() {
+    let (c, src) = encode_killed_at("killed-history", "encode:history");
+    assert_eq!(record_lines(&c), (1, 1));
+    c.encode(&[&src], &[]).ok().has("encoded 0, skipped 0, failed 0, already done 1");
+    assert_eq!(record_lines(&c), (1, 1));
+    replaces(&c);
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn an_encode_killed_before_its_line_in_the_log_is_done_and_leaves_only_an_empty_folder() {
+    let (c, src) = encode_killed_at("killed-finished", "encode:finished");
+    let log = std::fs::read_to_string(c.out().join("av1opt-log.tsv")).unwrap_or_default();
+    assert!(!log.contains("\tok\t"), "{log}");
+    // The temporary folder holds nothing by then; it goes with the next encode into this folder.
+    let left = left_hidden(&c);
+    assert_eq!(left.len(), 1, "{:?}", c.outputs());
+    assert_eq!(std::fs::read_dir(c.out().join(&left[0])).unwrap().count(), 0);
+    c.encode(&[&src], &[]).ok().has("encoded 0, skipped 0, failed 0, already done 1");
+    replaces(&c);
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn an_encode_killed_once_its_line_was_in_the_log_is_done_and_can_replace_its_original() {
+    let (c, src) = encode_killed_at("killed-logged", "batch:logged");
+    assert!(std::fs::read_to_string(c.out().join("av1opt-log.tsv")).unwrap().contains("\tok\t"));
+    assert!(left_hidden(&c).is_empty(), "{:?}", c.outputs());
+    c.encode(&[&src], &[]).ok().has("encoded 0, skipped 0, failed 0, already done 1");
+    replaces(&c);
 }

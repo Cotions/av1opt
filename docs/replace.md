@@ -78,7 +78,13 @@ single output files.
   original to its place. After the trash is emptied there is nothing to undo. The trash has
   to agree: a file goes back only if the trash's own record says it came from that place, and
   only if all of it is still what was recorded of the original (read whole against its hash, or
-  against its samples where a report has only those), whatever its date says.
+  against its samples where a report has only those), whatever its date says. `--undo` asks
+  of a report what replacing does: where av1opt's record holds the replacement, the report has
+  to say what the record does (where the original went in the trash, where the AV1 file came
+  from); where it holds nothing, the original's place has to be in the folders named and the
+  report your own file in a folder nobody else can write to, or `--trust-reports` given.
+  Otherwise a copy of a report in a shared folder could send your AV1 file out of the library
+  to a name of someone else's choosing.
 - av1opt's own record notes each replacement and undo before the report is rewritten. A
   report left behind (the disk was full, or the run was killed in between) is set right by
   the next `replace`, `--undo` or the page, once the record, the trash and the files (read

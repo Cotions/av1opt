@@ -149,7 +149,9 @@ enum Cmd {
         #[arg(long)]
         apply: bool,
         /// The other way round: take replaced originals back out of the trash and return the
-        /// AV1 files to where they were (also needs --apply to act).
+        /// AV1 files to where they were (also needs --apply to act). Reports are judged as for
+        /// replacing: by av1opt's record where it holds the replacement, otherwise only your
+        /// own in a folder nobody else can write to, unless --trust-reports is given.
         #[arg(long)]
         undo: bool,
         /// Also replace originals stored on ZFS.

@@ -390,6 +390,23 @@ impl Ledger {
         (!others.is_empty()).then(|| others.join(" and "))
     }
 
+    /// What this record says of a replacement `replace --undo` on the command line is about to
+    /// put back, asked before the report's word or the folders named count for anything: None if
+    /// it holds nothing of the AV1 file in the original's place nor of any output of that
+    /// original, and otherwise whether the report's replacement is the one on record.
+    pub fn judges_replaced(&self, d: &Replaced) -> Option<Result<(), String>> {
+        if self.known_as(&d.dest).is_none() && self.outputs_of(&d.source).is_none() {
+            return None;
+        }
+        if let Some(e) = self.known_as(&d.dest).filter(|e| !Self::of_source(e, &d.source)) {
+            return Some(Err(format!("av1opt's record says the file at {} came from another original, {}, so this report is not followed", d.dest.display(), e.source.display())));
+        }
+        if self.entry(&d.dest, &d.source).is_none_or(|e| e.replaced.is_none()) {
+            return Some(Err(format!("av1opt's record does not say that {} took the place of {}, so this report is not followed", d.dest.display(), d.source.display())));
+        }
+        Some(self.check_replaced(d).map_err(|_| "the report does not say what av1opt recorded of this replacement (where the original went in the trash, or where the AV1 file came from), so it is not followed".to_string()))
+    }
+
     /// Whether the page may undo this replacement: the original, the trash entry and the place
     /// the AV1 file goes back to have to be the ones on record, whatever the report says.
     pub fn check_replaced(&self, d: &Replaced) -> Result<(), String> {

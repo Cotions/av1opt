@@ -986,8 +986,8 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
         if cut.is_some() {
             // The sound and the rest of a cut are the finished encode's.
             let finished = probe::probe(&tools.ffprobe, &partial, std::fs::metadata(&partial)?.len())?;
-            let count = stream_count(tools, &partial)?;
-            return Ok(revideo_args(video, first, &partial, &finished, count, &streams, &info, o.container, out, said));
+            let kinds = stream_kinds(tools, &partial)?;
+            return Ok(revideo_args(video, first, &partial, &finished, &kinds, &covers, &streams, &info, o.container, out, said));
         }
         Ok(mux_args(video, false, first, input, &info, o.container, o.audio, &covers, &meta, &o.meta, out, said))
     };
@@ -1654,14 +1654,16 @@ fn bare_stream_marks(info: &MediaInfo, marks: &mut Vec<String>, notes: &mut Vec<
 /// finished file (`finished`, which holds `streams`), whose every other stream, tag, mark and
 /// chapter is kept as it is. For an encode with sections removed: its sound, subtitles and
 /// chapters came out of the cut and are not the source's to take again. What the result
-/// holds comes back with the arguments, as from `mux_args`.
+/// holds comes back with the arguments, as from `mux_args`. `finished_streams` is what
+/// `stream_kinds` says of the finished file, `cover_files` what its one pass attached.
 #[allow(clippy::too_many_arguments)]
 fn revideo_args(
     video: &Path,
     video_first: f64,
     finished: &Path,
     finished_info: &MediaInfo,
-    finished_streams: usize,
+    finished_streams: &[(String, bool)],
+    cover_files: &[CoverFile],
     streams: &Streams,
     info: &MediaInfo,
     container: Container,
@@ -1672,8 +1674,26 @@ fn revideo_args(
     let offset = finished_info.video_start - finished_info.start_time - video_first;
     let mut a: Vec<String> = ["-y", "-v", "error", "-copyts", "-itsoffset", &format!("{offset:.6}"), "-i", &path_arg(video)].map(String::from).to_vec();
     a.extend(["-itsoffset".into(), format!("{:.6}", -finished_info.start_time), "-i".into(), path_arg(finished)]);
-    // The finished file's video stream is its first: everything after it stays in its order.
-    a.extend(["-map", "0:v", "-map", "1", "-map", "-1:v:0", "-c", "copy", "-field_order:v:0", "progressive"].map(String::from));
+    // The finished file's video stream is its first: what comes after it stays in its order,
+    // but for two kinds of stream a copy does not leave as they are. The chapters of an MP4
+    // are a track of their own, which ffmpeg hands on as a track of data beside the chapters
+    // it writes: every repaired cut with chapters held one, marked as a camera's telemetry
+    // ("gpmd"). And the cover of a Matroska file is an attachment, which a copy makes a
+    // second video track of one frame: it is attached from its file, as in the one pass.
+    a.extend(["-map", "0:v"].map(String::from));
+    let mut kept = vec![0];
+    let mut attachments = 0;
+    for (i, (kind, cover)) in finished_streams.iter().enumerate().skip(1) {
+        if kind == "data" || (container == Container::Mkv && *cover) {
+            continue;
+        }
+        if kind == "attachment" {
+            attachments += 1;
+        }
+        a.extend(["-map".into(), format!("1:{i}")]);
+        kept.push(i);
+    }
+    a.extend(["-c", "copy", "-field_order:v:0", "progressive"].map(String::from));
     if let Some(aspect) = display_aspect(info) {
         a.extend(["-aspect:v:0".into(), aspect]);
     }
@@ -1682,7 +1702,7 @@ fn revideo_args(
     a.extend(bare_stream_marks(info, &mut streams.view_marks, notes));
     a.extend(["-map_metadata", "1", "-map_chapters", "1"].map(String::from));
     // Naming one stream's tags turns off ffmpeg's copying for all of them: each is named.
-    a.extend((0..finished_streams).flat_map(|k| [format!("-map_metadata:s:{k}"), format!("1:s:{k}")]));
+    a.extend(kept.iter().enumerate().flat_map(|(k, i)| [format!("-map_metadata:s:{k}"), format!("1:s:{i}")]));
     // MP4 keeps a track's name where ffmpeg reads it as one tag and writes it from another
     // (see `title_args`): copied as tags, the names of a repaired MP4 were lost.
     a.extend(title_args("v:0", &finished_info.video_track, container));
@@ -1695,6 +1715,15 @@ fn revideo_args(
     if !finished_info.video_disposition.is_empty() {
         a.extend(["-disposition:v:0".into(), finished_info.video_disposition.clone()]);
     }
+    if container == Container::Mkv {
+        // After the attachments that were copied, each with its name and type (see `stream_args`).
+        for (k, f) in cover_files.iter().enumerate() {
+            let t = attachments + k;
+            a.extend(["-attach".into(), path_arg(&f.path)]);
+            a.extend([format!("-metadata:s:t:{t}"), format!("mimetype={}", f.mime)]);
+            a.extend([format!("-metadata:s:t:{t}"), format!("filename={}", f.name)]);
+        }
+    }
     if container == Container::Mp4 {
         a.extend(["-movflags", "+faststart"].map(String::from));
         if !info.view_marks.is_empty() {
@@ -1705,15 +1734,27 @@ fn revideo_args(
     (a, streams)
 }
 
-/// How many streams a file holds.
-fn stream_count(tools: &Tools, path: &Path) -> Result<usize> {
+/// The streams of a file in its order: the kind of each as ffprobe names it ("video", "audio",
+/// "subtitle", "data", "attachment"), and whether it is a cover.
+fn stream_kinds(tools: &Tools, path: &Path) -> Result<Vec<(String, bool)>> {
     let mut command = crate::tools::probe_command(&tools.ffprobe);
-    command.args(["-v", "error", "-show_entries", "stream=index", "-of", "csv=p=0"]).arg(crate::tools::probe_arg(path));
+    command.args(["-v", "error", "-show_entries", "stream=index,codec_type:stream_disposition=attached_pic", "-of", "csv=p=0"]).arg(crate::tools::probe_arg(path));
     let out = probe::run_ffprobe(command, probe::Reads::Little)?;
     if !out.status.success() {
         bail!("ffprobe: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
-    Ok(String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.trim().is_empty()).count())
+    Ok(parse_stream_kinds(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// A line a stream of ffprobe's `index,codec_type,attached_pic`.
+fn parse_stream_kinds(text: &str) -> Vec<(String, bool)> {
+    text.lines()
+        .filter_map(|l| {
+            let mut f = l.trim().split(',');
+            let (_, kind, cover) = (f.next()?, f.next()?, f.next());
+            (!kind.is_empty()).then(|| (kind.to_string(), cover == Some("1")))
+        })
+        .collect()
 }
 
 /// Channel layouts libopus takes as they are, with their channels in ffmpeg's order, fewest
@@ -3773,6 +3814,32 @@ mod tests {
     }
 
     #[test]
+    fn a_repaired_cut_keeps_its_chapters_and_covers_as_the_one_pass_wrote_them() {
+        let source = info(&[]);
+        let finished = stream_args(&source, 0, Container::Mp4, Audio::Keep, &[], None, &mut Vec::new());
+        let kind = |k: &str, cover| (k.to_string(), cover);
+        let maps = |a: &[String]| a.windows(2).filter(|w| w[0] == "-map").map(|w| w[1].clone()).collect::<Vec<_>>();
+        let tags = |a: &[String]| a.windows(2).filter(|w| w[0].starts_with("-map_metadata:s:")).map(|w| format!("{} {}", w[0], w[1])).collect::<Vec<_>>();
+        // An MP4 as ffprobe lists it: the chapters are its third stream, the cover its fifth.
+        // Copied with the rest, the chapter track came out as a track of data beside the
+        // chapters ffmpeg wrote, and every stream after it took the tags of the one before.
+        let mp4 = [kind("video", false), kind("audio", false), kind("data", false), kind("subtitle", false), kind("video", true)];
+        let (a, _) = revideo_args(Path::new("v.ivf"), 0.0, Path::new("partial.mp4"), &source, &mp4, &[], &finished, &source, Container::Mp4, Path::new("o.mp4"), &mut Vec::new());
+        assert_eq!(maps(&a), ["0:v", "1:1", "1:3", "1:4"], "{a:?}");
+        assert_eq!(tags(&a), ["-map_metadata:s:0 1:s:0", "-map_metadata:s:1 1:s:1", "-map_metadata:s:2 1:s:3", "-map_metadata:s:3 1:s:4"], "{a:?}");
+        assert!(a.windows(2).any(|w| w == ["-map_chapters", "1"]) && !a.iter().any(|x| x == "-attach"), "{a:?}");
+        // A Matroska file: a font, then the cover, which a copy made a video track of one frame.
+        let mkv = [kind("video", false), kind("audio", false), kind("subtitle", false), kind("attachment", false), kind("video", true)];
+        let cover = [CoverFile { path: "cover0.png".into(), mime: "image/png", name: "front.png".into() }];
+        let (a, _) = revideo_args(Path::new("v.ivf"), 0.0, Path::new("partial.mkv"), &source, &mkv, &cover, &finished, &source, Container::Mkv, Path::new("o.mkv"), &mut Vec::new());
+        assert_eq!(maps(&a), ["0:v", "1:1", "1:2", "1:3"], "{a:?}");
+        let at = a.iter().position(|x| x == "-attach").expect("the cover is attached");
+        assert!(a[at + 1].ends_with("cover0.png"), "{a:?}");
+        assert_eq!(a[at + 2..at + 6], ["-metadata:s:t:1", "mimetype=image/png", "-metadata:s:t:1", "filename=front.png"], "{a:?}");
+        assert_eq!(parse_stream_kinds("0,video,0\n1,audio,0\n2,data,0\n3,video,1\n"), [kind("video", false), kind("audio", false), kind("data", false), kind("video", true)]);
+    }
+
+    #[test]
     fn a_repaired_cut_is_not_asked_for_the_360_degree_mark_that_no_bare_stream_can_be_given() {
         let mut source = info(&[]);
         source.view_marks = vec!["Stereo 3D".into(), "Spherical Mapping".into()];
@@ -3781,7 +3848,8 @@ mod tests {
         // The one pass of the cut kept both marks, and its check asked for both.
         let finished = stream_args(&source, 0, Container::Mp4, Audio::Keep, &[], None, &mut notes);
         assert_eq!(finished.view_marks, source.view_marks);
-        let (args, streams) = revideo_args(Path::new("v.ivf"), 0.0, Path::new("partial.mp4"), &source, 2, &finished, &source, Container::Mp4, Path::new("o.mp4"), &mut notes);
+        let kinds = [("video".to_string(), false), ("audio".to_string(), false)];
+        let (args, streams) = revideo_args(Path::new("v.ivf"), 0.0, Path::new("partial.mp4"), &source, &kinds, &[], &finished, &source, Container::Mp4, Path::new("o.mp4"), &mut notes);
         assert!(args.windows(2).any(|w| w == ["-stereo3d:v:0", "tb"]), "{args:?}");
         // Asked of the file joined from the stretches encoded again, the 360 degree mark
         // failed the encode after its search, its one pass and its repairs.
@@ -3790,7 +3858,7 @@ mod tests {
         assert_eq!((streams.audio, streams.subs), (finished.audio, finished.subs));
         source.stereo3d = "frame alternate".into();
         notes.clear();
-        let (args, streams) = revideo_args(Path::new("v.ivf"), 0.0, Path::new("partial.mkv"), &source, 2, &finished, &source, Container::Mkv, Path::new("o.mkv"), &mut notes);
+        let (args, streams) = revideo_args(Path::new("v.ivf"), 0.0, Path::new("partial.mkv"), &source, &kinds, &[], &finished, &source, Container::Mkv, Path::new("o.mkv"), &mut notes);
         assert!(!args.iter().any(|a| a == "-stereo3d:v:0"), "{args:?}");
         assert!(streams.view_marks.is_empty());
         assert!(notes.len() == 2 && notes[0].starts_with("the 3D mark (frame alternate) is lost"), "{notes:?}");

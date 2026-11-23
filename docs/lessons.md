@@ -226,5 +226,11 @@
   of pictures encoded again at a join put a removed frame into the file. Both read the sound
   as well now (one packet of it for a stretch, copied to nowhere), which gives them the
   encode's clock by the same rule that gave the encode its own.
+- **A copy of every stream is not a copy of the file.** The video of a repaired cut is put
+  into the finished file with `-map 1 -c copy` for the rest. ffmpeg reads the track an MP4
+  keeps its chapters in as a stream of data and wrote it back beside the chapters themselves,
+  marked "gpmd"; it reads the cover of a Matroska file, an attachment, as a video stream and
+  wrote it back as a second video track of one frame. The streams are now named one by one,
+  the chapter track left to `-map_chapters` and the cover attached from its file.
 - **ffmpeg ignores `-svtav1-params` names it can't parse.** A typo only prints a warning and the
   encode runs without the option, so parameters are tried on a few generated frames first.

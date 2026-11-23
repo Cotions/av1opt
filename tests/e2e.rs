@@ -815,12 +815,14 @@ fn a_cut_video_whose_weak_stretch_the_samples_miss_is_repaired_frame_for_frame_a
     let c = Case::new("cut-repair");
     let clip = weak_numbered_clip(&c, "weak.mp4");
     assert_eq!(frame_numbers(&clip), (0..576).collect::<Vec<u32>>());
-    // With names, a subtitle line and chapters, in Matroska, to see that the repaired file keeps
-    // what the cut made of them.
+    // With names, a subtitle line, chapters and a cover, in Matroska, to see that the repaired
+    // file keeps what the cut made of them.
+    c.ffmpeg(&["-f", "lavfi", "-i", "color=c=blue:s=64x64", "-frames:v", "1", "cover.png"]);
     std::fs::write(c.videos().join("line.srt"), "1\n00:00:08,000 --> 00:00:09,000\nAfter the cut\n").unwrap();
     std::fs::write(c.videos().join("chapters.txt"), ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=8000\ntitle=One\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=8000\nEND=24000\ntitle=Two\n").unwrap();
     c.ffmpeg(&[
         "-i", "weak.mp4", "-i", "line.srt", "-f", "ffmetadata", "-i", "chapters.txt", "-map", "0", "-map", "1", "-map_chapters", "2", "-c", "copy",
+        "-attach", "cover.png", "-metadata:s:t", "mimetype=image/png", "-metadata:s:t", "filename=cover.png",
         "-metadata:s:v:0", "title=Main picture", "-metadata:s:a:0", "title=Commentary", "-metadata:s:a:0", "language=fra", "-metadata:s:s:0", "language=eng", "weak.mkv",
     ]);
     let src = c.videos().join("weak.mkv");
@@ -852,6 +854,12 @@ fn a_cut_video_whose_weak_stretch_the_samples_miss_is_repaired_frame_for_frame_a
         assert!((duration(&out) - 20.0).abs() < 0.1, "{}", p["format"]);
         assert_eq!((track_name(v), track_name(a), tag(a, "language"), tag(s, "language")), (Some("Main picture"), Some("Commentary"), Some("fra"), Some("eng")), "{container}: {p}");
         assert_eq!(v["disposition"]["default"], 1, "{container}: {v}");
+        // And no stream more than the cut made. Copied with the rest, the track an MP4 keeps
+        // its chapters in came out a second time as a track of data, and the cover of a
+        // Matroska file, an attachment, as a second video track.
+        let count = |kind: &str, cover: i64| p["streams"].as_array().unwrap().iter().filter(|s| s["codec_type"] == kind && s["disposition"]["attached_pic"] == cover).count();
+        assert_eq!((count("video", 0), count("video", 1), count("audio", 0), count("subtitle", 0), count("data", 0)), (1, 1, 1, 1, usize::from(container == "mp4")), "{container}: {p}");
+        assert_eq!(p["streams"].as_array().unwrap().len(), if container == "mp4" { 5 } else { 4 }, "{container}: {p}");
         let chapters: Vec<(f64, String)> = p["chapters"].as_array().unwrap().iter().map(|ch| (ch["start_time"].as_str().unwrap().parse().unwrap(), tag(ch, "title").unwrap_or("").to_string())).collect();
         assert!(chapters.len() == 2 && (chapters[1].0 - 4.0).abs() < 0.05 && chapters[1].1 == "Two", "{container}: {chapters:?}");
         let line = Command::new(ffmpeg_bin()).args(["-v", "error", "-i"]).arg(&out).args(["-map", "0:s:0", "-f", "srt", "-"]).output().unwrap();

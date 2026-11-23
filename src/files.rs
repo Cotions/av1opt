@@ -355,12 +355,16 @@ fn others_may_have_written_of(path: &Path, file: &std::fs::File, me: u32, owners
     if others_may_write(file, meta.mode(), meta.gid()) {
         return Some("other users can write to it".into());
     }
-    let dir = folder_of(path);
+    // The folder as it is reached now, links on the way followed (an output folder named by a
+    // link in the home folder, say): it is that folder that is judged, and it has to hold this
+    // very file under its name, its one name on the drive.
+    let real = in_real_folder(path);
+    let dir = folder_of(&real);
     let folder = match open_folder(dir) {
         Ok(folder) => folder,
         Err(e) => return Some(format!("its folder {} cannot be looked at ({e})", dir.display())),
     };
-    let Some(name) = path.file_name().and_then(|n| std::ffi::CString::new(n.as_bytes()).ok()) else {
+    let Some(name) = real.file_name().and_then(|n| std::ffi::CString::new(n.as_bytes()).ok()) else {
         return Some("it has no name of its own".into());
     };
     // SAFETY: fstatat on a descriptor we own, with a valid NUL-terminated name, fills the
@@ -1179,6 +1183,24 @@ pub(crate) mod tests {
         std::fs::rename(&path, dir.join("moved")).unwrap();
         std::fs::write(&path, b"{}").unwrap();
         assert!(others_may_have_written(&path, &opened).is_some_and(|why| why.contains("moved or replaced")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_in_a_folder_named_by_a_link_is_judged_by_the_folder_the_link_leads_to() {
+        let dir = room("own-by-link");
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(real.join("a.av1opt.json"), b"{}").unwrap();
+        std::os::unix::fs::symlink(&real, dir.join("link")).unwrap();
+        let path = dir.join("link/a.av1opt.json");
+        let judged = || others_may_have_written(&path, &std::fs::File::open(&path).unwrap());
+        assert_eq!(judged(), None);
+        // What is judged is the folder it leads to.
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(judged().is_some_and(|why| why.contains(&format!("other users can write to its folder {}", real.display()))), "{:?}", judged());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

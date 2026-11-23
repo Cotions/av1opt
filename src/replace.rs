@@ -3832,4 +3832,15 @@ mod tests {
         assert!(f.lib("a.mp4").exists() && f.out("a.mkv").exists());
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
     }
+
+    #[test]
+    fn a_pair_not_on_record_in_an_output_folder_named_by_a_link_is_judged_by_the_folder_it_leads_to() {
+        let f = Fix::new("out-by-link");
+        record_in(&f);
+        f.encode("a.mp4", "a.mkv", 1000, 400);
+        std::os::unix::fs::symlink(f.dir.join("out"), f.dir.join("outlink")).unwrap();
+        run_watched(&[f.dir.join("outlink"), f.dir.join("lib")], true, false, true, false, false, false, &|| {}).unwrap();
+        assert_eq!(std::fs::read(f.lib("a.mkv")).unwrap(), vec![b'o'; 400]);
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
 }

@@ -62,6 +62,13 @@ single output files.
   the next `replace`, `--undo` or the page, once the record, the trash and the files (read
   whole) all show what happened; a replacement whose report could not be written ends with
   an error that says where both files are and what puts them back.
+- A replacement or an undo stopped between two of its moves (killed, or the power went) is
+  put right the same way, by the record and the files and never by the report's word: a
+  replacement stopped once the original was in the trash is put back as it was before it
+  (the original back in its place, the AV1 file back in the output folder, a copy of it on
+  another drive removed), and an undo stopped while the original was still in the trash goes
+  back to the replacement; an undo that had both files back is finished. `--apply` then does
+  what was asked; without it the list says what was stopped half-way and where the original is.
 - Originals on ZFS are left alone unless `--allow-zfs` is given, and are put back there by
   `--undo` only with it.
 - A later `encode` or `scan` over the library sees the replaced files as AV1 and skips them.

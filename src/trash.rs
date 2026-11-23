@@ -352,6 +352,38 @@ fn holds_with(trashed: &Path, original: &Path, is_top: &dyn Fn(&Path) -> bool) -
     inner().unwrap_or(false)
 }
 
+/// The files in the trash that say they came from `original`: in the user's own trash and in
+/// the trash folders at the top of the original's drive, where [`trash`] puts a file of that
+/// place. The newest first. What each is has yet to be shown (see [`holds`]): an info file
+/// alone is no proof.
+pub fn entries_from(original: &Path) -> Vec<PathBuf> {
+    // SAFETY: getuid has no failure mode and touches no memory.
+    let uid = unsafe { libc::getuid() };
+    let mut bins: Vec<PathBuf> = home_trash().into_iter().collect();
+    let folder = original.parent().unwrap_or(Path::new("/"));
+    if let Ok(dev) = std::fs::metadata(folder).map(|m| m.dev()) {
+        let top = std::iter::once(folder).chain(folder.ancestors().skip(1)).take_while(|d| std::fs::metadata(d).is_ok_and(|m| m.dev() == dev)).last();
+        if let Some(top) = top {
+            bins.push(top.join(".Trash").join(uid.to_string()));
+            bins.push(top.join(format!(".Trash-{uid}")));
+        }
+    }
+    let mut found: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for bin in bins {
+        for entry in std::fs::read_dir(bin.join("info")).into_iter().flatten().flatten() {
+            use std::os::unix::ffi::OsStrExt;
+            let name = entry.file_name();
+            let Some(stem) = name.as_bytes().strip_suffix(b".trashinfo") else { continue };
+            let trashed = bin.join("files").join(std::ffi::OsStr::from_bytes(stem));
+            if says_came_from(&trashed, original) {
+                found.push((entry.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH), trashed));
+            }
+        }
+    }
+    found.sort_by_key(|f| std::cmp::Reverse(f.0));
+    found.into_iter().map(|(_, p)| p).collect()
+}
+
 /// Puts a file `trash` moved away back at `to` and drops its info file. Nothing at `to` is
 /// replaced.
 pub fn restore(trashed: &Path, to: &Path) -> Result<()> {

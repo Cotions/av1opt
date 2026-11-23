@@ -205,10 +205,15 @@ av1opt encode talk.mp4 -o /out --remove 0:00-0:42 --remove 12:03.5-14:10 --remov
 Leaves those parts out of the output (one input file only). Times are `h:mm:ss`, `m:ss` or
 seconds, with decimals; `end` (or nothing after the dash) means the end of the video. Sections
 may overlap and come in any order. The video is re-encoded anyway, so the cuts are
-frame-accurate: the kept parts are trimmed from the decoded source and joined (ffmpeg
-`trim`/`concat`). Audio is cut the same way and re-encoded to Opus; text subtitles and chapters
+frame-accurate: the frames of the kept parts are picked from the decoded source and moved back
+by what was removed before them (ffmpeg `select`/`setpts`), the sound is trimmed and joined
+(`atrim`/`concat`). A frame is removed if it is shown from inside a section; a kept part ends
+where its last frame does, picture and sound alike, so that the parts after it stay where the
+timeline puts them (a variable-rate source is cut at the times given). A frame held across a
+section is shown that much less, as the sound is. Audio is re-encoded to Opus; text subtitles and chapters
 are moved to their new times (lines and chapters inside removed parts go); image subtitles
-(PGS, DVD) and TTML are dropped. Sample clips and spot checks are taken from kept parts only. A cut is
+(PGS, DVD) and TTML are dropped. Sample clips and spot checks are taken from kept parts only; a
+spot check compares the frames of one kept part with the same frames where the output shows them. A cut is
 never skipped for being AV1 already or saving too little, and if the VMAF target is out of reach
 it is encoded at the best CRF tried. At least one second of the video has to stay: sections
 that remove all of it, or all but a moment, are refused before the encode starts, and the web UI

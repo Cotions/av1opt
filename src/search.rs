@@ -306,8 +306,8 @@ pub fn snap_seek(t: f64, fps: f64, first_frame: f64) -> f64 {
 }
 
 /// Where a clip lies in its file, in the file's time (see [`clip_place`]).
-#[derive(Debug, PartialEq)]
-struct ClipPlace {
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub struct ClipPlace {
     /// Where decoding starts, a run-in before the clip. None where the clip is so near the
     /// first frame that decoding from the start costs no more.
     seek: Option<f64>,
@@ -316,10 +316,23 @@ struct ClipPlace {
     from: f64,
 }
 
+impl ClipPlace {
+    /// The clip, of no frame before `first`.
+    pub fn not_before(self, first: f64) -> ClipPlace {
+        ClipPlace { from: self.from.max(first), ..self }
+    }
+
+    /// The same frames in a file that shows each of them `by` seconds earlier: an encode
+    /// with sections removed.
+    pub fn earlier(self, by: f64) -> ClipPlace {
+        ClipPlace { seek: self.seek.map(|s| s - by).filter(|s| *s > 0.0), from: self.from - by }
+    }
+}
+
 /// The place of the clip at `start` seconds of a file whose frames come `rate` a second, the
 /// first of them at `first_frame`. It depends on nothing but these, so that a file and its
 /// encode, and a cut that seeks and one that decodes from the start, take the same frames.
-fn clip_place(start: f64, rate: f64, first_frame: f64) -> ClipPlace {
+pub fn clip_place(start: f64, rate: f64, first_frame: f64) -> ClipPlace {
     let into_picture = (start - first_frame).max(0.0);
     if rate.is_nan() || rate <= 0.0 {
         return ClipPlace { seek: (into_picture > PREROLL_SECS).then_some(start - PREROLL_SECS), from: start };
@@ -352,7 +365,22 @@ pub fn extract_reference(
     secs: f64,
     out: &Path,
 ) -> Result<u64> {
-    let place = clip_place(start, cfr_value(info), first_frame);
+    extract_reference_at(tools, input, info, is_source, file_start, clip_place(start, cfr_value(info), first_frame), None, secs, out)
+}
+
+/// [`extract_reference`] of the clip at `place`, in the file's time, of no frame from `until` on.
+#[allow(clippy::too_many_arguments)]
+pub fn extract_reference_at(
+    tools: &Tools,
+    input: &Path,
+    info: &MediaInfo,
+    is_source: bool,
+    file_start: f64,
+    place: ClipPlace,
+    until: Option<f64>,
+    secs: f64,
+    out: &Path,
+) -> Result<u64> {
     let cut = |seek: Option<f64>| -> Result<u64> {
         let mut vf = if is_source { source_filters(info) } else { Vec::new() };
         // The frames are chosen by the file's own timestamps (`-copyts`): where the decoder
@@ -364,9 +392,10 @@ pub fn extract_reference(
         // key frames far apart), and then the first frame seen is not the clip's first. Such a
         // cut keeps nothing, and is made again from further back.
         let from = place.from + file_start;
+        let before = until.map_or_else(String::new, |u| format!("*lt(t,{:.6})", u + file_start));
         vf.push(match seek {
-            Some(_) => format!("select='gte(t,{from:.6})*if(eq(n,0),st(0,lt(t,{from:.6})),ld(0))'"),
-            None => format!("select='gte(t,{from:.6})'"),
+            Some(_) => format!("select='gte(t,{from:.6}){before}*if(eq(n,0),st(0,lt(t,{from:.6})),ld(0))'"),
+            None => format!("select='gte(t,{from:.6}){before}'"),
         });
         // Time counts from the first frame kept before frames are put on the constant-rate
         // grid: every frame is then at a whole number of frame times, give or take the
@@ -405,7 +434,7 @@ pub fn extract_reference(
             return Ok(frames);
         }
     }
-    bail!("no picture at {} in {}: the video ends earlier than it says, or is damaged", crate::tools::hms(start), input.display())
+    bail!("no picture at {} in {}: the video ends earlier than it says, or is damaged", crate::tools::hms(place.from.max(0.0)), input.display())
 }
 
 /// When a file's first video frame is shown, counted from the start of the file (other

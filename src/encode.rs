@@ -594,7 +594,10 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     }
     // Removing sections is an edit the user asked for, so the output is wanted even when the
     // re-encode alone wouldn't be worth it.
-    let cut = if o.remove.is_empty() { None } else { Some(Sections::new(&o.remove, info.duration_s)?) };
+    // On the frames' constant grid where there is one; frames that keep times of their own are
+    // cut where the sections say.
+    let on_frames = |s: Sections| if info.vfr { Ok(s) } else { s.on_frames(search::cfr_value(&info), info.picture_start()) };
+    let cut = if o.remove.is_empty() { None } else { Some(on_frames(Sections::new(&o.remove, info.duration_s)?)?) };
     // (The parts kept are counted along the whole file; samples and checks taken where there
     // is sound and no picture would have nothing in them.)
     if cut.is_some() && info.duration_s - info.picture_end() > 1.0 {
@@ -2400,6 +2403,8 @@ fn lengths_to_compare(info: &MediaInfo, out: &MediaInfo, cut: Option<&Sections>)
 
 /// VMAF of `secs` seconds of the output from `start` against the source from `src_start`,
 /// both cut out and compared by themselves. `name` keeps the cuts of different checks apart.
+/// `part`: sections were removed, and these are the frames of the kept part the clip lies in,
+/// as for [`Sections::picture_of`].
 #[allow(clippy::too_many_arguments)]
 fn spot_check(
     tools: &Tools,
@@ -2408,6 +2413,7 @@ fn spot_check(
     out: &Path,
     out_info: &MediaInfo,
     (start, src_start, secs): (f64, f64, f64),
+    part: Option<(f64, Option<f64>)>,
     retry_below: f64,
     threads: usize,
     tmp: &Path,
@@ -2416,8 +2422,36 @@ fn spot_check(
     let (model, pix) = (search::vmaf_model(info), search::reference_pix_fmt(info));
     let r = tmp.join(format!("{name}.ref.mkv"));
     let d = tmp.join(format!("{name}.out.mkv"));
-    search::extract_reference(tools, input, info, true, search::first_frame(info), info.start_time, src_start, secs, &r)?;
-    search::extract_reference(tools, out, info, false, search::first_frame(out_info), out_info.start_time, start, secs, &d)?;
+    let rate = search::cfr_value(info);
+    let place = search::clip_place(src_start, rate, search::first_frame(info));
+    let ((place, until), (out_place, out_until)) = match part {
+        None => ((place, None), (search::clip_place(start, rate, search::first_frame(out_info)), None)),
+        // Each file's clip used to start a quarter of a frame before the frame nearest its
+        // start on the grid of the source's rate. The output's frames are on that grid after a
+        // cut only if they were in the source and the cut moved them by whole frames: those of
+        // a source whose frames come when they like, cut at the times given, are not, and the
+        // output's clip began a frame before the source's. Resampled to the rate, the two were
+        // then out of step by a fraction of a frame that no shift by whole frames set right (a
+        // screen recording read VMAF 81 where it scores 92). Nor may either clip reach past its
+        // part, where the source has removed frames and the output the next part's.
+        // The output's clip is the source's, moved by what was removed before it, and both
+        // hold the frames of the part alone. (Less a little for the output, whose times were
+        // rounded to its time base.)
+        Some((first, until)) => {
+            let place = place.not_before(first);
+            let by = src_start - start + 6e-4;
+            ((place, until), (place.earlier(by), until.map(|u| u - by)))
+        }
+    };
+    // Both clips are cut at once: a cut keeps two or three cores busy, and nothing else of the
+    // run goes on beside it.
+    let (of_source, of_output) = std::thread::scope(|s| {
+        let of_source = s.spawn(|| search::extract_reference_at(tools, input, info, true, info.start_time, place, until, secs, &r));
+        let of_output = search::extract_reference_at(tools, out, info, false, out_info.start_time, out_place, out_until, secs, &d);
+        (of_source.join().unwrap_or_else(|e| std::panic::resume_unwind(e)), of_output)
+    });
+    of_source?;
+    of_output?;
     let mut v = tools.vmaf(&d, &r, model, pix, threads, 0, 1)?;
     // Seeking two different files can land a frame or two apart; retry nearby alignments
     // before calling the encode bad.
@@ -2458,7 +2492,8 @@ fn verify(
         // and each file's picture starts where that file puts it.
         let along = (start + search::first_frame(&out_info), start + search::first_frame(info), secs);
         let (start, src_start, secs) = cut.map_or(along, |c| c.window(start, secs));
-        let v = spot_check(tools, input, info, out, &out_info, (start, src_start, secs), floor, threads, tmp, &format!("verify{i}"))?;
+        let part = cut.map(|c| c.picture_of(src_start, info.duration_s));
+        let v = spot_check(tools, input, info, out, &out_info, (start, src_start, secs), part, floor, threads, tmp, &format!("verify{i}"))?;
         eprintln!("  spot check at {}: VMAF {v:.2}", hms(start));
         tools.emit(Event::SpotCheck { at_secs: start, vmaf: v });
         scores.push(v);
@@ -2616,7 +2651,7 @@ fn verify_whole(
                 }
             };
             let at = (begin + search::first_frame(&out_info), begin + search::first_frame(info), secs);
-            let v = spot_check(tools, input, info, out, &out_info, at, alone - JOIN_SLACK, threads, tmp, &format!("joined{i}"))?;
+            let v = spot_check(tools, input, info, out, &out_info, at, None, alone - JOIN_SLACK, threads, tmp, &format!("joined{i}"))?;
             eprintln!("  joined video at {}: VMAF {v:.2} ({alone:.2} by itself)", hms(at.0));
             if v < alone - JOIN_SLACK {
                 bail!("the stretch at {} was encoded again but scores VMAF {v:.2} once put back into the video, against {alone:.2} on its own; {FAILED_INSIDE}", hms(st.start_secs));
@@ -3349,6 +3384,32 @@ mod tests {
     }
 
     #[test]
+    fn the_two_clips_of_a_spot_check_are_cut_at_the_same_time() {
+        let dir = folder_for_test("spot-check-cuts");
+        let (ffmpeg, ffprobe) = (dir.join("ffmpeg"), dir.join("ffprobe"));
+        // A cut says that it has begun, and waits a second at most to see the other one say so
+        // while it is still at work: one after the other, neither ever does.
+        let (began, together) = (dir.join("began"), dir.join("together"));
+        std::fs::create_dir(&began).unwrap();
+        let cut = format!(
+            "case \"$*\" in\n*libvmaf*) echo 'VMAF score: 95.5' >&2;;\n*) : > '{0}'/$$; n=0\n\
+             while [ ! -e '{1}' ] && [ $n -lt 20 ]; do\n\
+             if [ $(ls '{0}' | wc -l) -ge 2 ]; then : > '{1}'; fi; sleep 0.05; n=$((n+1)); done\n\
+             rm -f '{0}'/$$;;\nesac\n",
+            began.display(),
+            together.display()
+        );
+        crate::files::write_script(&ffmpeg, &cut);
+        crate::files::write_script(&ffprobe, "echo 150\n");
+        let tools = Tools::new(ffmpeg.to_str().unwrap().into(), ffprobe.to_str().unwrap().into(), None);
+        let i = info(&[]);
+        let v = spot_check(&tools, &dir.join("in.mkv"), &i, &dir.join("out.mp4"), &i, (10.0, 10.0, 5.0), None, 90.0, 2, &dir, "verify0").unwrap();
+        assert_eq!(v, 95.5);
+        assert!(together.exists(), "the cut of the source had ended before the cut of the output began");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_cut_keeps_what_tracks_are_marked_as_and_says_what_is_left_out() {
         let mut i = info(&[("aac", 2, 128_000.0), ("aac", 2, 128_000.0)]);
         i.audio[1].disposition = "default+original".into();
@@ -3464,7 +3525,7 @@ mod tests {
             &[], &metadata::Resolved::default(), &MetaOptions::default(), Some(&cut), Path::new("out.mkv"), &mut Vec::new(),
         );
         let graph = &a[a.iter().position(|x| x == "-filter_complex").unwrap() + 1];
-        assert!(graph.contains("concat=n=2:v=1:a=1[vout][ap0];[ap0]pan=5.1|c0=c0|c1=c1|c2=c2|c3=c3|c4=c4|c5=c5[ao0]"), "{graph}");
+        assert!(graph.contains("concat=n=2:v=0:a=1[ap0];[ap0]pan=5.1|c0=c0|c1=c1|c2=c2|c3=c3|c4=c4|c5=c5[ao0]"), "{graph}");
         assert!(a.windows(2).any(|w| w == ["-map", "[ao0]"]));
     }
 

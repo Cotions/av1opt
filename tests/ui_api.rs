@@ -2091,7 +2091,7 @@ fn every_job_taken_is_in_the_queue_a_killed_server_leaves() {
                 std::fs::write(d.join(format!("videos/v{i}.mp4")), b"xx").unwrap();
             }
         });
-        let count = std::sync::atomic::AtomicUsize::new(0);
+        let so_far = std::sync::atomic::AtomicUsize::new(0);
         let taken = std::thread::scope(|scope| {
             let poster = scope.spawn(|| {
                 let mut taken = Vec::new();
@@ -2100,21 +2100,19 @@ fn every_job_taken_is_in_the_queue_a_killed_server_leaves() {
                     let body = json!({ "inputs": [&input], "out_dir": s.dir.join("out") }).to_string();
                     let request = format!("POST /api/jobs HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\nCookie: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", s.port, s.cookie(), body.len());
                     match s.try_raw(&request) {
-                        Ok(r) if r.status == 200 => {
-                            taken.push(input);
-                            count.store(taken.len(), std::sync::atomic::Ordering::SeqCst);
-                        }
+                        Ok(r) if r.status == 200 => taken.push(input),
                         Ok(r) if r.status == 0 => break,
                         Ok(r) => panic!("{} {}", r.status, r.body),
                         Err(_) => break,
                     }
+                    so_far.store(taken.len(), std::sync::atomic::Ordering::Relaxed);
                 }
                 taken
             });
-            // A different moment each round, a good while into the posting: past the second job
-            // taken (each one is saved to the drive, which takes longer while other tests write).
-            let start = std::time::Instant::now();
-            while count.load(std::sync::atomic::Ordering::SeqCst) < 2 && start.elapsed() < Duration::from_secs(20) {
+            // A different moment each round, a good while into the posting: counted from the
+            // first jobs taken, since a busy machine can take a second over those.
+            let started = Instant::now();
+            while so_far.load(std::sync::atomic::Ordering::Relaxed) < 3 && started.elapsed() < Duration::from_secs(30) {
                 std::thread::sleep(Duration::from_millis(5));
             }
             let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos();

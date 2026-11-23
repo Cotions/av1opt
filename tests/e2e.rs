@@ -707,6 +707,83 @@ fn removed_sections_are_gone_to_the_frame() {
 
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn sections_ending_between_two_frames_leave_the_rest_where_it_is_looked_for() {
+    let c = Case::new("remove-between");
+    let src = c.clip("talk.mp4", "320x180", 16);
+    // Each kept part ends a millisecond after one of its frames, which is then shown for
+    // nearly a whole frame more than the part lasts: four such parts put the last one
+    // nearly four frames later than its place on the timeline, where the spot checks cut it.
+    let r = c.encode(&[&src], &["--remove", "1.001-2", "--remove", "3.001-4", "--remove", "5.001-6", "--remove", "7.001-8"]);
+    r.ok().has("encoded 1,");
+    let out = c.out().join("talk.mp4");
+    let kept = "lte(n,24)+between(n,48,72)+between(n,96,120)+between(n,144,168)+gte(n,192)";
+    assert_eq!(frames(&out), 4 * 25 + 192);
+    assert_in_step(&out, &src, kept);
+    // The last part's first frame is where the timeline says, and so is its sound.
+    let t = frame_times(&out);
+    assert!((t[100] - 100.0 / 24.0).abs() < 0.002, "the last part starts at {:.4} s", t[100]);
+    let a = streams(&probe(&out), "audio")[0]["duration"].as_str().unwrap().parse::<f64>().unwrap();
+    assert!((a - 292.0 / 24.0).abs() < 0.03, "sound {a:.3} s, picture {:.3} s", 292.0 / 24.0);
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn sections_removed_from_a_held_frame_take_its_time_with_them() {
+    let c = Case::new("remove-held");
+    // Slides: 24 frames a second for 2 s, then one a second, then 24 again from 14 s.
+    c.ffmpeg(&[
+        "-f", "lavfi", "-i", "testsrc2=s=320x180:r=24:d=20", "-f", "lavfi", "-i", "sine=f=440:d=20", "-vf", "select='lt(n,48)+gte(n,336)+not(mod(n,24))'",
+        "-fps_mode", "vfr", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "16", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "64k", "-shortest", "slides.mkv",
+    ]);
+    let src = c.videos().join("slides.mkv");
+    let want = frame_times(&src);
+    assert_eq!(want.len(), 204);
+    // Each section lies inside the second a slide is shown: no frame goes, the slide is shown
+    // 0.875 s less. The join used to show it its whole second and fill the sound with silence.
+    // The samples miss the slides, which a high CRF leaves far below the floor (VMAF 78) and
+    // only the spot checks see: a lower one keeps this about the cut.
+    let r = c.encode(&[&src], &["--max-crf", "40", "--remove", "3.1-4", "--remove", "5.1-6", "--remove", "7.1-8"]);
+    r.ok().has("encoded 1,");
+    let out = c.out().join("slides.mp4");
+    let got = frame_times(&out);
+    assert_eq!(got.len(), want.len());
+    // The source is taken for 24 frames a second, so each kept part ends where its last frame
+    // does: 1/24 s past the section's start.
+    let to_out = |t: f64| t - [(4.0, 0.875), (6.0, 1.75), (8.0, 2.625)].iter().filter(|(at, _)| t >= *at - 1e-6).map(|&(_, gone)| gone).fold(0.0, f64::max);
+    let worst = got.iter().zip(&want).map(|(g, w)| (g - to_out(*w)).abs()).fold(0.0, f64::max);
+    assert!(worst < 0.002, "a frame is {worst:.3} s from its place");
+    assert_in_step(&out, &src, "1");
+    assert!((duration(&out) - 17.4).abs() < 0.1, "{}", duration(&out));
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_recording_cut_between_its_frames_is_checked_against_the_same_frames() {
+    let c = Case::new("remove-recording");
+    // A screen recording: 30 frames a second, a third of that while little moves. Its frames
+    // are on no grid the checks could put them on, so it is cut at the times given.
+    c.ffmpeg(&[
+        "-f", "lavfi", "-i", "testsrc2=s=320x180:r=30:d=14", "-f", "lavfi", "-i", "sine=f=440:d=14", "-vf", "select='lt(mod(n,20),10)+not(mod(n,3))'",
+        "-fps_mode", "vfr", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "16", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "64k", "-shortest", "rec.mkv",
+    ]);
+    let src = c.videos().join("rec.mkv");
+    let want = frame_times(&src);
+    // The output's clip of the part after the first section used to start on the frame
+    // before the source's, and the spot check read VMAF 81 for a stretch that scores 92.
+    let r = c.encode(&[&src], &["--remove", "1.01-2.03", "--remove", "3.5-4.2"]);
+    r.ok().has("encoded 1,");
+    let out = c.out().join("rec.mp4");
+    let kept: Vec<f64> = want.iter().copied().filter(|&t| t < 1.01 || (2.03..3.5).contains(&t) || t >= 4.2).collect();
+    let got = frame_times(&out);
+    assert_eq!(got.len(), kept.len());
+    let to_out = |t: f64| t - if t >= 4.2 { 1.72 } else if t >= 2.03 { 1.02 } else { 0.0 };
+    let worst = got.iter().zip(&kept).map(|(g, w)| (g - to_out(*w)).abs()).fold(0.0, f64::max);
+    assert!(worst < 0.002, "a frame is {worst:.3} s from its place");
+    assert_in_step(&out, &src, "lt(t,1.01)+gte(t,2.03)*lt(t,3.5)+gte(t,4.2)");
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn tags_are_kept_dropped_set_and_filled_from_info_files() {
     let c = Case::new("meta");
     c.clip("plain.mp4", "320x180", 6);

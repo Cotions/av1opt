@@ -3451,7 +3451,7 @@ mod tests {
             &[], &metadata::Resolved::default(), &MetaOptions::default(), Some(&cut), Path::new("out.mkv"), &mut Vec::new(),
         );
         let graph = &a[a.iter().position(|x| x == "-filter_complex").unwrap() + 1];
-        assert!(graph.contains("concat=n=2:v=1:a=1[vout][ap0];[ap0]pan=5.1|c0=c0|c1=c1|c2=c2|c3=c3|c4=c4|c5=c5[ao0]"), "{graph}");
+        assert!(graph.contains("concat=n=2:v=0:a=1[ap0];[ap0]pan=5.1|c0=c0|c1=c1|c2=c2|c3=c3|c4=c4|c5=c5[ao0]"), "{graph}");
         assert!(a.windows(2).any(|w| w == ["-map", "[ao0]"]));
     }
 

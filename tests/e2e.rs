@@ -726,6 +726,36 @@ fn sections_ending_between_two_frames_leave_the_rest_where_it_is_looked_for() {
 
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn sections_removed_from_a_held_frame_take_its_time_with_them() {
+    let c = Case::new("remove-held");
+    // Slides: 24 frames a second for 2 s, then one a second, then 24 again from 14 s.
+    c.ffmpeg(&[
+        "-f", "lavfi", "-i", "testsrc2=s=320x180:r=24:d=20", "-f", "lavfi", "-i", "sine=f=440:d=20", "-vf", "select='lt(n,48)+gte(n,336)+not(mod(n,24))'",
+        "-fps_mode", "vfr", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "16", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "64k", "-shortest", "slides.mkv",
+    ]);
+    let src = c.videos().join("slides.mkv");
+    let want = frame_times(&src);
+    assert_eq!(want.len(), 204);
+    // Each section lies inside the second a slide is shown: no frame goes, the slide is shown
+    // 0.875 s less. The join used to show it its whole second and fill the sound with silence.
+    // The samples miss the slides, which a high CRF leaves far below the floor (VMAF 78) and
+    // only the spot checks see: a lower one keeps this about the cut.
+    let r = c.encode(&[&src], &["--max-crf", "40", "--remove", "3.1-4", "--remove", "5.1-6", "--remove", "7.1-8"]);
+    r.ok().has("encoded 1,");
+    let out = c.out().join("slides.mp4");
+    let got = frame_times(&out);
+    assert_eq!(got.len(), want.len());
+    // The source is taken for 24 frames a second, so each kept part ends where its last frame
+    // does: 1/24 s past the section's start.
+    let to_out = |t: f64| t - [(4.0, 0.875), (6.0, 1.75), (8.0, 2.625)].iter().filter(|(at, _)| t >= *at - 1e-6).map(|&(_, gone)| gone).fold(0.0, f64::max);
+    let worst = got.iter().zip(&want).map(|(g, w)| (g - to_out(*w)).abs()).fold(0.0, f64::max);
+    assert!(worst < 0.002, "a frame is {worst:.3} s from its place");
+    assert_in_step(&out, &src, "1");
+    assert!((duration(&out) - 17.4).abs() < 0.1, "{}", duration(&out));
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn tags_are_kept_dropped_set_and_filled_from_info_files() {
     let c = Case::new("meta");
     c.clip("plain.mp4", "320x180", 6);

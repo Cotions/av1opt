@@ -53,7 +53,7 @@
   trials led to the same CRF. So the worst sample was made to count: past what verification
   allowed, the CRF came down before the encode, and a video with samples far apart could be
   encoded per scene (`--scenes=auto`). Since the whole video is scored after its encode (see
-  below), the CRF comes down this way only in HDR and with sections removed.
+  below), the CRF comes down this way only in HDR.
 - **A Matroska header names a frame rate whatever the frames do.** ffprobe reports 24 fps as
   both the nominal and the average rate of an MKV whose frames come at 12, so comparing the
   two finds variable frame rates in MP4 only. Scene mode then cut such a file into

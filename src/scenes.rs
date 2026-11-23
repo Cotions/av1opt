@@ -12,6 +12,7 @@
 
 use crate::events::Event;
 use crate::probe::MediaInfo;
+use crate::sections::Sections;
 use crate::search::{self, EncodeSettings, Trial};
 use crate::sequence_header;
 use crate::tools::{FAILED_INSIDE, Tools, hms, path_arg};
@@ -444,8 +445,13 @@ fn frame_time(cfr: &str) -> String {
 /// [`Plan::timed`]) no grid is laid over the source: the frames between the bounds are taken
 /// as they are and numbered along the constant rate, so the encoder and VMAF get the same
 /// kind of clip either way, holding every source frame once.
-pub(crate) fn extract_chunk(tools: &Tools, input: &Path, info: &MediaInfo, b: Bounds, timed: Option<(i64, i64)>, out: &Path) -> Result<u64> {
-    let mut vf = search::source_filters(info);
+///
+/// With `cut` (sections removed from the output) the bounds are times of the output's picture,
+/// made out of the source by [`Sections::picture_filters`]: the clip is cut from that picture,
+/// and can hold the end of one kept part and the start of the next.
+pub(crate) fn extract_chunk(tools: &Tools, input: &Path, info: &MediaInfo, b: Bounds, timed: Option<(i64, i64)>, cut: Option<&Sections>, out: &Path) -> Result<u64> {
+    let mut vf: Vec<String> = cut.map(|c| c.picture_filters(info.duration_s).to_vec()).unwrap_or_default();
+    vf.extend(search::source_filters(info));
     let cfr = search::cfr(info);
     if timed.is_none() {
         vf.push(format!("fps={cfr}"));
@@ -467,7 +473,9 @@ pub(crate) fn extract_chunk(tools: &Tools, input: &Path, info: &MediaInfo, b: Bo
     }
     let rate = search::cfr_value(info);
     let secs = |s: i64| timed.map_or(s as f64 / rate, |(n, d)| s as f64 * n as f64 / d as f64);
-    let seek = b.start.map_or(0.0, |s| (secs(s) - info.start_time - search::PREROLL_SECS).max(0.0));
+    // (The picture of a cut counts from the start of the file, its own timestamps from where
+    // the output's do, and is sought at the source time it shows there.)
+    let seek = b.start.map_or(0.0, |s| (cut.map_or(secs(s) - info.start_time, |c| c.to_source(secs(s))) - search::PREROLL_SECS).max(0.0));
     let cut = |seek: f64| -> Result<u64> {
         let mut filters = vf.clone();
         // A seek can land past the chunk's first frame (MPEG-TS, no index, key frames far
@@ -476,13 +484,14 @@ pub(crate) fn extract_chunk(tools: &Tools, input: &Path, info: &MediaInfo, b: Bo
         if let (true, Some(start)) = (seek > 0.0, b.start) {
             filters.insert(before_trim, format!("select='if(eq(n,0),st(0,lte(pts,{start})),ld(0))'"));
         }
-        let mut args: Vec<String> = [
-            "-y", "-v", "error", "-copyts", "-ss", &format!("{seek:.3}"), "-i", &path_arg(input),
-            "-map", &format!("0:{}", info.video_index), "-an", "-sn", "-dn", "-vf", &filters.join(","),
-            "-c:v", search::REFERENCE_CODEC,
-        ]
-        .map(String::from)
-        .to_vec();
+        let mut args: Vec<String> = ["-y", "-v", "error", "-copyts"].map(String::from).to_vec();
+        if cut.is_some() {
+            args.push("-start_at_zero".into());
+        }
+        args.extend(
+            ["-ss", &format!("{seek:.3}"), "-i", &path_arg(input), "-map", &format!("0:{}", info.video_index), "-an", "-sn", "-dn", "-vf", &filters.join(","), "-c:v", search::REFERENCE_CODEC]
+                .map(String::from),
+        );
         args.extend(search::reference_format(info).into_iter().map(String::from));
         args.push(path_arg(out));
         tools.run(&args)?;
@@ -538,7 +547,7 @@ fn encode_chunk(c: &Ctx, plan: &Plan, i: usize) -> Result<ChunkResult> {
     let reference = chunk_path(c.work, i, "ref.mkv");
     let probe_out = chunk_path(c.work, i, "probe.obu");
     let part = chunk_path(c.work, i, "obu.part");
-    let frames = extract_chunk(c.tools, c.input, c.info, b, plan.timed, &reference)?;
+    let frames = extract_chunk(c.tools, c.input, c.info, b, plan.timed, None, &reference)?;
     if frames == 0 {
         bail!("cutting the chunk at {} from the source gave no frames; {FAILED_INSIDE}", hms(start_secs));
     }
@@ -1002,7 +1011,7 @@ mod tests {
         // The first runs across the key frame at 8 s: its end alone would be found there.
         for (from, to) in [(150usize, 250usize), (125, 150), (60, 100), (210, 240)] {
             let b = Bounds { start: Some(first_pts + from as i64), end: Some(first_pts + to as i64) };
-            let frames = extract_chunk(&tools, &path, &info, b, None, &clip).unwrap();
+            let frames = extract_chunk(&tools, &path, &info, b, None, None, &clip).unwrap();
             assert_eq!(frames as usize, to - from, "frames {from} to {to}");
             assert_eq!(hashes(&clip), all[from..to], "frames {from} to {to}");
         }

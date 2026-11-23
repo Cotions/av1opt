@@ -297,7 +297,7 @@ enum Cmd {
         /// clips, one for about every 8 seconds of video (8 to 64; a video under 64 seconds is
         /// sampled whole, as 1 s clips side by side), where the whole video is checked after
         /// its encode; one 4 s clip for about every two minutes (8 to 32) where it is not
-        /// (--scenes, removed sections, HDR).
+        /// (--scenes, HDR) and with sections removed.
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..=200))]
         samples: Option<u64>,
         /// Length of a sample clip in seconds, 1 to 60 (4 with --samples alone).

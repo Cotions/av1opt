@@ -987,7 +987,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
             // The sound and the rest of a cut are the finished encode's.
             let finished = probe::probe(&tools.ffprobe, &partial, std::fs::metadata(&partial)?.len())?;
             let count = stream_count(tools, &partial)?;
-            return Ok((revideo_args(video, first, &partial, &finished, count, &info, o.container, out), streams.clone()));
+            return Ok(revideo_args(video, first, &partial, &finished, count, &streams, &info, o.container, out, said));
         }
         Ok(mux_args(video, false, first, input, &info, o.container, o.audio, &covers, &meta, &o.meta, out, said))
     };
@@ -1614,16 +1614,7 @@ fn mux_args(
     let mut streams = stream_args(info, 1, container, audio, covers, None, notes);
     // How the picture is shown came with the source's video stream on the one pass; a bare
     // stream has none of it, and ffmpeg can set the 3D layout but not the 360 degree mapping.
-    if info.view_marks.iter().any(|m| m == "Stereo 3D") {
-        match stereo_layout(&info.stereo3d) {
-            Some(layout) => a.extend(["-stereo3d:v:0".into(), layout.into()]),
-            None => notes.push(format!("the 3D mark ({}) is lost: ffmpeg cannot give it to a video joined from bare streams (after repair or --scenes)", info.stereo3d)),
-        }
-    }
-    if info.view_marks.iter().any(|m| m == "Spherical Mapping") {
-        notes.push("the 360 degree mark (spherical mapping) is lost: ffmpeg cannot give it to a video joined from bare streams (after repair or --scenes), so players show the flat picture".into());
-    }
-    streams.view_marks.retain(|m| m == "Stereo 3D" && stereo_layout(&info.stereo3d).is_some());
+    a.extend(bare_stream_marks(info, &mut streams.view_marks, notes));
     a.extend(metadata::ffmpeg_args(mo, tags, 1));
     // The video's language and marks are the source's video's, not the bare stream's (which
     // has none): a repaired Matroska lost "Main picture", its language and its default mark.
@@ -1638,12 +1629,43 @@ fn mux_args(
     (a, streams)
 }
 
+/// What a bare video stream can be given of how its source's picture is shown (see
+/// `mux_args`): the arguments that give it, with `marks` left holding what the file will have
+/// and `notes` told what it will not. The check of the finished file asks for the marks it is
+/// handed: a mark nothing can write, left among them, fails a good encode.
+fn bare_stream_marks(info: &MediaInfo, marks: &mut Vec<String>, notes: &mut Vec<String>) -> Vec<String> {
+    let mut a = Vec::new();
+    if info.view_marks.iter().any(|m| m == "Stereo 3D") {
+        match stereo_layout(&info.stereo3d) {
+            Some(layout) => a.extend(["-stereo3d:v:0".into(), layout.into()]),
+            None => notes.push(format!("the 3D mark ({}) is lost: ffmpeg cannot give it to a video joined from bare streams (after repair or --scenes)", info.stereo3d)),
+        }
+    }
+    if info.view_marks.iter().any(|m| m == "Spherical Mapping") {
+        notes.push("the 360 degree mark (spherical mapping) is lost: ffmpeg cannot give it to a video joined from bare streams (after repair or --scenes), so players show the flat picture".into());
+    }
+    marks.retain(|m| m == "Stereo 3D" && stereo_layout(&info.stereo3d).is_some());
+    a
+}
+
 /// A bare video stream (`video`, its first frame at `video_first`) in place of the video of a
-/// finished file (`finished`), whose every other stream, tag, mark and chapter is kept as it
-/// is. For an encode with sections removed: its sound, subtitles and chapters came out of the
-/// cut and are not the source's to take again.
+/// finished file (`finished`, which holds `streams`), whose every other stream, tag, mark and
+/// chapter is kept as it is. For an encode with sections removed: its sound, subtitles and
+/// chapters came out of the cut and are not the source's to take again. What the result
+/// holds comes back with the arguments, as from `mux_args`.
 #[allow(clippy::too_many_arguments)]
-fn revideo_args(video: &Path, video_first: f64, finished: &Path, finished_info: &MediaInfo, finished_streams: usize, info: &MediaInfo, container: Container, out: &Path) -> Vec<String> {
+fn revideo_args(
+    video: &Path,
+    video_first: f64,
+    finished: &Path,
+    finished_info: &MediaInfo,
+    finished_streams: usize,
+    streams: &Streams,
+    info: &MediaInfo,
+    container: Container,
+    out: &Path,
+    notes: &mut Vec<String>,
+) -> (Vec<String>, Streams) {
     // The picture keeps its place against the sound of the finished file (see `mux_args`).
     let offset = finished_info.video_start - finished_info.start_time - video_first;
     let mut a: Vec<String> = ["-y", "-v", "error", "-copyts", "-itsoffset", &format!("{offset:.6}"), "-i", &path_arg(video)].map(String::from).to_vec();
@@ -1653,11 +1675,9 @@ fn revideo_args(video: &Path, video_first: f64, finished: &Path, finished_info: 
     if let Some(aspect) = display_aspect(info) {
         a.extend(["-aspect:v:0".into(), aspect]);
     }
-    if info.view_marks.iter().any(|m| m == "Stereo 3D")
-        && let Some(layout) = stereo_layout(&info.stereo3d)
-    {
-        a.extend(["-stereo3d:v:0".into(), layout.into()]);
-    }
+    // The picture's marks were on the stream this one replaces.
+    let mut streams = streams.clone();
+    a.extend(bare_stream_marks(info, &mut streams.view_marks, notes));
     a.extend(["-map_metadata", "1", "-map_chapters", "1"].map(String::from));
     // Naming one stream's tags turns off ffmpeg's copying for all of them: each is named.
     a.extend((0..finished_streams).flat_map(|k| [format!("-map_metadata:s:{k}"), format!("1:s:{k}")]));
@@ -1680,7 +1700,7 @@ fn revideo_args(video: &Path, video_first: f64, finished: &Path, finished_info: 
         }
     }
     a.push(path_arg(out));
-    a
+    (a, streams)
 }
 
 /// How many streams a file holds.
@@ -3741,6 +3761,30 @@ mod tests {
         let (_, streams) = mux_args(Path::new("v.ivf"), false, 0.0, Path::new("in.mp4"), &source, Container::Mkv, Audio::Keep, &[], &Resolved::default(), &MetaOptions::default(), Path::new("o.mkv"), &mut notes);
         assert!(streams.view_marks.is_empty());
         assert!(notes[0].starts_with("the 3D mark (frame alternate) is lost"), "{notes:?}");
+    }
+
+    #[test]
+    fn a_repaired_cut_is_not_asked_for_the_360_degree_mark_that_no_bare_stream_can_be_given() {
+        let mut source = info(&[]);
+        source.view_marks = vec!["Stereo 3D".into(), "Spherical Mapping".into()];
+        source.stereo3d = "top and bottom".into();
+        let mut notes = Vec::new();
+        // The one pass of the cut kept both marks, and its check asked for both.
+        let finished = stream_args(&source, 0, Container::Mp4, Audio::Keep, &[], None, &mut notes);
+        assert_eq!(finished.view_marks, source.view_marks);
+        let (args, streams) = revideo_args(Path::new("v.ivf"), 0.0, Path::new("partial.mp4"), &source, 2, &finished, &source, Container::Mp4, Path::new("o.mp4"), &mut notes);
+        assert!(args.windows(2).any(|w| w == ["-stereo3d:v:0", "tb"]), "{args:?}");
+        // Asked of the file joined from the stretches encoded again, the 360 degree mark
+        // failed the encode after its search, its one pass and its repairs.
+        assert_eq!(streams.view_marks, ["Stereo 3D"]);
+        assert!(notes.len() == 1 && notes[0].starts_with("the 360 degree mark (spherical mapping) is lost"), "{notes:?}");
+        assert_eq!((streams.audio, streams.subs), (finished.audio, finished.subs));
+        source.stereo3d = "frame alternate".into();
+        notes.clear();
+        let (args, streams) = revideo_args(Path::new("v.ivf"), 0.0, Path::new("partial.mkv"), &source, 2, &finished, &source, Container::Mkv, Path::new("o.mkv"), &mut notes);
+        assert!(!args.iter().any(|a| a == "-stereo3d:v:0"), "{args:?}");
+        assert!(streams.view_marks.is_empty());
+        assert!(notes.len() == 2 && notes[0].starts_with("the 3D mark (frame alternate) is lost"), "{notes:?}");
     }
 
     #[test]

@@ -2427,8 +2427,15 @@ fn spot_check(
             ((place, until), (place.earlier(by), until.map(|u| u - by)))
         }
     };
-    search::extract_reference_at(tools, input, info, true, info.start_time, place, until, secs, &r)?;
-    search::extract_reference_at(tools, out, info, false, out_info.start_time, out_place, out_until, secs, &d)?;
+    // Both clips are cut at once: a cut keeps two or three cores busy, and nothing else of the
+    // run goes on beside it.
+    let (of_source, of_output) = std::thread::scope(|s| {
+        let of_source = s.spawn(|| search::extract_reference_at(tools, input, info, true, info.start_time, place, until, secs, &r));
+        let of_output = search::extract_reference_at(tools, out, info, false, out_info.start_time, out_place, out_until, secs, &d);
+        (of_source.join().unwrap_or_else(|e| std::panic::resume_unwind(e)), of_output)
+    });
+    of_source?;
+    of_output?;
     let mut v = tools.vmaf(&d, &r, model, pix, threads, 0, 1)?;
     // Seeking two different files can land a frame or two apart; retry nearby alignments
     // before calling the encode bad.
@@ -3358,6 +3365,32 @@ mod tests {
             subtitle_codecs: vec![], subtitle_dispositions: vec![], other_streams: vec![],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn the_two_clips_of_a_spot_check_are_cut_at_the_same_time() {
+        let dir = folder_for_test("spot-check-cuts");
+        let (ffmpeg, ffprobe) = (dir.join("ffmpeg"), dir.join("ffprobe"));
+        // A cut says that it has begun, and waits a second at most to see the other one say so
+        // while it is still at work: one after the other, neither ever does.
+        let (began, together) = (dir.join("began"), dir.join("together"));
+        std::fs::create_dir(&began).unwrap();
+        let cut = format!(
+            "case \"$*\" in\n*libvmaf*) echo 'VMAF score: 95.5' >&2;;\n*) : > '{0}'/$$; n=0\n\
+             while [ ! -e '{1}' ] && [ $n -lt 20 ]; do\n\
+             if [ $(ls '{0}' | wc -l) -ge 2 ]; then : > '{1}'; fi; sleep 0.05; n=$((n+1)); done\n\
+             rm -f '{0}'/$$;;\nesac\n",
+            began.display(),
+            together.display()
+        );
+        crate::files::write_script(&ffmpeg, &cut);
+        crate::files::write_script(&ffprobe, "echo 150\n");
+        let tools = Tools::new(ffmpeg.to_str().unwrap().into(), ffprobe.to_str().unwrap().into(), None);
+        let i = info(&[]);
+        let v = spot_check(&tools, &dir.join("in.mkv"), &i, &dir.join("out.mp4"), &i, (10.0, 10.0, 5.0), None, 90.0, 2, &dir, "verify0").unwrap();
+        assert_eq!(v, 95.5);
+        assert!(together.exists(), "the cut of the source had ended before the cut of the output began");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

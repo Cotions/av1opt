@@ -53,7 +53,7 @@
   trials led to the same CRF. So the worst sample was made to count: past what verification
   allowed, the CRF came down before the encode, and a video with samples far apart could be
   encoded per scene (`--scenes=auto`). Since the whole video is scored after its encode (see
-  below), the CRF comes down this way only in HDR and with sections removed.
+  below), the CRF comes down this way only in HDR.
 - **A Matroska header names a frame rate whatever the frames do.** ffprobe reports 24 fps as
   both the nominal and the average rate of an MKV whose frames come at 12, so comparing the
   two finds variable frame rates in MP4 only. Scene mode then cut such a file into
@@ -215,6 +215,23 @@
 - **A container's length is not the picture's.** One recording had 7:40 of video under 17:32
   of sound. Samples and spot checks were placed along the 17:32 and asked for frames that
   don't exist. They go by the video stream's own length now.
+- **Where a transport stream starts depends on what is read from it.** ffmpeg counts the time
+  of an MPEG transport or program stream from the first packet of the streams it reads, not
+  from where the file says it starts. The encode of a video with sections removed reads sound
+  and picture; the whole-video check and the stretches encoded again read the picture alone,
+  and picked the kept frames by a clock that ran behind the encode's by as much as the sound
+  starts before the picture. With 23 ms of that (what ffmpeg itself writes) at 24 frames a
+  second, they took the first frame of each removed section for a kept one and left out the
+  first frame after it: as many frames on both sides, so the count told nothing, and a group
+  of pictures encoded again at a join put a removed frame into the file. Both read the sound
+  as well now (one packet of it for a stretch, copied to nowhere), which gives them the
+  encode's clock by the same rule that gave the encode its own.
+- **A copy of every stream is not a copy of the file.** The video of a repaired cut is put
+  into the finished file with `-map 1 -c copy` for the rest. ffmpeg reads the track an MP4
+  keeps its chapters in as a stream of data and wrote it back beside the chapters themselves,
+  marked "gpmd"; it reads the cover of a Matroska file, an attachment, as a video stream and
+  wrote it back as a second video track of one frame. The streams are now named one by one,
+  the chapter track left to `-map_chapters` and the cover attached from its file.
 - **ffmpeg ignores `-svtav1-params` names it can't parse.** A typo only prints a warning and the
   encode runs without the option, so parameters are tried on a few generated frames first.
 - **What the files look like is not who left them so.** The first recovery of a replacement

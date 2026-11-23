@@ -808,10 +808,10 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     let work = work.filter(|_| scenes);
     // A one-pass encode is checked along its whole length afterwards, and what falls short
     // is encoded again by itself (see `repair`): the video's one CRF need not carry its
-    // worst stretch then. Not with sections removed (the frames of source and encode no
-    // longer pair up one to one) nor in HDR (the stretches would lose the mastering data
-    // the one pass hands to the encoder).
-    let whole_check = !scenes && cut.is_none() && !info.hdr;
+    // worst stretch then. With sections removed too: the source is set against the encode
+    // through the same picking of frames the encode was made with. Not in HDR (the
+    // stretches would lose the mastering data the one pass hands to the encoder).
+    let whole_check = !scenes && !info.hdr;
     if !scenes
         && !whole_check
         && reached
@@ -909,6 +909,9 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
             }
         }
     }
+    // Retimed subtitles and chapters of a cut, for its encode and any made after it. (A cut is
+    // never encoded in scenes.)
+    let cut_inputs = cut.as_ref().map(|c| prepare_cut(tools, input, &info, c, o.meta.keep, &tmp.path, &mut notes)).transpose()?;
     let (streams, chunks, expect_frames) = if let (Some(work), Some(plan)) = (&work, plan) {
         let vf = search::source_filters(&info);
         if !vf.is_empty() {
@@ -950,8 +953,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
         let _ = std::fs::remove_file(&video);
         (streams, Some(chunks), Some(plan.total_frames))
     } else {
-        let cut = cut.as_ref().map(|c| prepare_cut(tools, input, &info, c, o.meta.keep, &tmp.path, &mut notes)).transpose()?;
-        let (args, streams) = full_encode_args(input, &info, &enc, best.crf, o.container, o.audio, &covers, &meta, &o.meta, cut.as_ref(), &partial, &mut notes);
+        let (args, streams) = full_encode_args(input, &info, &enc, best.crf, o.container, o.audio, &covers, &meta, &o.meta, cut_inputs.as_ref(), &partial, &mut notes);
         for n in &notes {
             eprintln!("note: {n}");
             tools.emit(Event::Note { text: n.clone() });
@@ -980,7 +982,14 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     let mean_slope = search::slope_at(&trials, best.crf);
     let may_encode_again = std::cell::Cell::new(whole_check);
     let remux = |video: &Path, out: &Path, said: &mut Vec<String>| -> Result<(Vec<String>, Streams)> {
-        Ok(mux_args(video, false, first_video_time(tools, video)?, input, &info, o.container, o.audio, &covers, &meta, &o.meta, out, said))
+        let first = first_video_time(tools, video)?;
+        if cut.is_some() {
+            // The sound and the rest of a cut are the finished encode's.
+            let finished = probe::probe(&tools.ffprobe, &partial, std::fs::metadata(&partial)?.len())?;
+            let kinds = stream_kinds(tools, &partial)?;
+            return Ok(revideo_args(video, first, &partial, &finished, &kinds, &covers, &streams, &info, o.container, out, said));
+        }
+        Ok(mux_args(video, false, first, input, &info, o.container, o.audio, &covers, &meta, &o.meta, out, said))
     };
     // The CRF of a search that counted weak samples as encoded again (see `search::lifted_mean`).
     // The whole video where it can be gone by, spot checks where not.
@@ -997,7 +1006,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
                 may_encode_again: may_encode_again.get(),
             };
             if let Some((scores, out_info, summary)) =
-                verify_whole(tools, input, &info, &partial, &streams, &enc, &rules, floor_for(best), o.min_crf, vmaf_threads, &tmp.path, &remux, notes)?
+                verify_whole(tools, input, &info, &partial, &streams, cut.as_ref(), &enc, &rules, floor_for(best), o.min_crf, vmaf_threads, &tmp.path, &remux, notes)?
             {
                 return Ok((scores, out_info, Some(summary)));
             }
@@ -1024,7 +1033,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
         best = search::Trial { crf, ..best };
         lifted_crf = lifted_crf.map(|_| crf);
         tools.emit(Event::Chosen { crf, vmaf: goal_for(&best), predicted_savings: 1.0 - best.size_ratio });
-        let (args, _) = full_encode_args(input, &info, &enc, crf, o.container, o.audio, &covers, &meta, &o.meta, None, &partial, &mut Vec::new());
+        let (args, _) = full_encode_args(input, &info, &enc, crf, o.container, o.audio, &covers, &meta, &o.meta, cut_inputs.as_ref(), &partial, &mut Vec::new());
         tools.emit(Event::Phase { phase: "encoding".into(), detail: format!("crf {crf}, preset {preset}") });
         tools.run_with_progress(&args, out_duration, "encoding")?;
         verified = check(&best, &mut notes);
@@ -1035,10 +1044,11 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     // so it says nothing of the video's mean: it counts for the worst sample only. Averaged
     // in, up to eight such stretches pulled the mean the search goes by under what the rest
     // of the video scores, for a CRF lower than the mean asks for.
+    // With sections removed as well: the stretch is where the source has it, inside one kept
+    // part, as the samples of a cut are, and the second encode removes the same sections.
     if let Err(e) = &verified
         && let Some(low) = e.downcast_ref::<LowSpot>()
         && chunks.is_none()
-        && cut.is_none()
         && let (Some(pos), Some(params)) = (&positions, params)
     {
         let t2 = tools.stopwatch();
@@ -1063,7 +1073,8 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
                 let predicted_savings = 1.0 - b.size_ratio;
                 tools.emit(Event::Chosen { crf: b.crf, vmaf: b.mean_vmaf, predicted_savings });
                 eprintln!("chose crf {} (VMAF {:.2}), predicted video savings {:.0}%", b.crf, b.mean_vmaf, predicted_savings * 100.0);
-                if predicted_savings < o.min_savings && !o.force {
+                // (With sections removed the output is wanted anyway, as after the first search.)
+                if predicted_savings < o.min_savings && !o.force && cut.is_none() {
                     skip!(
                         "a spot check at {} scored VMAF {lowest:.2} at CRF {}; the CRF that holds that stretch ({}) saves {:.0}%, below --min-savings {:.0}%",
                         hms(at), best.crf, b.crf, predicted_savings * 100.0, o.min_savings * 100.0
@@ -1081,7 +1092,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
                 trials = all;
                 search_secs += t2.secs(tools);
                 let t3 = tools.stopwatch();
-                let (args, _) = full_encode_args(input, &info, &enc, best.crf, o.container, o.audio, &covers, &meta, &o.meta, None, &partial, &mut Vec::new());
+                let (args, _) = full_encode_args(input, &info, &enc, best.crf, o.container, o.audio, &covers, &meta, &o.meta, cut_inputs.as_ref(), &partial, &mut Vec::new());
                 tools.emit(Event::Phase { phase: "encoding".into(), detail: format!("crf {}, preset {preset}", best.crf) });
                 tools.run_with_progress(&args, out_duration, "encoding")?;
                 verified = check(&best, &mut notes);
@@ -1621,16 +1632,7 @@ fn mux_args(
     let mut streams = stream_args(info, 1, container, audio, covers, None, notes);
     // How the picture is shown came with the source's video stream on the one pass; a bare
     // stream has none of it, and ffmpeg can set the 3D layout but not the 360 degree mapping.
-    if info.view_marks.iter().any(|m| m == "Stereo 3D") {
-        match stereo_layout(&info.stereo3d) {
-            Some(layout) => a.extend(["-stereo3d:v:0".into(), layout.into()]),
-            None => notes.push(format!("the 3D mark ({}) is lost: ffmpeg cannot give it to a video joined from bare streams (after repair or --scenes)", info.stereo3d)),
-        }
-    }
-    if info.view_marks.iter().any(|m| m == "Spherical Mapping") {
-        notes.push("the 360 degree mark (spherical mapping) is lost: ffmpeg cannot give it to a video joined from bare streams (after repair or --scenes), so players show the flat picture".into());
-    }
-    streams.view_marks.retain(|m| m == "Stereo 3D" && stereo_layout(&info.stereo3d).is_some());
+    a.extend(bare_stream_marks(info, &mut streams.view_marks, notes));
     a.extend(metadata::ffmpeg_args(mo, tags, 1));
     // The video's language and marks are the source's video's, not the bare stream's (which
     // has none): a repaired Matroska lost "Main picture", its language and its default mark.
@@ -1643,6 +1645,132 @@ fn mux_args(
     a.extend(streams.args.iter().cloned());
     a.push(path_arg(out));
     (a, streams)
+}
+
+/// What a bare video stream can be given of how its source's picture is shown (see
+/// `mux_args`): the arguments that give it, with `marks` left holding what the file will have
+/// and `notes` told what it will not. The check of the finished file asks for the marks it is
+/// handed: a mark nothing can write, left among them, fails a good encode.
+fn bare_stream_marks(info: &MediaInfo, marks: &mut Vec<String>, notes: &mut Vec<String>) -> Vec<String> {
+    let mut a = Vec::new();
+    if info.view_marks.iter().any(|m| m == "Stereo 3D") {
+        match stereo_layout(&info.stereo3d) {
+            Some(layout) => a.extend(["-stereo3d:v:0".into(), layout.into()]),
+            None => notes.push(format!("the 3D mark ({}) is lost: ffmpeg cannot give it to a video joined from bare streams (after repair or --scenes)", info.stereo3d)),
+        }
+    }
+    if info.view_marks.iter().any(|m| m == "Spherical Mapping") {
+        notes.push("the 360 degree mark (spherical mapping) is lost: ffmpeg cannot give it to a video joined from bare streams (after repair or --scenes), so players show the flat picture".into());
+    }
+    marks.retain(|m| m == "Stereo 3D" && stereo_layout(&info.stereo3d).is_some());
+    a
+}
+
+/// A bare video stream (`video`, its first frame at `video_first`) in place of the video of a
+/// finished file (`finished`, which holds `streams`), whose every other stream, tag, mark and
+/// chapter is kept as it is. For an encode with sections removed: its sound, subtitles and
+/// chapters came out of the cut and are not the source's to take again. What the result
+/// holds comes back with the arguments, as from `mux_args`. `finished_streams` is what
+/// `stream_kinds` says of the finished file, `cover_files` what its one pass attached.
+#[allow(clippy::too_many_arguments)]
+fn revideo_args(
+    video: &Path,
+    video_first: f64,
+    finished: &Path,
+    finished_info: &MediaInfo,
+    finished_streams: &[(String, bool)],
+    cover_files: &[CoverFile],
+    streams: &Streams,
+    info: &MediaInfo,
+    container: Container,
+    out: &Path,
+    notes: &mut Vec<String>,
+) -> (Vec<String>, Streams) {
+    // The picture keeps its place against the sound of the finished file (see `mux_args`).
+    let offset = finished_info.video_start - finished_info.start_time - video_first;
+    let mut a: Vec<String> = ["-y", "-v", "error", "-copyts", "-itsoffset", &format!("{offset:.6}"), "-i", &path_arg(video)].map(String::from).to_vec();
+    a.extend(["-itsoffset".into(), format!("{:.6}", -finished_info.start_time), "-i".into(), path_arg(finished)]);
+    // The finished file's video stream is its first: what comes after it stays in its order,
+    // but for two kinds of stream a copy does not leave as they are. The chapters of an MP4
+    // are a track of their own, which ffmpeg hands on as a track of data beside the chapters
+    // it writes: every repaired cut with chapters held one, marked as a camera's telemetry
+    // ("gpmd"). And the cover of a Matroska file is an attachment, which a copy makes a
+    // second video track of one frame: it is attached from its file, as in the one pass.
+    a.extend(["-map", "0:v"].map(String::from));
+    let mut kept = vec![0];
+    let mut attachments = 0;
+    for (i, (kind, cover)) in finished_streams.iter().enumerate().skip(1) {
+        if kind == "data" || (container == Container::Mkv && *cover) {
+            continue;
+        }
+        if kind == "attachment" {
+            attachments += 1;
+        }
+        a.extend(["-map".into(), format!("1:{i}")]);
+        kept.push(i);
+    }
+    a.extend(["-c", "copy", "-field_order:v:0", "progressive"].map(String::from));
+    if let Some(aspect) = display_aspect(info) {
+        a.extend(["-aspect:v:0".into(), aspect]);
+    }
+    // The picture's marks were on the stream this one replaces.
+    let mut streams = streams.clone();
+    a.extend(bare_stream_marks(info, &mut streams.view_marks, notes));
+    a.extend(["-map_metadata", "1", "-map_chapters", "1"].map(String::from));
+    // Naming one stream's tags turns off ffmpeg's copying for all of them: each is named.
+    a.extend(kept.iter().enumerate().flat_map(|(k, i)| [format!("-map_metadata:s:{k}"), format!("1:s:{i}")]));
+    // MP4 keeps a track's name where ffmpeg reads it as one tag and writes it from another
+    // (see `title_args`): copied as tags, the names of a repaired MP4 were lost.
+    a.extend(title_args("v:0", &finished_info.video_track, container));
+    for (i, s) in finished_info.audio.iter().enumerate() {
+        a.extend(title_args(&format!("a:{i}"), &s.track, container));
+    }
+    for (i, track) in finished_info.subtitle_tracks.iter().enumerate() {
+        a.extend(title_args(&format!("s:{i}"), track, container));
+    }
+    if !finished_info.video_disposition.is_empty() {
+        a.extend(["-disposition:v:0".into(), finished_info.video_disposition.clone()]);
+    }
+    if container == Container::Mkv {
+        // After the attachments that were copied, each with its name and type (see `stream_args`).
+        for (k, f) in cover_files.iter().enumerate() {
+            let t = attachments + k;
+            a.extend(["-attach".into(), path_arg(&f.path)]);
+            a.extend([format!("-metadata:s:t:{t}"), format!("mimetype={}", f.mime)]);
+            a.extend([format!("-metadata:s:t:{t}"), format!("filename={}", f.name)]);
+        }
+    }
+    if container == Container::Mp4 {
+        a.extend(["-movflags", "+faststart"].map(String::from));
+        if !info.view_marks.is_empty() {
+            a.extend(["-strict", "unofficial"].map(String::from));
+        }
+    }
+    a.push(path_arg(out));
+    (a, streams)
+}
+
+/// The streams of a file in its order: the kind of each as ffprobe names it ("video", "audio",
+/// "subtitle", "data", "attachment"), and whether it is a cover.
+fn stream_kinds(tools: &Tools, path: &Path) -> Result<Vec<(String, bool)>> {
+    let mut command = crate::tools::probe_command(&tools.ffprobe);
+    command.args(["-v", "error", "-show_entries", "stream=index,codec_type:stream_disposition=attached_pic", "-of", "csv=p=0"]).arg(crate::tools::probe_arg(path));
+    let out = probe::run_ffprobe(command, probe::Reads::Little)?;
+    if !out.status.success() {
+        bail!("ffprobe: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(parse_stream_kinds(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// A line a stream of ffprobe's `index,codec_type,attached_pic`.
+fn parse_stream_kinds(text: &str) -> Vec<(String, bool)> {
+    text.lines()
+        .filter_map(|l| {
+            let mut f = l.trim().split(',');
+            let (_, kind, cover) = (f.next()?, f.next()?, f.next());
+            (!kind.is_empty()).then(|| (kind.to_string(), cover == Some("1")))
+        })
+        .collect()
 }
 
 /// Channel layouts libopus takes as they are, with their channels in ffmpeg's order, fewest
@@ -1869,6 +1997,7 @@ fn shown_ratio((w, h): (u32, u32), width: u32, height: u32) -> f64 {
 }
 
 /// Audio, subtitle, cover and attachment arguments for source input number `src`.
+#[derive(Clone)]
 struct Streams {
     args: Vec<String>,
     /// (output, source) stream specifiers whose tags must be copied explicitly (cut mode).
@@ -2066,6 +2195,11 @@ fn stream_args(
     // (`optimize` refused what cannot be planned before the search; what is left is kept.)
     let sound = plan_sound(info, container, audio, cut_subs.is_some()).unwrap_or_default();
     a.extend(title_args("v:0", &info.video_track, container));
+    // The cut's picture comes out of its filter graph too: a Matroska cut lost the video's
+    // default mark, which players use to pick the track.
+    if cut_subs.is_some() {
+        a.extend(["-disposition:v:0".into(), marked(Some(&info.video_disposition))]);
+    }
     for (i, (s, (way, note))) in info.audio.iter().zip(sound).enumerate() {
         if cut_subs.is_some() {
             a.extend(["-map".into(), format!("[ao{i}]")]);
@@ -2551,6 +2685,7 @@ fn verify_whole(
     info: &MediaInfo,
     out: &Path,
     streams: &Streams,
+    cut: Option<&Sections>,
     enc: &EncodeSettings,
     rules: &repair::MeanRules,
     floor: f64,
@@ -2561,12 +2696,13 @@ fn verify_whole(
     notes: &mut Vec<String>,
 ) -> Result<Option<(Vec<f64>, MediaInfo, repair::Summary)>> {
     let took = tools.stopwatch();
-    let mut out_info = check_layout(tools, info, out, streams, None, None)?;
+    let mut out_info = check_layout(tools, info, out, streams, None, cut)?;
     let why_not = |e: &anyhow::Error| e.to_string().lines().last().unwrap_or("").to_string();
-    let survey = match repair::survey(tools, input, info, out, threads, tmp) {
+    let survey = match repair::survey(tools, input, info, out, cut, threads, tmp) {
         Ok(Some(s)) => s,
         Ok(None) => {
-            eprintln!("the frames of the encode can't be set against the source's one for one: spot checks instead of the whole video");
+            let kept = if cut.is_some() { " kept" } else { "" };
+            eprintln!("the frames of the encode can't be set against the source's{kept} ones one for one: spot checks instead of the whole video");
             return Ok(None);
         }
         Err(e) if crate::events::is_cancelled(&e) => return Err(e),
@@ -2592,13 +2728,26 @@ fn verify_whole(
         };
         return Err(EncodeAgain { crf: again, why }.into());
     }
-    let ctx = repair::Ctx { tools, input, info, enc, crf, floor, target, min_crf, threads, dir: tmp };
+    // Where the survey's first frame is on the output's timeline, which a cut counts from the
+    // start of the file as the source's (see `Sections::window`).
+    let first = cut.map_or(0.0, |c| c.to_out(search::first_frame(info)));
+    let ctx = repair::Ctx { tools, input, info, enc, crf, floor, target, min_crf, threads, dir: tmp, cut };
     let outcome = match repair::repair(&ctx, out, &survey) {
         Ok(o) => o,
         Err(e) if crate::events::is_cancelled(&e) => return Err(e),
         Err(e) => match e.downcast::<repair::StillLow>() {
-            // In the source's time, as the search takes its samples.
-            Ok(low) => return Err(LowSpot { windows: low.windows.iter().map(|w| (w.0 + search::first_frame(info), w.1, w.2)).collect(), floor, hint: false }.into()),
+            // In the source's time, as the search takes its samples; of a cut, inside one kept
+            // part each (see `Sections::window`), where a sample holds no frame that was removed.
+            Ok(low) => {
+                let place = |w: &(f64, f64, f64)| match cut {
+                    None => (w.0 + search::first_frame(info), w.1, w.2),
+                    Some(c) => {
+                        let (_, src, secs) = c.window(w.0 + first, w.1);
+                        (src, secs, w.2)
+                    }
+                };
+                return Err(LowSpot { windows: low.windows.iter().map(place).collect(), floor, hint: false }.into());
+            }
             Err(e) => {
                 let n = format!("stretches below VMAF {floor:.0} could not be encoded again ({}): judged by spot checks", why_not(&e));
                 eprintln!("note: {n}");
@@ -2617,7 +2766,7 @@ fn verify_whole(
         tools.run(&args)?;
         let _ = std::fs::remove_file(video);
         std::fs::rename(&joined, out)?;
-        out_info = check_layout(tools, info, out, &joined_streams, Some(frames), None)?;
+        out_info = check_layout(tools, info, out, &joined_streams, Some(frames), cut)?;
         if let Some(n) = crate::sequence_header::note(&outcome.differences, "the stretches encoded again", "the rest") {
             eprintln!("note: {n}");
             tools.emit(Event::Note { text: n.clone() });
@@ -2635,6 +2784,7 @@ fn verify_whole(
         if s.stretches.len() > 1 {
             ends.push(&s.stretches[s.stretches.len() - 1]);
         }
+        let mut looked_at = None;
         for (i, st) in ends.into_iter().enumerate() {
             // Half the clip before the stretch and half in it (or, for a stretch the video
             // begins with, across its end): were the stretch's frames a step off, no one shift
@@ -2650,8 +2800,21 @@ fn verify_whole(
                     (st.start_secs, secs, alone)
                 }
             };
-            let at = (begin + search::first_frame(&out_info), begin + search::first_frame(info), secs);
-            let v = spot_check(tools, input, info, out, &out_info, at, None, alone - JOIN_SLACK, threads, tmp, &format!("joined{i}"))?;
+            // A cut's clip lies inside one kept part, as its spot checks do, and is moved into
+            // the part with the most of it where it would cross a join.
+            let (at, part, alone) = match cut {
+                None => ((begin + search::first_frame(&out_info), begin + search::first_frame(info), secs), None, alone),
+                Some(c) => {
+                    let (o, src, secs) = c.window(begin + first, secs);
+                    let Some(alone) = outcome.at(o - first, secs) else { continue };
+                    ((o, src, secs), Some(c.picture_of(src, info.duration_s)), alone)
+                }
+            };
+            // (Moved into one part, the clips of both ends can be the same.)
+            if looked_at.replace(at) == Some(at) {
+                continue;
+            }
+            let v = spot_check(tools, input, info, out, &out_info, at, part, alone - JOIN_SLACK, threads, tmp, &format!("joined{i}"))?;
             eprintln!("  joined video at {}: VMAF {v:.2} ({alone:.2} by itself)", hms(at.0));
             if v < alone - JOIN_SLACK {
                 bail!("the stretch at {} was encoded again but scores VMAF {v:.2} once put back into the video, against {alone:.2} on its own; {FAILED_INSIDE}", hms(st.start_secs));
@@ -2729,8 +2892,8 @@ fn verify_whole(
     }
     eprintln!("whole video as kept: mean VMAF {:.2}, lowest {:.0} s {:.2}", s.mean_vmaf, repair::WINDOW_SECS, s.lowest_vmaf);
     let mut scores = Vec::new();
-    for (start, secs) in spot_checks(info.picture_secs()) {
-        if let Some(v) = outcome.at(start, secs) {
+    for (start, secs) in spot_checks(cut.map_or(info.picture_secs(), Sections::kept)) {
+        if let Some(v) = outcome.at(start - first, secs) {
             tools.emit(Event::SpotCheck { at_secs: start, vmaf: v });
             scores.push(v);
         }
@@ -3412,6 +3575,7 @@ mod tests {
     #[test]
     fn a_cut_keeps_what_tracks_are_marked_as_and_says_what_is_left_out() {
         let mut i = info(&[("aac", 2, 128_000.0), ("aac", 2, 128_000.0)]);
+        i.video_disposition = "default".into();
         i.audio[1].disposition = "default+original".into();
         i.subtitle_codecs = vec!["subrip".into(), "hdmv_pgs_subtitle".into(), "ass".into()];
         i.subtitle_dispositions = vec![String::new(), "default".into(), "forced".into()];
@@ -3422,9 +3586,11 @@ mod tests {
         let plain = stream_args(&i, 0, Container::Mkv, Audio::Keep, &[], None, &mut notes);
         assert!(!plain.args.iter().any(|a| a.starts_with("-disposition")), "{:?}", plain.args);
         assert!(notes.iter().any(|n| n.starts_with("left out: data (tmcd), video (h264)")), "{notes:?}");
-        // Out of a cut they are told: the second sound track is the default one, and the
-        // third subtitle track (the second kept: the image one cannot be cut) is forced.
+        // Out of a cut they are told: the picture and the second sound track are the default
+        // ones, and the third subtitle track (the second kept: the image one cannot be cut) is
+        // forced.
         let cut = stream_args(&i, 0, Container::Mkv, Audio::Keep, &[], Some(&[Some(1), None, Some(2)]), &mut Vec::new());
+        assert_eq!(value(&cut, "-disposition:v:0").as_deref(), Some("default"));
         assert_eq!(value(&cut, "-disposition:a:0").as_deref(), Some("0"));
         assert_eq!(value(&cut, "-disposition:a:1").as_deref(), Some("default+original"));
         assert_eq!(value(&cut, "-disposition:s:0").as_deref(), Some("0"));
@@ -3661,6 +3827,57 @@ mod tests {
         let (_, streams) = mux_args(Path::new("v.ivf"), false, 0.0, Path::new("in.mp4"), &source, Container::Mkv, Audio::Keep, &[], &Resolved::default(), &MetaOptions::default(), Path::new("o.mkv"), &mut notes);
         assert!(streams.view_marks.is_empty());
         assert!(notes[0].starts_with("the 3D mark (frame alternate) is lost"), "{notes:?}");
+    }
+
+    #[test]
+    fn a_repaired_cut_keeps_its_chapters_and_covers_as_the_one_pass_wrote_them() {
+        let source = info(&[]);
+        let finished = stream_args(&source, 0, Container::Mp4, Audio::Keep, &[], None, &mut Vec::new());
+        let kind = |k: &str, cover| (k.to_string(), cover);
+        let maps = |a: &[String]| a.windows(2).filter(|w| w[0] == "-map").map(|w| w[1].clone()).collect::<Vec<_>>();
+        let tags = |a: &[String]| a.windows(2).filter(|w| w[0].starts_with("-map_metadata:s:")).map(|w| format!("{} {}", w[0], w[1])).collect::<Vec<_>>();
+        // An MP4 as ffprobe lists it: the chapters are its third stream, the cover its fifth.
+        // Copied with the rest, the chapter track came out as a track of data beside the
+        // chapters ffmpeg wrote, and every stream after it took the tags of the one before.
+        let mp4 = [kind("video", false), kind("audio", false), kind("data", false), kind("subtitle", false), kind("video", true)];
+        let (a, _) = revideo_args(Path::new("v.ivf"), 0.0, Path::new("partial.mp4"), &source, &mp4, &[], &finished, &source, Container::Mp4, Path::new("o.mp4"), &mut Vec::new());
+        assert_eq!(maps(&a), ["0:v", "1:1", "1:3", "1:4"], "{a:?}");
+        assert_eq!(tags(&a), ["-map_metadata:s:0 1:s:0", "-map_metadata:s:1 1:s:1", "-map_metadata:s:2 1:s:3", "-map_metadata:s:3 1:s:4"], "{a:?}");
+        assert!(a.windows(2).any(|w| w == ["-map_chapters", "1"]) && !a.iter().any(|x| x == "-attach"), "{a:?}");
+        // A Matroska file: a font, then the cover, which a copy made a video track of one frame.
+        let mkv = [kind("video", false), kind("audio", false), kind("subtitle", false), kind("attachment", false), kind("video", true)];
+        let cover = [CoverFile { path: "cover0.png".into(), mime: "image/png", name: "front.png".into() }];
+        let (a, _) = revideo_args(Path::new("v.ivf"), 0.0, Path::new("partial.mkv"), &source, &mkv, &cover, &finished, &source, Container::Mkv, Path::new("o.mkv"), &mut Vec::new());
+        assert_eq!(maps(&a), ["0:v", "1:1", "1:2", "1:3"], "{a:?}");
+        let at = a.iter().position(|x| x == "-attach").expect("the cover is attached");
+        assert!(a[at + 1].ends_with("cover0.png"), "{a:?}");
+        assert_eq!(a[at + 2..at + 6], ["-metadata:s:t:1", "mimetype=image/png", "-metadata:s:t:1", "filename=front.png"], "{a:?}");
+        assert_eq!(parse_stream_kinds("0,video,0\n1,audio,0\n2,data,0\n3,video,1\n"), [kind("video", false), kind("audio", false), kind("data", false), kind("video", true)]);
+    }
+
+    #[test]
+    fn a_repaired_cut_is_not_asked_for_the_360_degree_mark_that_no_bare_stream_can_be_given() {
+        let mut source = info(&[]);
+        source.view_marks = vec!["Stereo 3D".into(), "Spherical Mapping".into()];
+        source.stereo3d = "top and bottom".into();
+        let mut notes = Vec::new();
+        // The one pass of the cut kept both marks, and its check asked for both.
+        let finished = stream_args(&source, 0, Container::Mp4, Audio::Keep, &[], None, &mut notes);
+        assert_eq!(finished.view_marks, source.view_marks);
+        let kinds = [("video".to_string(), false), ("audio".to_string(), false)];
+        let (args, streams) = revideo_args(Path::new("v.ivf"), 0.0, Path::new("partial.mp4"), &source, &kinds, &[], &finished, &source, Container::Mp4, Path::new("o.mp4"), &mut notes);
+        assert!(args.windows(2).any(|w| w == ["-stereo3d:v:0", "tb"]), "{args:?}");
+        // Asked of the file joined from the stretches encoded again, the 360 degree mark
+        // failed the encode after its search, its one pass and its repairs.
+        assert_eq!(streams.view_marks, ["Stereo 3D"]);
+        assert!(notes.len() == 1 && notes[0].starts_with("the 360 degree mark (spherical mapping) is lost"), "{notes:?}");
+        assert_eq!((streams.audio, streams.subs), (finished.audio, finished.subs));
+        source.stereo3d = "frame alternate".into();
+        notes.clear();
+        let (args, streams) = revideo_args(Path::new("v.ivf"), 0.0, Path::new("partial.mkv"), &source, &kinds, &[], &finished, &source, Container::Mkv, Path::new("o.mkv"), &mut notes);
+        assert!(!args.iter().any(|a| a == "-stereo3d:v:0"), "{args:?}");
+        assert!(streams.view_marks.is_empty());
+        assert!(notes.len() == 2 && notes[0].starts_with("the 3D mark (frame alternate) is lost"), "{notes:?}");
     }
 
     #[test]

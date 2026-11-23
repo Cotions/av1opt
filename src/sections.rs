@@ -1,7 +1,7 @@
 //! Removing parts of a video. The encode re-encodes the picture anyway, so cuts are
-//! frame-accurate: the kept parts are trimmed out of the decoded source and joined with
-//! ffmpeg's trim/concat filters. This module parses the sections, maps times between the
-//! source and the shorter output, and retimes text subtitles and chapters to match.
+//! frame-accurate: the frames of the kept parts are picked out of the decoded source and moved
+//! together, their sound trimmed and joined. This module parses the sections, maps times
+//! between the source and the shorter output, and retimes text subtitles and chapters to match.
 
 use anyhow::{Result, bail};
 use std::fmt::Write as _;
@@ -248,11 +248,38 @@ impl Sections {
     /// be, and the encode was refused for it. The frames of the parts are picked and moved
     /// instead, each part to where the parts before it end, as the sound is.
     pub fn filter_graph(&self, video: usize, audio: usize, post: &[String], duration: f64) -> String {
+        let mut g = String::new();
+        let mut joined = String::new();
+        for (k, &(a, b)) in self.keep.iter().enumerate() {
+            let end = if self.picture(a, b, duration).1.is_none() { String::new() } else { format!(":end={b:.6}") };
+            for i in 0..audio {
+                let _ = write!(g, "[0:a:{i}]atrim=start={a:.6}{end},asetpts=PTS-{a:.6}/TB[a{i}_{k}];");
+                let _ = write!(joined, "[a{i}_{k}]");
+            }
+        }
+        let mut picture = self.picture_filters(duration).to_vec();
+        picture.extend(post.iter().cloned());
+        let _ = write!(g, "[0:{video}]{}[vout]", picture.join(","));
+        if audio > 0 {
+            let _ = write!(g, ";{joined}concat=n={}:v=0:a={audio}", self.keep.len());
+            for i in 0..audio {
+                let _ = write!(g, "[ao{i}]");
+            }
+        }
+        g
+    }
+
+    /// The `select` and `setpts` filters that make the picture of the output out of the
+    /// source's: the frames of the kept parts, each part moved back to where the parts before
+    /// it end. The source's timestamps are taken as counted from the start of its file, as
+    /// ffmpeg counts them unless told to keep them (`-copyts` without `-start_at_zero`).
+    /// Whatever else sets the output against its source (the whole-video check, the stretches
+    /// encoded again) goes through these same two filters, so that both hold the same frames
+    /// in the same order.
+    pub fn picture_filters(&self, duration: f64) -> [String; 2] {
         let mut pick = Vec::new();
         let mut shift = String::new();
         let (mut out, mut before) = (0.0, 0.0);
-        let mut g = String::new();
-        let mut joined = String::new();
         for (k, &(a, b)) in self.keep.iter().enumerate() {
             let (va, vb) = self.picture(a, b, duration);
             pick.push(vb.map_or_else(|| format!("gte(t,{va:.6})"), |vb| format!("gte(t,{va:.6})*lt(t,{vb:.6})")));
@@ -264,22 +291,43 @@ impl Sections {
                 let _ = write!(shift, "+if(gte(T,{va:.6}),{:.6},0)", moved - before);
             }
             (before, out) = (moved, out + b - a);
-            let end = if vb.is_none() { String::new() } else { format!(":end={b:.6}") };
-            for i in 0..audio {
-                let _ = write!(g, "[0:a:{i}]atrim=start={a:.6}{end},asetpts=PTS-{a:.6}/TB[a{i}_{k}];");
-                let _ = write!(joined, "[a{i}_{k}]");
-            }
         }
-        let mut picture = vec![format!("select='{}'", pick.join("+")), format!("setpts='round(PTS-({shift})/TB)'")];
-        picture.extend(post.iter().cloned());
-        let _ = write!(g, "[0:{video}]{}[vout]", picture.join(","));
-        if audio > 0 {
-            let _ = write!(g, ";{joined}concat=n={}:v=0:a={audio}", self.keep.len());
-            for i in 0..audio {
-                let _ = write!(g, "[ao{i}]");
-            }
+        [format!("select='{}'", pick.join("+")), format!("setpts='round(PTS-({shift})/TB)'")]
+    }
+
+    /// Output arguments that make an ffmpeg which decodes the picture of input `input` read
+    /// that input's sound as well, without decoding it: all of it, or `packets` of each track
+    /// into an output of their own.
+    ///
+    /// ffmpeg counts the time of an MPEG transport or program stream from the first packet of
+    /// the streams it reads, not from where the file says it starts. The encode of a cut reads
+    /// the sound and the picture; the whole-video check and the stretches encoded again read
+    /// the picture alone, and where the sound starts first their clock ran behind the
+    /// encode's by that lead. In a transport stream whose sound starts 23 ms before its
+    /// picture, at 24 frames a second, they took the first frame of each removed section for
+    /// a kept one and left out the first frame after it: the same number of frames, so the
+    /// count told nothing, and a group of pictures encoded again at a join put the removed
+    /// frame into the file. Reading what the encode read gives them the encode's clock.
+    pub fn sound_read_too(input: usize, packets: Option<u32>) -> Vec<String> {
+        let mut a = vec!["-map".to_string(), format!("{input}:a"), "-c:a".into(), "copy".into()];
+        if let Some(n) = packets {
+            a.extend(["-frames:a".into(), n.to_string()]);
         }
-        g
+        a
+    }
+
+    /// Source time of output time `t`: inside the kept part that shows it, the part after a
+    /// join at the join itself.
+    pub fn to_source(&self, t: f64) -> f64 {
+        let mut base = 0.0;
+        for (i, &(a, b)) in self.keep.iter().enumerate() {
+            let len = b - a;
+            if t < base + len || i + 1 == self.keep.len() {
+                return a + (t - base).max(0.0);
+            }
+            base += len;
+        }
+        t
     }
 
     /// Moves an event `[start, end]` onto the output timeline; None if it falls entirely in
@@ -721,6 +769,34 @@ mod tests {
         }
         assert!(close(s.kept_within(1e9), s.kept()));
         assert!(close(s.kept_within(0.0), 0.0));
+    }
+
+    #[test]
+    fn an_output_time_goes_back_to_the_source_time_it_shows() {
+        let s = cut_video();
+        for (out, src) in [(0.0, 0.0), (9.5, 9.5), (10.0, 30.0), (25.0, 45.0), (30.0, 60.0), (69.0, 99.0), (-1.0, 0.0)] {
+            assert!(close(s.to_source(out), src), "{out}: {}", s.to_source(out));
+        }
+        // And back again, anywhere the output shows.
+        for i in 0..=139 {
+            let out = i as f64 / 2.0;
+            assert!(close(s.to_out(s.to_source(out)), out), "{out}");
+        }
+        // On the frames, the parts are where their frames are.
+        let f = Sections::new(&[(1.001, 2.0)], 10.0).unwrap().on_frames(24.0, 0.0).unwrap();
+        assert!(close(f.to_source(25.0 / 24.0), 2.0));
+        assert!(close(f.to_source(1.0), 1.0));
+    }
+
+    #[test]
+    fn what_checks_the_cut_picks_the_frames_the_encode_was_made_of() {
+        // The whole-video check and the stretches encoded again decode the source through
+        // the same two filters as the encode: both sides hold the same frames in one order.
+        for s in [cut_video(), Sections::new(&[(1.001, 2.0), (3.001, 4.0)], 10.0).unwrap().on_frames(24.0, 0.0).unwrap()] {
+            let [select, setpts] = s.picture_filters(100.0);
+            let g = s.filter_graph(3, 1, &["crop=2:2:0:0".into()], 100.0);
+            assert!(g.contains(&format!("[0:3]{select},{setpts},crop=2:2:0:0[vout]")), "{g}");
+        }
     }
 
     #[test]

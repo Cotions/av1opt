@@ -17,6 +17,7 @@
 use crate::events::Event;
 use crate::probe::MediaInfo;
 use crate::scenes::{self, Bounds, Times};
+use crate::sections::Sections;
 use crate::search::{self, EncodeSettings, VMAF_STRIDE};
 use crate::sequence_header;
 use crate::tools::{Tools, WENT_WRONG_INSIDE, hms, path_arg};
@@ -117,14 +118,20 @@ pub struct Survey {
 /// two don't hold the same number of frames, the source's timestamps can't be read, too many
 /// of its frames are shown for unequal times (see [`UNEVEN_STEPS_IN_A_HUNDRED`]), or a GOP
 /// starts where no cut can be made.
-pub fn survey(tools: &Tools, input: &Path, info: &MediaInfo, output: &Path, threads: usize, dir: &Path) -> Result<Option<Survey>> {
+///
+/// With `cut` (sections removed) the source is decoded through the same picture filters as the
+/// encode was (see [`Sections::picture_filters`]): both sides then hold the frames the output
+/// shows, in its order, and the times are those of the output's picture. Should the two not
+/// hold as many frames, this is `None` like the rest: frames would be scored against others.
+pub fn survey(tools: &Tools, input: &Path, info: &MediaInfo, output: &Path, cut: Option<&Sections>, threads: usize, dir: &Path) -> Result<Option<Survey>> {
     let keys = tools.key_packets(output)?;
     let gops: Vec<usize> = keys.iter().enumerate().filter(|(_, k)| **k).map(|(i, _)| i).collect();
     if gops.first() != Some(&0) {
         return Ok(None);
     }
     let pix = search::reference_pix_fmt(info);
-    let mut vf = search::source_filters(info);
+    let mut vf: Vec<String> = cut.map(|c| c.picture_filters(info.duration_s).to_vec()).unwrap_or_default();
+    vf.extend(search::source_filters(info));
     vf.extend([
         // `metadata` prints frames that carry the key, so every frame is given one.
         "metadata=mode=add:key=av1opt:value=1".into(),
@@ -142,12 +149,19 @@ pub fn survey(tools: &Tools, input: &Path, info: &MediaInfo, output: &Path, thre
         vf.join(","),
         search::vmaf_model(info)
     );
-    let args: Vec<String> = [
-        "-y", "-copyts", "-i", &path_arg(output), "-i", &path_arg(&std::path::absolute(input)?),
-        "-lavfi", &filter, "-an", "-sn", "-dn", "-f", "null", "-",
-    ]
-    .map(String::from)
-    .to_vec();
+    let mut args: Vec<String> = ["-y", "-copyts"].map(String::from).to_vec();
+    // The picture of a cut is picked by times counted from the start of the file, as the
+    // encode counted them.
+    if cut.is_some() {
+        args.push("-start_at_zero".into());
+    }
+    args.extend(["-i", &path_arg(output), "-i", &path_arg(&std::path::absolute(input)?), "-lavfi", &filter].map(String::from));
+    // And the start of the file is where the encode had it (see `Sections::sound_read_too`).
+    match cut.filter(|_| !info.audio.is_empty()) {
+        Some(_) => args.extend(Sections::sound_read_too(1, None)),
+        None => args.push("-an".into()),
+    }
+    args.extend(["-sn", "-dn", "-f", "null", "-"].map(String::from));
     // The scored frames are numbered in seconds (`settb=1`), so the output's clock reads
     // frames where it says seconds.
     tools.run_with_progress_in(Some(dir), &args, keys.len() as f64, "checking")?;
@@ -653,6 +667,8 @@ pub struct Ctx<'a> {
     pub min_crf: u8,
     pub threads: usize,
     pub dir: &'a Path,
+    /// Sections removed from the output: the stretches are cut from its picture (see [`survey`]).
+    pub cut: Option<&'a Sections>,
 }
 
 /// What repairs at the floor would make of a video, imitated on its scores.
@@ -1163,7 +1179,7 @@ fn fix(c: &Ctx, goal: Goal, times: &Times, secs: &[f64], all: &[(usize, f64)], r
     // The frames between two of the source's own timestamps, as scene mode cuts a source
     // whose frames keep their times: the encode holds every source frame once.
     let b = Bounds { start: (run.start > 0).then(|| times.pts[run.start]), end: times.pts.get(run.end).copied() };
-    let got = scenes::extract_chunk(c.tools, c.input, c.info, b, Some(times.tb), &reference)? as usize;
+    let got = scenes::extract_chunk(c.tools, c.input, c.info, b, Some(times.tb), c.cut, &reference)? as usize;
     if got != run.end - run.start {
         bail!("the stretch at {at} holds {got} frames cut from the source, {} in the encode", run.end - run.start);
     }
@@ -1458,7 +1474,7 @@ mod tests {
         crate::encode::FREE_IN_TESTS.set(Some(1_500_000_000));
         let tools = Tools::new("false".into(), "false".into(), None);
         let (info, enc) = (MediaInfo::default(), EncodeSettings { preset: 8, pix_fmt_out: "yuv420p10le", params: String::new(), keyint_frames: None });
-        let c = Ctx { tools: &tools, input: &dir.join("in.mkv"), info: &info, enc: &enc, crf: 30.0, floor: 90.0, target: 70.0, min_crf: 20, threads: 1, dir: &dir };
+        let c = Ctx { tools: &tools, input: &dir.join("in.mkv"), info: &info, enc: &enc, crf: 30.0, floor: 90.0, target: 70.0, min_crf: 20, threads: 1, dir: &dir, cut: None };
         let survey = Survey { scores: scored(300, |_| 70.0), times: Times { pts: (0..300).collect(), tb: (1, 30) }, gops: vec![0] };
         let why = repair(&c, &output, &survey).err().expect("no room").to_string();
         // One line: it ends up in the note that says the stretches were left as they are.

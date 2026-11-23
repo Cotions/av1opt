@@ -13,8 +13,8 @@ For each file:
    throws that off is where the clips lie, not how long they are: one clip of 1 second for
    every 8 seconds of video, 8 at least and 64 at most, spread evenly from the first second
    to the last; a video under 64 seconds is sampled whole, as clips of a second side by side.
-   Where one CRF has to carry its worst stretch (`--scenes`, HDR, removed sections), clips
-   of 4 seconds, long enough to show a stretch: 8 of them up to about 17 minutes, then one
+   Where one CRF has to carry its worst stretch (`--scenes`, HDR), and with sections removed,
+   clips of 4 seconds, long enough to show a stretch: 8 of them up to about 17 minutes, then one
    for every two minutes of video, 32 at most. `--samples` and `--sample-secs` set the
    number and the length by hand; what they leave out follows the 4-second scheme, and the
    search then goes by the samples as they are, whole-video check or not.
@@ -54,7 +54,7 @@ For each file:
    scheme a sample 4 or more below the samples' mean gets a note that quality differs along
    the video (see [per-scene CRF](#per-scene-crf---scenes)), unless `--scenes` gives every
    scene its own CRF anyway. Where the whole
-   video can't be scored afterwards (step 5: HDR, removed sections), one CRF has to carry
+   video can't be scored afterwards (step 5: HDR), one CRF has to carry
    its worst stretch: a spot check may read 4 VMAF below the target, and reads a little
    higher or lower than the samples did. If the worst sample at the chosen CRF is not a
    point above that mark there, the search goes on to the CRF that puts it there, and the
@@ -146,15 +146,21 @@ For each file:
    the video is encoded once more at the lower CRF that search finds, which the report
    says; if that saves less than `--min-savings` the video is skipped, and a second failure
    stands.
-   Where frames can't be paired one for one (removed sections, a source in which more than
+   With sections removed the source is decoded through the same picking of frames as the
+   encode was (see [Removing sections](#removing-sections---remove)), so that both sides hold
+   the same frames in the same order, and the stretches encoded again are cut from that same
+   picture; a video too weak for its repairs is searched and encoded again as a whole one
+   is, with the same sections removed and each weak stretch a sample from inside one kept part.
+   Where frames can't be paired one for one (the two sides of a cut hold different numbers of
+   frames, a source in which more than
    one frame in ten stays on screen much longer or shorter than the rest, as in a screen
    recording), in HDR and for videos encoded per scene, it is spot checks at
    fixed positions instead (five seconds at 30% and at 70% of the way;
    one for every ten minutes of a video of 25 minutes or more, eight at most; all of a
    video of ten seconds or less, once). So it is where stretches can't be encoded again (no
    room for them on the drive, say), and the report then says so. A spot check more than 4
-   below the target leads to the same second search; a video encoded per scene or with
-   sections removed fails instead. Nothing is written unless all checks pass. The source
+   below the target leads to the same second search, with sections removed as well; a video
+   encoded per scene fails instead. Nothing is written unless all checks pass. The source
    has to be as it was, too. It counts as changed if its size is different, or if its
    modification time is more than two seconds off and a fingerprint of its contents (a hash
    of its size and of a megabyte at its start, middle and end) differs as well; a file only
@@ -213,7 +219,22 @@ timeline puts them (a variable-rate source is cut at the times given). A frame h
 section is shown that much less, as the sound is. Audio is re-encoded to Opus; text subtitles and chapters
 are moved to their new times (lines and chapters inside removed parts go); image subtitles
 (PGS, DVD) and TTML are dropped. Sample clips and spot checks are taken from kept parts only; a
-spot check compares the frames of one kept part with the same frames where the output shows them. A cut is
+spot check compares the frames of one kept part with the same frames where the output shows them.
+The finished cut is scored along its whole length and its weak stretches encoded again, as a
+one-pass encode is (see [encode](#encode), step 5), so its CRF does not have to carry its
+worst sample: the source is decoded through the same `select`/`setpts`, its times counted
+from the start of the file as the encode counted them (`-copyts -start_at_zero`, and the
+sound read beside the picture as the encode read it: ffmpeg starts a transport stream at the
+first packet of what it reads), the frames
+are counted on both sides, and a group of pictures that holds a join is encoded again from
+the frames the output shows there, the end of one kept part and the start of the next. Only
+the video stream of the cut is then replaced: its sound, subtitles, chapters and marks stay
+as the cut made them. The whole video is encoded once more where the scores say so, with the
+same sections removed. A variable-rate source cut at the times given goes the same way, under
+the same rule as any other source (no more than one step between frames in ten uneven);
+past that, and wherever the two sides of the cut do not hold as many frames, it gets the
+spot checks, and one that fails makes its stretch a sample of a second search, as without
+sections removed: nothing else holds the CRF of a cut to its worst stretch. A cut is
 never skipped for being AV1 already or saving too little, and if the VMAF target is out of reach
 it is encoded at the best CRF tried. At least one second of the video has to stay: sections
 that remove all of it, or all but a moment, are refused before the encode starts, and the web UI

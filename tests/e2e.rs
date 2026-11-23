@@ -782,6 +782,180 @@ fn a_recording_cut_between_its_frames_is_checked_against_the_same_frames() {
     assert_in_step(&out, &src, "lt(t,1.01)+gte(t,2.03)*lt(t,3.5)+gte(t,4.2)");
 }
 
+/// 24 s at 24 fps, 640x360, easy but for 12 s to 16 s, which a high CRF leaves far below the
+/// floor, and with its frame number burned into each frame (see [`frame_numbers`]).
+fn weak_numbered_clip(c: &Case, name: &str) -> PathBuf {
+    c.ffmpeg(&[
+        "-f", "lavfi", "-i", "testsrc2=s=640x360:r=24:d=12", "-f", "lavfi", "-i", "life=s=640x360:r=24:mold=10:ratio=0.1:seed=1:death_color=#C83232:life_color=#00ff00,trim=duration=4",
+        "-f", "lavfi", "-i", "testsrc2=s=640x360:r=24:d=8", "-f", "lavfi", "-i", "sine=f=440:d=24", "-f", "lavfi", "-i", &format!("nullsrc=s=480x24:r=24:d=24,format=gray,geq=lum='{NUMBER_BITS}'"),
+        "-filter_complex", "[0:v]format=yuv420p[a];[1:v]format=yuv420p[b];[2:v]format=yuv420p[c];[a][b][c]concat=n=3:v=1:a=0[p];[4:v]format=yuv420p[n];[p][n]overlay=0:0:shortest=1[v]",
+        "-map", "[v]", "-map", "3:a", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "16", "-c:a", "aac", "-b:a", "64k", name,
+    ]);
+    c.videos().join(name)
+}
+
+/// The number of a frame, in twelve blocks 40 pixels wide along the top 24 lines: bright for a
+/// one, dark for a nought, the lowest bit first.
+const NUMBER_BITS: &str = "if(mod(floor(N/pow(2,floor(X/40))),2),235,16)";
+
+/// The frame numbers burned into the first video stream of `path` by [`weak_numbered_clip`],
+/// in the order the frames are shown.
+fn frame_numbers(path: &Path) -> Vec<u32> {
+    let o = Command::new(ffmpeg_bin())
+        .args(["-v", "error", "-nostdin", "-i"])
+        .arg(path)
+        .args(["-map", "0:v:0", "-vf", "crop=480:24:0:0,scale=12:1:flags=area,format=gray", "-fps_mode", "passthrough", "-f", "rawvideo", "-"])
+        .output()
+        .expect("run ffmpeg");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    o.stdout.chunks(12).map(|bits| bits.iter().enumerate().filter(|(_, b)| **b > 125).map(|(k, _)| 1 << k).sum()).collect()
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_cut_video_whose_weak_stretch_the_samples_miss_is_repaired_frame_for_frame_across_the_join() {
+    let c = Case::new("cut-repair");
+    let clip = weak_numbered_clip(&c, "weak.mp4");
+    assert_eq!(frame_numbers(&clip), (0..576).collect::<Vec<u32>>());
+    // With names, a subtitle line, chapters and a cover, in Matroska, to see that the repaired
+    // file keeps what the cut made of them.
+    c.ffmpeg(&["-f", "lavfi", "-i", "color=c=blue:s=64x64", "-frames:v", "1", "cover.png"]);
+    std::fs::write(c.videos().join("line.srt"), "1\n00:00:08,000 --> 00:00:09,000\nAfter the cut\n").unwrap();
+    std::fs::write(c.videos().join("chapters.txt"), ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=8000\ntitle=One\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=8000\nEND=24000\ntitle=Two\n").unwrap();
+    c.ffmpeg(&[
+        "-i", "weak.mp4", "-i", "line.srt", "-f", "ffmetadata", "-i", "chapters.txt", "-map", "0", "-map", "1", "-map_chapters", "2", "-c", "copy",
+        "-attach", "cover.png", "-metadata:s:t", "mimetype=image/png", "-metadata:s:t", "filename=cover.png",
+        "-metadata:s:v:0", "title=Main picture", "-metadata:s:a:0", "title=Commentary", "-metadata:s:a:0", "language=fra", "-metadata:s:s:0", "language=eng", "weak.mkv",
+    ]);
+    let src = c.videos().join("weak.mkv");
+    // 2 s to 6 s go, and the weak 4 s come at 8 s to 12 s of the output. The samples lie in
+    // the easy parts, and a high CRF is chosen; a spot check found the weak stretch and threw
+    // the encode away, where the video without the cut would have been repaired.
+    for container in ["mp4", "mkv"] {
+        let out_dir = c.dir.join(container);
+        let r = c.encode_into(&out_dir, &[&src], &["--container", container, "--remove", "2-6"]);
+        r.ok().has("verifying: the whole video against its source").has("encoding again:").has("whole video as kept:").lacks("spot check at");
+        let out = out_dir.join(format!("weak.{container}"));
+        let rep = c.report_in(&out_dir, "weak");
+        let w = &rep["whole"];
+        let stretches = w["stretches"].as_array().unwrap();
+        // A group of pictures encoded again starts before the join at 2 s and goes on past it.
+        assert!(stretches.iter().any(|st| st["start_secs"].as_f64().unwrap() < 2.0 && st["start_secs"].as_f64().unwrap() + st["secs"].as_f64().unwrap() > 2.0), "{rep}");
+        assert!(w["lowest_vmaf"].as_f64().unwrap() >= 89.0 && w["lowest_before"].as_f64().unwrap() < 89.0, "{rep}");
+        assert_eq!(rep["mean_vmaf"], w["mean_vmaf"]);
+        assert_eq!(rep["removed"].as_array().map(Vec::len), Some(1), "{rep}");
+        // Every frame the output shows is the one it should, in the stretch encoded again too.
+        let want: Vec<u32> = (0..576).filter(|n| *n < 48 || *n >= 144).collect();
+        assert_eq!(frame_numbers(&out), want, "{container}");
+        assert_in_step(&out, &src, "lt(n,48)+gte(n,144)");
+        // What the cut made of the rest stays: the sound as long as the picture, the names,
+        // the line and the chapters moved by the 4 s that went.
+        let p = probe(&out);
+        let (v, a, s) = (streams(&p, "video")[0], streams(&p, "audio")[0], streams(&p, "subtitle")[0]);
+        assert_eq!(a["codec_name"], "opus");
+        assert!((duration(&out) - 20.0).abs() < 0.1, "{}", p["format"]);
+        assert_eq!((track_name(v), track_name(a), tag(a, "language"), tag(s, "language")), (Some("Main picture"), Some("Commentary"), Some("fra"), Some("eng")), "{container}: {p}");
+        assert_eq!(v["disposition"]["default"], 1, "{container}: {v}");
+        // And no stream more than the cut made. Copied with the rest, the track an MP4 keeps
+        // its chapters in came out a second time as a track of data, and the cover of a
+        // Matroska file, an attachment, as a second video track.
+        let count = |kind: &str, cover: i64| p["streams"].as_array().unwrap().iter().filter(|s| s["codec_type"] == kind && s["disposition"]["attached_pic"] == cover).count();
+        assert_eq!((count("video", 0), count("video", 1), count("audio", 0), count("subtitle", 0), count("data", 0)), (1, 1, 1, 1, usize::from(container == "mp4")), "{container}: {p}");
+        assert_eq!(p["streams"].as_array().unwrap().len(), if container == "mp4" { 5 } else { 4 }, "{container}: {p}");
+        let chapters: Vec<(f64, String)> = p["chapters"].as_array().unwrap().iter().map(|ch| (ch["start_time"].as_str().unwrap().parse().unwrap(), tag(ch, "title").unwrap_or("").to_string())).collect();
+        assert!(chapters.len() == 2 && (chapters[1].0 - 4.0).abs() < 0.05 && chapters[1].1 == "Two", "{container}: {chapters:?}");
+        let line = Command::new(ffmpeg_bin()).args(["-v", "error", "-i"]).arg(&out).args(["-map", "0:s:0", "-f", "srt", "-"]).output().unwrap();
+        assert!(String::from_utf8_lossy(&line.stdout).contains("00:00:04,000 --> 00:00:05,000"), "{container}: {}", String::from_utf8_lossy(&line.stdout));
+        assert_eq!(c.outputs_in(&out_dir), ["av1opt-log.tsv", "weak.av1opt.json", &format!("weak.{container}")]);
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_variable_rate_video_cut_between_its_frames_is_repaired_frame_for_frame() {
+    let c = Case::new("cut-repair-vfr");
+    weak_numbered_clip(&c, "weak.mp4");
+    // Every 20th frame left out, which leaves the frames at times of their own, and a cut that
+    // starts and ends between two of them.
+    c.ffmpeg(&["-i", "weak.mp4", "-vf", "select='mod(n,20)'", "-fps_mode", "vfr", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "16", "-c:a", "copy", "gaps.mkv"]);
+    let src = c.videos().join("gaps.mkv");
+    let r = c.encode(&[&src], &["--remove", "2.01-6.03"]);
+    r.ok().has("verifying: the whole video against its source").has("encoding again:").lacks("spot check at");
+    let out = c.out().join("gaps.mp4");
+    let want: Vec<u32> = (0..576).filter(|n| n % 20 != 0 && (f64::from(*n) / 24.0 < 2.01 || f64::from(*n) / 24.0 >= 6.03)).collect();
+    assert_eq!(frame_numbers(&out), want);
+    // At the times the cut gave them, 4.02 s earlier after it (counted from the first, frame 1).
+    let got = frame_times(&out);
+    let at = |n: u32| f64::from(n) / 24.0 - if f64::from(n) / 24.0 >= 6.03 { 4.02 } else { 0.0 } - 1.0 / 24.0;
+    let worst = got.iter().zip(&want).map(|(g, n)| (g - at(*n)).abs()).fold(0.0, f64::max);
+    assert!(worst < 0.002, "a frame is {worst:.3} s from its place");
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_cut_transport_stream_whose_sound_starts_first_is_repaired_from_the_frames_it_shows() {
+    let c = Case::new("cut-repair-ts");
+    weak_numbered_clip(&c, "weak.mp4");
+    // As ffmpeg writes a transport stream, the sound starts 23 ms before the picture: more
+    // than the quarter of a frame the kept parts are picked by. ffmpeg counts such a file's
+    // time from the first packet of what it reads, and the check and the stretches encoded
+    // again, which read the picture alone, took frame 48 for kept and frame 144 for removed.
+    c.ffmpeg(&["-i", "weak.mp4", "-c", "copy", "weak.ts"]);
+    let src = c.videos().join("weak.ts");
+    let starts = |kind: &str| streams(&probe(&src), kind)[0]["start_time"].as_str().unwrap().parse::<f64>().unwrap();
+    assert!(starts("video") - starts("audio") > 0.25 / 24.0, "sound at {}, picture at {}", starts("audio"), starts("video"));
+    let r = c.encode(&[&src], &["--remove", "2-6"]);
+    r.ok().has("verifying: the whole video against its source").has("encoding again:").lacks("spot check at");
+    let out = c.out().join("weak.mp4");
+    assert_eq!(frame_numbers(&out), (0..576).filter(|n| *n < 48 || *n >= 144).collect::<Vec<u32>>());
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_cut_that_fails_a_spot_check_is_searched_and_encoded_again_with_its_sections_removed() {
+    let c = Case::new("cut-again");
+    weak_numbered_clip(&c, "weak.mp4");
+    // Every sixth frame gone and the rest at their own times: more uneven steps than a video
+    // scored along its whole length may have, so this one gets spot checks. The two samples
+    // (from 5.4 s and from 16.1 s) miss the hard four seconds from 12 s, most of which lie in
+    // the spot check from 12.95 s. A cut failed there, with nothing left to hold its CRF to
+    // its worst stretch, where a video without sections removed is searched again.
+    c.ffmpeg(&["-i", "weak.mp4", "-vf", "select='mod(n,6)'", "-fps_mode", "vfr", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "12", "-c:a", "copy", "uneven.mkv"]);
+    let r = c.encode(&[&c.videos().join("uneven.mkv")], &["--remove", "20-20.5"]);
+    r.ok().has("encoded 1,").has("spot checks instead of the whole video").has("a stretch the samples missed: searching again with it as a sample");
+    let rep = c.report("uneven");
+    assert!(rep["notes"].to_string().contains("encoded a second time, after a spot check at"), "{rep}");
+    assert!(verify_scores(&rep).iter().all(|v| *v >= 89.0), "{rep}");
+    let chosen = rep["crf"].as_f64().unwrap();
+    assert!(chosen < rep["first_crf"].as_f64().unwrap(), "{rep}");
+    // The second encode removed the section too.
+    let out = c.out().join("uneven.mp4");
+    assert_eq!(frame_numbers(&out), (0..576).filter(|n| n % 6 != 0 && !(480..492).contains(n)).collect::<Vec<u32>>());
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_cut_video_that_needs_nothing_is_checked_whole_and_kept_as_encoded() {
+    let c = Case::new("cut-whole");
+    let src = c.clip("easy.mp4", "320x180", 16);
+    // (The same file as before the whole check came to cuts, byte for byte: only the report
+    // says more.)
+    let r = c.encode(&[&src], &["--remove", "0-2", "--remove", "7-9"]);
+    r.ok().has("verifying: the whole video against its source").has("whole video as kept:").lacks("encoding again:").lacks("encoded a second time").lacks("spot check at");
+    let rep = c.report("easy");
+    assert!(rep.get("first_crf").is_none(), "{rep}");
+    let w = &rep["whole"];
+    assert!(w["stretches"].as_array().unwrap().is_empty() && w.get("top_up").is_none_or(Value::is_null), "{rep}");
+    assert!(w["mean_vmaf"].as_f64().unwrap() >= 93.0 - 0.05, "{rep}");
+    assert_eq!(rep["verify_vmaf"].as_array().map(Vec::len), Some(2), "{rep}");
+    let out = c.out().join("easy.mp4");
+    assert_eq!(frames(&out), 384 - 96);
+    // In step: paired one frame off either way, the frames match far worse.
+    let kept = "between(n,48,167)+gte(n,216)";
+    let (right, early, late) = (psnr(&out, "1", &src, kept), psnr(&out, "gte(n,1)", &src, kept), psnr(&out, "1", &src, "between(n,49,167)+gte(n,216)"));
+    assert!(right > 28.0 && right > early + 3.0 && right > late + 3.0, "PSNR in step {right:.1}, one early {early:.1}, one late {late:.1}");
+}
+
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn tags_are_kept_dropped_set_and_filled_from_info_files() {
@@ -3088,6 +3262,8 @@ fn chapters_stay_in_place_after_a_cut_wherever_the_file_starts() {
         let out_dir = c.dir.join(name.trim_end_matches(".mkv"));
         c.encode_into(&out_dir, &[&src], &["--container", "mkv", "--remove", "2-4"]).ok();
         let p = probe(&out_dir.join(name));
+        // The picture out of the cut is still the default track, as it was in the source.
+        assert_eq!(streams(&p, "video")[0]["disposition"]["default"], 1, "{name}: {p}");
         let got: Vec<(f64, f64, String)> = p["chapters"]
             .as_array()
             .unwrap()

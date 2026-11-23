@@ -2116,6 +2116,11 @@ fn stream_args(
     // (`optimize` refused what cannot be planned before the search; what is left is kept.)
     let sound = plan_sound(info, container, audio, cut_subs.is_some()).unwrap_or_default();
     a.extend(title_args("v:0", &info.video_track, container));
+    // The cut's picture comes out of its filter graph too: a Matroska cut lost the video's
+    // default mark, which players use to pick the track.
+    if cut_subs.is_some() {
+        a.extend(["-disposition:v:0".into(), marked(Some(&info.video_disposition))]);
+    }
     for (i, (s, (way, note))) in info.audio.iter().zip(sound).enumerate() {
         if cut_subs.is_some() {
             a.extend(["-map".into(), format!("[ao{i}]")]);
@@ -3484,6 +3489,7 @@ mod tests {
     #[test]
     fn a_cut_keeps_what_tracks_are_marked_as_and_says_what_is_left_out() {
         let mut i = info(&[("aac", 2, 128_000.0), ("aac", 2, 128_000.0)]);
+        i.video_disposition = "default".into();
         i.audio[1].disposition = "default+original".into();
         i.subtitle_codecs = vec!["subrip".into(), "hdmv_pgs_subtitle".into(), "ass".into()];
         i.subtitle_dispositions = vec![String::new(), "default".into(), "forced".into()];
@@ -3494,9 +3500,11 @@ mod tests {
         let plain = stream_args(&i, 0, Container::Mkv, Audio::Keep, &[], None, &mut notes);
         assert!(!plain.args.iter().any(|a| a.starts_with("-disposition")), "{:?}", plain.args);
         assert!(notes.iter().any(|n| n.starts_with("left out: data (tmcd), video (h264)")), "{notes:?}");
-        // Out of a cut they are told: the second sound track is the default one, and the
-        // third subtitle track (the second kept: the image one cannot be cut) is forced.
+        // Out of a cut they are told: the picture and the second sound track are the default
+        // ones, and the third subtitle track (the second kept: the image one cannot be cut) is
+        // forced.
         let cut = stream_args(&i, 0, Container::Mkv, Audio::Keep, &[], Some(&[Some(1), None, Some(2)]), &mut Vec::new());
+        assert_eq!(value(&cut, "-disposition:v:0").as_deref(), Some("default"));
         assert_eq!(value(&cut, "-disposition:a:0").as_deref(), Some("0"));
         assert_eq!(value(&cut, "-disposition:a:1").as_deref(), Some("default+original"));
         assert_eq!(value(&cut, "-disposition:s:0").as_deref(), Some("0"));

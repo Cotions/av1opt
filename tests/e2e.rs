@@ -851,6 +851,7 @@ fn a_cut_video_whose_weak_stretch_the_samples_miss_is_repaired_frame_for_frame_a
         assert_eq!(a["codec_name"], "opus");
         assert!((duration(&out) - 20.0).abs() < 0.1, "{}", p["format"]);
         assert_eq!((track_name(v), track_name(a), tag(a, "language"), tag(s, "language")), (Some("Main picture"), Some("Commentary"), Some("fra"), Some("eng")), "{container}: {p}");
+        assert_eq!(v["disposition"]["default"], 1, "{container}: {v}");
         let chapters: Vec<(f64, String)> = p["chapters"].as_array().unwrap().iter().map(|ch| (ch["start_time"].as_str().unwrap().parse().unwrap(), tag(ch, "title").unwrap_or("").to_string())).collect();
         assert!(chapters.len() == 2 && (chapters[1].0 - 4.0).abs() < 0.05 && chapters[1].1 == "Two", "{container}: {chapters:?}");
         let line = Command::new(ffmpeg_bin()).args(["-v", "error", "-i"]).arg(&out).args(["-map", "0:s:0", "-f", "srt", "-"]).output().unwrap();
@@ -3148,6 +3149,8 @@ fn chapters_stay_in_place_after_a_cut_wherever_the_file_starts() {
         let out_dir = c.dir.join(name.trim_end_matches(".mkv"));
         c.encode_into(&out_dir, &[&src], &["--container", "mkv", "--remove", "2-4"]).ok();
         let p = probe(&out_dir.join(name));
+        // The picture out of the cut is still the default track, as it was in the source.
+        assert_eq!(streams(&p, "video")[0]["disposition"]["default"], 1, "{name}: {p}");
         let got: Vec<(f64, f64, String)> = p["chapters"]
             .as_array()
             .unwrap()

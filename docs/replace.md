@@ -34,8 +34,21 @@ single output files.
   (`~/.local/share/av1opt`, for your user only): a line for each finished encode (output, report,
   original, what tells the original from another file, a SHA-256 of the output) and for each
   replacement and undo. A report on record is followed wherever its original is, because the
-  record vouches for that path. Any other report is followed only to originals inside the folders
-  you name, so name the originals' folder as well or add `--anywhere`.
+  record vouches for that path. Where the record holds an output, or any output made from its
+  original, the record decides, whatever folders are named: all of the output is read and has
+  to be the file av1opt made, and a report that names another output for an original on record
+  is not followed (if that output is yours too, `adopt` takes it on record).
+- A report the record knows nothing of is followed only to originals inside the folders you
+  name (name the originals' folder as well, or add `--anywhere`), and only if it and its output
+  are your own files in a folder nobody else can write to, or one with the sticky bit, which
+  keeps everyone to their own files. Anyone who can put files in the output folder can copy a
+  genuine report there, fingerprint of the original and all, and put a file of their own of the
+  stated size beside it. `--trust-reports` takes such reports at their word all the same; on
+  drives that show the same owner and permissions for every file (FAT, exFAT, NTFS, some
+  network drives) it is the only way. On a network drive what is shown is what the mount says,
+  and users of other machines may be able to write there whatever it shows.
+- Two reports the record knows nothing of that name the same original are both refused, each
+  naming the other: one of them is not what it says. Remove the one you do not want.
 - Outputs that are not on record, such as those made before it began, are taken onto it by
   [`av1opt adopt`](adopt.md).
 - Nothing is deleted and no file is written over. The original goes to the trash of the drive
@@ -85,3 +98,4 @@ single output files.
 | `--allow-zfs` | off | Also replace originals stored on ZFS. |
 | `--accept-changed-date` | off | Take an original whose date changed as the file that was encoded, where its report cannot tell; originals seen to differ are still refused. |
 | `--anywhere` | off | Follow reports to originals wherever they are, not only in the folders named. |
+| `--trust-reports` | off | Take reports that are not on record at their word where others could have put them there or changed them: in a folder others can write to, files of another user's, or a drive that shows one owner for every file. |

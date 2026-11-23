@@ -1868,6 +1868,67 @@ fn an_output_takes_its_originals_place_and_gives_it_back() {
 
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn replace_goes_by_the_record_and_otherwise_only_by_reports_nobody_else_could_have_put_there() {
+    use std::os::unix::fs::PermissionsExt;
+    let c = Case::new("replace-record-wins");
+    let src = c.clip("a.mkv", "320x180", 2);
+    let original = std::fs::read(&src).unwrap();
+    c.encode(&[&c.videos()], &[]).ok().has("encoded 1,");
+    let (out, report, placed) = (c.out().join("a.mp4"), c.out().join("a.av1opt.json"), c.videos().join("a.mp4"));
+    let encoded = std::fs::read(&out).unwrap();
+    let junk = || vec![b'j'; encoded.len()];
+    let replace = |extra: &[&str]| {
+        let mut a: Vec<std::ffi::OsString> = vec!["replace".into(), c.out().into(), c.videos().into()];
+        a.extend(extra.iter().map(Into::into));
+        c.av1opt(&a)
+    };
+    let untouched = || {
+        assert_eq!(std::fs::read(&src).unwrap(), original);
+        assert!(!placed.exists());
+    };
+
+    // A second report for the same original, a copy of the genuine one naming a file of the
+    // stated size that sorts first: the record knows which output av1opt made.
+    let mut planted: Value = serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+    planted["output"] = c.out().join("0.mp4").to_string_lossy().into();
+    std::fs::write(c.out().join("0.av1opt.json"), planted.to_string()).unwrap();
+    std::fs::write(c.out().join("0.mp4"), junk()).unwrap();
+    replace(&["--apply"]).ok().has("av1opt's record says").has("not to this output").has("1 original replaced");
+    assert_eq!(std::fs::read(&placed).unwrap(), encoded);
+    assert_eq!(std::fs::read(c.out().join("0.mp4")).unwrap(), junk());
+    replace(&["--undo", "--apply"]).ok();
+    for name in ["0.av1opt.json", "0.mp4"] {
+        std::fs::remove_file(c.out().join(name)).unwrap();
+    }
+    untouched();
+
+    // The output swapped for a file of its size: all of it is compared with the record, though
+    // the originals' folder is named.
+    std::fs::rename(&out, c.out().join("kept")).unwrap();
+    std::fs::write(&out, junk()).unwrap();
+    let run = replace(&["--apply"]);
+    assert_ne!(run.code, Some(0), "{}", run.err);
+    run.has("the output is not the file av1opt made: its contents differ");
+    untouched();
+    std::fs::remove_file(&out).unwrap();
+    std::fs::rename(c.out().join("kept"), &out).unwrap();
+
+    // Not on record, in a folder anyone can write to: the report could be anybody's.
+    std::fs::remove_file(c.dir.join("data/av1opt/ledger.jsonl")).unwrap();
+    std::fs::set_permissions(c.out(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    replace(&["--apply"]).ok().has("av1opt has no record of this pair").has("other users can write to its folder").has("add --trust-reports").has("0 originals replaced");
+    untouched();
+    // In a folder only its user can write to, the user's own report is followed.
+    std::fs::set_permissions(c.out(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    replace(&[]).ok().has("1 output can take their original's place");
+    // And where others could write, on the user's word.
+    std::fs::set_permissions(c.out(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    replace(&["--apply", "--trust-reports"]).ok().has("1 original replaced");
+    assert_eq!(std::fs::read(&placed).unwrap(), encoded);
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn a_source_completed_after_its_encode_is_not_replaced_and_one_only_touched_is() {
     use std::os::unix::fs::FileExt;
     const MEGABYTE: usize = 1 << 20;

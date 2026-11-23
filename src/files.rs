@@ -301,6 +301,84 @@ fn has_access_list(folder: &Path) -> bool {
     size > 0
 }
 
+/// Whether the open file or folder `file` has an access list beyond its mode.
+fn has_access_list_open(file: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    // SAFETY: a descriptor we own and a valid NUL-terminated name; with no buffer, fgetxattr
+    // only gives the size.
+    let size = unsafe { libc::fgetxattr(file.as_raw_fd(), c"system.posix_acl_access".as_ptr(), std::ptr::null_mut(), 0) };
+    size > 0
+}
+
+/// Whether users other than this one may write to the open file or folder `file`, of mode
+/// `mode` and group `gid`: as [`others_may_rename_in`] judges a folder's group, sticky bit
+/// aside.
+fn others_may_write(file: &std::fs::File, mode: u32, gid: u32) -> bool {
+    mode & 0o002 != 0 || (mode & 0o020 != 0 && (has_access_list_open(file) || !group_is_mine_alone(gid)))
+}
+
+/// Why a user other than this one may have put the plain file `file`, opened from `path`,
+/// where it is or written what is in it, if one may: it belongs to another user, has other
+/// names, others may write to it, or others may rename things in its folder (which has no
+/// sticky bit to keep each to their own names), or the folder is another user's. Judged on the
+/// open file and its folder, opened now and found to hold this same file under its name.
+///
+/// A drive that keeps no owners or modes of its own (FAT, exFAT, NTFS, and network drives that
+/// show one owner for everything) shows what it was mounted with, and that is what is judged:
+/// files shown as another user's, or as open to everyone, cannot be told to be this user's.
+pub fn others_may_have_written(path: &Path, file: &std::fs::File) -> Option<String> {
+    others_may_have_written_of(path, file, my_user())
+}
+
+fn others_may_have_written_of(path: &Path, file: &std::fs::File, me: u32) -> Option<String> {
+    use std::os::fd::AsRawFd;
+    let meta = match file.metadata() {
+        Ok(meta) => meta,
+        Err(e) => return Some(format!("it cannot be looked at ({e})")),
+    };
+    if !meta.is_file() {
+        return Some(format!("it is {}, not a plain file", kind_of(&meta)));
+    }
+    if meta.uid() != me {
+        return Some("it belongs to another user".into());
+    }
+    if meta.nlink() != 1 {
+        return Some("it has other names on the drive too (hard links)".into());
+    }
+    if others_may_write(file, meta.mode(), meta.gid()) {
+        return Some("other users can write to it".into());
+    }
+    let dir = folder_of(path);
+    let folder = match open_folder(dir) {
+        Ok(folder) => folder,
+        Err(e) => return Some(format!("its folder {} cannot be looked at ({e})", dir.display())),
+    };
+    let Some(name) = path.file_name().and_then(|n| std::ffi::CString::new(n.as_bytes()).ok()) else {
+        return Some("it has no name of its own".into());
+    };
+    // SAFETY: fstatat on a descriptor we own, with a valid NUL-terminated name, fills the
+    // struct it is given and nothing else.
+    let there = unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        (libc::fstatat(folder.as_raw_fd(), name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) == 0).then_some((st.st_dev, st.st_ino))
+    };
+    if there != Some((meta.dev(), meta.ino())) {
+        return Some("it was moved or replaced while it was being looked at".into());
+    }
+    let found = match folder.metadata() {
+        Ok(found) => found,
+        Err(e) => return Some(format!("its folder {} cannot be looked at ({e})", dir.display())),
+    };
+    // The owner of a folder can rename anything in it, sticky bit or not.
+    if found.uid() != me && found.uid() != 0 {
+        return Some(format!("its folder {} belongs to another user", dir.display()));
+    }
+    if found.mode() & 0o1000 == 0 && others_may_write(&folder, found.mode(), found.gid()) {
+        return Some(format!("other users can write to its folder {}, which has no sticky bit to keep them from renaming files of yours there", dir.display()));
+    }
+    None
+}
+
 /// Whether the group `gid` is this user's own and holds nobody else, as far as can be told
 /// cheaply from the system's user and group lists (by way of libc, so that lists kept
 /// elsewhere, as in LDAP, count too): it is this user's own group, named as this user is, and
@@ -979,6 +1057,39 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_file_counts_as_written_by_this_user_alone_only_if_nobody_else_could_have() {
+        let dir = room("own-file");
+        let path = dir.join("a.av1opt.json");
+        std::fs::write(&path, b"{}").unwrap();
+        let set = |p: &Path, mode: u32| std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+        set(&dir, 0o755);
+        set(&path, 0o644);
+        let judged = |me: u32| others_may_have_written_of(&path, &std::fs::File::open(&path).unwrap(), me);
+        assert_eq!(judged(my_user()), None);
+        // A file and a folder that look like another user's.
+        assert_eq!(judged(my_user() + 1).as_deref(), Some("it belongs to another user"));
+        set(&path, 0o666);
+        assert_eq!(judged(my_user()).as_deref(), Some("other users can write to it"));
+        set(&path, 0o644);
+        set(&dir, 0o777);
+        assert!(judged(my_user()).is_some_and(|why| why.starts_with("other users can write to its folder")));
+        // The sticky bit keeps others to their own names.
+        set(&dir, 0o1777);
+        assert_eq!(judged(my_user()), None);
+        set(&dir, 0o755);
+        // A second name, which could be anywhere on the drive.
+        std::fs::hard_link(&path, dir.join("other")).unwrap();
+        assert!(judged(my_user()).is_some_and(|why| why.contains("hard links")));
+        std::fs::remove_file(dir.join("other")).unwrap();
+        // The file opened has to be the one at its name in the folder judged.
+        let opened = std::fs::File::open(&path).unwrap();
+        std::fs::rename(&path, dir.join("moved")).unwrap();
+        std::fs::write(&path, b"{}").unwrap();
+        assert!(others_may_have_written(&path, &opened).is_some_and(|why| why.contains("moved or replaced")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The number of a process that has ended.

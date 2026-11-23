@@ -27,8 +27,13 @@ const FILE_NAME: &str = "ledger.jsonl";
 /// What the page says of an output this record does not hold.
 pub const NOT_RECORDED: &str = "av1opt has no record of making this output here (it was made elsewhere, moved, made before this record began, or its report was put there by someone else), so the page will not move files for it; if you trust its report, run `av1opt adopt` in a terminal on the output's folder, or let `av1opt replace` there do it";
 
-/// What is said of a report that tells another story than the record.
+/// What is said of a report of a replacement that tells another story than the record.
 const DISAGREES: &str = "the report beside this output does not say what av1opt recorded when it made and moved these files, so the record does not vouch for it; if you trust the report, `av1opt replace` in a terminal can do it, given the original's folder or --anywhere";
+
+/// What is said of a report of an encode that tells another story than the record. The record
+/// wins on the command line too: a report is only a file, and whoever could write to its
+/// folder chose what it says.
+const DISAGREES_MADE: &str = "the report beside this output does not say what av1opt recorded when it made it, so av1opt does not follow it, on the page or on the command line; if the report is right, the record is not, and encoding the original again puts that right";
 
 #[cfg(test)]
 thread_local! {
@@ -278,12 +283,6 @@ impl Ledger {
         self.problem.as_deref()
     }
 
-    /// Whether the record speaks for this output and this original, so that the report's word
-    /// is not needed for where the original is. All of the output is compared before it moves.
-    pub fn vouches_for(&self, p: &Plan) -> bool {
-        self.check_ready(p, None).is_ok() && self.entry(&p.output, &p.source).and_then(|e| e.made.as_ref()).is_some_and(|m| m.output_sha256.is_some())
-    }
-
     /// What `av1opt adopt` can do about an output that can be replaced.
     pub fn adopting(&self, p: &Plan) -> Standing {
         self.standing(&p.output, &p.source, || self.check_ready(p, None))
@@ -328,7 +327,7 @@ impl Ledger {
         }
         let made = entry.made.as_ref().ok_or_else(|| self.refusal())?;
         if p.source_bytes != made.original.source_bytes || !made.original.is_what(&p.original) {
-            return Err(DISAGREES.into());
+            return Err(DISAGREES_MADE.into());
         }
         if p.output_bytes != made.output_bytes {
             return Err("the output is not the file av1opt made: its size differs".into());
@@ -340,6 +339,32 @@ impl Ledger {
             Ok(_) => Err("the output is not the file av1opt made: its contents differ".into()),
             Err(e) => Err(format!("the output could not be read to check that it is the file av1opt made: {e}")),
         }
+    }
+
+    /// What this record says of a pair `replace` on the command line is about to act on, which
+    /// is asked before the report's word or the folders named count for anything: None if it
+    /// holds nothing of this output, nor of any output made from this original or put in its
+    /// place. `Ok(true)` if it vouches for all of it (with `output`, all of that compared with
+    /// the hash recorded), `Ok(false)` if it agrees but has no hash of the output to compare
+    /// it with, so that the file itself has to show the rest, and why not otherwise.
+    pub fn judges(&self, p: &Plan, output: Option<&OpenFile>) -> Option<Result<bool, String>> {
+        if let Some(e) = self.known_at(&p.output) {
+            if e.source != p.source {
+                return Some(Err(format!("av1opt's record says this output was made from another original, {}", e.source.display())));
+            }
+            let hashed = e.made.as_ref().is_some_and(|m| m.output_sha256.is_some());
+            return Some(self.check_ready(p, output.filter(|_| hashed)).map(|()| hashed));
+        }
+        let mut others: Vec<String> = self.outputs.iter().filter(|(_, e)| e.source == p.source && (e.made.is_some() || e.replaced.is_some())).map(|(o, _)| o.display().to_string()).collect();
+        if others.is_empty() {
+            return None;
+        }
+        others.sort();
+        Some(Err(format!(
+            "av1opt's record says {} was encoded to {}, not to this output, so this report is not followed; if this output is one you made too, `av1opt adopt` on its folder takes it on record",
+            p.source.display(),
+            others.join(" and ")
+        )))
     }
 
     /// Whether the page may undo this replacement: the original, the trash entry and the place
@@ -979,16 +1004,16 @@ mod tests {
         let s = Scratch::new("vouches");
         let (source, output) = s.encoded("a");
         let ledger = load();
-        assert!(ledger.vouches_for(&s.plan(&source, &output)));
+        assert_eq!(ledger.judges(&s.plan(&source, &output), None), Some(Ok(true)));
         // The same pair, with a report that tells another story of the original or the output:
         // `replace` compared the files with the report, not with the record.
         let other_original = Plan { original: Recorded { fingerprint: Some("other samples".into()), ..known() }, ..s.plan(&source, &output) };
-        assert!(!ledger.vouches_for(&other_original));
+        assert!(ledger.judges(&other_original, None).is_some_and(|j| j.is_err()));
         let other_output = Plan { output_bytes: 999, ..s.plan(&source, &output) };
-        assert!(!ledger.vouches_for(&other_output));
+        assert!(ledger.judges(&other_output, None).is_some_and(|j| j.is_err()));
         let replaced = s.0.join("a.mkv");
         moved(&source, &s.0.join("Trash/files/a.mp4"), &replaced, &output).unwrap();
-        assert!(!load().vouches_for(&s.plan(&source, &replaced)));
+        assert!(load().judges(&s.plan(&source, &replaced), None).is_some_and(|j| j.is_err()));
     }
 
     #[test]
@@ -1082,7 +1107,7 @@ mod tests {
         ] {
             let mut forged = s.plan(&source, &output);
             change(&mut forged.original);
-            assert_eq!(load().check_ready(&forged, None), Err(DISAGREES.to_string()));
+            assert_eq!(load().check_ready(&forged, None), Err(DISAGREES_MADE.to_string()));
         }
         // An output of the right size with other contents is only caught by reading it.
         std::fs::write(&output, vec![b'x'; 1000]).unwrap();

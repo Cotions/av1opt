@@ -538,6 +538,7 @@ impl CutOff {
         for folder in self.folders_written() {
             crate::fsguard::ensure_writable_location(&folder, allow_zfs).with_context(|| format!("{}, which is not done there without --allow-zfs", self.told().unwrap_or_default()))?;
         }
+        crate::signals::stop_point("recover:checked");
         let folder = |p: &Path| p.parent().unwrap_or(Path::new("/")).to_path_buf();
         let restore = || -> Result<()> {
             let trash = self.trash.as_deref().context("no trash entry on record")?;
@@ -3805,13 +3806,13 @@ mod tests {
     #[test]
     fn a_recovery_that_is_itself_stopped_at_each_of_its_moves_is_finished_by_the_next_run() {
         let cases: [(&str, bool, bool, &[&'static str]); 7] = [
-            ("replace:trashed", false, false, &["recover:restored"]),
-            ("replace:placed", false, false, &["recover:moved", "recover:restored"]),
-            ("replace:placed", false, true, &["recover:hidden", "recover:moved", "recover:restored"]),
-            ("replace:removed", false, true, &["move:copied", "recover:moved", "recover:restored"]),
-            ("move:copied", true, true, &["recover:hidden", "recover:moved"]),
-            ("undo:moved", true, false, &["recover:restored", "recover:noted"]),
-            ("undo:restored", true, true, &["recover:noted"]),
+            ("replace:trashed", false, false, &["recover:checked", "recover:restored"]),
+            ("replace:placed", false, false, &["recover:checked", "recover:moved", "recover:restored"]),
+            ("replace:placed", false, true, &["recover:checked", "recover:hidden", "recover:moved", "recover:restored"]),
+            ("replace:removed", false, true, &["recover:checked", "move:copied", "recover:moved", "recover:restored"]),
+            ("move:copied", true, true, &["recover:checked", "recover:hidden", "recover:moved"]),
+            ("undo:moved", true, false, &["recover:checked", "recover:restored", "recover:noted"]),
+            ("undo:restored", true, true, &["recover:checked", "recover:noted"]),
         ];
         for (step, undoing, far, inside) in cases {
             for &stop in inside {
@@ -3938,5 +3939,187 @@ mod tests {
         let taken = lock(&report).map(drop).map_err(|e| e.to_string());
         let_go.join().unwrap();
         assert_eq!(taken, Ok(()));
+    }
+
+    /// Other bytes of the same size as `bytes`: one in the middle changed.
+    fn other_bytes(mut bytes: Vec<u8>) -> Vec<u8> {
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 1;
+        bytes
+    }
+
+    /// Writes other bytes of the same size over `p`, in place and its date kept, as a drive
+    /// that rots or a tool that keeps dates leaves a file.
+    fn rewrite_in_place(p: &Path) {
+        use std::io::Write;
+        let date = std::fs::metadata(p).unwrap().modified().unwrap();
+        let bytes = other_bytes(std::fs::read(p).unwrap());
+        let mut f = std::fs::File::options().write(true).open(p).unwrap();
+        f.write_all(&bytes).unwrap();
+        f.set_modified(date).unwrap();
+    }
+
+    /// What `files` will be once `p` is rewritten by [`rewrite_in_place`].
+    fn with_rewritten(mut files: Vec<(PathBuf, Vec<u8>)>, p: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let file = files.iter_mut().find(|(at, _)| at == p).expect("no such file");
+        file.1 = other_bytes(std::mem::take(&mut file.1));
+        files
+    }
+
+    /// The recovery of `p`, as a run that works on the pair does it first.
+    fn put_right_now(p: &Pair) -> Result<Option<Stranded>, String> {
+        let mut held = vec![lock(&p.report).unwrap()];
+        set_right(&p.report, true, &mut held).map_err(|e| format!("{e:#}"))
+    }
+
+    /// [`put_right_now`], with `p` rewritten in place at `step`, as someone else might change it
+    /// once the recovery has looked at it.
+    fn put_right_changing(pair: &Pair, step: &'static str, p: PathBuf) -> Result<Option<Stranded>, String> {
+        crate::signals::CHANGE_AT.with(|c| *c.borrow_mut() = Some((step, Box::new(move || rewrite_in_place(&p)))));
+        let done = put_right_now(pair);
+        crate::signals::CHANGE_AT.with(|c| *c.borrow_mut() = None);
+        done
+    }
+
+    /// A pair stopped at `step` (a replacement, or the undo of one), as a run that has ended.
+    fn stopped_pair(name: &str, step: &'static str, undoing: bool, far: bool) -> Option<Pair> {
+        let p = Pair::new(name, far, "a.mkv")?;
+        if undoing {
+            p.f.apply(&p.report).unwrap();
+        }
+        stopped_at(step, || drop(if undoing { undo(&p.report, true).map(drop) } else { p.f.apply(&p.report).map(drop) }));
+        p.as_if_its_run_had_ended();
+        Some(p)
+    }
+
+    /// Stopped once the original went to the trash, and the file there was changed at its size
+    /// and date since: it is not the recorded original, so the files are not as that run left
+    /// them, and nothing is moved.
+    #[test]
+    fn a_stopped_replacement_whose_trash_entry_holds_another_file_of_that_size_is_left_alone() {
+        let p = stopped_pair("wrong-trash", "replace:trashed", false, false).unwrap();
+        rewrite_in_place(&p.f.dir.join("Trash/files/a.mp4"));
+        let before = files_of(&p);
+        let done = put_right_now(&p);
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        assert!(done.as_ref().is_err_and(|e| e.contains("leaves them as they are")), "{done:?}");
+        assert!(files_of(&p) == before, "files were moved");
+    }
+
+    /// The same file changed once the recovery looked at it, just before it is taken back: it
+    /// is read again through the descriptor it is moved by, and stays in the trash.
+    #[test]
+    fn an_original_changed_in_the_trash_once_looked_at_is_not_taken_back() {
+        let p = stopped_pair("trash-changed-late", "replace:trashed", false, false).unwrap();
+        let trashed = p.f.dir.join("Trash/files/a.mp4");
+        let after = with_rewritten(files_of(&p), &trashed);
+        let done = put_right_changing(&p, "recover:checked", trashed);
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        assert!(done.as_ref().is_err_and(|e| e.contains("the file in the trash is not the original")), "{done:?}");
+        assert!(files_of(&p) == after, "files were moved");
+    }
+
+    /// Stopped once the AV1 file took the original's place, and that file was changed at its
+    /// size since: it is not the recorded AV1 file, and nothing is moved.
+    #[test]
+    fn a_stopped_replacement_whose_av1_file_is_another_of_that_size_is_left_alone() {
+        let p = stopped_pair("wrong-av1", "replace:placed", false, false).unwrap();
+        rewrite_in_place(&p.f.lib("a.mkv"));
+        let before = files_of(&p);
+        let done = put_right_now(&p);
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        assert!(done.as_ref().is_err_and(|e| e.contains("leaves them as they are")), "{done:?}");
+        assert!(files_of(&p) == before, "files were moved");
+    }
+
+    /// The same file changed once the recovery looked at it, just before it moves back: it is
+    /// read again through the descriptor it is moved by, and stays where it is.
+    #[test]
+    fn an_av1_file_changed_once_looked_at_is_not_moved_back() {
+        let p = stopped_pair("av1-changed-late", "replace:placed", false, false).unwrap();
+        let placed = p.f.lib("a.mkv");
+        let after = with_rewritten(files_of(&p), &placed);
+        let done = put_right_changing(&p, "recover:checked", placed);
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        assert!(done.as_ref().is_err_and(|e| e.contains("is not the AV1 file av1opt recorded")), "{done:?}");
+        assert!(files_of(&p) == after, "files were moved");
+    }
+
+    /// A replacement across drives stopped with the copy in the original's folder and the AV1
+    /// file still in the output folder; the AV1 file there changes once the recovery looked at
+    /// it (before the copy is hidden, or while it is): the copy is no longer a copy of it, and
+    /// stays.
+    #[test]
+    fn a_copy_stays_when_the_file_it_is_a_copy_of_changes_once_looked_at() {
+        for step in ["recover:checked", "recover:hidden"] {
+            let Some(p) = stopped_pair(&format!("copy-of-changed-{}", step.replace(':', "-")), "replace:placed", false, true) else { return };
+            let kept = p.out.join("a.mkv");
+            let after = with_rewritten(files_of(&p), &kept);
+            let done = put_right_changing(&p, step, kept);
+            crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+            assert!(done.as_ref().is_err_and(|e| e.contains("is not a copy of")), "{step}: {done:?}");
+            assert!(files_of(&p) == after, "{step}: files were moved");
+        }
+    }
+
+    /// An undo stopped with both files back and the record not yet written, and the original
+    /// back in its place changed at its size since: it is not the recorded original, and the
+    /// undo is not written down as done.
+    #[test]
+    fn an_undo_stopped_with_both_files_back_is_not_written_down_if_the_original_is_another_file() {
+        let p = stopped_pair("wrong-original-back", "undo:restored", true, false).unwrap();
+        rewrite_in_place(&p.f.lib("a.mp4"));
+        let before = files_of(&p);
+        let record = std::fs::read(p.f.dir.join("data/av1opt/ledger.jsonl")).ok();
+        let done = put_right_now(&p);
+        let after = std::fs::read(p.f.dir.join("data/av1opt/ledger.jsonl")).ok();
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        assert!(done.as_ref().is_err_and(|e| e.contains("leaves them as they are")), "{done:?}");
+        assert!(files_of(&p) == before && says_replaced(&p.report), "files or the report were changed");
+        assert_eq!(after, record);
+    }
+
+    /// A pair stopped half-way, and a report that is not the one that run worked from: another
+    /// encode's of the same original in another output folder, or the report changed since
+    /// (another size, another trash entry or output folder for an undo). The line on record is
+    /// not taken for that report's, and nothing is moved.
+    #[test]
+    fn a_stopped_pair_whose_report_is_not_the_one_its_run_worked_from_is_left_alone() {
+        // Each edits the report and says where it goes (None: in place of the pair's).
+        type Edit<'a> = &'a dyn Fn(&Pair, &mut Value) -> Option<PathBuf>;
+        let cases: [(&str, &'static str, bool, Edit); 4] = [
+            ("second-output", "replace:trashed", false, &|p, r| {
+                let second = p.f.dir.join("out2");
+                std::fs::create_dir_all(&second).unwrap();
+                std::fs::copy(p.out.join("a.mkv"), second.join("a.mkv")).unwrap();
+                r["output"] = json!(second.join("a.mkv"));
+                Some(second.join("a.av1opt.json"))
+            }),
+            ("other-size", "replace:trashed", false, &|_, r| {
+                r["output_bytes"] = json!(401);
+                None
+            }),
+            ("other-trash", "undo:moved", true, &|p, r| {
+                r["replaced"]["trash"] = json!(p.f.dir.join("Trash/files/b.mp4"));
+                None
+            }),
+            ("other-from", "undo:moved", true, &|p, r| {
+                r["replaced"]["from"] = json!(p.out.join("c.mkv"));
+                None
+            }),
+        ];
+        for (name, step, undoing, edit) in cases {
+            let p = stopped_pair(&format!("not-its-report-{name}"), step, undoing, false).unwrap();
+            let mut r = read_report(&p.report).unwrap();
+            let report = edit(&p, &mut r).unwrap_or_else(|| p.report.clone());
+            std::fs::write(&report, serde_json::to_vec(&r).unwrap()).unwrap();
+            let before = files_of(&p);
+            let as_written = std::fs::read(&report).unwrap();
+            let mut held = vec![lock(&report).unwrap()];
+            let done = set_right(&report, true, &mut held).map_err(|e| format!("{e:#}"));
+            drop(held);
+            crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+            assert!(files_of(&p) == before && std::fs::read(&report).unwrap() == as_written, "{name}: {done:?}, and files were moved");
+        }
     }
 }

@@ -80,10 +80,17 @@ pub fn exit_code() -> Option<i32> {
     }
 }
 
+/// A change a unit test makes to files at a step (see [`CHANGE_AT`]).
+#[cfg(test)]
+pub(crate) type Change = (&'static str, Box<dyn Fn()>);
+
 #[cfg(test)]
 thread_local! {
     /// The step at which a unit test of this thread stops what it runs (see [`stop_point`]).
     pub(crate) static STOP_AT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+    /// A step at which a unit test of this thread changes files instead, as someone else might
+    /// between two steps, and what it does there.
+    pub(crate) static CHANGE_AT: std::cell::RefCell<Option<Change>> = const { std::cell::RefCell::new(None) };
 }
 
 /// A named moment between two of the steps that change the disk when an encode is finished or
@@ -94,9 +101,17 @@ thread_local! {
 /// left in an environment does not end runs without a word. In a build without the feature the
 /// variable is not read at all. In the unit tests, the step in [`STOP_AT`] panics instead,
 /// which leaves the files as a kill would where nothing that is dropped on the way out changes
-/// the disk.
+/// the disk, and a change in [`CHANGE_AT`] for the step is made there first.
 #[cfg_attr(not(any(test, feature = "stop-points")), inline(always))]
 pub fn stop_point(step: &str) {
+    #[cfg(test)]
+    CHANGE_AT.with(|c| {
+        if let Some((at, change)) = &*c.borrow()
+            && *at == step
+        {
+            change();
+        }
+    });
     #[cfg(test)]
     if STOP_AT.get() == Some(step) {
         std::panic::panic_any(format!("stopped at {step}"));

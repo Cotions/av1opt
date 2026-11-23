@@ -37,7 +37,12 @@ single output files.
   record vouches for that path. Where the record holds an output, or any output made from its
   original, the record decides, whatever folders are named: all of the output is read and has
   to be the file av1opt made, and a report that names another output for an original on record
-  is not followed (if that output is yours too, `adopt` takes it on record).
+  is not followed (if that output is yours too, `adopt` takes it on record). A report cannot
+  get past the record by naming a file another way (through a link to its folder, or
+  `/proc/self/root`): paths are compared with their folders resolved, and an output or
+  original of the same name is also compared by the file itself, so a second mount of a
+  folder or a drive that ignores letter case does not make one file two. `--trust-reports`
+  never counts against the record.
 - A report the record knows nothing of is followed only to originals inside the folders you
   name (name the originals' folder as well, or add `--anywhere`), and only if it and its output
   are your own files in a folder nobody else can write to, or one with the sticky bit, which

@@ -272,10 +272,24 @@ impl Ledger {
         self.outputs.get(output).filter(|e| e.made.is_some() || e.replaced.is_some())
     }
 
+    /// What is recorded of whatever output is at `output`, under that path or under another
+    /// path of the same file (see [`crate::files::same_file`]): a report can name a file by any
+    /// of its paths, and the record holds one. Other paths are looked for among the outputs of
+    /// the same name, letter case aside; a second link under another name is not found.
+    fn known_as(&self, output: &Path) -> Option<&Entry> {
+        let other_path = || self.outputs.iter().find(|(o, e)| (e.made.is_some() || e.replaced.is_some()) && crate::files::may_be_same_name(o, output) && crate::files::same_file(o, output));
+        self.known_at(output).or_else(|| other_path().map(|(_, e)| e))
+    }
+
+    /// Whether `e` is of the original at `source`, by any of its paths.
+    fn of_source(e: &Entry, source: &Path) -> bool {
+        e.source == source || (crate::files::may_be_same_name(&e.source, source) && crate::files::same_file(&e.source, source))
+    }
+
     /// What is recorded of the output at `output`, if it was made from `source` or took its
     /// place. An output put back by the command line that av1opt never saw made is not one.
     pub fn entry(&self, output: &Path, source: &Path) -> Option<&Entry> {
-        self.known_at(output).filter(|e| e.source == source)
+        self.known_as(output).filter(|e| Self::of_source(e, source))
     }
 
     /// Why the record on disk is not being used, if it is not.
@@ -294,10 +308,10 @@ impl Ledger {
     }
 
     fn standing(&self, output: &Path, source: &Path, agrees: impl Fn() -> Result<(), String>) -> Standing {
-        match self.known_at(output) {
+        match self.known_as(output) {
             None => Standing::NotYet,
             // A report must not be able to give a file on record another past.
-            Some(e) if e.source != source => Standing::Refused(format!("av1opt's record says this output came from another original, {}", e.source.display())),
+            Some(e) if !Self::of_source(e, source) => Standing::Refused(format!("av1opt's record says this output came from another original, {}", e.source.display())),
             Some(_) => agrees().map_or_else(Standing::Refused, |()| Standing::OnRecord),
         }
     }
@@ -348,14 +362,14 @@ impl Ledger {
     /// the hash recorded), `Ok(false)` if it agrees but has no hash of the output to compare
     /// it with, so that the file itself has to show the rest, and why not otherwise.
     pub fn judges(&self, p: &Plan, output: Option<&OpenFile>) -> Option<Result<bool, String>> {
-        if let Some(e) = self.known_at(&p.output) {
-            if e.source != p.source {
+        if let Some(e) = self.known_as(&p.output) {
+            if !Self::of_source(e, &p.source) {
                 return Some(Err(format!("av1opt's record says this output was made from another original, {}", e.source.display())));
             }
             let hashed = e.made.as_ref().is_some_and(|m| m.output_sha256.is_some());
             return Some(self.check_ready(p, output.filter(|_| hashed)).map(|()| hashed));
         }
-        let mut others: Vec<String> = self.outputs.iter().filter(|(_, e)| e.source == p.source && (e.made.is_some() || e.replaced.is_some())).map(|(o, _)| o.display().to_string()).collect();
+        let mut others: Vec<String> = self.outputs.iter().filter(|(_, e)| (e.made.is_some() || e.replaced.is_some()) && Self::of_source(e, &p.source)).map(|(o, _)| o.display().to_string()).collect();
         if others.is_empty() {
             return None;
         }

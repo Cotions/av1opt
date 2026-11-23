@@ -720,6 +720,38 @@ pub fn folder_of(path: &Path) -> &Path {
     path.parent().unwrap_or(Path::new("."))
 }
 
+/// `path` as av1opt's record holds the files it names: its folder with every link on the way
+/// resolved, and its own name as it is. A report can name one file by many paths (by way of
+/// `/proc/self/root`, a link to a folder, `/a/./b`), and a path compared as text with what the
+/// record holds would find nothing of a file the record knows well. A path whose folder is not
+/// there is given back as it is.
+pub fn in_real_folder(path: &Path) -> PathBuf {
+    let real = path.parent().and_then(|d| std::fs::canonicalize(d).ok()).zip(path.file_name());
+    real.map_or_else(|| path.to_path_buf(), |(d, name)| d.join(name))
+}
+
+/// Whether `a` and `b` name the same file: one path once their folders are resolved (see
+/// [`in_real_folder`]), or, where both are there, one file on the drive. A second mount of a
+/// folder, a drive that does not tell letter case apart, or a second (hard) link gives one
+/// file other paths, which only the file's own number shows. A link at either name is taken
+/// as itself, not as what it leads to.
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    if a == b || in_real_folder(a) == in_real_folder(b) {
+        return true;
+    }
+    match (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) {
+        (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
+        _ => false,
+    }
+}
+
+/// Whether two names could name the same file on some drive: the same once letter case is set
+/// aside. What is compared by [`same_file`] where comparing everything would be slow.
+pub fn may_be_same_name(a: &Path, b: &Path) -> bool {
+    let lower = |p: &Path| p.file_name().map(|n| n.to_string_lossy().to_lowercase());
+    lower(a).is_some() && lower(a) == lower(b)
+}
+
 /// The end of a name no other save has: this process's number and a count of its saves, and
 /// then `ending`. Two names cut to fit can begin alike, so it is this that tells them apart.
 pub fn unique_tail(ending: &str) -> String {

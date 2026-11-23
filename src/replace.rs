@@ -107,6 +107,13 @@ fn full_path(r: &Value, key: &str) -> Result<PathBuf, String> {
     Ok(p.components().collect())
 }
 
+/// The path of a video from a report, with its folder resolved as av1opt's record holds paths
+/// (see [`crate::files::in_real_folder`]): whatever a report names a file by, it is that file
+/// that is looked up in the record, compared with the paths of other reports, and moved.
+fn file_path(r: &Value, key: &str) -> Result<PathBuf, String> {
+    full_path(r, key).map(|p| crate::files::in_real_folder(&p))
+}
+
 /// Whether `report` is the report `encode` wrote for an output at `output`: the same folder,
 /// the output's name with `.av1opt.json` for its extension. A report is only a file, and what
 /// it names gets moved; one that turns up somewhere else (in a folder of downloads, say) and
@@ -230,7 +237,7 @@ enum Stranded {
 /// hash. `full` reads all of the files compared; without it this is the look of a list, by
 /// sizes and samples.
 fn stranded(report: &Path, r: &Value, ledger: &crate::ledger::Ledger, full: bool) -> Option<(Value, Stranded)> {
-    let source = full_path(r, "input").ok()?;
+    let source = file_path(r, "input").ok()?;
     let holds_output = |path: &Path, bytes: u64, hash: &str| {
         if !full {
             return file_size(path) == Some(bytes);
@@ -240,8 +247,8 @@ fn stranded(report: &Path, r: &Value, ledger: &crate::ledger::Ledger, full: bool
     let mut fixed = r.clone();
     if let Some(done) = r.get("replaced").filter(|d| d.is_object()) {
         // Put back, with the report still saying replaced.
-        let dest = full_path(r, "output").ok()?;
-        let from = full_path(done, "from").ok()?;
+        let dest = file_path(r, "output").ok()?;
+        let from = file_path(done, "from").ok()?;
         let trash_path = full_path(done, "trash").ok()?;
         if !beside(report, &from) {
             return None;
@@ -259,7 +266,7 @@ fn stranded(report: &Path, r: &Value, ledger: &crate::ledger::Ledger, full: bool
         return Some((fixed, Stranded::Undone));
     }
     // Replaced, with the report still saying not.
-    let from = full_path(r, "output").ok()?;
+    let from = file_path(r, "output").ok()?;
     if !beside(report, &from) || r["superseded"].as_bool() == Some(true) {
         return None;
     }
@@ -342,14 +349,14 @@ impl CutOff {
     /// `full` reads the files compared in full, which acting on it needs; without it this is the
     /// look of a list, by sizes and samples.
     fn of(report: &Path, r: &Value, ledger: &crate::ledger::Ledger, full: bool) -> Option<CutOff> {
-        let source = full_path(r, "input").ok()?;
+        let source = file_path(r, "input").ok()?;
         let output_bytes = r["output_bytes"].as_u64()?;
         let is_output = |path: &Path, hash: Option<&str>| match hash {
             Some(hash) if full => OpenFile::open(path, output_bytes).ok().and_then(|f| f.sha256().ok()).is_some_and(|now| now == hash),
             _ => file_size(path) == Some(output_bytes),
         };
         if let Some(done) = r.get("replaced").filter(|d| d.is_object()) {
-            let (dest, from, trash) = (full_path(r, "output").ok()?, full_path(done, "from").ok()?, full_path(done, "trash").ok()?);
+            let (dest, from, trash) = (file_path(r, "output").ok()?, file_path(done, "from").ok()?, full_path(done, "trash").ok()?);
             if !beside(report, &from) {
                 return None;
             }
@@ -364,7 +371,7 @@ impl CutOff {
             let cut = if from == dest { restored } else { at_from && (in_trash || (restored && !at_dest)) };
             return cut.then(|| CutOff { source, from, dest, trash, at_from, at_dest, undoing: true, restored, source_bytes: moved.original.source_bytes(), output_bytes, original });
         }
-        let from = full_path(r, "output").ok()?;
+        let from = file_path(r, "output").ok()?;
         let dest = source.with_extension(from.extension()?);
         // Only an original that is gone can have been on its way to the trash. An AV1 file that
         // takes the original's very name can be there in its place.
@@ -427,7 +434,7 @@ impl CutOff {
                 eprintln!("warning: the original is back, but av1opt's own record of that could not be written: {e:#}");
             }
             let mut r = r.clone();
-            if r["replaced"]["from"].as_str().is_some_and(|recorded| Path::new(recorded) != self.from) {
+            if file_path(&r["replaced"], "from").is_ok_and(|recorded| recorded != self.from) {
                 r["superseded"] = json!(true);
             }
             r["output"] = json!(self.from);
@@ -498,12 +505,12 @@ fn check_inner(report: &Path, judging: Judging) -> Result<Check, String> {
         Some(ledger) => stranded(report, &r, ledger, !(judging.for_list || judging.listing)).map_or(r, |(fixed, _)| fixed),
         None => r,
     };
-    let source = full_path(&r, "input")?;
-    let output = full_path(&r, "output")?;
+    let source = file_path(&r, "input")?;
+    let output = file_path(&r, "output")?;
     let source_bytes = r["source_bytes"].as_u64().ok_or("report has no sizes")?;
     let output_bytes = r["output_bytes"].as_u64().ok_or("report has no sizes")?;
     if let Some(done) = r.get("replaced").filter(|d| d.is_object()) {
-        let recorded = full_path(done, "from")?;
+        let recorded = file_path(done, "from")?;
         let trash = full_path(done, "trash")?;
         let from = if beside(report, &recorded) { Some(recorded.clone()) } else { place_beside_aside(report, &recorded) };
         let Some(from) = from else {
@@ -1153,7 +1160,7 @@ fn undo_watched(report: &Path, allow_zfs: bool, accept: Accept<Replaced>, before
     let mut r = read_report(report).map_err(|e| anyhow!(e))?;
     // Undone from a report set aside: the AV1 file did not go back to where it came from, as
     // a newer encode is there, and that encode's report is the one to go by.
-    if r["replaced"]["from"].as_str().is_some_and(|recorded| Path::new(recorded) != d.from) {
+    if file_path(&r["replaced"], "from").is_ok_and(|recorded| recorded != d.from) {
         r["superseded"] = json!(true);
     }
     r["output"] = json!(d.from);
@@ -1269,8 +1276,8 @@ fn why_not_own(p: &Plan, output: &OpenFile) -> Option<String> {
     let read = (&mut report).take(REPORT_LIMIT + 1).read_to_end(&mut bytes);
     let r: Option<Value> = read.ok().and_then(|_| serde_json::from_slice(&bytes).ok());
     let same = r.is_some_and(|r| {
-        full_path(&r, "input").ok().as_ref() == Some(&p.source)
-            && full_path(&r, "output").ok().as_ref() == Some(&p.output)
+        file_path(&r, "input").ok().as_ref() == Some(&p.source)
+            && file_path(&r, "output").ok().as_ref() == Some(&p.output)
             && r["source_bytes"].as_u64() == Some(p.source_bytes)
             && r["output_bytes"].as_u64() == Some(p.output_bytes)
             && Recorded::in_report(&r) == p.original
@@ -1311,10 +1318,15 @@ fn admitted(p: &Plan, output: Option<&OpenFile>, ledger: &crate::ledger::Ledger,
 
 /// The reports among `plans` that name the same original as another of them, with what is said
 /// of each: av1opt cannot tell which of two is the encode, and the other may be anybody's.
+/// One original named by two paths (a second mount of its folder, say) is the same original.
 fn named_twice(plans: &[&Plan]) -> std::collections::HashMap<PathBuf, String> {
-    let mut by_source: std::collections::HashMap<&Path, Vec<&Path>> = std::collections::HashMap::new();
+    let mut by_source: Vec<(&Path, Vec<&Path>)> = Vec::new();
     for p in plans {
-        by_source.entry(&p.source).or_default().push(&p.report);
+        let same = |s: &&mut (&Path, Vec<&Path>)| crate::files::may_be_same_name(s.0, &p.source) && crate::files::same_file(s.0, &p.source);
+        match by_source.iter_mut().find(|s| same(s)) {
+            Some((_, reports)) => reports.push(&p.report),
+            None => by_source.push((&p.source, vec![&p.report])),
+        }
     }
     let mut out = std::collections::HashMap::new();
     for (source, reports) in by_source.into_iter().filter(|(_, r)| r.len() > 1) {
@@ -3115,7 +3127,7 @@ mod tests {
     /// `report`'s pair on record as an encode, with the hash of its output, as `encode` leaves it.
     fn on_record(report: &Path) {
         let r = read_report(report).unwrap();
-        let (source, output) = (full_path(&r, "input").unwrap(), full_path(&r, "output").unwrap());
+        let (source, output) = (file_path(&r, "input").unwrap(), file_path(&r, "output").unwrap());
         let original = Recorded::in_report(&r);
         let output_sha256 = Some(crate::ledger::sha256_of_file(&output).unwrap());
         let (source_bytes, output_bytes) = (file_size(&source).unwrap(), file_size(&output).unwrap());
@@ -3598,6 +3610,81 @@ mod tests {
         std::fs::remove_file(f.out("0.av1opt.json")).unwrap();
         adopt(&named, true, false, false).unwrap();
         assert!(adopted());
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
+
+    /// A copy of `report` naming `source` and, as its output, a file of the stated size at
+    /// `output` in the output folder, as someone who can write there would put it.
+    fn plant(f: &Fix, report: &Path, source: &Path, output: &Path) -> PathBuf {
+        let mut planted = read_report(report).unwrap();
+        planted["input"] = json!(source);
+        planted["output"] = json!(output);
+        std::fs::write(f.out("0.mkv"), vec![b'e'; 400]).unwrap();
+        let planted_report = f.out("0.av1opt.json");
+        write_report(&planted_report, &planted).unwrap();
+        planted_report
+    }
+
+    #[test]
+    fn a_report_naming_a_pair_on_record_by_another_path_is_held_to_the_record() {
+        // Where planted files look like the user's own (no flag), and where anyone can write
+        // and the person trusts the reports: the record wins either way.
+        for (name, mode, trust_reports) in [("alias-own", 0o755, false), ("alias-trust", 0o777, true)] {
+            let f = Fix::new(name);
+            record_in(&f);
+            let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+            on_record(&report);
+            // `/proc/self/root` leads to the same files by another path.
+            let alias = |p: &Path| PathBuf::from(format!("/proc/self/root{}", p.display()));
+            let planted = plant(&f, &report, &alias(&f.lib("a.mp4")), &alias(&f.out("0.mkv")));
+            set_mode(&f.dir.join("out"), mode);
+            let why = admitted_named(&f, &planted, trust_reports).unwrap_err();
+            assert!(why.contains(&format!("av1opt's record says {} was encoded to {}, not to this output", f.lib("a.mp4").display(), f.out("a.mkv").display())), "{why}");
+            replace_named(&f, trust_reports).unwrap();
+            assert_eq!(std::fs::read(f.lib("a.mkv")).unwrap(), vec![b'o'; 400], "{name}");
+            assert_eq!(std::fs::read(f.out("0.mkv")).unwrap(), vec![b'e'; 400], "{name}");
+            set_mode(&f.dir.join("out"), 0o755);
+            crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        }
+    }
+
+    #[test]
+    fn an_original_on_record_named_by_a_second_path_of_the_same_file_is_held_to_the_record() {
+        // A second name of the original's own file, as a second mount of its folder or a drive
+        // that does not tell letter case apart gives it: here a hard link of the same name in
+        // another folder named, which shows the same device and file number.
+        let f = Fix::new("second-path");
+        record_in(&f);
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        on_record(&report);
+        std::fs::create_dir_all(f.dir.join("lib2")).unwrap();
+        std::fs::hard_link(f.lib("a.mp4"), f.dir.join("lib2/a.mp4")).unwrap();
+        let planted = plant(&f, &report, &f.dir.join("lib2/a.mp4"), &f.out("0.mkv"));
+        let Check::Ready(p) = check(&planted) else { panic!("{:?}", check(&planted)) };
+        let why = crate::ledger::load().judges(&p, None).expect("the record holds this original").unwrap_err();
+        assert!(why.contains(&format!("was encoded to {}, not to this output", f.out("a.mkv").display())), "{why}");
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
+
+    #[test]
+    fn two_reports_naming_one_original_by_two_paths_are_both_refused() {
+        let f = Fix::new("twice-two-paths");
+        record_in(&f);
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        let alias = PathBuf::from(format!("/proc/self/root{}", f.lib("a.mp4").display()));
+        let by_link = plant(&f, &report, &alias, &f.out("0.mkv"));
+        std::fs::create_dir_all(f.dir.join("lib2")).unwrap();
+        std::fs::hard_link(f.lib("a.mp4"), f.dir.join("lib2/a.mp4")).unwrap();
+        let mut by_number = read_report(&report).unwrap();
+        by_number["input"] = json!(f.dir.join("lib2/a.mp4"));
+        by_number["output"] = json!(f.out("1.mkv"));
+        std::fs::write(f.out("1.mkv"), vec![b'e'; 400]).unwrap();
+        write_report(&f.out("1.av1opt.json"), &by_number).unwrap();
+        let plans: Vec<Plan> = [&report, &by_link, &f.out("1.av1opt.json")].iter().map(|r| if let Check::Ready(p) = check(r) { p } else { panic!("{:?}", check(r)) }).collect();
+        let twice = named_twice(&plans.iter().collect::<Vec<_>>());
+        assert_eq!(twice.len(), 3, "{twice:?}");
+        replace_named(&f, true).unwrap();
+        assert_eq!(std::fs::read(f.lib("a.mp4")).unwrap(), vec![b's'; 1000]);
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
     }
 }

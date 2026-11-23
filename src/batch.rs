@@ -716,7 +716,7 @@ pub(crate) fn overwrite_refused(output: &Path, input: &Path) -> Option<String> {
         return None;
     }
     match report_input(output) {
-        Some(made) if made.source == input => vouched_for(output, input)
+        Some(made) if crate::files::same_file(&made.source, input) => vouched_for(output, input)
             .map(|why| format!("--overwrite replaces only an encode of the same file, and nothing vouches that {shown} is one: av1opt has no record of making it, and its report, which names this file, {why}; move or delete it if it may go")),
         Some(made) => Some(format!("--overwrite replaces only an encode of the same file, and {shown} was made from {}; move or delete it to encode this file there", made.source.display())),
         None => Some(format!("--overwrite replaces only an encode of the same file, and {shown} has no report saying what it was made from; move or delete it if it may go")),

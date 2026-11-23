@@ -212,7 +212,8 @@ where its last frame does, picture and sound alike, so that the parts after it s
 timeline puts them (a variable-rate source is cut at the times given). A frame held across a
 section is shown that much less, as the sound is. Audio is re-encoded to Opus; text subtitles and chapters
 are moved to their new times (lines and chapters inside removed parts go); image subtitles
-(PGS, DVD) and TTML are dropped. Sample clips and spot checks are taken from kept parts only. A cut is
+(PGS, DVD) and TTML are dropped. Sample clips and spot checks are taken from kept parts only; a
+spot check compares the frames of one kept part with the same frames where the output shows them. A cut is
 never skipped for being AV1 already or saving too little, and if the VMAF target is out of reach
 it is encoded at the best CRF tried. At least one second of the video has to stay: sections
 that remove all of it, or all but a moment, are refused before the encode starts, and the web UI

@@ -209,6 +209,22 @@ impl Sections {
         (0.0, 0.0, 0.0)
     }
 
+    /// The frames of the kept part that holds source time `src`, as the cut picks them: from
+    /// the first time, and before the second unless the part runs to the end. The output
+    /// shows each of them as much earlier as `src` is past its output time.
+    pub fn picture_of(&self, src: f64, duration: f64) -> (f64, Option<f64>) {
+        let &(a, b) = self.keep.iter().find(|&&(_, b)| src < b).or(self.keep.last()).unwrap_or(&(0.0, f64::INFINITY));
+        self.picture(a, b, duration)
+    }
+
+    /// The frames of kept part `(a, b)`, see [`Self::picture_of`].
+    fn picture(&self, a: f64, b: f64, duration: f64) -> (f64, Option<f64>) {
+        // Leave the last part open: the container's duration can be a little short of the
+        // streams' last frame or sample. Parts on the frames are cut a quarter of a frame
+        // before a frame, whatever the last digit of its timestamp (see `search::snap_seek`).
+        ((a - self.quarter).max(0.0), (b < duration - 1e-3).then_some(b - self.quarter))
+    }
+
     /// Up to `count` sample clips of `secs` seconds spread over the output, each inside one
     /// kept part. Returns (source start, length) pairs.
     pub fn sample_positions(&self, count: usize, secs: f64) -> Vec<(f64, f64)> {
@@ -238,13 +254,8 @@ impl Sections {
         let mut g = String::new();
         let mut joined = String::new();
         for (k, &(a, b)) in self.keep.iter().enumerate() {
-            // Leave the last part open: the container's duration can be a little short of
-            // the streams' last frame or sample.
-            let open = b >= duration - 1e-3;
-            // Parts on the frames are cut for the picture a quarter of a frame before a frame,
-            // whatever the last digit of its timestamp (see `search::snap_seek`).
-            let (va, vb) = ((a - self.quarter).max(0.0), b - self.quarter);
-            pick.push(if open { format!("gte(t,{va:.6})") } else { format!("gte(t,{va:.6})*lt(t,{vb:.6})") });
+            let (va, vb) = self.picture(a, b, duration);
+            pick.push(vb.map_or_else(|| format!("gte(t,{va:.6})"), |vb| format!("gte(t,{va:.6})*lt(t,{vb:.6})")));
             // How far the frames of this part move back, as a change from the part before.
             let moved = a - out;
             if k == 0 {
@@ -253,7 +264,7 @@ impl Sections {
                 let _ = write!(shift, "+if(gte(T,{va:.6}),{:.6},0)", moved - before);
             }
             (before, out) = (moved, out + b - a);
-            let end = if open { String::new() } else { format!(":end={b:.6}") };
+            let end = if vb.is_none() { String::new() } else { format!(":end={b:.6}") };
             for i in 0..audio {
                 let _ = write!(g, "[0:a:{i}]atrim=start={a:.6}{end},asetpts=PTS-{a:.6}/TB[a{i}_{k}];");
                 let _ = write!(joined, "[a{i}_{k}]");
@@ -447,6 +458,15 @@ mod tests {
         assert_eq!(s.window(12.0, 5.0), (12.0, 32.0, 5.0));
         // Longer than the part: shortened to fit.
         assert_eq!(s.window(0.0, 15.0), (0.0, 0.0, 10.0));
+        // The frames a spot check may take: those of its part, the last part open.
+        assert_eq!(s.picture_of(32.0, 100.0), (30.0, Some(50.0)));
+        assert_eq!(s.picture_of(0.0, 100.0), (0.0, Some(10.0)));
+        assert_eq!(s.picture_of(95.0, 100.0), (60.0, None));
+        let f = Sections::new(&[(1.001, 2.0)], 10.0).unwrap().on_frames(24.0, 0.0).unwrap();
+        let (first, until) = f.picture_of(5.0, 10.0);
+        assert!(close(first, 2.0 - 0.25 / 24.0) && until.is_none());
+        let (first, until) = f.picture_of(0.5, 10.0);
+        assert!(close(first, 0.0) && close(until.unwrap(), 25.0 / 24.0 - 0.25 / 24.0));
         // A clip that is the whole of a part, where the sums do not come out even.
         let s = Sections::new(&[(0.3, 0.6)], 2.5).unwrap();
         let (out, src, secs) = s.window(1.0, 5.0);

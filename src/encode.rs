@@ -2387,6 +2387,8 @@ fn lengths_to_compare(info: &MediaInfo, out: &MediaInfo, cut: Option<&Sections>)
 
 /// VMAF of `secs` seconds of the output from `start` against the source from `src_start`,
 /// both cut out and compared by themselves. `name` keeps the cuts of different checks apart.
+/// `part`: sections were removed, and these are the frames of the kept part the clip lies in,
+/// as for [`Sections::picture_of`].
 #[allow(clippy::too_many_arguments)]
 fn spot_check(
     tools: &Tools,
@@ -2395,6 +2397,7 @@ fn spot_check(
     out: &Path,
     out_info: &MediaInfo,
     (start, src_start, secs): (f64, f64, f64),
+    part: Option<(f64, Option<f64>)>,
     retry_below: f64,
     threads: usize,
     tmp: &Path,
@@ -2403,8 +2406,29 @@ fn spot_check(
     let (model, pix) = (search::vmaf_model(info), search::reference_pix_fmt(info));
     let r = tmp.join(format!("{name}.ref.mkv"));
     let d = tmp.join(format!("{name}.out.mkv"));
-    search::extract_reference(tools, input, info, true, search::first_frame(info), info.start_time, src_start, secs, &r)?;
-    search::extract_reference(tools, out, info, false, search::first_frame(out_info), out_info.start_time, start, secs, &d)?;
+    let rate = search::cfr_value(info);
+    let place = search::clip_place(src_start, rate, search::first_frame(info));
+    let ((place, until), (out_place, out_until)) = match part {
+        None => ((place, None), (search::clip_place(start, rate, search::first_frame(out_info)), None)),
+        // Each file's clip used to start a quarter of a frame before the frame nearest its
+        // start on the grid of the source's rate. The output's frames are on that grid after a
+        // cut only if they were in the source and the cut moved them by whole frames: those of
+        // a source whose frames come when they like, cut at the times given, are not, and the
+        // output's clip began a frame before the source's. Resampled to the rate, the two were
+        // then out of step by a fraction of a frame that no shift by whole frames set right (a
+        // screen recording read VMAF 81 where it scores 92). Nor may either clip reach past its
+        // part, where the source has removed frames and the output the next part's.
+        // The output's clip is the source's, moved by what was removed before it, and both
+        // hold the frames of the part alone. (Less a little for the output, whose times were
+        // rounded to its time base.)
+        Some((first, until)) => {
+            let place = place.not_before(first);
+            let by = src_start - start + 6e-4;
+            ((place, until), (place.earlier(by), until.map(|u| u - by)))
+        }
+    };
+    search::extract_reference_at(tools, input, info, true, info.start_time, place, until, secs, &r)?;
+    search::extract_reference_at(tools, out, info, false, out_info.start_time, out_place, out_until, secs, &d)?;
     let mut v = tools.vmaf(&d, &r, model, pix, threads, 0, 1)?;
     // Seeking two different files can land a frame or two apart; retry nearby alignments
     // before calling the encode bad.
@@ -2445,7 +2469,8 @@ fn verify(
         // and each file's picture starts where that file puts it.
         let along = (start + search::first_frame(&out_info), start + search::first_frame(info), secs);
         let (start, src_start, secs) = cut.map_or(along, |c| c.window(start, secs));
-        let v = spot_check(tools, input, info, out, &out_info, (start, src_start, secs), floor, threads, tmp, &format!("verify{i}"))?;
+        let part = cut.map(|c| c.picture_of(src_start, info.duration_s));
+        let v = spot_check(tools, input, info, out, &out_info, (start, src_start, secs), part, floor, threads, tmp, &format!("verify{i}"))?;
         eprintln!("  spot check at {}: VMAF {v:.2}", hms(start));
         tools.emit(Event::SpotCheck { at_secs: start, vmaf: v });
         scores.push(v);
@@ -2603,7 +2628,7 @@ fn verify_whole(
                 }
             };
             let at = (begin + search::first_frame(&out_info), begin + search::first_frame(info), secs);
-            let v = spot_check(tools, input, info, out, &out_info, at, alone - JOIN_SLACK, threads, tmp, &format!("joined{i}"))?;
+            let v = spot_check(tools, input, info, out, &out_info, at, None, alone - JOIN_SLACK, threads, tmp, &format!("joined{i}"))?;
             eprintln!("  joined video at {}: VMAF {v:.2} ({alone:.2} by itself)", hms(at.0));
             if v < alone - JOIN_SLACK {
                 bail!("the stretch at {} was encoded again but scores VMAF {v:.2} once put back into the video, against {alone:.2} on its own; {FAILED_INSIDE}", hms(st.start_secs));

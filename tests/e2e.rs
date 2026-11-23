@@ -756,6 +756,32 @@ fn sections_removed_from_a_held_frame_take_its_time_with_them() {
 
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_recording_cut_between_its_frames_is_checked_against_the_same_frames() {
+    let c = Case::new("remove-recording");
+    // A screen recording: 30 frames a second, a third of that while little moves. Its frames
+    // are on no grid the checks could put them on, so it is cut at the times given.
+    c.ffmpeg(&[
+        "-f", "lavfi", "-i", "testsrc2=s=320x180:r=30:d=14", "-f", "lavfi", "-i", "sine=f=440:d=14", "-vf", "select='lt(mod(n,20),10)+not(mod(n,3))'",
+        "-fps_mode", "vfr", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "16", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "64k", "-shortest", "rec.mkv",
+    ]);
+    let src = c.videos().join("rec.mkv");
+    let want = frame_times(&src);
+    // The output's clip of the part after the first section used to start on the frame
+    // before the source's, and the spot check read VMAF 81 for a stretch that scores 92.
+    let r = c.encode(&[&src], &["--remove", "1.01-2.03", "--remove", "3.5-4.2"]);
+    r.ok().has("encoded 1,");
+    let out = c.out().join("rec.mp4");
+    let kept: Vec<f64> = want.iter().copied().filter(|&t| t < 1.01 || (2.03..3.5).contains(&t) || t >= 4.2).collect();
+    let got = frame_times(&out);
+    assert_eq!(got.len(), kept.len());
+    let to_out = |t: f64| t - if t >= 4.2 { 1.72 } else if t >= 2.03 { 1.02 } else { 0.0 };
+    let worst = got.iter().zip(&kept).map(|(g, w)| (g - to_out(*w)).abs()).fold(0.0, f64::max);
+    assert!(worst < 0.002, "a frame is {worst:.3} s from its place");
+    assert_in_step(&out, &src, "lt(t,1.01)+gte(t,2.03)*lt(t,3.5)+gte(t,4.2)");
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn tags_are_kept_dropped_set_and_filled_from_info_files() {
     let c = Case::new("meta");
     c.clip("plain.mp4", "320x180", 6);

@@ -1157,6 +1157,10 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
         eprintln!("warning: could not copy the file date: {e}");
     }
 
+    // On the drive before it has the output's name: after a power cut, a file of the right size
+    // that was never written out (zeros, on some filesystems) would pass for the encode, and
+    // `replace` goes by its size.
+    made_file.sync_all().with_context(|| format!("cannot write the finished encode {} out to the drive", crate::files::Named(&partial)))?;
     crate::signals::stop_point("encode:ready");
     // The place was free when the encode began, hours ago perhaps. A file that has turned up
     // there since is not this run's to write over: the encode is kept under another name.

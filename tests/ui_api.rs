@@ -1998,6 +1998,7 @@ fn every_job_taken_is_in_the_queue_a_killed_server_leaves() {
                 std::fs::write(d.join(format!("videos/v{i}.mp4")), b"xx").unwrap();
             }
         });
+        let so_far = std::sync::atomic::AtomicUsize::new(0);
         let taken = std::thread::scope(|scope| {
             let poster = scope.spawn(|| {
                 let mut taken = Vec::new();
@@ -2011,10 +2012,16 @@ fn every_job_taken_is_in_the_queue_a_killed_server_leaves() {
                         Ok(r) => panic!("{} {}", r.status, r.body),
                         Err(_) => break,
                     }
+                    so_far.store(taken.len(), std::sync::atomic::Ordering::Relaxed);
                 }
                 taken
             });
-            // A different moment each round, a good while into the posting.
+            // A different moment each round, a good while into the posting: counted from the
+            // first jobs taken, since a busy machine can take a second over those.
+            let started = Instant::now();
+            while so_far.load(std::sync::atomic::Ordering::Relaxed) < 3 && started.elapsed() < Duration::from_secs(30) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
             let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos();
             std::thread::sleep(Duration::from_millis(150 + u64::from(nanos % 300)));
             unsafe { libc::kill(s.child.id() as i32, libc::SIGKILL) };

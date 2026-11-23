@@ -974,6 +974,7 @@ pub fn run_placed(tools: &Tools, jobs: &[Job], out_dir: &Path, place: Option<&Ou
         }
 
         encode::clean_stale_temp(&job.out_dir);
+        let _of_an_earlier_file = encode::free_at_cleanup();
         match guarded(|| {
             #[cfg(test)]
             if BUG_IN_TESTS.with_borrow(|on| on.as_deref() == job.input.file_name()) {
@@ -1012,7 +1013,9 @@ pub fn run_placed(tools: &Tools, jobs: &[Job], out_dir: &Path, place: Option<&Ou
                 record("skip", &abs, file, &e.to_string());
             }
             Err(e) => {
-                let detail = format!("{e:#}");
+                // The room there was before the file's temporary files went, if it had any.
+                let free = encode::free_at_cleanup().into_iter().chain(encode::free_bytes(&job.out_dir)).min();
+                let detail = with_full_disk(format!("{e:#}"), &job.out_dir, free);
                 eprintln!("FAILED: {detail}");
                 end("error", &detail, 0);
                 sum.failed += 1;
@@ -1028,6 +1031,25 @@ pub fn run_placed(tools: &Tools, jobs: &[Job], out_dir: &Path, place: Option<&Ou
         }
     }
     Ok(sum)
+}
+
+/// With less than this free where a file's output goes, its failure is put down to that.
+const FULL_BELOW: u64 = 4 << 20;
+
+/// What to say of a file that failed with `detail` while `free` bytes were left on the disk of
+/// `folder`, where its output and its temporary files go. A disk that fills during an encode
+/// shows as whatever broke on it first: an empty libvmaf log ("is not JSON"), ffmpeg's last
+/// lines about its muxer, a bare OS error. So it is said first, in so many words. A refusal
+/// to start for want of room says it already.
+fn with_full_disk(detail: String, folder: &Path, free: Option<u64>) -> String {
+    if detail.starts_with("not enough free space") {
+        return detail;
+    }
+    match free {
+        Some(free) if free < FULL_BELOW => format!("no space left on the disk of {} ({:.1} MB free): {detail}", folder.display(), free as f64 / 1e6),
+        _ if detail.contains("No space left on device") => format!("no space left on a disk: {detail}"),
+        _ => detail,
+    }
 }
 
 /// Runs the work on one file so that a bug in av1opt itself (a panic) fails that file and
@@ -1046,6 +1068,25 @@ pub(crate) fn guarded<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failure_on_a_full_disk_says_the_disk_is_full() {
+        let out = Path::new("/out");
+        // What a disk filling during a trial, an encode and a write of av1opt's own looked like.
+        let json = "libvmaf's log is not JSON: EOF while parsing a value at line 1 column 0";
+        assert_eq!(with_full_disk(json.into(), out, Some(0)), format!("no space left on the disk of /out (0.0 MB free): {json}"));
+        assert_eq!(with_full_disk(json.into(), out, Some(3_000_000)), format!("no space left on the disk of /out (3.0 MB free): {json}"));
+        let mux = "ffmpeg failed (exit status: 228):\n[out#0/mp4 @ 0x5d] Error closing file: No space left on device";
+        assert!(with_full_disk(mux.into(), out, Some(0)).starts_with("no space left on the disk of /out (0.0 MB free): ffmpeg failed"));
+        // Room where the output goes, and still no space somewhere: another disk it writes to.
+        assert_eq!(with_full_disk("No space left on device (os error 28)".into(), out, Some(50_000_000_000)), "no space left on a disk: No space left on device (os error 28)");
+        assert_eq!(with_full_disk("No space left on device (os error 28)".into(), out, None), "no space left on a disk: No space left on device (os error 28)");
+        // Any other failure with room left is said as it is, and so is the refusal to start.
+        assert_eq!(with_full_disk(json.into(), out, Some(FULL_BELOW)), json);
+        assert_eq!(with_full_disk(json.into(), out, None), json);
+        let refused = "not enough free space in /out: 0.0 GB free, ~0.5 GB needed";
+        assert_eq!(with_full_disk(refused.into(), out, Some(0)), refused);
+    }
     use std::io::Write;
 
     #[test]

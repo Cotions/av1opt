@@ -354,8 +354,22 @@ impl TempDir {
     }
 }
 
+thread_local! {
+    /// The free space where the last temporary folder of this thread was, just before it went.
+    static FREE_AT_CLEANUP: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// The free space on the disk of the temporary folder this thread last had, as it was before
+/// the folder was removed, and `None` from then until the next one goes. A file that failed
+/// because the disk was full finds room there again once its own temporary files are gone, so
+/// the room to judge that failure by is the room from before.
+pub(crate) fn free_at_cleanup() -> Option<u64> {
+    FREE_AT_CLEANUP.take()
+}
+
 impl Drop for TempDir {
     fn drop(&mut self) {
+        FREE_AT_CLEANUP.set(free_bytes(&self.path));
         if !self.keep {
             let _ = self.held.remove_all();
         }

@@ -1007,6 +1007,9 @@ fn write_report_locking(report: &Path, r: &Value, held: Option<&mut Vec<Lock>>) 
     Ok(())
 }
 
+/// How long [`lock`] waits for a report another run holds.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Held while the files of a report are moved, so that two runs (two clicks, or the command
 /// and the page at once) never work on the same pair. Gone when the returned lock is dropped.
 fn lock(report: &Path) -> Result<Lock> {
@@ -1014,13 +1017,24 @@ fn lock(report: &Path) -> Result<Lock> {
     use std::os::unix::fs::OpenOptionsExt;
     // Without waiting: a pipe left under a report's name would never finish opening.
     let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(report).with_context(|| format!("no report at {}", report.display()))?;
-    // SAFETY: flock on a descriptor we own; no memory is involved.
-    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0
-        && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock
-    {
-        bail!("this file is being replaced or put back right now");
+    // A lock just let go of is still held for a moment by a program another thread is starting
+    // (the encoder, or a tool the page runs): its copy of the descriptor goes only once that
+    // program has started. A busy report is tried again for that long before it is said to be.
+    let until = std::time::Instant::now() + LOCK_WAIT;
+    loop {
+        // SAFETY: flock on a descriptor we own; no memory is involved.
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            break;
+        }
+        // A filesystem without locks: carry on as a single run would.
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::WouldBlock {
+            break;
+        }
+        if std::time::Instant::now() >= until {
+            bail!("this file is being replaced or put back right now");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    // A filesystem without locks: carry on as a single run would.
     Ok(Lock(f))
 }
 
@@ -3847,4 +3861,24 @@ mod tests {
         assert_eq!(second, Err("this file is being replaced or put back right now".to_string()));
     }
 
+    /// A lock let go of is still held by a program another thread is starting until it has
+    /// started (here another descriptor of the report, let go of a little later): the next run
+    /// waits for it rather than say the pair is busy. With every test of this program in one
+    /// process, starting tools as they go, runs one after the other on one pair were refused.
+    #[test]
+    fn a_lock_let_go_of_a_moment_ago_is_waited_for() {
+        use std::os::fd::AsRawFd;
+        let f = Fix::new("lock-let-go");
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        let other = std::fs::File::open(&report).unwrap();
+        // SAFETY: flock on a descriptor the test owns.
+        assert_eq!(unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        let let_go = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(other);
+        });
+        let taken = lock(&report).map(drop).map_err(|e| e.to_string());
+        let_go.join().unwrap();
+        assert_eq!(taken, Ok(()));
+    }
 }

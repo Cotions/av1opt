@@ -184,7 +184,8 @@ enum Cmd {
     /// refused unless it holds the original's date and a fingerprint or hash of it, its output
     /// and original (or, once replaced, the original in the trash) pass the checks `replace`
     /// makes, and it and its output are your own files in a folder nobody else can write to
-    /// (or one with the sticky bit), unless --trust-reports is given.
+    /// (or one with the sticky bit), unless --trust-reports is given. An original the record
+    /// already holds an output of gets no second one, --trust-reports or not.
     Adopt {
         /// Output folders, reports (`.av1opt.json`) or output files.
         #[arg(required = true)]

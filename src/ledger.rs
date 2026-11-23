@@ -309,7 +309,16 @@ impl Ledger {
 
     fn standing(&self, output: &Path, source: &Path, agrees: impl Fn() -> Result<(), String>) -> Standing {
         match self.known_as(output) {
-            None => Standing::NotYet,
+            // One original has one output on record: a report naming another for it would put a
+            // file the record never saw made beside the one it did, and `replace` would then
+            // follow the record to either.
+            None => match self.outputs_of(source) {
+                None => Standing::NotYet,
+                Some(others) => Standing::Refused(format!(
+                    "av1opt's record says {} was encoded to {others}, so this output is not taken on record as another encode of it; {ONE_ON_RECORD}",
+                    source.display()
+                )),
+            },
             // A report must not be able to give a file on record another past.
             Some(e) if !Self::of_source(e, source) => Standing::Refused(format!("av1opt's record says this output came from another original, {}", e.source.display())),
             Some(_) => agrees().map_or_else(Standing::Refused, |()| Standing::OnRecord),
@@ -369,16 +378,16 @@ impl Ledger {
             let hashed = e.made.as_ref().is_some_and(|m| m.output_sha256.is_some());
             return Some(self.check_ready(p, output.filter(|_| hashed)).map(|()| hashed));
         }
-        let mut others: Vec<String> = self.outputs.iter().filter(|(_, e)| (e.made.is_some() || e.replaced.is_some()) && Self::of_source(e, &p.source)).map(|(o, _)| o.display().to_string()).collect();
-        if others.is_empty() {
-            return None;
-        }
+        let others = self.outputs_of(&p.source)?;
+        Some(Err(format!("av1opt's record says {} was encoded to {others}, not to this output, so this report is not followed; {ONE_ON_RECORD}", p.source.display())))
+    }
+
+    /// The outputs on record made from the original at `source` or put in its place, by any of
+    /// its paths, as they are told; None if there are none.
+    fn outputs_of(&self, source: &Path) -> Option<String> {
+        let mut others: Vec<String> = self.outputs.iter().filter(|(_, e)| (e.made.is_some() || e.replaced.is_some()) && Self::of_source(e, source)).map(|(o, _)| o.display().to_string()).collect();
         others.sort();
-        Some(Err(format!(
-            "av1opt's record says {} was encoded to {}, not to this output, so this report is not followed; if this output is one you made too, `av1opt adopt` on its folder takes it on record",
-            p.source.display(),
-            others.join(" and ")
-        )))
+        (!others.is_empty()).then(|| others.join(" and "))
     }
 
     /// Whether the page may undo this replacement: the original, the trash entry and the place
@@ -390,6 +399,9 @@ impl Ledger {
         if same { Ok(()) } else { Err(DISAGREES.into()) }
     }
 }
+
+/// What is said to someone with a second output of an original that has one on record.
+const ONE_ON_RECORD: &str = "if both are encodes you made, keep the one on record and remove the other and its report";
 
 /// The record as of now, read again only when the file has changed: `/media` asks on every
 /// request a player makes.

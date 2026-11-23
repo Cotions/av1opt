@@ -17,6 +17,9 @@ replaces those), and a report whose output or original fails the checks `replace
 refused. So is one that `replace` would not follow on its word: the report, and its output
 while that is still in the output folder, have to be your own files in a folder nobody else can write to (or one with the sticky bit),
 unless `--trust-reports` is given, and two reports for one original are both refused. An
+original has one output on record: a report naming another output for an original the record
+already holds is refused, with or without `--trust-reports` (if both are encodes you made, keep
+the one on record and remove the other and its report). An
 output that already replaced its original is taken too if it is where `replace`
 puts it, in the original's place, and the file in the trash says it came from there and is,
 read in full, the one the report describes.

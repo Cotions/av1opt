@@ -3687,4 +3687,40 @@ mod tests {
         assert_eq!(std::fs::read(f.lib("a.mp4")).unwrap(), vec![b's'; 1000]);
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
     }
+
+    #[test]
+    fn adopt_does_not_take_a_second_output_of_an_original_on_record() {
+        for (name, mode, trust_reports) in [("adopt-second-own", 0o755, false), ("adopt-second-trust", 0o777, true)] {
+            let f = Fix::new(name);
+            let record = record_in(&f);
+            let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+            on_record(&report);
+            let planted = plant(&f, &report, &f.lib("a.mp4"), &f.out("0.mkv"));
+            set_mode(&f.dir.join("out"), mode);
+            let Check::Ready(p) = check(&planted) else { panic!("{:?}", check(&planted)) };
+            let crate::ledger::Standing::Refused(why) = crate::ledger::load().adopting(&p) else { panic!("{name}: taken") };
+            assert!(why.contains(&format!("was encoded to {}", f.out("a.mkv").display())) && why.contains("keep the one on record and remove the other and its report"), "{why}");
+            let before = std::fs::read_to_string(&record).unwrap();
+            adopt(&[f.dir.join("out"), f.dir.join("lib")], true, false, trust_reports).unwrap();
+            assert_eq!(std::fs::read_to_string(&record).unwrap(), before, "{name}");
+            // And `replace` with no flag, the folder private again, still goes by the record.
+            set_mode(&f.dir.join("out"), 0o755);
+            replace_named(&f, false).unwrap();
+            assert_eq!(std::fs::read(f.lib("a.mkv")).unwrap(), vec![b'o'; 400], "{name}");
+            assert_eq!(std::fs::read(f.out("0.mkv")).unwrap(), vec![b'e'; 400], "{name}");
+            crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        }
+    }
+
+    #[test]
+    fn a_second_report_for_an_original_on_record_is_not_sent_to_adopt() {
+        let f = Fix::new("second-told");
+        record_in(&f);
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        on_record(&report);
+        let planted = plant(&f, &report, &f.lib("a.mp4"), &f.out("0.mkv"));
+        let why = admitted_named(&f, &planted, false).unwrap_err();
+        assert!(!why.contains("av1opt adopt") && why.contains("keep the one on record and remove the other and its report"), "{why}");
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
 }

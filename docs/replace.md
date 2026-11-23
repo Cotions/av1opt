@@ -37,7 +37,8 @@ single output files.
   record vouches for that path. Where the record holds an output, or any output made from its
   original, the record decides, whatever folders are named: all of the output is read and has
   to be the file av1opt made, and a report that names another output for an original on record
-  is not followed (if that output is yours too, `adopt` takes it on record). A report cannot
+  is not followed (if both are encodes you made, keep the one on record and remove the other
+  output and its report). A report cannot
   get past the record by naming a file another way (through a link to its folder, or
   `/proc/self/root`): paths are compared with their folders resolved, and an output or
   original of the same name is also compared by the file itself, so a second mount of a

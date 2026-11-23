@@ -427,12 +427,18 @@ fn others_may_have_written_of(path: &Path, file: &std::fs::File, me: u32, owners
         Ok(found) => found,
         Err(e) => return Some(format!("its folder {} cannot be looked at ({e})", dir.display())),
     };
+    folder_refusal(dir, found.uid(), found.mode(), me, &|| who_else_may_write(&folder, found.mode(), found.gid()))
+}
+
+/// Why the folder `dir`, of owner `owner` and mode `mode`, lets someone other than `me` rename
+/// a file in it, if it does; `who` says who besides `me` may write to it.
+fn folder_refusal(dir: &Path, owner: u32, mode: u32, me: u32, who: &dyn Fn() -> Option<String>) -> Option<String> {
     // The owner of a folder can rename anything in it, sticky bit or not.
-    if found.uid() != me && found.uid() != 0 {
+    if owner != me && owner != 0 {
         return Some(format!("its folder {} belongs to another user", dir.display()));
     }
-    if found.mode() & 0o1000 == 0
-        && let Some(who) = who_else_may_write(&folder, found.mode(), found.gid())
+    if mode & 0o1000 == 0
+        && let Some(who) = who()
     {
         return Some(format!(
             "other users can write to its folder {} ({who}), which has no sticky bit to keep them from renaming files of yours there; `chmod +t {}` gives it one, if everyone who uses the folder only ever renames or removes their own files in it",
@@ -1322,6 +1328,20 @@ pub(crate) mod tests {
         std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o777)).unwrap();
         assert!(judged().is_some_and(|why| why.contains(&format!("other users can write to its folder {}", real.display()))), "{:?}", judged());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_of_another_users_is_refused_even_with_the_sticky_bit_and_roots_is_not() {
+        let dir = Path::new("/srv/out");
+        let nobody = || None;
+        let me = 1000;
+        assert_eq!(folder_refusal(dir, 1001, 0o755, me, &nobody).as_deref(), Some("its folder /srv/out belongs to another user"));
+        assert_eq!(folder_refusal(dir, 1001, 0o1777, me, &nobody).as_deref(), Some("its folder /srv/out belongs to another user"));
+        assert_eq!(folder_refusal(dir, 0, 0o755, me, &nobody), None);
+        assert_eq!(folder_refusal(dir, me, 0o755, me, &nobody), None);
+        let everyone = || Some("every user".to_string());
+        assert!(folder_refusal(dir, 0, 0o777, me, &everyone).is_some_and(|why| why.contains("(every user)")));
+        assert_eq!(folder_refusal(dir, 0, 0o1777, me, &everyone), None);
     }
 
     #[test]

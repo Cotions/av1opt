@@ -3843,4 +3843,66 @@ mod tests {
         assert_eq!(std::fs::read(f.lib("a.mkv")).unwrap(), vec![b'o'; 400]);
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
     }
+
+    #[test]
+    fn a_report_naming_an_output_on_record_as_made_from_another_original_is_not_followed() {
+        let f = Fix::new("other-original");
+        record_in(&f);
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        on_record(&report);
+        // The same output, said to be made from another original of the stated size.
+        std::fs::write(f.lib("b.mp4"), vec![b't'; 1000]).unwrap();
+        let mut r = read_report(&report).unwrap();
+        r["input"] = json!(f.lib("b.mp4"));
+        let (_, known) = Recorded::of(&f.lib("b.mp4")).unwrap();
+        r["source_mtime"] = json!(known.modified);
+        r["source_fingerprint"] = json!(known.fingerprint);
+        write_report(&report, &r).unwrap();
+        for trust_reports in [false, true] {
+            let why = admitted_named(&f, &report, trust_reports).unwrap_err();
+            assert_eq!(why, format!("av1opt's record says this output was made from another original, {}", f.lib("a.mp4").display()));
+        }
+        replace_named(&f, true).unwrap();
+        assert_eq!(std::fs::read(f.lib("b.mp4")).unwrap(), vec![b't'; 1000]);
+        assert!(!f.lib("b.mkv").exists());
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
+
+    #[test]
+    fn a_report_that_changes_while_it_is_checked_is_not_followed() {
+        let f = Fix::new("changed-while-checked");
+        record_in(&f);
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        let Check::Ready(p) = check(&report) else { panic!("{:?}", check(&report)) };
+        let output = OpenFile::open(&p.output, p.output_bytes).unwrap();
+        assert_eq!(why_not_own(&p, &output), None);
+        // Rewritten in its place, by its owner, after the plan was made from it.
+        let mut r = read_report(&report).unwrap();
+        r["input"] = json!(f.lib("b.mp4"));
+        std::fs::write(&report, serde_json::to_vec(&r).unwrap()).unwrap();
+        let why = why_not_own(&p, &output).unwrap();
+        assert_eq!(why, format!("the report {} changed while it was being checked, so nothing was changed", report.display()));
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
+
+    #[test]
+    fn adopt_takes_a_replaced_report_only_where_nobody_else_could_have_put_it() {
+        let f = Fix::new("adopt-replaced-not-own");
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        f.apply(&report).unwrap();
+        let record = record_in(&f);
+        let named = [f.dir.join("out"), f.dir.join("lib")];
+        let adopted = || std::fs::read_to_string(&record).unwrap_or_default().contains("\"adopted\"");
+        set_mode(&f.dir.join("out"), 0o777);
+        let Check::Replaced(d) = check(&report) else { panic!("{:?}", check(&report)) };
+        let Found::Refused(why) = found_for_adoption(&report, Judging::default(), &crate::ledger::load(), &NamedFolders::of(&named, false), false) else { panic!("taken") };
+        assert!(why.contains("other users can write to its folder") && why.contains("add --trust-reports"), "{why}");
+        adopt(&named, true, false, false).unwrap();
+        assert!(!adopted());
+        adopt(&named, true, false, true).unwrap();
+        assert!(adopted());
+        assert!(crate::ledger::load().check_replaced(&d).is_ok());
+        set_mode(&f.dir.join("out"), 0o755);
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
 }

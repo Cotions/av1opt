@@ -902,6 +902,29 @@ fn a_cut_transport_stream_whose_sound_starts_first_is_repaired_from_the_frames_i
 
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_cut_that_fails_a_spot_check_is_searched_and_encoded_again_with_its_sections_removed() {
+    let c = Case::new("cut-again");
+    weak_numbered_clip(&c, "weak.mp4");
+    // Every sixth frame gone and the rest at their own times: more uneven steps than a video
+    // scored along its whole length may have, so this one gets spot checks. The two samples
+    // (from 5.4 s and from 16.1 s) miss the hard four seconds from 12 s, most of which lie in
+    // the spot check from 12.95 s. A cut failed there, with nothing left to hold its CRF to
+    // its worst stretch, where a video without sections removed is searched again.
+    c.ffmpeg(&["-i", "weak.mp4", "-vf", "select='mod(n,6)'", "-fps_mode", "vfr", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "12", "-c:a", "copy", "uneven.mkv"]);
+    let r = c.encode(&[&c.videos().join("uneven.mkv")], &["--remove", "20-20.5"]);
+    r.ok().has("encoded 1,").has("spot checks instead of the whole video").has("a stretch the samples missed: searching again with it as a sample");
+    let rep = c.report("uneven");
+    assert!(rep["notes"].to_string().contains("encoded a second time, after a spot check at"), "{rep}");
+    assert!(verify_scores(&rep).iter().all(|v| *v >= 89.0), "{rep}");
+    let chosen = rep["crf"].as_f64().unwrap();
+    assert!(chosen < rep["first_crf"].as_f64().unwrap(), "{rep}");
+    // The second encode removed the section too.
+    let out = c.out().join("uneven.mp4");
+    assert_eq!(frame_numbers(&out), (0..576).filter(|n| n % 6 != 0 && !(480..492).contains(n)).collect::<Vec<u32>>());
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn a_cut_video_that_needs_nothing_is_checked_whole_and_kept_as_encoded() {
     let c = Case::new("cut-whole");
     let src = c.clip("easy.mp4", "320x180", 16);

@@ -149,8 +149,8 @@ For each file:
    With sections removed the source is decoded through the same picking of frames as the
    encode was (see [Removing sections](#removing-sections---remove)), so that both sides hold
    the same frames in the same order, and the stretches encoded again are cut from that same
-   picture; a video too weak for its repairs then fails where a whole one would be searched
-   again.
+   picture; a video too weak for its repairs is searched and encoded again as a whole one
+   is, with the same sections removed and each weak stretch a sample from inside one kept part.
    Where frames can't be paired one for one (the two sides of a cut hold different numbers of
    frames, a source in which more than
    one frame in ten stays on screen much longer or shorter than the rest, as in a screen
@@ -159,8 +159,8 @@ For each file:
    one for every ten minutes of a video of 25 minutes or more, eight at most; all of a
    video of ten seconds or less, once). So it is where stretches can't be encoded again (no
    room for them on the drive, say), and the report then says so. A spot check more than 4
-   below the target leads to the same second search; a video encoded per scene or with
-   sections removed fails instead. Nothing is written unless all checks pass. The source
+   below the target leads to the same second search, with sections removed as well; a video
+   encoded per scene fails instead. Nothing is written unless all checks pass. The source
    has to be as it was, too. It counts as changed if its size is different, or if its
    modification time is more than two seconds off and a fingerprint of its contents (a hash
    of its size and of a megabyte at its start, middle and end) differs as well; a file only
@@ -233,7 +233,8 @@ as the cut made them. The whole video is encoded once more where the scores say 
 same sections removed. A variable-rate source cut at the times given goes the same way, under
 the same rule as any other source (no more than one step between frames in ten uneven);
 past that, and wherever the two sides of the cut do not hold as many frames, it gets the
-spot checks. A cut is
+spot checks, and one that fails makes its stretch a sample of a second search, as without
+sections removed: nothing else holds the CRF of a cut to its worst stretch. A cut is
 never skipped for being AV1 already or saving too little, and if the VMAF target is out of reach
 it is encoded at the best CRF tried. At least one second of the video has to stay: sections
 that remove all of it, or all but a moment, are refused before the encode starts, and the web UI

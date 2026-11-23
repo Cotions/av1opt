@@ -1044,10 +1044,11 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     // so it says nothing of the video's mean: it counts for the worst sample only. Averaged
     // in, up to eight such stretches pulled the mean the search goes by under what the rest
     // of the video scores, for a CRF lower than the mean asks for.
+    // With sections removed as well: the stretch is where the source has it, inside one kept
+    // part, as the samples of a cut are, and the second encode removes the same sections.
     if let Err(e) = &verified
         && let Some(low) = e.downcast_ref::<LowSpot>()
         && chunks.is_none()
-        && cut.is_none()
         && let (Some(pos), Some(params)) = (&positions, params)
     {
         let t2 = tools.stopwatch();
@@ -1072,7 +1073,8 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
                 let predicted_savings = 1.0 - b.size_ratio;
                 tools.emit(Event::Chosen { crf: b.crf, vmaf: b.mean_vmaf, predicted_savings });
                 eprintln!("chose crf {} (VMAF {:.2}), predicted video savings {:.0}%", b.crf, b.mean_vmaf, predicted_savings * 100.0);
-                if predicted_savings < o.min_savings && !o.force {
+                // (With sections removed the output is wanted anyway, as after the first search.)
+                if predicted_savings < o.min_savings && !o.force && cut.is_none() {
                     skip!(
                         "a spot check at {} scored VMAF {lowest:.2} at CRF {}; the CRF that holds that stretch ({}) saves {:.0}%, below --min-savings {:.0}%",
                         hms(at), best.crf, b.crf, predicted_savings * 100.0, o.min_savings * 100.0
@@ -1090,7 +1092,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
                 trials = all;
                 search_secs += t2.secs(tools);
                 let t3 = tools.stopwatch();
-                let (args, _) = full_encode_args(input, &info, &enc, best.crf, o.container, o.audio, &covers, &meta, &o.meta, None, &partial, &mut Vec::new());
+                let (args, _) = full_encode_args(input, &info, &enc, best.crf, o.container, o.audio, &covers, &meta, &o.meta, cut_inputs.as_ref(), &partial, &mut Vec::new());
                 tools.emit(Event::Phase { phase: "encoding".into(), detail: format!("crf {}, preset {preset}", best.crf) });
                 tools.run_with_progress(&args, out_duration, "encoding")?;
                 verified = check(&best, &mut notes);
@@ -2677,10 +2679,17 @@ fn verify_whole(
         Ok(o) => o,
         Err(e) if crate::events::is_cancelled(&e) => return Err(e),
         Err(e) => match e.downcast::<repair::StillLow>() {
-            // In the source's time, as the search takes its samples.
+            // In the source's time, as the search takes its samples; of a cut, inside one kept
+            // part each (see `Sections::window`), where a sample holds no frame that was removed.
             Ok(low) => {
-                let at = |t: f64| cut.map_or(t + search::first_frame(info), |c| c.to_source(t + first));
-                return Err(LowSpot { windows: low.windows.iter().map(|w| (at(w.0), w.1, w.2)).collect(), floor, hint: false }.into());
+                let place = |w: &(f64, f64, f64)| match cut {
+                    None => (w.0 + search::first_frame(info), w.1, w.2),
+                    Some(c) => {
+                        let (_, src, secs) = c.window(w.0 + first, w.1);
+                        (src, secs, w.2)
+                    }
+                };
+                return Err(LowSpot { windows: low.windows.iter().map(place).collect(), floor, hint: false }.into());
             }
             Err(e) => {
                 let n = format!("stretches below VMAF {floor:.0} could not be encoded again ({}): judged by spot checks", why_not(&e));

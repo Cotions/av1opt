@@ -624,6 +624,7 @@ fn move_open(file: &OpenFile, from: &Path, to: &Path, bytes: u64) -> Result<Move
             clear_left_behind(to);
             let copy = copy_new(file, &part, bytes)?;
             land(&part, to, &copy).inspect_err(|_| drop(std::fs::remove_file(&part))).with_context(|| format!("cannot name the copy {}", to.display()))?;
+            crate::signals::stop_point("move:copied");
             if !file.is_at(from) {
                 eprintln!("warning: copied, but {} is another file by now, so it was left there", from.display());
             } else if let Err(e) = std::fs::remove_file(from) {
@@ -773,6 +774,7 @@ fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: &dy
     let mut staged_first = None;
     if !in_place && p.copy {
         staged_first = Some(stage()?);
+        crate::signals::stop_point("replace:staged");
     }
     // Reading a large original takes minutes, and a write behind the place being read would not
     // have shown in what was read.
@@ -801,6 +803,7 @@ fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: &dy
             Err(b) => anyhow!("{CHANGED_WHILE_CHECKED}, and it is still in the trash at {} ({b:#})", trashed.display()),
         });
     }
+    crate::signals::stop_point("replace:trashed");
     // Some(copy): the output was copied, and its old file is still in the output folder.
     let placed: Result<Option<OpenFile>> = if in_place {
         if output.is_at(&p.output) { Ok(None) } else { Err(anyhow!("{} was replaced by another file", p.output.display())) }
@@ -830,11 +833,13 @@ fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: &dy
         }
     };
 
+    crate::signals::stop_point("replace:placed");
     // From here on both files are where they belong. On record first: if what follows does
     // not get done, the record is what the report can be set right by.
     let source_mtime = std::fs::symlink_metadata(&trashed).ok().and_then(|m| crate::source::modified_seconds(&m));
     let went = Recorded { modified: source_mtime.or(p.original.modified), ..p.original.clone() };
     let move_noted = crate::ledger::note_replaced(&crate::ledger::Replacement { original: &p.source, trash: &trashed, output: &p.dest, from: &p.output, source_bytes: p.source_bytes, known: &went, output_bytes: p.output_bytes });
+    crate::signals::stop_point("replace:noted");
     let mut warnings = Vec::new();
     // Through the open file: by name, this would reach whatever has been put there since.
     if copy.as_ref().unwrap_or(&output).file.set_permissions(source_meta.permissions()).is_err() {
@@ -851,6 +856,7 @@ fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: &dy
     if let Err(e) = &move_noted {
         warnings.push(format!("av1opt's own record of this could not be written ({e:#}), so the page will not offer to put the original back; `av1opt replace --undo` in a terminal can"));
     }
+    crate::signals::stop_point("replace:report");
     before_report();
     let noted = read_report(report).map_err(|e| anyhow!(e)).and_then(|mut r| {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
@@ -947,6 +953,7 @@ fn undo_watched(report: &Path, allow_zfs: bool, accept: Accept<Replaced>, before
         bail!("the file in the trash was changed or replaced while it was being checked, so nothing was moved");
     }
     let moved = if d.from == d.dest { None } else { Some(move_open(&av1, &d.dest, &d.from, d.output_bytes)?) };
+    crate::signals::stop_point("undo:moved");
     if let Err(e) = trash::restore_if(&d.trash, &d.source, &|m| original.is(m)) {
         // Both go back to where the report says they are, so that this can be tried again.
         let at_from = match &moved {
@@ -959,10 +966,12 @@ fn undo_watched(report: &Path, allow_zfs: bool, accept: Accept<Replaced>, before
             Err(back) => e.context(format!("the original is still in the trash at {}, and the AV1 file is at {} because it could not go back to {} ({back:#})", d.trash.display(), d.from.display(), d.dest.display())),
         });
     }
+    crate::signals::stop_point("undo:restored");
     sync_dir(d.source.parent().unwrap_or(Path::new("/")));
     if let Err(e) = crate::ledger::note_undone(&d.source, &d.dest, &d.from) {
         eprintln!("warning: the original is back, but av1opt's own record of that could not be written: {e:#}");
     }
+    crate::signals::stop_point("undo:noted");
     before_report();
     let mut r = read_report(report).map_err(|e| anyhow!(e))?;
     // Undone from a report set aside: the AV1 file did not go back to where it came from, as

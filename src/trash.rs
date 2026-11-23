@@ -202,7 +202,10 @@ pub(crate) fn trash_with(path: &Path, home: Option<&Path>, uid: u32, when: Strin
         let dest = files.join(&unique);
         // A leftover file without its info file: don't replace it.
         // (In one step: a file put there between a look and the move would be replaced.)
-        let moved = f.write_all(text.as_bytes()).and_then(|_| f.sync_all()).and_then(|_| rename_new(path, &dest));
+        let moved = f.write_all(text.as_bytes()).and_then(|_| f.sync_all()).and_then(|_| {
+            crate::signals::stop_point("trash:info");
+            rename_new(path, &dest)
+        });
         match moved {
             Ok(()) => return Ok(dest),
             Err(e) => {

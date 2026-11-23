@@ -989,6 +989,7 @@ pub fn run_placed(tools: &Tools, jobs: &[Job], out_dir: &Path, place: Option<&Ou
                 sum.bytes_out += out_size;
                 end("ok", &out.display().to_string(), out_size);
                 record("ok", &abs, file, &out.display().to_string());
+                crate::signals::stop_point("batch:logged");
             }
             // Whatever else went wrong once the run was stopped comes of the stopping: Ctrl-C
             // reaches an ffprobe under way directly, and it fails like a damaged file.

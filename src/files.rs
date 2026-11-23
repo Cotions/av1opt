@@ -301,13 +301,223 @@ fn has_access_list(folder: &Path) -> bool {
     size > 0
 }
 
+/// Whether the open file or folder `file` has an access list beyond its mode.
+fn has_access_list_open(file: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    // SAFETY: a descriptor we own and a valid NUL-terminated name; with no buffer, fgetxattr
+    // only gives the size.
+    let size = unsafe { libc::fgetxattr(file.as_raw_fd(), c"system.posix_acl_access".as_ptr(), std::ptr::null_mut(), 0) };
+    size > 0
+}
+
+/// Whether the open file or folder `file` has an NFSv4 access list. Such a list can let other
+/// users write whatever the mode shows, and it is not read here: having one at all counts.
+fn has_nfs4_access_list(file: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    // SAFETY: as in has_access_list_open.
+    let size = unsafe { libc::fgetxattr(file.as_raw_fd(), c"system.nfs4_acl".as_ptr(), std::ptr::null_mut(), 0) };
+    size > 0
+}
+
+/// Who besides this user may write to the open file or folder `file`, of mode `mode` and group
+/// `gid`, as [`others_may_rename_in`] judges a folder's group, sticky bit aside; told the way a
+/// person can act on it: everyone, the members of its group (named), or those its access list
+/// names. None if nobody.
+fn who_else_may_write(file: &std::fs::File, mode: u32, gid: u32) -> Option<String> {
+    who_else_may_write_with(mode, gid, has_access_list_open(file), has_nfs4_access_list(file))
+}
+
+/// [`who_else_may_write`], with whether the file has a POSIX access list (`posix_list`) and an
+/// NFSv4 one (`nfs4_list`) passed in. A POSIX list lets nobody write past the group bits of the
+/// mode, which stand for the most it grants; an NFSv4 list is not bound by the mode at all.
+fn who_else_may_write_with(mode: u32, gid: u32, posix_list: bool, nfs4_list: bool) -> Option<String> {
+    if nfs4_list {
+        return Some("whoever its NFSv4 access list lets, which av1opt does not read".into());
+    }
+    if mode & 0o002 != 0 {
+        return Some("every user".into());
+    }
+    if mode & 0o020 == 0 {
+        return None;
+    }
+    if posix_list {
+        return Some("the users its access list names".into());
+    }
+    (!group_is_mine_alone(gid)).then(|| match group_name(gid) {
+        Some(name) => format!("the members of the group {name}"),
+        None => format!("the members of group number {gid}"),
+    })
+}
+
+/// The name of the group `gid`, from the system's lists.
+fn group_name(gid: u32) -> Option<String> {
+    let mut buffer = vec![0 as libc::c_char; 1 << 16];
+    // SAFETY: the struct is filled by the call from the buffer given, which outlives the one use
+    // of the pointer in it; a result of null or an error means nothing was found.
+    unsafe {
+        let mut group: libc::group = std::mem::zeroed();
+        let mut found = std::ptr::null_mut();
+        if libc::getgrgid_r(gid, &mut group, buffer.as_mut_ptr(), buffer.len(), &mut found) != 0 || found.is_null() {
+            return None;
+        }
+        Some(std::ffi::CStr::from_ptr(group.gr_name).to_string_lossy().into_owned())
+    }
+}
+
+/// Why a user other than this one may have put the plain file `file`, opened from `path`,
+/// where it is or written what is in it, if one may: it belongs to another user, has other
+/// names, others may write to it, or others may rename things in its folder (which has no
+/// sticky bit to keep each to their own names), or the folder is another user's. Judged on the
+/// open file and its folder, opened now and found to hold this same file under its name.
+///
+/// A drive that keeps no owners or modes of its own (FAT, exFAT, NTFS, and network drives that
+/// show one owner for everything) shows what it was mounted with, and that is what is judged:
+/// files shown as another user's, or as open to everyone, cannot be told to be this user's.
+///
+/// So a file on a drive known not to keep owners and modes at all is never taken to be this
+/// user's alone, however it is shown: on a FAT stick or a network share mounted with `uid=`
+/// every file shows as the user's own in a private folder, whoever put it there.
+pub fn others_may_have_written(path: &Path, file: &std::fs::File) -> Option<String> {
+    others_may_have_written_of(path, file, my_user(), owners_kept_on(path, file))
+}
+
+fn others_may_have_written_of(path: &Path, file: &std::fs::File, me: u32, owners: Owners) -> Option<String> {
+    use std::os::fd::AsRawFd;
+    if let Owners::NotKept(drive) = owners {
+        return Some(format!("it is on {drive}, which does not keep who owns a file or who may write to it, so nothing there can say whose the file is"));
+    }
+    let meta = match file.metadata() {
+        Ok(meta) => meta,
+        Err(e) => return Some(format!("it cannot be looked at ({e})")),
+    };
+    if !meta.is_file() {
+        return Some(format!("it is {}, not a plain file", kind_of(&meta)));
+    }
+    if meta.uid() != me {
+        return Some("it belongs to another user".into());
+    }
+    if meta.nlink() != 1 {
+        return Some("it has other names on the drive too (hard links)".into());
+    }
+    if let Some(who) = who_else_may_write(file, meta.mode(), meta.gid()) {
+        return Some(format!("other users can write to it ({who})"));
+    }
+    // The folder as it is reached now, links on the way followed (an output folder named by a
+    // link in the home folder, say): it is that folder that is judged, and it has to hold this
+    // very file under its name, its one name on the drive.
+    let real = in_real_folder(path);
+    let dir = folder_of(&real);
+    let folder = match open_folder(dir) {
+        Ok(folder) => folder,
+        Err(e) => return Some(format!("its folder {} cannot be looked at ({e})", dir.display())),
+    };
+    let Some(name) = real.file_name().and_then(|n| std::ffi::CString::new(n.as_bytes()).ok()) else {
+        return Some("it has no name of its own".into());
+    };
+    // SAFETY: fstatat on a descriptor we own, with a valid NUL-terminated name, fills the
+    // struct it is given and nothing else.
+    let there = unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        (libc::fstatat(folder.as_raw_fd(), name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) == 0).then_some((st.st_dev, st.st_ino))
+    };
+    if there != Some((meta.dev(), meta.ino())) {
+        return Some("it was moved or replaced while it was being looked at".into());
+    }
+    let found = match folder.metadata() {
+        Ok(found) => found,
+        Err(e) => return Some(format!("its folder {} cannot be looked at ({e})", dir.display())),
+    };
+    folder_refusal(dir, found.uid(), found.mode(), me, &|| who_else_may_write(&folder, found.mode(), found.gid()))
+}
+
+/// Why the folder `dir`, of owner `owner` and mode `mode`, lets someone other than `me` rename
+/// a file in it, if it does; `who` says who besides `me` may write to it.
+fn folder_refusal(dir: &Path, owner: u32, mode: u32, me: u32, who: &dyn Fn() -> Option<String>) -> Option<String> {
+    // The owner of a folder can rename anything in it, sticky bit or not.
+    if owner != me && owner != 0 {
+        return Some(format!("its folder {} belongs to another user", dir.display()));
+    }
+    if mode & 0o1000 == 0
+        && let Some(who) = who()
+    {
+        return Some(format!(
+            "other users can write to its folder {} ({who}), which has no sticky bit to keep them from renaming files of yours there; `chmod +t {}` gives it one, if everyone who uses the folder only ever renames or removes their own files in it",
+            dir.display(),
+            dir.display()
+        ));
+    }
+    None
+}
+
+/// Whether a drive keeps who owns each file and who may write to it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Owners {
+    Kept,
+    /// It shows every file with the owner and modes it was mounted with, or with one owner for
+    /// all: what kind of drive it is, as told to the person.
+    NotKept(&'static str),
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Folders this thread takes to be on a FAT drive, with all below them: there is no such
+    /// drive to test on, and mounting one takes root.
+    pub(crate) static OWNERLESS_IN_TESTS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// What the drive of `file`, opened from `path`, keeps of owners, by the kind of drive the
+/// system says it is.
+fn owners_kept_on(path: &Path, file: &std::fs::File) -> Owners {
+    use std::os::fd::AsRawFd;
+    #[cfg(test)]
+    if OWNERLESS_IN_TESTS.with_borrow(|d| d.iter().any(|d| path.starts_with(d))) {
+        return owners_kept_by(0x4d44);
+    }
+    let _ = path;
+    // SAFETY: fstatfs on a descriptor we own fills the struct it is given and nothing else.
+    let magic = unsafe {
+        let mut st: libc::statfs = std::mem::zeroed();
+        (libc::fstatfs(file.as_raw_fd(), &mut st) == 0).then_some(st.f_type)
+    };
+    // The kind is a 32-bit number, held in a wider signed one on some systems.
+    magic.map_or(Owners::Kept, |m| owners_kept_by(m as u64 & 0xffff_ffff))
+}
+
+/// What a drive of the kind `magic` (statfs's `f_type`) keeps of owners. FAT, exFAT and NTFS
+/// keep none, and Linux shows what they were mounted with. An SMB share shows the owner and
+/// modes it was mounted with unless the server speaks Unix extensions, which cannot be told
+/// from here, and a FUSE drive (ntfs-3g, exFAT and rclone among them) shows whatever its program
+/// says: both count as keeping none, so that what anyone else put there is never taken for
+/// this user's own.
+fn owners_kept_by(magic: u64) -> Owners {
+    match magic {
+        0x4d44 => Owners::NotKept("a FAT drive"),
+        0x2011_bab0 => Owners::NotKept("an exFAT drive"),
+        0x5346_544e | 0x7366_746e => Owners::NotKept("an NTFS drive"),
+        0xff53_4d42 | 0xfe53_4d42 | 0x517b => Owners::NotKept("an SMB (Windows) network share"),
+        0x6573_5546 => Owners::NotKept("a FUSE drive (ntfs-3g, exFAT, rclone or the like)"),
+        _ => Owners::Kept,
+    }
+}
+
 /// Whether the group `gid` is this user's own and holds nobody else, as far as can be told
 /// cheaply from the system's user and group lists (by way of libc, so that lists kept
 /// elsewhere, as in LDAP, count too): it is this user's own group, named as this user is, and
-/// lists no member but this user. A group some other user has as their own without being listed
-/// in it can only be found by going through every user, which is not done: any other group
-/// counts as shared.
+/// lists no member but this user, and no other user in `/etc/passwd` has it as their own group,
+/// which makes them a member without being listed in it. (Users kept elsewhere, as in LDAP, who
+/// have it as their own are not found: going through every one of them is not done.)
 fn group_is_mine_alone(gid: u32) -> bool {
+    let theirs_too = std::fs::read_to_string("/etc/passwd").map_or(true, |passwd| others_have_as_their_own(&passwd, gid, my_user()));
+    !theirs_too && listed_as_mine_alone(gid)
+}
+
+/// Whether a user other than `me` in the text of `/etc/passwd` has `gid` as their own group.
+fn others_have_as_their_own(passwd: &str, gid: u32, me: u32) -> bool {
+    passwd.lines().map(|l| l.split(':').collect::<Vec<&str>>()).filter(|f| f.len() >= 4).any(|f| f[2].parse() != Ok(me) && f[3].parse() == Ok(gid))
+}
+
+/// The part of [`group_is_mine_alone`] that the system's lists, by way of libc, can tell.
+fn listed_as_mine_alone(gid: u32) -> bool {
     let mut buffer = vec![0 as libc::c_char; 1 << 16];
     // SAFETY: the structs are filled by the calls from the buffer given, which outlives every
     // use of the pointers in them; a result of null or an error means nothing was found.
@@ -662,6 +872,38 @@ pub fn folder_of(path: &Path) -> &Path {
     path.parent().unwrap_or(Path::new("."))
 }
 
+/// `path` as av1opt's record holds the files it names: its folder with every link on the way
+/// resolved, and its own name as it is. A report can name one file by many paths (by way of
+/// `/proc/self/root`, a link to a folder, `/a/./b`), and a path compared as text with what the
+/// record holds would find nothing of a file the record knows well. A path whose folder is not
+/// there is given back as it is.
+pub fn in_real_folder(path: &Path) -> PathBuf {
+    let real = path.parent().and_then(|d| std::fs::canonicalize(d).ok()).zip(path.file_name());
+    real.map_or_else(|| path.to_path_buf(), |(d, name)| d.join(name))
+}
+
+/// Whether `a` and `b` name the same file: one path once their folders are resolved (see
+/// [`in_real_folder`]), or, where both are there, one file on the drive. A second mount of a
+/// folder, a drive that does not tell letter case apart, or a second (hard) link gives one
+/// file other paths, which only the file's own number shows. A link at either name is taken
+/// as itself, not as what it leads to.
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    if a == b || in_real_folder(a) == in_real_folder(b) {
+        return true;
+    }
+    match (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) {
+        (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
+        _ => false,
+    }
+}
+
+/// Whether two names could name the same file on some drive: the same once letter case is set
+/// aside. What is compared by [`same_file`] where comparing everything would be slow.
+pub fn may_be_same_name(a: &Path, b: &Path) -> bool {
+    let lower = |p: &Path| p.file_name().map(|n| n.to_string_lossy().to_lowercase());
+    lower(a).is_some() && lower(a) == lower(b)
+}
+
 /// The end of a name no other save has: this process's number and a count of its saves, and
 /// then `ending`. Two names cut to fit can begin alike, so it is this that tells them apart.
 pub fn unique_tail(ending: &str) -> String {
@@ -999,6 +1241,151 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_file_counts_as_written_by_this_user_alone_only_if_nobody_else_could_have() {
+        let dir = room("own-file");
+        let path = dir.join("a.av1opt.json");
+        std::fs::write(&path, b"{}").unwrap();
+        let set = |p: &Path, mode: u32| std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+        set(&dir, 0o755);
+        set(&path, 0o644);
+        let judged = |me: u32| others_may_have_written_of(&path, &std::fs::File::open(&path).unwrap(), me, Owners::Kept);
+        assert_eq!(judged(my_user()), None);
+        // A file and a folder that look like another user's.
+        assert_eq!(judged(my_user() + 1).as_deref(), Some("it belongs to another user"));
+        set(&path, 0o666);
+        assert_eq!(judged(my_user()).as_deref(), Some("other users can write to it (every user)"));
+        set(&path, 0o644);
+        set(&dir, 0o777);
+        assert!(judged(my_user()).is_some_and(|why| why.starts_with("other users can write to its folder")));
+        // The sticky bit keeps others to their own names.
+        set(&dir, 0o1777);
+        assert_eq!(judged(my_user()), None);
+        set(&dir, 0o755);
+        // A second name, which could be anywhere on the drive.
+        std::fs::hard_link(&path, dir.join("other")).unwrap();
+        assert!(judged(my_user()).is_some_and(|why| why.contains("hard links")));
+        std::fs::remove_file(dir.join("other")).unwrap();
+        // The file opened has to be the one at its name in the folder judged.
+        let opened = std::fs::File::open(&path).unwrap();
+        std::fs::rename(&path, dir.join("moved")).unwrap();
+        std::fs::write(&path, b"{}").unwrap();
+        assert!(others_may_have_written(&path, &opened).is_some_and(|why| why.contains("moved or replaced")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A group this user is in besides their own, if there is one.
+    fn shared_group() -> Option<u32> {
+        let mut groups = vec![0 as libc::gid_t; 256];
+        // SAFETY: getgroups writes at most as many numbers as it is told there is room for, and
+        // getegid has no failure mode.
+        let (count, own) = unsafe { (libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()), libc::getegid()) };
+        groups[..count.max(0) as usize].iter().copied().find(|g| *g != own && !group_is_mine_alone(*g))
+    }
+
+    #[test]
+    fn a_group_another_user_has_as_their_own_is_shared_though_its_list_names_nobody() {
+        let passwd = "root:x:0:0:root:/root:/bin/sh\nme:x:1000:1000::/home/me:/bin/sh\nyou:x:1001:1000::/home/you:/bin/sh\n";
+        assert!(others_have_as_their_own(passwd, 1000, 1000));
+        assert!(!others_have_as_their_own(passwd, 1001, 1000) && others_have_as_their_own(passwd, 1000, 1001));
+        assert!(!others_have_as_their_own("me:x:1000:1000::/home/me:/bin/sh\nyou:x:1001:1001::/home/you:/bin/sh\n", 1000, 1000));
+        // On this machine, this user's own group, if it is theirs alone.
+        // SAFETY: getegid has no failure mode.
+        let own = unsafe { libc::getegid() };
+        let passwd = std::fs::read_to_string("/etc/passwd").unwrap();
+        if others_have_as_their_own(&passwd, own, my_user()) {
+            assert!(!group_is_mine_alone(own));
+        }
+    }
+
+    #[test]
+    fn a_file_with_an_nfs4_access_list_may_be_written_by_others_whatever_its_mode() {
+        for mode in [0o600, 0o644, 0o755, 0o700] {
+            let who = who_else_may_write_with(mode, 0, false, true).unwrap();
+            assert!(who.contains("NFSv4 access list"), "{who}");
+        }
+        assert_eq!(who_else_may_write_with(0o644, 0, false, false), None);
+        // A POSIX list grants no more than the group bits.
+        assert_eq!(who_else_may_write_with(0o644, 0, true, false), None);
+        assert_eq!(who_else_may_write_with(0o664, 0, true, false).as_deref(), Some("the users its access list names"));
+    }
+
+    #[test]
+    fn a_folder_shared_with_a_group_is_told_by_the_groups_name_with_the_ways_out() {
+        let Some(group) = shared_group() else { return crate::tools::skipped("group-share", "this user is in no group but their own") };
+        let dir = room("group-share");
+        let path = dir.join("a.av1opt.json");
+        std::fs::write(&path, b"{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::chown(&dir, None, Some(group)).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o2775)).unwrap();
+        let why = others_may_have_written(&path, &std::fs::File::open(&path).unwrap()).unwrap();
+        let name = group_name(group).unwrap();
+        assert!(why.contains(&format!("({})", format_args!("the members of the group {name}"))) && why.contains(&format!("`chmod +t {}`", dir.display())), "{why}");
+        // Which, done, settles it.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o3775)).unwrap();
+        assert_eq!(others_may_have_written(&path, &std::fs::File::open(&path).unwrap()), None);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(others_may_have_written(&path, &std::fs::File::open(&path).unwrap()).unwrap().contains("(every user)"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_in_a_folder_named_by_a_link_is_judged_by_the_folder_the_link_leads_to() {
+        let dir = room("own-by-link");
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(real.join("a.av1opt.json"), b"{}").unwrap();
+        std::os::unix::fs::symlink(&real, dir.join("link")).unwrap();
+        let path = dir.join("link/a.av1opt.json");
+        let judged = || others_may_have_written(&path, &std::fs::File::open(&path).unwrap());
+        assert_eq!(judged(), None);
+        // What is judged is the folder it leads to.
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(judged().is_some_and(|why| why.contains(&format!("other users can write to its folder {}", real.display()))), "{:?}", judged());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_of_another_users_is_refused_even_with_the_sticky_bit_and_roots_is_not() {
+        let dir = Path::new("/srv/out");
+        let nobody = || None;
+        let me = 1000;
+        assert_eq!(folder_refusal(dir, 1001, 0o755, me, &nobody).as_deref(), Some("its folder /srv/out belongs to another user"));
+        assert_eq!(folder_refusal(dir, 1001, 0o1777, me, &nobody).as_deref(), Some("its folder /srv/out belongs to another user"));
+        assert_eq!(folder_refusal(dir, 0, 0o755, me, &nobody), None);
+        assert_eq!(folder_refusal(dir, me, 0o755, me, &nobody), None);
+        let everyone = || Some("every user".to_string());
+        assert!(folder_refusal(dir, 0, 0o777, me, &everyone).is_some_and(|why| why.contains("(every user)")));
+        assert_eq!(folder_refusal(dir, 0, 0o1777, me, &everyone), None);
+    }
+
+    #[test]
+    fn a_file_on_a_drive_that_keeps_no_owners_is_never_taken_for_this_users_alone() {
+        let dir = room("ownerless");
+        let path = dir.join("a.av1opt.json");
+        std::fs::write(&path, b"{}").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // As a FAT stick or an SMB share mounted with `uid=` shows it: the user's own file, in a
+        // folder only they can write to.
+        let file = std::fs::File::open(&path).unwrap();
+        assert_eq!(others_may_have_written_of(&path, &file, my_user(), Owners::Kept), None);
+        for magic in [0x4d44, 0x2011_bab0, 0x7366_746e, 0xff53_4d42, 0xfe53_4d42, 0x6573_5546] {
+            let Owners::NotKept(drive) = owners_kept_by(magic) else { panic!("{magic:x} keeps owners") };
+            let why = others_may_have_written_of(&path, &file, my_user(), Owners::NotKept(drive)).unwrap();
+            assert!(why.contains(drive) && why.contains("does not keep who owns a file"), "{why}");
+        }
+        // Linux drives, and the drive these tests run on, keep them.
+        for magic in [0xef53, 0x9123_683e, 0x5846_5342, 0x0102_1994, 0x6969] {
+            assert_eq!(owners_kept_by(magic), Owners::Kept, "{magic:x}");
+        }
+        assert_eq!(owners_kept_on(&path, &file), Owners::Kept);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The number of a process that has ended.

@@ -134,10 +134,13 @@ enum Cmd {
     /// Put finished AV1 outputs where their originals were: the original goes to the trash,
     /// the output takes its name in its folder. Lists what would happen and changes nothing
     /// until --apply is given. Only outputs whose report (`.av1opt.json`) still matches both
-    /// files are touched, and no existing file is ever written over. A report is followed only
-    /// to originals inside the folders named here (name the originals' folder as well as the
-    /// output folder, or give --anywhere), unless av1opt's own record says that this output was
-    /// made from that original.
+    /// files are touched, and no existing file is ever written over. Where av1opt's own record
+    /// holds the output or its original, the record decides, and all of the output has to be
+    /// the file it made. Otherwise a report is followed only to originals inside the folders
+    /// named here (name the originals' folder as well as the output folder, or give
+    /// --anywhere), and only if the report and its output are your own files in a folder nobody
+    /// else can write to (or one with the sticky bit), unless --trust-reports is given. Two
+    /// such reports for one original are both refused.
     Replace {
         /// Output folders, the folders of the originals, reports (`.av1opt.json`) or output files.
         #[arg(required = true)]
@@ -146,7 +149,9 @@ enum Cmd {
         #[arg(long)]
         apply: bool,
         /// The other way round: take replaced originals back out of the trash and return the
-        /// AV1 files to where they were (also needs --apply to act).
+        /// AV1 files to where they were (also needs --apply to act). Reports are judged as for
+        /// replacing: by av1opt's record where it holds the replacement, otherwise only your
+        /// own in a folder nobody else can write to, unless --trust-reports is given.
         #[arg(long)]
         undo: bool,
         /// Also replace originals stored on ZFS.
@@ -164,6 +169,13 @@ enum Cmd {
         /// report can name any file: use this only for reports you trust.
         #[arg(long)]
         anywhere: bool,
+        /// Take reports av1opt has no record of at their word even where others could have
+        /// put them there or changed them: in a folder other users can write to, files of
+        /// another user's, or a drive that keeps no owners of its own (FAT, exFAT, NTFS, SMB
+        /// shares, FUSE drives), where this is the only way. Whoever can write there can make an original go to the trash
+        /// for a file of theirs: use this only where you trust everyone who can.
+        #[arg(long)]
+        trust_reports: bool,
     },
     /// Take outputs that are not on av1opt's private record, such as those made before it began,
     /// onto it, so that the page can replace them and put their originals back. Reads the reports
@@ -171,9 +183,11 @@ enum Cmd {
     /// the record. Naming a folder here says that you trust the reports in it, as naming it to
     /// `replace` does. A report is followed only to originals inside the folders named here
     /// (name the originals' folder as well as the output folder, or give --anywhere), and is
-    /// refused unless it holds the original's date and a fingerprint or hash of it, and its
-    /// output and original (or, once replaced, the original in the trash) pass the checks
-    /// `replace` makes.
+    /// refused unless it holds the original's date and a fingerprint or hash of it, its output
+    /// and original (or, once replaced, the original in the trash) pass the checks `replace`
+    /// makes, and it and its output are your own files in a folder nobody else can write to
+    /// (or one with the sticky bit), unless --trust-reports is given. An original the record
+    /// already holds an output of gets no second one, --trust-reports or not.
     Adopt {
         /// Output folders, reports (`.av1opt.json`) or output files.
         #[arg(required = true)]
@@ -185,6 +199,10 @@ enum Cmd {
         /// report can name any file: use this only for reports you trust.
         #[arg(long)]
         anywhere: bool,
+        /// Take reports at their word even where others could have put them there or changed
+        /// them, as for `replace`.
+        #[arg(long)]
+        trust_reports: bool,
     },
     /// Compare encoder settings on your own videos: for every preset and SVT-AV1 parameter set,
     /// find the CRF that reaches the target VMAF on sample clips, then rank the settings by
@@ -611,13 +629,13 @@ fn run_command(command: Cmd) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Replace { paths, apply, undo, allow_zfs, accept_changed_date, anywhere } => {
+        Cmd::Replace { paths, apply, undo, allow_zfs, accept_changed_date, anywhere, trust_reports } => {
             let paths: Vec<PathBuf> = paths.iter().map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone())).collect();
-            replace::run(&paths, apply, undo, allow_zfs, accept_changed_date, anywhere)
+            replace::run(&paths, apply, undo, allow_zfs, accept_changed_date, anywhere, trust_reports)
         }
-        Cmd::Adopt { paths, apply, anywhere } => {
+        Cmd::Adopt { paths, apply, anywhere, trust_reports } => {
             let paths: Vec<PathBuf> = paths.iter().map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone())).collect();
-            replace::adopt(&paths, apply, anywhere)
+            replace::adopt(&paths, apply, anywhere, trust_reports)
         }
         Cmd::Bench {
             paths, presets, param_sets, target_vmaf, max_videos, samples, sample_secs, min_crf, max_crf, refresh, work_dir, save, csv, json,

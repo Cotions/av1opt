@@ -1272,7 +1272,7 @@ fn the_command_follows_a_pair_on_record_without_being_told_where_the_original_is
     std::fs::write(&output, vec![b'e'; 1000]).unwrap();
     let run = replace_command(&dir, &[out.as_os_str(), apply]);
     let said = out_of(&run);
-    assert!(!run.status.success() && said.contains("outside the folders named") && said.contains("contents differ"), "{said}");
+    assert!(!run.status.success() && said.contains("the output is not the file av1opt made: its contents differ"), "{said}");
     assert!(original.exists() && output.exists() && !placed.exists());
 }
 

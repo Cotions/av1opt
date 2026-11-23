@@ -716,10 +716,31 @@ pub(crate) fn overwrite_refused(output: &Path, input: &Path) -> Option<String> {
         return None;
     }
     match report_input(output) {
-        Some(made) if made.source == input => None,
+        Some(made) if crate::files::same_file(&made.source, input) => vouched_for(output, input)
+            .map(|why| format!("--overwrite replaces only an encode of the same file, and nothing vouches that {shown} is one: av1opt has no record of making it, and its report, which names this file, {why}; move or delete it if it may go")),
         Some(made) => Some(format!("--overwrite replaces only an encode of the same file, and {shown} was made from {}; move or delete it to encode this file there", made.source.display())),
         None => Some(format!("--overwrite replaces only an encode of the same file, and {shown} has no report saying what it was made from; move or delete it if it may go")),
     }
+}
+
+/// Why the word of the report beside `output`, which names `input`, is not enough to write over
+/// `output`, if it is not. Anybody who can put a file in the output folder can put a report
+/// there naming any input, and a file of the user's that was never an encode would then be
+/// written over: the record has to hold this output as made from this input, or the report
+/// has to be the user's own file in a folder nobody else can write to, as av1opt leaves it.
+fn vouched_for(output: &Path, input: &Path) -> Option<String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let resolved = output.parent().and_then(|d| std::fs::canonicalize(d).ok()).zip(output.file_name()).map(|(d, n)| d.join(n));
+    if resolved.is_some_and(|o| crate::ledger::load().entry(&o, input).is_some()) {
+        return None;
+    }
+    let report = output.with_extension("av1opt.json");
+    let opened = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC).open(&report);
+    let why = match opened {
+        Ok(file) => crate::files::others_may_have_written(&report, &file)?,
+        Err(e) => format!("cannot be opened ({e})"),
+    };
+    Some(format!("is not a file only you can have written ({why})"))
 }
 
 /// The finished encode of this input that a run given its folder differently left at the job's
@@ -1337,6 +1358,32 @@ mod tests {
         let (_, ends) = source.walk(&out.0, &o);
         assert!(ends["d.mkv"].1.contains("has no report"), "{:?}", ends["d.mkv"]);
         assert_eq!(std::fs::read(out.0.join("d.mp4")).unwrap(), b"video");
+    }
+
+    #[test]
+    fn overwrite_believes_a_report_only_from_the_record_or_a_folder_nobody_else_writes_to() {
+        let source = Folder::new("planted-in", &["c.mkv"]);
+        let out = Folder::new("planted-out", &["c.mp4"]);
+        let o = Options { overwrite: true, ..options() };
+        // A file of the user's that was never an encode, and a report beside it naming the input,
+        // put there by someone else who can write to the folder.
+        std::fs::write(out.0.join("c.av1opt.json"), serde_json::json!({"input": source.0.join("c.mkv"), "output": out.0.join("c.mp4"), "source_bytes": 5}).to_string()).unwrap();
+        std::fs::set_permissions(&out.0, std::os::unix::fs::PermissionsExt::from_mode(0o777)).unwrap();
+        let (_, ends) = source.walk(&out.0, &o);
+        let (status, detail) = &ends["c.mkv"];
+        assert!(status == "error" && detail.contains("nothing vouches that") && detail.contains("other users can write to its folder"), "{detail}");
+        assert_eq!(std::fs::read(out.0.join("c.mp4")).unwrap(), b"video");
+        // On av1opt's record as made from this input, it is an encode to make again.
+        let data = out.0.join("data/av1opt");
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = Some(data.clone()));
+        let (output, input) = (std::fs::canonicalize(&out.0).unwrap().join("c.mp4"), std::fs::canonicalize(source.0.join("c.mkv")).unwrap());
+        let report = out.0.join("c.av1opt.json");
+        crate::ledger::note_encoded(&crate::ledger::Encode { output: &output, report: &report, source: &input, source_bytes: 5, original: &crate::source::Recorded::default(), output_bytes: 5, output_sha256: None }).unwrap();
+        assert_eq!(overwrite_refused(&output, &input), None);
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        // And so it is in a folder only the user can write to.
+        std::fs::set_permissions(&out.0, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        assert_eq!(overwrite_refused(&output, &input), None);
     }
 
     #[test]

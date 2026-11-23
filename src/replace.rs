@@ -107,6 +107,13 @@ fn full_path(r: &Value, key: &str) -> Result<PathBuf, String> {
     Ok(p.components().collect())
 }
 
+/// The path of a video from a report, with its folder resolved as av1opt's record holds paths
+/// (see [`crate::files::in_real_folder`]): whatever a report names a file by, it is that file
+/// that is looked up in the record, compared with the paths of other reports, and moved.
+fn file_path(r: &Value, key: &str) -> Result<PathBuf, String> {
+    full_path(r, key).map(|p| crate::files::in_real_folder(&p))
+}
+
 /// Whether `report` is the report `encode` wrote for an output at `output`: the same folder,
 /// the output's name with `.av1opt.json` for its extension. A report is only a file, and what
 /// it names gets moved; one that turns up somewhere else (in a folder of downloads, say) and
@@ -230,7 +237,7 @@ enum Stranded {
 /// hash. `full` reads all of the files compared; without it this is the look of a list, by
 /// sizes and samples.
 fn stranded(report: &Path, r: &Value, ledger: &crate::ledger::Ledger, full: bool) -> Option<(Value, Stranded)> {
-    let source = full_path(r, "input").ok()?;
+    let source = file_path(r, "input").ok()?;
     let holds_output = |path: &Path, bytes: u64, hash: &str| {
         if !full {
             return file_size(path) == Some(bytes);
@@ -240,8 +247,8 @@ fn stranded(report: &Path, r: &Value, ledger: &crate::ledger::Ledger, full: bool
     let mut fixed = r.clone();
     if let Some(done) = r.get("replaced").filter(|d| d.is_object()) {
         // Put back, with the report still saying replaced.
-        let dest = full_path(r, "output").ok()?;
-        let from = full_path(done, "from").ok()?;
+        let dest = file_path(r, "output").ok()?;
+        let from = file_path(done, "from").ok()?;
         let trash_path = full_path(done, "trash").ok()?;
         if !beside(report, &from) {
             return None;
@@ -259,7 +266,7 @@ fn stranded(report: &Path, r: &Value, ledger: &crate::ledger::Ledger, full: bool
         return Some((fixed, Stranded::Undone));
     }
     // Replaced, with the report still saying not.
-    let from = full_path(r, "output").ok()?;
+    let from = file_path(r, "output").ok()?;
     if !beside(report, &from) || r["superseded"].as_bool() == Some(true) {
         return None;
     }
@@ -683,12 +690,12 @@ fn check_inner(report: &Path, judging: Judging) -> Result<Check, String> {
         Some(ledger) => stranded(report, &r, ledger, !(judging.for_list || judging.listing)).map_or(r, |(fixed, _)| fixed),
         None => r,
     };
-    let source = full_path(&r, "input")?;
-    let output = full_path(&r, "output")?;
+    let source = file_path(&r, "input")?;
+    let output = file_path(&r, "output")?;
     let source_bytes = r["source_bytes"].as_u64().ok_or("report has no sizes")?;
     let output_bytes = r["output_bytes"].as_u64().ok_or("report has no sizes")?;
     if let Some(done) = r.get("replaced").filter(|d| d.is_object()) {
-        let recorded = full_path(done, "from")?;
+        let recorded = file_path(done, "from")?;
         let trash = full_path(done, "trash")?;
         let from = if beside(report, &recorded) { Some(recorded.clone()) } else { place_beside_aside(report, &recorded) };
         let Some(from) = from else {
@@ -1401,7 +1408,7 @@ fn undo_watched(report: &Path, allow_zfs: bool, accept: Accept<Replaced>, before
     let mut r = read_report(report).map_err(|e| anyhow!(e))?;
     // Undone from a report set aside: the AV1 file did not go back to where it came from, as
     // a newer encode is there, and that encode's report is the one to go by.
-    if r["replaced"]["from"].as_str().is_some_and(|recorded| Path::new(recorded) != d.from) {
+    if file_path(&r["replaced"], "from").is_ok_and(|recorded| recorded != d.from) {
         r["superseded"] = json!(true);
     }
     r["output"] = json!(d.from);
@@ -1492,20 +1499,138 @@ fn outside_named(source: &Path) -> String {
     format!("the original {} is outside the folders named here and av1opt has no record of this pair; {THREE_WAYS}", source.display())
 }
 
+/// What is said where naming the folders is not enough to vouch for a pair av1opt has no record
+/// of, before the reason.
+const NOT_YOURS: &str = "av1opt has no record of this pair, and naming its folders vouches only for a report and an output that are your own files, in a folder nobody else can write to (or one with the sticky bit)";
+
+/// What is said after the reason: the way through.
+const TRUST_REPORTS: &str = "if you trust this report, and everyone who can write where it is, add --trust-reports";
+
+/// Why naming the folders does not vouch for the pair of `p`, which the record holds nothing
+/// of, if it does not: its report and its output have to be this user's own files in a folder
+/// nobody else can write to or rename things in, as av1opt leaves them, since anyone who can
+/// put files there can copy a genuine report, fingerprint and all, and put anything of the
+/// stated size beside it. Judged on the output as it was opened to be moved and on the report
+/// opened now, and the report is read again through that: what it says has to be what `p` was
+/// made from.
+fn why_not_own(p: &Plan, output: &OpenFile) -> Option<String> {
+    use std::io::Read;
+    let not_yours = |what: &Path, why: &str| Some(format!("{NOT_YOURS}, and {} is not one: {why}; {TRUST_REPORTS}", what.display()));
+    let opened = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC).open(&p.report);
+    let mut report = match opened {
+        Ok(report) => report,
+        Err(e) => return not_yours(&p.report, &format!("it cannot be opened ({e})")),
+    };
+    if let Some(why) = crate::files::others_may_have_written(&p.report, &report) {
+        return not_yours(&p.report, &why);
+    }
+    if let Some(why) = crate::files::others_may_have_written(&p.output, &output.file) {
+        return not_yours(&p.output, &why);
+    }
+    let mut bytes = Vec::new();
+    let read = (&mut report).take(REPORT_LIMIT + 1).read_to_end(&mut bytes);
+    let r: Option<Value> = read.ok().and_then(|_| serde_json::from_slice(&bytes).ok());
+    let same = r.is_some_and(|r| {
+        file_path(&r, "input").ok().as_ref() == Some(&p.source)
+            && file_path(&r, "output").ok().as_ref() == Some(&p.output)
+            && r["source_bytes"].as_u64() == Some(p.source_bytes)
+            && r["output_bytes"].as_u64() == Some(p.output_bytes)
+            && Recorded::in_report(&r) == p.original
+    });
+    (!same).then(|| format!("the report {} changed while it was being checked, so nothing was changed", p.report.display()))
+}
+
+/// Whether `replace` on the command line may put the output of `p` in its original's place, or
+/// why not. Whatever av1opt's own record holds of this output or of its original decides, and
+/// the folders named do not count against it: a report is only a file, and the record is not.
+/// Where the record holds nothing, the original has to be in the folders named (or anywhere,
+/// with --anywhere) and, unless `trust_reports`, the report and the output have to be this
+/// user's own (see [`why_not_own`]). `output` is the output as it was opened to be moved, all
+/// of which is then compared with the hash on record; without it (for a list) the output is
+/// opened here, and only its size is compared with the record.
+fn admitted(p: &Plan, output: Option<&OpenFile>, ledger: &crate::ledger::Ledger, named: &NamedFolders, trust_reports: bool) -> Result<(), String> {
+    match ledger.judges(p, output) {
+        Some(Ok(true)) => return Ok(()),
+        Some(Err(why)) => return Err(why),
+        Some(Ok(false)) | None => {}
+    }
+    if !named.holds(&p.source) {
+        return Err(outside_named(&p.source));
+    }
+    if trust_reports {
+        return Ok(());
+    }
+    let opened;
+    let output = match output {
+        Some(output) => output,
+        None => {
+            opened = OpenFile::open(&p.output, p.output_bytes).map_err(|e| format!("{e:#}"))?;
+            &opened
+        }
+    };
+    why_not_own(p, output).map_or(Ok(()), Err)
+}
+
+/// Whether `replace --undo` on the command line may put back the replacement `d`, or why not:
+/// it takes the user's AV1 file out of the library to where the report says it came from, and
+/// rewrites the report as the user's own. Whatever av1opt's record holds of this AV1 file or of
+/// its original decides, as for [`admitted`]; where it holds nothing, the original's place has
+/// to be in the folders named and, unless `trust_reports`, the report has to be this user's own
+/// in a folder nobody else can write to, as `replace` asks of a report it has no record of.
+fn admitted_back(d: &Replaced, ledger: &crate::ledger::Ledger, named: &NamedFolders, trust_reports: bool) -> Result<(), String> {
+    if let Some(judged) = ledger.judges_replaced(d) {
+        return judged;
+    }
+    if !named.holds(&d.source) {
+        return Err(outside_named(&d.source));
+    }
+    if trust_reports {
+        return Ok(());
+    }
+    report_not_own(&d.report).map_or(Ok(()), Err)
+}
+
+/// The reports among `plans` that name the same original as another of them, with what is said
+/// of each: av1opt cannot tell which of two is the encode, and the other may be anybody's.
+/// One original named by two paths (a second mount of its folder, say) is the same original.
+fn named_twice(plans: &[&Plan]) -> std::collections::HashMap<PathBuf, String> {
+    let mut by_source: Vec<(&Path, Vec<&Path>)> = Vec::new();
+    for p in plans {
+        let same = |s: &&mut (&Path, Vec<&Path>)| crate::files::may_be_same_name(s.0, &p.source) && crate::files::same_file(s.0, &p.source);
+        match by_source.iter_mut().find(|s| same(s)) {
+            Some((_, reports)) => reports.push(&p.report),
+            None => by_source.push((&p.source, vec![&p.report])),
+        }
+    }
+    let mut out = std::collections::HashMap::new();
+    for (source, reports) in by_source.into_iter().filter(|(_, r)| r.len() > 1) {
+        for report in &reports {
+            let others: Vec<String> = reports.iter().filter(|r| *r != report).map(|r| r.display().to_string()).collect();
+            out.insert(
+                report.to_path_buf(),
+                format!("{} names the same original, {}, and av1opt has no record of either, so it cannot tell which is the encode and follows neither; remove the report you do not want, or the output it names, and run this again", others.join(" and "), source.display()),
+            );
+        }
+    }
+    out
+}
+
 fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
-/// The `replace` command: lists what would happen, and does it with `go`. A report is followed to
-/// an original inside the folders in `paths`, or anywhere with `anywhere`, or where av1opt's own
-/// record says that this output and this original belong together: then it is the record that
-/// vouches for the original's path, and not the report.
-pub fn run(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_changed_date: bool, anywhere: bool) -> Result<()> {
-    run_watched(paths, go, back, allow_zfs, accept_changed_date, anywhere, &|| {})
+/// The `replace` command: lists what would happen, and does it with `go`. Where av1opt's own
+/// record holds this output or its original, the record decides (see [`admitted`]); otherwise a
+/// report is followed to an original inside the folders in `paths`, or anywhere with
+/// `anywhere`, if it and its output are this user's own or `trust_reports` says to take them
+/// at their word.
+pub fn run(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_changed_date: bool, anywhere: bool, trust_reports: bool) -> Result<()> {
+    run_watched(paths, go, back, allow_zfs, accept_changed_date, anywhere, trust_reports, &|| {})
 }
 
 /// [`run`], with `before_report` called as [`apply_judging`] calls it.
-fn run_watched(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_changed_date: bool, anywhere: bool, before_report: &dyn Fn()) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn run_watched(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_changed_date: bool, anywhere: bool, trust_reports: bool, before_report: &dyn Fn()) -> Result<()> {
     use crate::report::gb;
     // Only what is going to be replaced is worth keeping reads for.
     let reads = WholeReads::default();
@@ -1570,11 +1695,19 @@ fn run_watched(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_
     }
     let judging = Judging { accept_changed_date, on_command_line: true, remember: go.then_some(&reads), listing: true, ledger: Some(&ledger), ..Judging::default() };
     let (mut ready, mut replaced, mut stay) = (Vec::new(), Vec::new(), Vec::new());
-    for r in &reports {
-        match check_judging(r, judging) {
-            Check::Ready(p) if !named.holds(&p.source) && !ledger.vouches_for(&p) => stay.push((p.output.clone(), outside_named(&p.source))),
+    let checked: Vec<(&PathBuf, Check)> = reports.iter().map(|r| (r, check_judging(r, judging))).collect();
+    // Two reports in the folders named for one original that the record knows nothing of: one
+    // of them is not what it says, and nothing here tells which.
+    let unknown: Vec<&Plan> = checked.iter().filter_map(|(_, c)| if let Check::Ready(p) = c { Some(p) } else { None }).filter(|p| ledger.judges(p, None).is_none() && named.holds(&p.source)).collect();
+    let twice = named_twice(&unknown);
+    for (r, c) in checked {
+        match c {
+            Check::Ready(p) if twice.contains_key(&p.report) => stay.push((p.output.clone(), twice[&p.report].clone())),
             Check::Ready(p) if p.zfs && !allow_zfs => stay.push((p.output.clone(), "the original is on ZFS (--allow-zfs replaces there too)".to_string())),
-            Check::Ready(p) => ready.push(p),
+            Check::Ready(p) => match admitted(&p, None, &ledger, &named, trust_reports) {
+                Ok(()) => ready.push(p),
+                Err(why) => stay.push((p.output.clone(), why)),
+            },
             Check::Replaced(d) => replaced.push(d),
             Check::No(why) => stay.push((r.clone(), why)),
         }
@@ -1584,7 +1717,8 @@ fn run_watched(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_
 
     if back {
         let (can, cannot): (Vec<_>, Vec<_>) = replaced.into_iter().partition(|d| d.can_undo);
-        let (can, outside): (Vec<_>, Vec<_>) = can.into_iter().partition(|d| named.holds(&d.source) || ledger.check_replaced(d).is_ok());
+        let (can, refused): (Vec<_>, Vec<_>) = can.into_iter().map(|d| (admitted_back(&d, &ledger, &named, trust_reports), d)).partition(|(why, _)| why.is_ok());
+        let can: Vec<Replaced> = can.into_iter().map(|(_, d)| d).collect();
         let (can, on_zfs): (Vec<_>, Vec<_>) = can.into_iter().partition(|d| !d.zfs || allow_zfs);
         println!("{} can go back to their place", plural(can.len(), "original", "originals"));
         for d in &can {
@@ -1596,10 +1730,10 @@ fn run_watched(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_
                 println!("  {}", d.source.display());
             }
         }
-        if !outside.is_empty() {
-            println!("{} outside the folders named here, with no record of them (name their folders too, add --anywhere if you trust these reports, or run `av1opt adopt` on the output folders)", plural(outside.len(), "original is", "originals are"));
-            for d in &outside {
-                println!("  {}", d.source.display());
+        if !refused.is_empty() {
+            println!("{} not followed", plural(refused.len(), "report is", "reports are"));
+            for (why, d) in &refused {
+                println!("  {} (of {}): {}", d.report.display(), d.source.display(), why.as_ref().err().map_or("", String::as_str));
             }
         }
         if !cannot.is_empty() {
@@ -1617,7 +1751,7 @@ fn run_watched(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_
         let mut done = 0;
         for d in &can {
             // Asked again here: the record may have changed since the list was made.
-            let accept = |d: &Replaced| if named.holds(&d.source) { Ok(()) } else { crate::ledger::load().check_replaced(d).map_err(|why| format!("{} ({why})", outside_named(&d.source))) };
+            let accept = |d: &Replaced| admitted_back(d, &crate::ledger::load(), &named, trust_reports);
             match undo_if(&d.report, allow_zfs, &accept) {
                 Ok(_) => done += 1,
                 Err(e) => {
@@ -1666,8 +1800,10 @@ fn run_watched(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_
         }
         let (mut done, mut trashed) = (0, 0u64);
         for p in &ready {
-            // Outside the folders named, all of the output has to be what the record says.
-            let accept = |p: &Plan, output: &OpenFile| if named.holds(&p.source) { Ok(()) } else { crate::ledger::load().check_ready(p, Some(output)).map_err(|why| format!("{} ({why})", outside_named(&p.source))) };
+            // Asked again here, of the output about to be moved: the record may have changed
+            // since the list was made, and where it holds the pair all of the output has to be
+            // what it says.
+            let accept = |p: &Plan, output: &OpenFile| admitted(p, Some(output), &crate::ledger::load(), &named, trust_reports);
             match apply_judging(&p.report, allow_zfs, judging, &trash::trash_noting, &accept, before_report) {
                 Ok(Done { report_behind: Some(why), source_bytes, .. }) => {
                     (done, behind) = (done + 1, behind + 1);
@@ -1727,7 +1863,19 @@ fn why_it_cannot_come_back(d: &Replaced) -> Option<String> {
     })
 }
 
-fn found_for_adoption(report: &Path, judging: Judging, ledger: &crate::ledger::Ledger, named: &NamedFolders) -> Found {
+/// Why the report at `report` may have been put there or written by somebody else, as
+/// [`why_not_own`] says, if it may.
+fn report_not_own(report: &Path) -> Option<String> {
+    let not_yours = |why: &str| Some(format!("{NOT_YOURS}, and {} is not one: {why}; {TRUST_REPORTS}", report.display()));
+    match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC).open(report) {
+        Ok(file) => crate::files::others_may_have_written(report, &file).and_then(|why| not_yours(&why)),
+        Err(e) => not_yours(&format!("it cannot be opened ({e})")),
+    }
+}
+
+/// What `adopt` takes on record is what the page then moves files on the strength of, so it
+/// asks of a report what naming a folder to `replace` asks of one the record does not know.
+fn found_for_adoption(report: &Path, judging: Judging, ledger: &crate::ledger::Ledger, named: &NamedFolders, trust_reports: bool) -> Found {
     use crate::ledger::Standing;
     match std::fs::symlink_metadata(report) {
         Ok(m) if m.file_type().is_symlink() => return Found::Refused("the report is a link".into()),
@@ -1741,12 +1889,16 @@ fn found_for_adoption(report: &Path, judging: Judging, ledger: &crate::ledger::L
         Check::No(why) => Found::Refused(why),
         Check::Ready(p) if !named.holds(&p.source) => Found::Refused(outside_named_for_adoption(&p.source)),
         Check::Ready(p) => match ledger.adopting(&p) {
-            Standing::NotYet => Found::Ready(p),
+            Standing::NotYet if trust_reports => Found::Ready(p),
+            Standing::NotYet => match OpenFile::open(&p.output, p.output_bytes) {
+                Ok(output) => why_not_own(&p, &output).map_or(Found::Ready(p), Found::Refused),
+                Err(e) => Found::Refused(format!("{e:#}")),
+            },
             Standing::OnRecord => Found::OnRecord,
             Standing::Refused(why) => Found::Refused(why),
         },
         Check::Replaced(d) => match ledger.adopting_replaced(&d) {
-            Standing::NotYet => match why_not_adopted_replaced(&d, named) {
+            Standing::NotYet => match why_not_adopted_replaced(&d, named).or_else(|| if trust_reports { None } else { report_not_own(&d.report) }) {
                 Some(why) => Found::Refused(why),
                 None => why_it_cannot_come_back(&d).map_or(Found::Replaced(d), Found::Refused),
             },
@@ -1829,11 +1981,11 @@ fn hash_of_output(path: &Path, bytes: u64) -> Result<String> {
 
 /// Looks at one report again, with nothing else acting on it, and takes it on record. False if
 /// it turned out to be there already.
-fn adopt_one(report: &Path, reads: &WholeReads, held: &mut crate::ledger::Held, named: &NamedFolders) -> Result<bool> {
+fn adopt_one(report: &Path, reads: &WholeReads, held: &mut crate::ledger::Held, named: &NamedFolders, trust_reports: bool) -> Result<bool> {
     use crate::ledger::{AdoptedReplacement, Adoption};
     let _lock = lock(report)?;
     let judging = Judging { remember: Some(reads), acting: true, ..Judging::default() };
-    match found_for_adoption(report, judging, held.current(), named) {
+    match found_for_adoption(report, judging, held.current(), named, trust_reports) {
         Found::Refused(why) => bail!("{why}"),
         Found::OnRecord => return Ok(false),
         Found::Ready(p) => {
@@ -1861,11 +2013,12 @@ fn adopt_one(report: &Path, reads: &WholeReads, held: &mut crate::ledger::Held, 
 /// The `adopt` command: lists which outputs under `paths` can go on av1opt's record, and with `go`
 /// writes them there. Nothing but the record is ever written, and without `go` nothing at all.
 /// A report is followed to an original inside the folders in `paths`, or anywhere with
-/// `anywhere`.
-pub fn adopt(paths: &[PathBuf], go: bool, anywhere: bool) -> Result<()> {
+/// `anywhere`, and taken only if it and its output are this user's own, or with `trust_reports`.
+pub fn adopt(paths: &[PathBuf], go: bool, anywhere: bool, trust_reports: bool) -> Result<()> {
     println!(
-        "Naming a folder here says that you trust the reports in it: what a report says of the output beside it and of its original goes on av1opt's private record, and the page then replaces that original, and puts it back, on the strength of it. A report is followed only to an original inside the folders named here{}, and is taken only if it holds the original's date and a fingerprint or hash of it that the original (or, once replaced, the file in the trash) still matches.",
-        if anywhere { " (anywhere, as --anywhere asks)" } else { "" }
+        "Naming a folder here says that you trust the reports in it: what a report says of the output beside it and of its original goes on av1opt's private record, and the page then replaces that original, and puts it back, on the strength of it. A report is followed only to an original inside the folders named here{}, and is taken only if it holds the original's date and a fingerprint or hash of it that the original (or, once replaced, the file in the trash) still matches{}.",
+        if anywhere { " (anywhere, as --anywhere asks)" } else { "" },
+        if trust_reports { "" } else { ", and if it and its output are your own files in a folder nobody else can write to (or one with the sticky bit)" }
     );
     let reports = reports_found(paths, &|dirs| report_names(dirs, &|e| !e.file_type().is_dir()));
     if reports.is_empty() {
@@ -1884,12 +2037,20 @@ pub fn adopt(paths: &[PathBuf], go: bool, anywhere: bool) -> Result<()> {
     let judging = Judging { remember: go.then_some(&reads), listing: true, ..Judging::default() };
     let (mut ready, mut replaced, mut known, mut refused) = (Vec::new(), Vec::new(), 0, Vec::new());
     for report in &reports {
-        match found_for_adoption(report, judging, held.current(), &named) {
+        match found_for_adoption(report, judging, held.current(), &named, trust_reports) {
             Found::Ready(p) => ready.push(p),
             Found::Replaced(d) => replaced.push(d),
             Found::OnRecord => known += 1,
             Found::Refused(why) => refused.push((report, why)),
         }
+    }
+    // Two reports for one original: neither goes on record, as `replace` follows neither.
+    let twice = named_twice(&ready.iter().collect::<Vec<_>>());
+    let (twins, single): (Vec<Plan>, Vec<Plan>) = ready.into_iter().partition(|p| twice.contains_key(&p.report));
+    ready = single;
+    for p in twins {
+        let report = reports.iter().find(|r| **r == p.report).expect("a report of this listing");
+        refused.push((report, twice[&p.report].clone()));
     }
     println!("{} can go on record", plural(ready.len(), "output", "outputs"));
     for p in &ready {
@@ -1913,7 +2074,7 @@ pub fn adopt(paths: &[PathBuf], go: bool, anywhere: bool) -> Result<()> {
     }
     let (mut done, mut failed) = (0, 0);
     for report in wanted {
-        match adopt_one(report, &reads, &mut held, &named) {
+        match adopt_one(report, &reads, &mut held, &named, trust_reports) {
             Ok(added) => {
                 done += usize::from(added);
                 if added {
@@ -2665,7 +2826,7 @@ mod tests {
         let e = apply_with(&report, false, &to_trash).unwrap_err().to_string();
         assert!(e.contains("the original is on ZFS"), "{e}");
         assert_eq!(everything_in(&f.dir), before);
-        run_watched(&[f.dir.join("out"), f.dir.join("lib")], true, false, false, false, false, &|| {}).unwrap();
+        run_watched(&[f.dir.join("out"), f.dir.join("lib")], true, false, false, false, false, false, &|| {}).unwrap();
         assert_eq!(everything_in(&f.dir), before);
         apply_with(&report, true, &to_trash).unwrap();
 
@@ -3171,11 +3332,11 @@ mod tests {
         }
         let loads = || crate::ledger::LOADS.with(std::cell::Cell::get);
         let (before, started) = (loads(), std::time::Instant::now());
-        adopt(std::slice::from_ref(&f.dir), false, false).unwrap();
+        adopt(std::slice::from_ref(&f.dir), false, false, false).unwrap();
         assert_eq!(loads() - before, 1);
         assert!(!f.dir.join("data").exists(), "the listing wrote to the record");
         let before = loads();
-        adopt(std::slice::from_ref(&f.dir), true, false).unwrap();
+        adopt(std::slice::from_ref(&f.dir), true, false, false).unwrap();
         assert_eq!(loads() - before, 1);
         let text = std::fs::read_to_string(&record).unwrap();
         assert_eq!(text.lines().filter(|l| l.contains("\"adopted\"")).count(), 2000);
@@ -3223,11 +3384,11 @@ mod tests {
         let named = [f.dir.join("out"), f.dir.join("lib")];
 
         change(b's');
-        let failed = adopt(&named, true, false).unwrap_err();
+        let failed = adopt(&named, true, false, false).unwrap_err();
         assert!(failed.to_string().contains("could not be taken on record"), "{failed:#}");
         assert!(!record.exists() || !std::fs::read_to_string(&record).unwrap().contains("\"adopted\""));
         change(b'x');
-        adopt(&named, true, false).unwrap();
+        adopt(&named, true, false, false).unwrap();
         assert!(std::fs::read_to_string(&record).unwrap().contains("\"adopted\""));
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
     }
@@ -3242,12 +3403,12 @@ mod tests {
         std::fs::remove_file(&record).unwrap();
         let named = [f.dir.join("out"), f.dir.join("lib")];
         let adopted = || std::fs::read_to_string(&record).unwrap_or_default().lines().filter(|l| l.contains("\"adopted\"")).count();
-        stopped_at("adopt:noted", || drop(adopt(&named, true, false)));
+        stopped_at("adopt:noted", || drop(adopt(&named, true, false, false)));
         assert_eq!(adopted(), 1);
-        adopt(&named, true, false).unwrap();
+        adopt(&named, true, false, false).unwrap();
         assert_eq!(adopted(), 2);
         // Each once: a third run finds both there already.
-        adopt(&named, true, false).unwrap();
+        adopt(&named, true, false, false).unwrap();
         assert_eq!(adopted(), 2);
         let ledger = crate::ledger::load();
         assert!(ledger.entry(&f.out("a.mkv"), &f.lib("a.mp4")).is_some_and(|e| e.made.is_some() && e.replaced.is_none()), "{ready:?}");
@@ -3265,7 +3426,7 @@ mod tests {
     /// `report`'s pair on record as an encode, with the hash of its output, as `encode` leaves it.
     fn on_record(report: &Path) {
         let r = read_report(report).unwrap();
-        let (source, output) = (full_path(&r, "input").unwrap(), full_path(&r, "output").unwrap());
+        let (source, output) = (file_path(&r, "input").unwrap(), file_path(&r, "output").unwrap());
         let original = Recorded::in_report(&r);
         let output_sha256 = Some(crate::ledger::sha256_of_file(&output).unwrap());
         let (source_bytes, output_bytes) = (file_size(&source).unwrap(), file_size(&output).unwrap());
@@ -3356,7 +3517,7 @@ mod tests {
         assert!(f.lib("a.mp4").exists() && f.out("a.mkv").exists() && !says_replaced(&report));
 
         // The command says so in its exit status.
-        let failed = run_watched(std::slice::from_ref(&f.dir), true, false, true, false, false, &unreadable).unwrap_err();
+        let failed = run_watched(std::slice::from_ref(&f.dir), true, false, true, false, false, false, &unreadable).unwrap_err();
         std::fs::set_permissions(&report, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(failed.to_string().contains("1 report could not be updated"), "{failed:#}");
         assert!(f.lib("a.mkv").exists() && !f.lib("a.mp4").exists());
@@ -3411,7 +3572,7 @@ mod tests {
 
         /// `replace --apply`, or with `back` `replace --undo --apply`, on the two folders.
         fn command(&self, back: bool) {
-            run_watched(&[self.out.clone(), self.f.dir.join("lib")], true, back, true, false, false, &|| {}).unwrap();
+            run_watched(&[self.out.clone(), self.f.dir.join("lib")], true, back, true, false, false, false, &|| {}).unwrap();
         }
 
         fn in_trash(&self) -> Vec<Vec<u8>> {
@@ -3658,7 +3819,7 @@ mod tests {
         f.apply(&first).unwrap();
         assert!(matches!(check(&first), Check::Replaced(d) if d.can_undo && crate::ledger::load().check_replaced(&d).is_ok()));
         // `replace --undo --apply` on the second output's folder and the library.
-        run_watched(&[out2.clone(), f.dir.join("lib")], true, true, true, false, false, &|| {}).unwrap();
+        run_watched(&[out2.clone(), f.dir.join("lib")], true, true, true, false, false, false, &|| {}).unwrap();
         let first_now = check(&first);
         let original_back = f.lib("a.mp4").exists();
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
@@ -3674,7 +3835,7 @@ mod tests {
         stopped_at("replace:trashed", || drop(p.f.apply(&p.report)));
         assert!(!p.f.lib("a.mp4").exists());
         crate::fsguard::ZFS_IN_TESTS.with_borrow_mut(|z| z.push(p.f.dir.join("lib")));
-        let _ = run_watched(&[p.out.clone(), p.f.dir.join("lib")], true, false, false, false, false, &|| {});
+        let _ = run_watched(&[p.out.clone(), p.f.dir.join("lib")], true, false, false, false, false, false, &|| {});
         crate::fsguard::ZFS_IN_TESTS.with_borrow_mut(Vec::clear);
         let back = p.f.lib("a.mp4").exists();
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
@@ -3690,7 +3851,7 @@ mod tests {
         stopped_at("undo:moved", || drop(undo(&p.report, true)));
         assert!(!p.f.lib("a.mkv").exists() && p.out.join("a.mkv").exists());
         crate::fsguard::ZFS_IN_TESTS.with_borrow_mut(|z| z.push(p.f.dir.join("lib")));
-        let _ = run_watched(&[p.out.clone(), p.f.dir.join("lib")], true, true, false, false, false, &|| {});
+        let _ = run_watched(&[p.out.clone(), p.f.dir.join("lib")], true, true, false, false, false, false, &|| {});
         crate::fsguard::ZFS_IN_TESTS.with_borrow_mut(Vec::clear);
         let moved_in = p.f.lib("a.mkv").exists();
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
@@ -3747,7 +3908,7 @@ mod tests {
             let seen = stopped_for_list(&p.report, &ledger).unwrap_or_else(|| panic!("{step}: not listed as stopped"));
             assert!(seen.can_put_right && !seen.zfs && seen.told.contains("stopped half-way"), "{step}: {}", seen.told);
             let _ = check_for_list_on_record(&p.report, &ledger);
-            run_watched(&[p.out.clone(), p.f.dir.join("lib")], false, undoing, true, false, false, &|| {}).unwrap();
+            run_watched(&[p.out.clone(), p.f.dir.join("lib")], false, undoing, true, false, false, false, &|| {}).unwrap();
             assert!(files_of(&p) == as_stopped, "{step}: a listing moved files");
             let done = put_right_stopped(&p.report, false);
             assert!(done.as_ref().is_ok_and(|d| d.contains("had been stopped half-way")), "{step}: {done:?}");
@@ -3776,7 +3937,7 @@ mod tests {
         std::fs::write(&report, serde_json::to_vec(&r).unwrap()).unwrap();
         on_record(&report);
         hand_trash(&f, "a.mp4");
-        let _ = run_watched(&[f.dir.join("lib")], true, true, true, false, false, &|| {});
+        let _ = run_watched(&[f.dir.join("lib")], true, true, true, false, false, false, &|| {});
         let av1 = std::fs::read(f.lib("a.mkv")).ok();
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
         assert_eq!(av1, Some(vec![b'o'; 400]), "the AV1 file is gone: it was removed as a copy of itself");
@@ -3793,7 +3954,7 @@ mod tests {
         stopped_at("replace:trashed", || drop(f.apply(&report)));
         assert!(!f.lib("a.mp4").exists());
         let named = [f.dir.join("out"), f.dir.join("lib")];
-        run_watched(&named, true, true, true, false, false, &|| {}).unwrap();
+        run_watched(&named, true, true, true, false, false, false, &|| {}).unwrap();
         let (back, av1) = (std::fs::read(f.lib("a.mp4")).ok(), std::fs::read(f.out("a.mkv")).ok());
         let listed = check(&report);
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
@@ -3897,7 +4058,7 @@ mod tests {
         stopped_at("replace:trashed", || drop(p.f.apply(&p.report)));
         let lib = p.f.dir.join("lib");
         std::fs::set_permissions(&lib, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let done = run_watched(&[p.out.clone(), lib.clone()], true, true, true, false, false, &|| {}).map_err(|e| format!("{e:#}"));
+        let done = run_watched(&[p.out.clone(), lib.clone()], true, true, true, false, false, false, &|| {}).map_err(|e| format!("{e:#}"));
         std::fs::set_permissions(&lib, std::fs::Permissions::from_mode(0o755)).unwrap();
         p.nothing_lost();
         assert!(done.as_ref().is_err_and(|e| e.contains("1 pair stopped half-way could not be put right")), "{done:?}");
@@ -4121,5 +4282,427 @@ mod tests {
             crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
             assert!(files_of(&p) == before && std::fs::read(&report).unwrap() == as_written, "{name}: {done:?}, and files were moved");
         }
+    }
+
+    /// Lists and applies `replace` on the output folder and the originals' folder.
+    fn replace_named(f: &Fix, trust_reports: bool) -> Result<()> {
+        run_watched(&[f.dir.join("out"), f.dir.join("lib")], true, false, true, false, false, trust_reports, &|| {})
+    }
+
+    /// What `replace` on the output folder and the originals' folder says of `report`.
+    fn admitted_named(f: &Fix, report: &Path, trust_reports: bool) -> Result<(), String> {
+        let Check::Ready(p) = check(report) else { panic!("{} is not ready", report.display()) };
+        admitted(&p, None, &crate::ledger::load(), &NamedFolders::of(&[f.dir.join("out"), f.dir.join("lib")], false), trust_reports)
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn an_output_on_record_is_compared_with_the_record_though_the_originals_folder_is_named() {
+        let f = Fix::new("record-wins-swap");
+        record_in(&f);
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        on_record(&report);
+        // Someone who can write to the output folder puts a file of the same size in its place.
+        let kept = swap_for_another_file(&f.out("a.mkv"));
+        assert!(replace_named(&f, true).unwrap_err().to_string().contains("1 original could not be replaced"));
+        assert_eq!(std::fs::read(f.lib("a.mp4")).unwrap(), vec![b's'; 1000]);
+        assert_eq!(std::fs::read(f.out("a.mkv")).unwrap(), vec![b'e'; 400]);
+        assert!(!f.dir.join("Trash/files/a.mp4").exists());
+        // Given back the file av1opt made, it goes.
+        std::fs::remove_file(f.out("a.mkv")).unwrap();
+        std::fs::rename(&kept, f.out("a.mkv")).unwrap();
+        replace_named(&f, false).unwrap();
+        assert_eq!(std::fs::read(f.lib("a.mkv")).unwrap(), vec![b'o'; 400]);
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
+
+    #[test]
+    fn a_second_report_for_an_original_on_record_is_not_followed() {
+        let f = Fix::new("record-wins-second");
+        record_in(&f);
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        on_record(&report);
+        // A copy of the genuine report, fingerprint and all, for a file of the stated size that
+        // sorts first.
+        let mut planted = read_report(&report).unwrap();
+        planted["output"] = json!(f.out("0.mkv"));
+        std::fs::write(f.out("0.mkv"), vec![b'e'; 400]).unwrap();
+        let planted_report = f.out("0.av1opt.json");
+        write_report(&planted_report, &planted).unwrap();
+        let why = admitted_named(&f, &planted_report, true).unwrap_err();
+        assert!(why.contains(&format!("av1opt's record says {} was encoded to {}, not to this output", f.lib("a.mp4").display(), f.out("a.mkv").display())), "{why}");
+        replace_named(&f, true).unwrap();
+        assert_eq!(std::fs::read(f.lib("a.mkv")).unwrap(), vec![b'o'; 400]);
+        assert_eq!(std::fs::read(f.out("0.mkv")).unwrap(), vec![b'e'; 400]);
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
+
+    #[test]
+    fn a_pair_not_on_record_is_followed_only_where_nobody_else_could_have_put_it() {
+        let f = Fix::new("not-own");
+        record_in(&f);
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        // A folder anyone can write to: the report and the output can be anybody's.
+        set_mode(&f.dir.join("out"), 0o777);
+        let why = admitted_named(&f, &report, false).unwrap_err();
+        assert!(why.contains("av1opt has no record of this pair") && why.contains("other users can write to its folder") && why.contains("add --trust-reports"), "{why}");
+        replace_named(&f, false).unwrap();
+        assert_eq!(std::fs::read(f.lib("a.mp4")).unwrap(), vec![b's'; 1000]);
+        assert!(!f.lib("a.mkv").exists());
+        // Nor where the report could be rewritten by others, or the output.
+        set_mode(&f.dir.join("out"), 0o755);
+        for file in [&report, &f.out("a.mkv")] {
+            set_mode(file, 0o666);
+            let why = admitted_named(&f, &report, false).unwrap_err();
+            assert!(why.contains(&format!("{} is not one: other users can write to it", file.display())), "{why}");
+            set_mode(file, 0o644);
+        }
+        // Somebody's word that they are to be trusted is enough.
+        set_mode(&f.dir.join("out"), 0o777);
+        replace_named(&f, true).unwrap();
+        assert_eq!(std::fs::read(f.lib("a.mkv")).unwrap(), vec![b'o'; 400]);
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
+
+    #[test]
+    fn a_pair_not_on_record_of_the_users_own_is_followed_in_a_private_or_sticky_folder() {
+        for (name, mode) in [("own-private", 0o755), ("own-sticky", 0o1777)] {
+            let f = Fix::new(name);
+            record_in(&f);
+            f.encode("a.mp4", "a.mkv", 1000, 400);
+            set_mode(&f.dir.join("out"), mode);
+            replace_named(&f, false).unwrap();
+            assert_eq!(std::fs::read(f.lib("a.mkv")).unwrap(), vec![b'o'; 400], "{name}");
+            crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        }
+    }
+
+    #[test]
+    fn two_reports_for_one_original_not_on_record_are_both_refused() {
+        let f = Fix::new("twice");
+        record_in(&f);
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        let mut second = read_report(&report).unwrap();
+        second["output"] = json!(f.out("0.mkv"));
+        std::fs::write(f.out("0.mkv"), vec![b'e'; 400]).unwrap();
+        let second_report = f.out("0.av1opt.json");
+        write_report(&second_report, &second).unwrap();
+        let plans: Vec<Plan> = [&report, &second_report].iter().map(|r| if let Check::Ready(p) = check(r) { p } else { panic!() }).collect();
+        let twice = named_twice(&plans.iter().collect::<Vec<_>>());
+        assert!(twice[&report].starts_with(&format!("{} names the same original, {}", second_report.display(), f.lib("a.mp4").display())), "{}", twice[&report]);
+        assert!(twice[&second_report].starts_with(&report.display().to_string()) && twice[&second_report].contains("remove the report you do not want"));
+        for trust_reports in [false, true] {
+            replace_named(&f, trust_reports).unwrap();
+            assert_eq!(std::fs::read(f.lib("a.mp4")).unwrap(), vec![b's'; 1000]);
+            assert!(!f.lib("a.mkv").exists());
+        }
+        // With one of them gone, the other is followed.
+        std::fs::remove_file(&second_report).unwrap();
+        replace_named(&f, false).unwrap();
+        assert_eq!(std::fs::read(f.lib("a.mkv")).unwrap(), vec![b'o'; 400]);
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
+
+    #[test]
+    fn adopt_takes_on_record_only_what_replace_would_follow() {
+        let f = Fix::new("adopt-own");
+        let record = record_in(&f);
+        f.encode("a.mp4", "a.mkv", 1000, 400);
+        let named = [f.dir.join("out"), f.dir.join("lib")];
+        let adopted = || record.exists() && std::fs::read_to_string(&record).unwrap().contains("\"adopted\"");
+        set_mode(&f.dir.join("out"), 0o777);
+        adopt(&named, true, false, false).unwrap();
+        assert!(!adopted());
+        adopt(&named, true, false, true).unwrap();
+        assert!(adopted());
+        // Two reports for one original: neither.
+        std::fs::remove_file(&record).unwrap();
+        set_mode(&f.dir.join("out"), 0o755);
+        let mut second = read_report(&f.out("a.av1opt.json")).unwrap();
+        second["output"] = json!(f.out("0.mkv"));
+        std::fs::write(f.out("0.mkv"), vec![b'e'; 400]).unwrap();
+        write_report(&f.out("0.av1opt.json"), &second).unwrap();
+        adopt(&named, true, false, false).unwrap();
+        assert!(!adopted());
+        std::fs::remove_file(f.out("0.av1opt.json")).unwrap();
+        adopt(&named, true, false, false).unwrap();
+        assert!(adopted());
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
+
+    /// A copy of `report` naming `source` and, as its output, a file of the stated size at
+    /// `output` in the output folder, as someone who can write there would put it.
+    fn plant(f: &Fix, report: &Path, source: &Path, output: &Path) -> PathBuf {
+        let mut planted = read_report(report).unwrap();
+        planted["input"] = json!(source);
+        planted["output"] = json!(output);
+        std::fs::write(f.out("0.mkv"), vec![b'e'; 400]).unwrap();
+        let planted_report = f.out("0.av1opt.json");
+        write_report(&planted_report, &planted).unwrap();
+        planted_report
+    }
+
+    #[test]
+    fn a_report_naming_a_pair_on_record_by_another_path_is_held_to_the_record() {
+        // Where planted files look like the user's own (no flag), and where anyone can write
+        // and the person trusts the reports: the record wins either way.
+        for (name, mode, trust_reports) in [("alias-own", 0o755, false), ("alias-trust", 0o777, true)] {
+            let f = Fix::new(name);
+            record_in(&f);
+            let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+            on_record(&report);
+            // `/proc/self/root` leads to the same files by another path.
+            let alias = |p: &Path| PathBuf::from(format!("/proc/self/root{}", p.display()));
+            let planted = plant(&f, &report, &alias(&f.lib("a.mp4")), &alias(&f.out("0.mkv")));
+            set_mode(&f.dir.join("out"), mode);
+            let why = admitted_named(&f, &planted, trust_reports).unwrap_err();
+            assert!(why.contains(&format!("av1opt's record says {} was encoded to {}, not to this output", f.lib("a.mp4").display(), f.out("a.mkv").display())), "{why}");
+            replace_named(&f, trust_reports).unwrap();
+            assert_eq!(std::fs::read(f.lib("a.mkv")).unwrap(), vec![b'o'; 400], "{name}");
+            assert_eq!(std::fs::read(f.out("0.mkv")).unwrap(), vec![b'e'; 400], "{name}");
+            set_mode(&f.dir.join("out"), 0o755);
+            crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        }
+    }
+
+    #[test]
+    fn an_original_on_record_named_by_a_second_path_of_the_same_file_is_held_to_the_record() {
+        // A second name of the original's own file, as a second mount of its folder or a drive
+        // that does not tell letter case apart gives it: here a hard link of the same name in
+        // another folder named, which shows the same device and file number.
+        let f = Fix::new("second-path");
+        record_in(&f);
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        on_record(&report);
+        std::fs::create_dir_all(f.dir.join("lib2")).unwrap();
+        std::fs::hard_link(f.lib("a.mp4"), f.dir.join("lib2/a.mp4")).unwrap();
+        let planted = plant(&f, &report, &f.dir.join("lib2/a.mp4"), &f.out("0.mkv"));
+        let Check::Ready(p) = check(&planted) else { panic!("{:?}", check(&planted)) };
+        let why = crate::ledger::load().judges(&p, None).expect("the record holds this original").unwrap_err();
+        assert!(why.contains(&format!("was encoded to {}, not to this output", f.out("a.mkv").display())), "{why}");
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
+
+    #[test]
+    fn two_reports_naming_one_original_by_two_paths_are_both_refused() {
+        let f = Fix::new("twice-two-paths");
+        record_in(&f);
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        let alias = PathBuf::from(format!("/proc/self/root{}", f.lib("a.mp4").display()));
+        let by_link = plant(&f, &report, &alias, &f.out("0.mkv"));
+        std::fs::create_dir_all(f.dir.join("lib2")).unwrap();
+        std::fs::hard_link(f.lib("a.mp4"), f.dir.join("lib2/a.mp4")).unwrap();
+        let mut by_number = read_report(&report).unwrap();
+        by_number["input"] = json!(f.dir.join("lib2/a.mp4"));
+        by_number["output"] = json!(f.out("1.mkv"));
+        std::fs::write(f.out("1.mkv"), vec![b'e'; 400]).unwrap();
+        write_report(&f.out("1.av1opt.json"), &by_number).unwrap();
+        let plans: Vec<Plan> = [&report, &by_link, &f.out("1.av1opt.json")].iter().map(|r| if let Check::Ready(p) = check(r) { p } else { panic!("{:?}", check(r)) }).collect();
+        let twice = named_twice(&plans.iter().collect::<Vec<_>>());
+        assert_eq!(twice.len(), 3, "{twice:?}");
+        replace_named(&f, true).unwrap();
+        assert_eq!(std::fs::read(f.lib("a.mp4")).unwrap(), vec![b's'; 1000]);
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
+
+    #[test]
+    fn adopt_does_not_take_a_second_output_of_an_original_on_record() {
+        for (name, mode, trust_reports) in [("adopt-second-own", 0o755, false), ("adopt-second-trust", 0o777, true)] {
+            let f = Fix::new(name);
+            let record = record_in(&f);
+            let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+            on_record(&report);
+            let planted = plant(&f, &report, &f.lib("a.mp4"), &f.out("0.mkv"));
+            set_mode(&f.dir.join("out"), mode);
+            let Check::Ready(p) = check(&planted) else { panic!("{:?}", check(&planted)) };
+            let crate::ledger::Standing::Refused(why) = crate::ledger::load().adopting(&p) else { panic!("{name}: taken") };
+            assert!(why.contains(&format!("was encoded to {}", f.out("a.mkv").display())) && why.contains("keep the one on record and remove the other and its report"), "{why}");
+            let before = std::fs::read_to_string(&record).unwrap();
+            adopt(&[f.dir.join("out"), f.dir.join("lib")], true, false, trust_reports).unwrap();
+            assert_eq!(std::fs::read_to_string(&record).unwrap(), before, "{name}");
+            // And `replace` with no flag, the folder private again, still goes by the record.
+            set_mode(&f.dir.join("out"), 0o755);
+            replace_named(&f, false).unwrap();
+            assert_eq!(std::fs::read(f.lib("a.mkv")).unwrap(), vec![b'o'; 400], "{name}");
+            assert_eq!(std::fs::read(f.out("0.mkv")).unwrap(), vec![b'e'; 400], "{name}");
+            crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        }
+    }
+
+    #[test]
+    fn a_second_report_for_an_original_on_record_is_not_sent_to_adopt() {
+        let f = Fix::new("second-told");
+        record_in(&f);
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        on_record(&report);
+        let planted = plant(&f, &report, &f.lib("a.mp4"), &f.out("0.mkv"));
+        let why = admitted_named(&f, &planted, false).unwrap_err();
+        assert!(!why.contains("av1opt adopt") && why.contains("keep the one on record and remove the other and its report"), "{why}");
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
+
+    #[test]
+    fn a_pair_not_on_record_on_a_drive_that_keeps_no_owners_needs_trust_reports() {
+        let f = Fix::new("ownerless");
+        record_in(&f);
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        // The output folder on a FAT drive: the files show as the user's own in a private
+        // folder, as on any drive mounted so, whoever put them there.
+        crate::files::OWNERLESS_IN_TESTS.with_borrow_mut(|d| d.push(f.dir.join("out")));
+        let why = admitted_named(&f, &report, false).unwrap_err();
+        assert!(why.contains(&format!("{} is not one: it is on a FAT drive, which does not keep who owns a file", report.display())) && why.contains("add --trust-reports"), "{why}");
+        replace_named(&f, false).unwrap();
+        assert_eq!(std::fs::read(f.lib("a.mp4")).unwrap(), vec![b's'; 1000]);
+        adopt(&[f.dir.join("out"), f.dir.join("lib")], true, false, false).unwrap();
+        assert!(crate::ledger::load().entry(&f.out("a.mkv"), &f.lib("a.mp4")).is_none());
+        replace_named(&f, true).unwrap();
+        assert_eq!(std::fs::read(f.lib("a.mkv")).unwrap(), vec![b'o'; 400]);
+        crate::files::OWNERLESS_IN_TESTS.with_borrow_mut(Vec::clear);
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
+
+    /// `replace --undo --apply` on the output folder and the originals' folder.
+    fn undo_named(f: &Fix, trust_reports: bool) -> Result<()> {
+        run_watched(&[f.dir.join("out"), f.dir.join("lib")], true, true, true, false, false, trust_reports, &|| {})
+    }
+
+    /// What `replace --undo` on the output folder and the originals' folder says of `report`.
+    fn admitted_back_named(f: &Fix, report: &Path, trust_reports: bool) -> Result<(), String> {
+        let Check::Replaced(d) = check(report) else { panic!("{} is not replaced: {:?}", report.display(), check(report)) };
+        admitted_back(&d, &crate::ledger::load(), &NamedFolders::of(&[f.dir.join("out"), f.dir.join("lib")], false), trust_reports)
+    }
+
+    /// A copy of the replaced `report` saying the AV1 file came from `from` in the output folder.
+    fn plant_replaced(f: &Fix, report: &Path, from: &str) -> PathBuf {
+        let mut planted = read_report(report).unwrap();
+        planted["replaced"]["from"] = json!(f.out(from));
+        let planted_report = f.out(from).with_extension("av1opt.json");
+        write_report(&planted_report, &planted).unwrap();
+        planted_report
+    }
+
+    #[test]
+    fn an_undo_follows_av1opts_record_of_the_replacement_over_a_report_that_says_otherwise() {
+        for trust_reports in [false, true] {
+            let f = Fix::new(&format!("undo-record-{trust_reports}"));
+            record_in(&f);
+            let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+            on_record(&report);
+            replace_named(&f, false).unwrap();
+            // Someone who can write to the output folder puts a copy of the report there that
+            // has the AV1 file come from a name of their choosing.
+            set_mode(&f.dir.join("out"), 0o777);
+            let planted = plant_replaced(&f, &report, "0.mkv");
+            let why = admitted_back_named(&f, &planted, trust_reports).unwrap_err();
+            assert!(why.contains("does not say what av1opt recorded of this replacement"), "{why}");
+            undo_named(&f, trust_reports).unwrap();
+            assert!(!f.out("0.mkv").exists(), "the AV1 file went where the planted report said");
+            assert_eq!((std::fs::read(f.out("a.mkv")).unwrap(), std::fs::read(f.lib("a.mp4")).unwrap()), (vec![b'o'; 400], vec![b's'; 1000]));
+            assert!(read_report(&planted).unwrap()["replaced"].is_object(), "the planted report was rewritten as the user's own");
+            set_mode(&f.dir.join("out"), 0o755);
+            crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        }
+    }
+
+    #[test]
+    fn an_undo_av1opt_has_no_record_of_follows_only_a_report_nobody_else_could_have_put_there() {
+        let f = Fix::new("undo-no-record");
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        f.apply(&report).unwrap();
+        record_in(&f);
+        assert!(crate::ledger::load().judges_replaced(&match check(&report) { Check::Replaced(d) => d, c => panic!("{c:?}") }).is_none());
+        set_mode(&f.dir.join("out"), 0o777);
+        let why = admitted_back_named(&f, &report, false).unwrap_err();
+        assert!(why.contains("av1opt has no record of this pair") && why.contains("other users can write to its folder") && why.contains("add --trust-reports"), "{why}");
+        undo_named(&f, false).unwrap();
+        assert!(f.lib("a.mkv").exists() && !f.lib("a.mp4").exists());
+        // Outside the folders named, not even then.
+        let lib_only = NamedFolders::of(&[f.dir.join("out")], false);
+        let Check::Replaced(d) = check(&report) else { panic!() };
+        assert!(admitted_back(&d, &crate::ledger::load(), &lib_only, true).unwrap_err().contains("outside the folders named here"));
+        // In a folder of the user's own, or with their word for it, it goes back.
+        undo_named(&f, true).unwrap();
+        assert_eq!((std::fs::read(f.out("a.mkv")).unwrap(), std::fs::read(f.lib("a.mp4")).unwrap()), (vec![b'o'; 400], vec![b's'; 1000]));
+        set_mode(&f.dir.join("out"), 0o755);
+        replace_named(&f, false).unwrap();
+        undo_named(&f, false).unwrap();
+        assert!(f.lib("a.mp4").exists() && f.out("a.mkv").exists());
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
+
+    #[test]
+    fn a_pair_not_on_record_in_an_output_folder_named_by_a_link_is_judged_by_the_folder_it_leads_to() {
+        let f = Fix::new("out-by-link");
+        record_in(&f);
+        f.encode("a.mp4", "a.mkv", 1000, 400);
+        std::os::unix::fs::symlink(f.dir.join("out"), f.dir.join("outlink")).unwrap();
+        run_watched(&[f.dir.join("outlink"), f.dir.join("lib")], true, false, true, false, false, false, &|| {}).unwrap();
+        assert_eq!(std::fs::read(f.lib("a.mkv")).unwrap(), vec![b'o'; 400]);
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
+
+    #[test]
+    fn a_report_naming_an_output_on_record_as_made_from_another_original_is_not_followed() {
+        let f = Fix::new("other-original");
+        record_in(&f);
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        on_record(&report);
+        // The same output, said to be made from another original of the stated size.
+        std::fs::write(f.lib("b.mp4"), vec![b't'; 1000]).unwrap();
+        let mut r = read_report(&report).unwrap();
+        r["input"] = json!(f.lib("b.mp4"));
+        let (_, known) = Recorded::of(&f.lib("b.mp4")).unwrap();
+        r["source_mtime"] = json!(known.modified);
+        r["source_fingerprint"] = json!(known.fingerprint);
+        write_report(&report, &r).unwrap();
+        for trust_reports in [false, true] {
+            let why = admitted_named(&f, &report, trust_reports).unwrap_err();
+            assert_eq!(why, format!("av1opt's record says this output was made from another original, {}", f.lib("a.mp4").display()));
+        }
+        replace_named(&f, true).unwrap();
+        assert_eq!(std::fs::read(f.lib("b.mp4")).unwrap(), vec![b't'; 1000]);
+        assert!(!f.lib("b.mkv").exists());
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
+
+    #[test]
+    fn a_report_that_changes_while_it_is_checked_is_not_followed() {
+        let f = Fix::new("changed-while-checked");
+        record_in(&f);
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        let Check::Ready(p) = check(&report) else { panic!("{:?}", check(&report)) };
+        let output = OpenFile::open(&p.output, p.output_bytes).unwrap();
+        assert_eq!(why_not_own(&p, &output), None);
+        // Rewritten in its place, by its owner, after the plan was made from it.
+        let mut r = read_report(&report).unwrap();
+        r["input"] = json!(f.lib("b.mp4"));
+        std::fs::write(&report, serde_json::to_vec(&r).unwrap()).unwrap();
+        let why = why_not_own(&p, &output).unwrap();
+        assert_eq!(why, format!("the report {} changed while it was being checked, so nothing was changed", report.display()));
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
+
+    #[test]
+    fn adopt_takes_a_replaced_report_only_where_nobody_else_could_have_put_it() {
+        let f = Fix::new("adopt-replaced-not-own");
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        f.apply(&report).unwrap();
+        let record = record_in(&f);
+        let named = [f.dir.join("out"), f.dir.join("lib")];
+        let adopted = || std::fs::read_to_string(&record).unwrap_or_default().contains("\"adopted\"");
+        set_mode(&f.dir.join("out"), 0o777);
+        let Check::Replaced(d) = check(&report) else { panic!("{:?}", check(&report)) };
+        let Found::Refused(why) = found_for_adoption(&report, Judging::default(), &crate::ledger::load(), &NamedFolders::of(&named, false), false) else { panic!("taken") };
+        assert!(why.contains("other users can write to its folder") && why.contains("add --trust-reports"), "{why}");
+        adopt(&named, true, false, false).unwrap();
+        assert!(!adopted());
+        adopt(&named, true, false, true).unwrap();
+        assert!(adopted());
+        assert!(crate::ledger::load().check_replaced(&d).is_ok());
+        set_mode(&f.dir.join("out"), 0o755);
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
     }
 }

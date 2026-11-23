@@ -27,8 +27,13 @@ const FILE_NAME: &str = "ledger.jsonl";
 /// What the page says of an output this record does not hold.
 pub const NOT_RECORDED: &str = "av1opt has no record of making this output here (it was made elsewhere, moved, made before this record began, or its report was put there by someone else), so the page will not move files for it; if you trust its report, run `av1opt adopt` in a terminal on the output's folder, or let `av1opt replace` there do it";
 
-/// What is said of a report that tells another story than the record.
+/// What is said of a report of a replacement that tells another story than the record.
 const DISAGREES: &str = "the report beside this output does not say what av1opt recorded when it made and moved these files, so the record does not vouch for it; if you trust the report, `av1opt replace` in a terminal can do it, given the original's folder or --anywhere";
+
+/// What is said of a report of an encode that tells another story than the record. The record
+/// wins on the command line too: a report is only a file, and whoever could write to its
+/// folder chose what it says.
+const DISAGREES_MADE: &str = "the report beside this output does not say what av1opt recorded when it made it, so av1opt does not follow it, on the page or on the command line; if the report is right, the record is not, and encoding the original again puts that right";
 
 #[cfg(test)]
 thread_local! {
@@ -344,10 +349,24 @@ impl Ledger {
         self.outputs.get(output).filter(|e| e.made.is_some() || e.replaced.is_some())
     }
 
+    /// What is recorded of whatever output is at `output`, under that path or under another
+    /// path of the same file (see [`crate::files::same_file`]): a report can name a file by any
+    /// of its paths, and the record holds one. Other paths are looked for among the outputs of
+    /// the same name, letter case aside; a second link under another name is not found.
+    fn known_as(&self, output: &Path) -> Option<&Entry> {
+        let other_path = || self.outputs.iter().find(|(o, e)| (e.made.is_some() || e.replaced.is_some()) && crate::files::may_be_same_name(o, output) && crate::files::same_file(o, output));
+        self.known_at(output).or_else(|| other_path().map(|(_, e)| e))
+    }
+
+    /// Whether `e` is of the original at `source`, by any of its paths.
+    fn of_source(e: &Entry, source: &Path) -> bool {
+        e.source == source || (crate::files::may_be_same_name(&e.source, source) && crate::files::same_file(&e.source, source))
+    }
+
     /// What is recorded of the output at `output`, if it was made from `source` or took its
     /// place. An output put back by the command line that av1opt never saw made is not one.
     pub fn entry(&self, output: &Path, source: &Path) -> Option<&Entry> {
-        self.known_at(output).filter(|e| e.source == source)
+        self.known_as(output).filter(|e| Self::of_source(e, source))
     }
 
     /// The replacement or undo of `source` that was under way when the record was last
@@ -367,12 +386,6 @@ impl Ledger {
         self.problem.as_deref()
     }
 
-    /// Whether the record speaks for this output and this original, so that the report's word
-    /// is not needed for where the original is. All of the output is compared before it moves.
-    pub fn vouches_for(&self, p: &Plan) -> bool {
-        self.check_ready(p, None).is_ok() && self.entry(&p.output, &p.source).and_then(|e| e.made.as_ref()).is_some_and(|m| m.output_sha256.is_some())
-    }
-
     /// What `av1opt adopt` can do about an output that can be replaced.
     pub fn adopting(&self, p: &Plan) -> Standing {
         self.standing(&p.output, &p.source, || self.check_ready(p, None))
@@ -384,10 +397,19 @@ impl Ledger {
     }
 
     fn standing(&self, output: &Path, source: &Path, agrees: impl Fn() -> Result<(), String>) -> Standing {
-        match self.known_at(output) {
-            None => Standing::NotYet,
+        match self.known_as(output) {
+            // One original has one output on record: a report naming another for it would put a
+            // file the record never saw made beside the one it did, and `replace` would then
+            // follow the record to either.
+            None => match self.outputs_of(source) {
+                None => Standing::NotYet,
+                Some(others) => Standing::Refused(format!(
+                    "av1opt's record says {} was encoded to {others}, so this output is not taken on record as another encode of it; {ONE_ON_RECORD}",
+                    source.display()
+                )),
+            },
             // A report must not be able to give a file on record another past.
-            Some(e) if e.source != source => Standing::Refused(format!("av1opt's record says this output came from another original, {}", e.source.display())),
+            Some(e) if !Self::of_source(e, source) => Standing::Refused(format!("av1opt's record says this output came from another original, {}", e.source.display())),
             Some(_) => agrees().map_or_else(Standing::Refused, |()| Standing::OnRecord),
         }
     }
@@ -417,7 +439,7 @@ impl Ledger {
         }
         let made = entry.made.as_ref().ok_or_else(|| self.refusal())?;
         if p.source_bytes != made.original.source_bytes || !made.original.is_what(&p.original) {
-            return Err(DISAGREES.into());
+            return Err(DISAGREES_MADE.into());
         }
         if p.output_bytes != made.output_bytes {
             return Err("the output is not the file av1opt made: its size differs".into());
@@ -431,6 +453,49 @@ impl Ledger {
         }
     }
 
+    /// What this record says of a pair `replace` on the command line is about to act on, which
+    /// is asked before the report's word or the folders named count for anything: None if it
+    /// holds nothing of this output, nor of any output made from this original or put in its
+    /// place. `Ok(true)` if it vouches for all of it (with `output`, all of that compared with
+    /// the hash recorded), `Ok(false)` if it agrees but has no hash of the output to compare
+    /// it with, so that the file itself has to show the rest, and why not otherwise.
+    pub fn judges(&self, p: &Plan, output: Option<&OpenFile>) -> Option<Result<bool, String>> {
+        if let Some(e) = self.known_as(&p.output) {
+            if !Self::of_source(e, &p.source) {
+                return Some(Err(format!("av1opt's record says this output was made from another original, {}", e.source.display())));
+            }
+            let hashed = e.made.as_ref().is_some_and(|m| m.output_sha256.is_some());
+            return Some(self.check_ready(p, output.filter(|_| hashed)).map(|()| hashed));
+        }
+        let others = self.outputs_of(&p.source)?;
+        Some(Err(format!("av1opt's record says {} was encoded to {others}, not to this output, so this report is not followed; {ONE_ON_RECORD}", p.source.display())))
+    }
+
+    /// The outputs on record made from the original at `source` or put in its place, by any of
+    /// its paths, as they are told; None if there are none.
+    fn outputs_of(&self, source: &Path) -> Option<String> {
+        let mut others: Vec<String> = self.outputs.iter().filter(|(_, e)| (e.made.is_some() || e.replaced.is_some()) && Self::of_source(e, source)).map(|(o, _)| o.display().to_string()).collect();
+        others.sort();
+        (!others.is_empty()).then(|| others.join(" and "))
+    }
+
+    /// What this record says of a replacement `replace --undo` on the command line is about to
+    /// put back, asked before the report's word or the folders named count for anything: None if
+    /// it holds nothing of the AV1 file in the original's place nor of any output of that
+    /// original, and otherwise whether the report's replacement is the one on record.
+    pub fn judges_replaced(&self, d: &Replaced) -> Option<Result<(), String>> {
+        if self.known_as(&d.dest).is_none() && self.outputs_of(&d.source).is_none() {
+            return None;
+        }
+        if let Some(e) = self.known_as(&d.dest).filter(|e| !Self::of_source(e, &d.source)) {
+            return Some(Err(format!("av1opt's record says the file at {} came from another original, {}, so this report is not followed", d.dest.display(), e.source.display())));
+        }
+        if self.entry(&d.dest, &d.source).is_none_or(|e| e.replaced.is_none()) {
+            return Some(Err(format!("av1opt's record does not say that {} took the place of {}, so this report is not followed", d.dest.display(), d.source.display())));
+        }
+        Some(self.check_replaced(d).map_err(|_| "the report does not say what av1opt recorded of this replacement (where the original went in the trash, or where the AV1 file came from), so it is not followed".to_string()))
+    }
+
     /// Whether the page may undo this replacement: the original, the trash entry and the place
     /// the AV1 file goes back to have to be the ones on record, whatever the report says.
     pub fn check_replaced(&self, d: &Replaced) -> Result<(), String> {
@@ -440,6 +505,9 @@ impl Ledger {
         if same { Ok(()) } else { Err(DISAGREES.into()) }
     }
 }
+
+/// What is said to someone with a second output of an original that has one on record.
+const ONE_ON_RECORD: &str = "if both are encodes you made, keep the one on record and remove the other and its report";
 
 /// The record as of now, read again only when the file has changed: `/media` asks on every
 /// request a player makes.
@@ -1145,16 +1213,16 @@ mod tests {
         let s = Scratch::new("vouches");
         let (source, output) = s.encoded("a");
         let ledger = load();
-        assert!(ledger.vouches_for(&s.plan(&source, &output)));
+        assert_eq!(ledger.judges(&s.plan(&source, &output), None), Some(Ok(true)));
         // The same pair, with a report that tells another story of the original or the output:
         // `replace` compared the files with the report, not with the record.
         let other_original = Plan { original: Recorded { fingerprint: Some("other samples".into()), ..known() }, ..s.plan(&source, &output) };
-        assert!(!ledger.vouches_for(&other_original));
+        assert!(ledger.judges(&other_original, None).is_some_and(|j| j.is_err()));
         let other_output = Plan { output_bytes: 999, ..s.plan(&source, &output) };
-        assert!(!ledger.vouches_for(&other_output));
+        assert!(ledger.judges(&other_output, None).is_some_and(|j| j.is_err()));
         let replaced = s.0.join("a.mkv");
         moved(&source, &s.0.join("Trash/files/a.mp4"), &replaced, &output).unwrap();
-        assert!(!load().vouches_for(&s.plan(&source, &replaced)));
+        assert!(load().judges(&s.plan(&source, &replaced), None).is_some_and(|j| j.is_err()));
     }
 
     #[test]
@@ -1248,7 +1316,7 @@ mod tests {
         ] {
             let mut forged = s.plan(&source, &output);
             change(&mut forged.original);
-            assert_eq!(load().check_ready(&forged, None), Err(DISAGREES.to_string()));
+            assert_eq!(load().check_ready(&forged, None), Err(DISAGREES_MADE.to_string()));
         }
         // An output of the right size with other contents is only caught by reading it.
         std::fs::write(&output, vec![b'x'; 1000]).unwrap();

@@ -368,7 +368,7 @@ folder), the file is refused before any sample is cut, with a message to rename 
 | `--sample-secs` | as described under Sample | Length of a sample clip in seconds (1-60). |
 | `--min-savings` | 0.15 | Skip the full encode when the predicted saving of the video stream is below this (0-0.95). |
 | `--force` | off | Encode even an AV1 file or one below `--min-savings`; skips noted in the log do not count. |
-| `--overwrite` | off | Encode again over an output already there if its report says it was made from this same file. |
+| `--overwrite` | off | Encode again over an output already there if its report says it was made from this same file, and av1opt's record holds that output or the report is your own file in a folder nobody else can write to (or one with the sticky bit). |
 | `--retry-skipped` | off | Try again the files an earlier run skipped. |
 | `--order` | `given` | Which file goes first: `given`, `savings` or `per-hour`. |
 | `--keep-temp` | off | Keep the temporary folder and a per-scene work folder, for debugging. |

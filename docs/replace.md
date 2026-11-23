@@ -62,14 +62,24 @@ single output files.
   the next `replace`, `--undo` or the page, once the record, the trash and the files (read
   whole) all show what happened; a replacement whose report could not be written ends with
   an error that says where both files are and what puts them back.
-- A replacement or an undo stopped between two of its moves (killed, or the power went) is
-  put right the same way, by the record and the files and never by the report's word: a
-  replacement stopped once the original was in the trash (also with the AV1 file already in
-  the original's own name) is put back as it was before it
+- Before its first move, a replacement and an undo each write a line to av1opt's record,
+  flushed to the drive, with what tells their moves from anyone else's (the two places of the
+  AV1 file and its hash, the original as it was checked, then its name in the trash before it
+  goes there). One stopped between two of its moves (killed, or the power went) is put right
+  by the next `replace --apply`, `--undo --apply` or the page's button, by that line and the
+  files read whole, never by the report's word: a replacement is put back as it was before it
   (the original back in its place, the AV1 file back in the output folder, a copy of it on
-  another drive removed), and an undo stopped while the original was still in the trash goes
-  back to the replacement; an undo that had both files back is finished. `--apply` then does
-  what was asked; without it the list says what was stopped half-way and where the original is.
+  another drive removed), an undo with the AV1 file still in the original's place goes back
+  to the replacement, and one with the AV1 file back in the output folder is finished. `--apply`
+  then does what was asked; without it the list says what was stopped half-way and where the
+  original is. A pair with no such line, or whose files are no longer as that run would have
+  left them (moved by hand since, or not the recorded files), is left as it is and said to
+  be: an original thrown away by hand with its AV1 file kept is "gone", as it is. Nothing is
+  put right in a folder on ZFS without `--allow-zfs`, a copy is removed only if the file it is
+  a copy of is still there and is another file (not the same file reached by a second path),
+  and a pair that could not be put right makes the run end in failure. Records written by an
+  earlier version have no such lines and never set this off; an earlier version reading a
+  newer record passes over them, as it does any line it does not know.
 - Originals on ZFS are left alone unless `--allow-zfs` is given, and are put back there by
   `--undo` only with it.
 - A later `encode` or `scan` over the library sees the replaced files as AV1 and skips them.

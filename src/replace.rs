@@ -285,21 +285,23 @@ fn stranded(report: &Path, r: &Value, ledger: &crate::ledger::Ledger, full: bool
 }
 
 /// Rewrites a report that is behind what av1opt's record and the files show (see [`stranded`]),
-/// and puts back as they were the files of a replacement or an undo that was stopped between
-/// two of its moves (see [`CutOff`]), reading in full what that rests on. Called with the
-/// report's lock held. Says how the pair stands then, if anything was done.
-fn set_right(report: &Path) -> Result<Option<Stranded>> {
+/// and puts right the files of a replacement or an undo that was stopped between two of its
+/// moves (see [`CutOff`]), reading in full what that rests on. Called with the report's lock
+/// held; a report rewritten here is locked before it takes the report's name, and that lock
+/// goes into `held`, so that the pair stays this run's while it goes on. Says how the pair
+/// stands then, if anything was done. A pair stopped half-way whose files are not as that run
+/// would have left them is an error that says so, and nothing of it is moved.
+fn set_right(report: &Path, allow_zfs: bool, held: &mut Vec<Lock>) -> Result<Option<Stranded>> {
     let mut done = None;
-    // A report set right can show a move that was cut off, and the other way round: a copy
-    // across drives on record whose old file is still there.
+    // A report set right can show a move that was cut off, and the other way round.
     for _ in 0..3 {
         let Ok(r) = read_report(report) else { break };
         let ledger = crate::ledger::load();
         if let Some((fixed, what)) = stranded(report, &r, &ledger, true) {
-            write_report(report, &fixed).context("the report is behind what av1opt's record and the files show, and could not be set right")?;
+            write_report_held(report, &fixed, held).context("the report is behind what av1opt's record and the files show, and could not be set right")?;
             done = Some(what);
         } else if let Some(cut) = CutOff::of(report, &r, &ledger, true) {
-            done = Some(cut.put_back(report, &r)?);
+            done = Some(cut.put_right(report, &r, allow_zfs, held)?);
         } else {
             break;
         }
@@ -307,34 +309,52 @@ fn set_right(report: &Path) -> Result<Option<Stranded>> {
     Ok(done)
 }
 
-/// A pair whose last replacement or undo was stopped between two of its moves (killed, or the
-/// power cut), so that its report, av1opt's record and where the files are do not tell one
-/// story: the original went to the trash and the AV1 file is not, or not only, in its place;
-/// or an undo had the AV1 file back in the output folder, or a copy of it there, before the
-/// original or the record followed. The report alone has the original gone or the AV1 file
-/// missing, and neither command would touch the pair again. What it was stopped at is told by
-/// the record and the files, never by the report's word: the file in the trash has to say it
-/// came from the original's place and be the recorded original, and each AV1 file the size and,
-/// where it is on record, the hash av1opt recorded.
+/// A pair whose replacement or undo was stopped between two of its moves (killed, or the power
+/// went): the line av1opt writes before the first move of each is the last on record for the
+/// original, and the report is the one that run worked from. What it was stopped at is told by
+/// that line and the files, never by the report's word: the file in the trash has to say it came
+/// from the original's place and be the recorded original, and each AV1 file the size and the
+/// hash on that line. Without such a line nothing is under way, whatever the files look like:
+/// an original thrown away by hand, say, with its AV1 file kept in the output folder.
 #[derive(Debug)]
 struct CutOff {
     source: PathBuf,
-    /// Where the AV1 file was before the replacement, and goes back to.
+    /// The AV1 file's place in the output folder.
     from: PathBuf,
-    /// Where the replacement puts the AV1 file.
+    /// Its place in the original's folder.
     dest: PathBuf,
-    trash: PathBuf,
-    /// The AV1 file is whole at `from`, and (another file: a copy across drives) at `dest`.
-    at_from: bool,
-    at_dest: bool,
-    /// An undo was under way: the report still says replaced.
+    /// Where the original is in the trash, or was to go; None for a replacement stopped before
+    /// that was known.
+    trash: Option<PathBuf>,
     undoing: bool,
-    /// The original is back in its place, which only an undo does.
-    restored: bool,
     source_bytes: u64,
     output_bytes: u64,
-    /// The original, as it was recorded when it went to the trash or was encoded.
+    output_sha256: String,
+    /// The original as that run checked it.
     original: Recorded,
+    left: Left,
+}
+
+/// Where a stopped run left the files.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Left {
+    /// Nothing is moved: the original is in its place, or the AV1 file in the original's for an
+    /// undo. Only the line on record is left over.
+    Nothing,
+    /// A replacement: the original in the trash and the AV1 file still in the output folder,
+    /// with or without a copy of it already in the original's folder.
+    Trashed { copy_placed: bool },
+    /// A replacement: the original in the trash and the AV1 file in the original's folder.
+    Placed,
+    /// An undo: the AV1 file in the original's folder and a copy of it in the output folder,
+    /// the original still in the trash.
+    CopiedBack,
+    /// An undo: the AV1 file back in the output folder, the original still in the trash.
+    MovedBack,
+    /// An undo: both files back.
+    BothBack,
+    /// Not as any step of that run leaves them: moved by hand since, or not the files recorded.
+    Unknown,
 }
 
 impl CutOff {
@@ -343,132 +363,258 @@ impl CutOff {
     /// look of a list, by sizes and samples.
     fn of(report: &Path, r: &Value, ledger: &crate::ledger::Ledger, full: bool) -> Option<CutOff> {
         let source = full_path(r, "input").ok()?;
-        let output_bytes = r["output_bytes"].as_u64()?;
-        let is_output = |path: &Path, hash: Option<&str>| match hash {
-            Some(hash) if full => OpenFile::open(path, output_bytes).ok().and_then(|f| f.sha256().ok()).is_some_and(|now| now == hash),
-            _ => file_size(path) == Some(output_bytes),
-        };
-        if let Some(done) = r.get("replaced").filter(|d| d.is_object()) {
-            let (dest, from, trash) = (full_path(r, "output").ok()?, full_path(done, "from").ok()?, full_path(done, "trash").ok()?);
-            if !beside(report, &from) {
-                return None;
+        let u = ledger.under_way(&source)?;
+        if r["output_bytes"].as_u64() != Some(u.output_bytes) {
+            return None;
+        }
+        // The report has to be the one that run worked from, as it left it.
+        match r.get("replaced").filter(|d| d.is_object()) {
+            Some(done) if u.undoing => {
+                let recorded = full_path(done, "from").ok()?;
+                let from = if beside(report, &recorded) { Some(recorded) } else { place_beside_aside(report, &recorded) };
+                if from.as_ref() != Some(&u.from) || full_path(r, "output").ok()? != u.dest || u.trash.as_ref() != Some(&full_path(done, "trash").ok()?) {
+                    return None;
+                }
             }
-            let entry = ledger.entry(&dest, &source)?;
-            let moved = entry.replaced.as_ref().filter(|m| m.trash == trash && m.from == from && m.output_bytes == output_bytes)?;
-            let hash = entry.made.as_ref().and_then(|m| m.output_sha256.as_deref());
-            let original = moved.original.as_recorded();
-            let in_trash = if full { trash::holds(&trash, &source, &original) } else { trash::holds_for_list(&trash, &source, &original) };
-            let restored = !in_trash && std::fs::symlink_metadata(&trash).is_err() && (if full { trash::is_file_recorded(&source, &original) } else { file_size(&source) == Some(moved.original.source_bytes()) });
-            let at_from = is_output(&from, hash);
-            let at_dest = dest != from && is_output(&dest, hash) && (hash.is_some() || !at_from || same_contents(&from, &dest, output_bytes));
-            let cut = if from == dest { restored } else { at_from && (in_trash || (restored && !at_dest)) };
-            return cut.then(|| CutOff { source, from, dest, trash, at_from, at_dest, undoing: true, restored, source_bytes: moved.original.source_bytes(), output_bytes, original });
+            None if !u.undoing => {
+                let from = full_path(r, "output").ok()?;
+                if from != u.from || !beside(report, &from) || r["superseded"].as_bool() == Some(true) || source.with_extension(from.extension()?) != u.dest {
+                    return None;
+                }
+            }
+            _ => return None,
         }
-        let from = full_path(r, "output").ok()?;
-        let dest = source.with_extension(from.extension()?);
-        // Only an original that is gone can have been on its way to the trash. An AV1 file that
-        // takes the original's very name can be there in its place.
-        let something_there = std::fs::symlink_metadata(&source).is_ok();
-        if (something_there && dest != source) || !beside(report, &from) || r["superseded"].as_bool() == Some(true) {
-            return None;
-        }
-        let entry = ledger.entry(&from, &source).filter(|e| e.replaced.is_none())?;
-        let made = entry.made.as_ref()?;
-        let hash = made.output_sha256.as_deref()?;
-        if !made.original.has_contents_of(&Recorded::in_report(r)) || made.output_bytes != output_bytes {
-            return None;
-        }
-        if something_there && !is_output(&source, Some(hash)) {
-            return None;
-        }
-        let original = made.original.as_recorded();
-        let holds = |t: &Path| if full { trash::holds(t, &source, &original) } else { trash::holds_for_list(t, &source, &original) };
-        let trash = trash::entries_from(&source).into_iter().find(|t| holds(t))?;
-        let at_from = is_output(&from, Some(hash));
-        let at_dest = dest != from && is_output(&dest, Some(hash));
-        // Anything else at either place is not this pair's, and stays out of it.
+        let original = u.original.as_recorded();
+        let (from, dest, bytes, hash) = (&u.from, &u.dest, u.output_bytes, u.output_sha256.as_str());
+        let is_original = |p: &Path| if full { trash::is_file_recorded(p, &original) } else { file_size(p) == Some(u.original.source_bytes()) };
+        let in_trash = u.trash.as_deref().is_some_and(|t| if full { trash::holds(t, &source, &original) } else { trash::holds_for_list(t, &source, &original) });
+        let is_av1 = |p: &Path| if full { OpenFile::open(p, bytes).ok().and_then(|f| f.sha256().ok()).is_some_and(|now| now == hash) } else { file_size(p) == Some(bytes) };
         let taken = |p: &Path| std::fs::symlink_metadata(p).is_ok();
-        let fits = if at_dest { at_from || !taken(&from) } else { at_from && (dest == from || !taken(&dest)) };
-        fits.then(|| CutOff { source, from, dest, trash, at_from, at_dest, undoing: false, restored: false, source_bytes: made.original.source_bytes(), output_bytes, original })
+        // Two names of one file (a folder mounted twice) are not two copies of it.
+        let at_dest = is_av1(dest);
+        let at_from = from != dest && !one_file(from, dest) && is_av1(from);
+        let left = if !u.undoing {
+            let source_free = !taken(&source) || (*dest == source && at_dest);
+            // The original is the first to move: with nothing at its name in the trash and a
+            // file in its place that is not the AV1 file, nothing of this run's was moved (or
+            // it was taken back since), whatever that file is now.
+            if u.trash.as_deref().is_none_or(|t| !taken(t)) && !source_free {
+                Left::Nothing
+            } else if in_trash && source_free && at_from {
+                if from == dest || !taken(dest) {
+                    Left::Trashed { copy_placed: false }
+                } else if at_dest {
+                    Left::Trashed { copy_placed: true }
+                } else {
+                    Left::Unknown
+                }
+            } else if in_trash && source_free && at_dest && from != dest && !taken(from) {
+                Left::Placed
+            } else {
+                Left::Unknown
+            }
+        } else {
+            let back = u.trash.as_deref().is_some_and(|t| !taken(t)) && is_original(&source);
+            // The AV1 file is the first to move: still in the original's place, with nothing
+            // in the place it goes back to and the trash entry still there, it never left.
+            if at_dest && u.trash.as_deref().is_some_and(taken) && (from == dest || !taken(from)) {
+                Left::Nothing
+            } else if in_trash && at_dest && at_from {
+                Left::CopiedBack
+            } else if in_trash && at_from && !taken(dest) {
+                Left::MovedBack
+            } else if back && (if from == dest { at_dest } else { at_from && (*dest == source || !taken(dest)) }) {
+                Left::BothBack
+            } else {
+                Left::Unknown
+            }
+        };
+        let (from, dest, trash) = (u.from.clone(), u.dest.clone(), u.trash.clone());
+        let (source_bytes, output_sha256) = (u.original.source_bytes(), u.output_sha256.clone());
+        Some(CutOff { source, from, dest, trash, undoing: u.undoing, source_bytes, output_bytes: bytes, output_sha256, original, left })
     }
 
-    /// What a list says of it.
-    fn told(&self) -> String {
-        let what = if self.undoing { "putting the original back" } else { "replacing the original" };
-        let back = if self.undoing && !self.restored { "replaced, as it was before the undo" } else { "as it was before" };
-        format!(
-            "av1opt was stopped half-way through {what} (killed, or the power went): the original is {}; with --apply the files are put back {back} first, and then what was asked is done",
-            if self.restored { format!("back at {}", self.source.display()) } else { format!("in the trash at {}", self.trash.display()) }
-        )
+    /// What a list says of it; nothing where nothing was moved.
+    fn told(&self) -> Option<String> {
+        let what = if self.undoing { "putting this original back" } else { "replacing this original" };
+        let stopped = format!("av1opt was stopped half-way through {what} (killed, or the power went)");
+        let trash = self.trash.as_deref().map_or_else(|| "the trash".to_string(), |t| t.display().to_string());
+        let (source, from, dest) = (self.source.display(), self.from.display(), self.dest.display());
+        Some(match self.left {
+            Left::Nothing => return None,
+            Left::Trashed { .. } | Left::Placed => format!("{stopped}: the original is in the trash at {trash}; putting it right takes it back to {source}, and the AV1 file back to {from}"),
+            Left::CopiedBack => format!("{stopped}: the AV1 file is still at {dest}, and a copy of it at {from}; putting it right removes that copy"),
+            Left::MovedBack => format!("{stopped}: the AV1 file is back at {from}, and the original still in the trash at {trash}; putting it right takes the original back to {source}"),
+            Left::BothBack => format!("{stopped}: both files are back, at {source} and {from}; putting it right only writes that down"),
+            Left::Unknown => format!(
+                "{stopped}, and the files are not where that run would have left them (moved or changed since), so av1opt leaves them as they are: the original was at {source} on its way to {trash}, and the AV1 file at {} on its way to {}",
+                if self.undoing { &dest } else { &from },
+                if self.undoing { &from } else { &dest }
+            ),
+        })
+    }
+
+    /// What is said once it was put right; nothing where nothing was moved.
+    fn done(&self) -> Option<String> {
+        let what = if self.undoing { "putting this original back" } else { "replacing this original" };
+        let (source, from, dest) = (self.source.display(), self.from.display(), self.dest.display());
+        let now = match self.left {
+            Left::Nothing | Left::Unknown => return None,
+            Left::Trashed { .. } | Left::Placed => format!("the original is back at {source} and the AV1 file at {from}, as they were before"),
+            Left::CopiedBack => format!("the copy at {from} was removed, and the AV1 file is at {dest}, as it was before"),
+            Left::MovedBack | Left::BothBack => format!("the original is back at {source} and the AV1 file at {from}, as the undo was to leave them"),
+        };
+        Some(format!("av1opt had been stopped half-way through {what}; {now}"))
+    }
+
+    /// Whether putting it right writes to a folder on ZFS.
+    fn on_zfs(&self) -> bool {
+        self.folders_written().iter().any(|f| crate::fsguard::ensure_writable_location(f, false).is_err())
+    }
+
+    /// The folders putting it right writes to.
+    fn folders_written(&self) -> Vec<PathBuf> {
+        let folder = |p: &Path| p.parent().unwrap_or(Path::new("/")).to_path_buf();
+        let trash_folder = || self.trash.as_deref().map(folder);
+        let mut folders = match self.left {
+            Left::Nothing if !self.undoing => trash_folder().into_iter().collect(),
+            Left::Nothing | Left::BothBack | Left::Unknown => vec![],
+            Left::Trashed { .. } => vec![folder(&self.source), folder(&self.dest)],
+            Left::Placed => vec![folder(&self.source), folder(&self.dest), folder(&self.from)],
+            Left::CopiedBack => vec![folder(&self.from)],
+            Left::MovedBack => vec![folder(&self.source)],
+        };
+        folders.dedup();
+        folders
     }
 
     /// Moves the files to the nearest state in which the report and the record tell their whole
-    /// story: before the replacement, or, for an undo stopped while the original was still in
-    /// the trash, the replacement it was undoing. An undo that had both files back is finished
-    /// instead, on record and in the report. No file is moved over another, and the one AV1
-    /// file removed is a copy of the one that stays.
-    fn put_back(&self, report: &Path, r: &Value) -> Result<Stranded> {
-        let remove_copy = |copy: &Path, kept: &Path| -> Result<()> {
-            let file = OpenFile::open(copy, self.output_bytes)?;
-            if !same_contents(copy, kept, self.output_bytes) || !file.is_at(copy) {
-                bail!("{} is not a copy of {}, so it was left where it is", copy.display(), kept.display());
+    /// story: before the replacement, or, for an undo, the replacement it was undoing or the undo
+    /// finished, whichever is one step away. No file is moved over another, the one AV1 file
+    /// removed is a copy of the one that stays, and nothing is written in a folder on ZFS
+    /// without `allow_zfs`. Says how the pair stands then.
+    fn put_right(&self, report: &Path, r: &Value, allow_zfs: bool, held: &mut Vec<Lock>) -> Result<Stranded> {
+        if self.left == Left::Unknown {
+            bail!("{}", self.told().unwrap_or_default());
+        }
+        for folder in self.folders_written() {
+            crate::fsguard::ensure_writable_location(&folder, allow_zfs).with_context(|| format!("{}, which is not done there without --allow-zfs", self.told().unwrap_or_default()))?;
+        }
+        let folder = |p: &Path| p.parent().unwrap_or(Path::new("/")).to_path_buf();
+        let restore = || -> Result<()> {
+            let trash = self.trash.as_deref().context("no trash entry on record")?;
+            let original = OpenFile::open(trash, self.source_bytes).context("the file in the trash is not the original")?;
+            if !trash::is_open_file_recorded(&original.file, &self.original) || !trash::says_came_from(trash, &self.source) {
+                bail!("the file in the trash is not the original: it changed after the original went there");
             }
-            std::fs::remove_file(copy).with_context(|| format!("cannot remove {}, a copy of {}", copy.display(), kept.display()))
+            trash::restore_if(trash, &self.source, &|m| original.is(m))?;
+            sync_dir(&folder(&self.source));
+            Ok(())
         };
         let move_av1 = |from: &Path, to: &Path| -> Result<()> {
             let file = OpenFile::open(from, self.output_bytes)?;
+            if file.sha256().ok().as_deref() != Some(self.output_sha256.as_str()) {
+                bail!("{} is not the AV1 file av1opt recorded, so it was left where it is", from.display());
+            }
             clear_left_behind(to);
-            move_open(&file, from, to, self.output_bytes).map(drop)
+            move_open(&file, from, to, self.output_bytes)?;
+            sync_dir(&folder(to));
+            Ok(())
         };
-        let folder = |p: &Path| p.parent().unwrap_or(Path::new("/")).to_path_buf();
-        if self.undoing && self.restored {
-            // Both files are back: what is missing is the record of it and the report.
-            if let Err(e) = crate::ledger::note_undone(&self.source, &self.dest, &self.from) {
-                eprintln!("warning: the original is back, but av1opt's own record of that could not be written: {e:#}");
+        let settled = || crate::ledger::note_settled(&self.source).context("the files are as they were, but av1opt's own record of that could not be written");
+        match self.left {
+            Left::Nothing => {
+                // A stop once the original's name in the trash was reserved leaves an info file
+                // with no file: this run's own, and nobody else's to keep.
+                if !self.undoing
+                    && let Some(trash) = &self.trash
+                {
+                    trash::drop_info_left_alone(trash, &self.source);
+                }
+                settled()?;
+                Ok(if self.undoing { Stranded::Replaced } else { Stranded::Undone })
             }
-            let mut r = r.clone();
-            if r["replaced"]["from"].as_str().is_some_and(|recorded| Path::new(recorded) != self.from) {
-                r["superseded"] = json!(true);
+            Left::Trashed { copy_placed } => {
+                if copy_placed {
+                    remove_copy(&self.dest, &self.from, self.output_bytes, &self.output_sha256)?;
+                    crate::signals::stop_point("recover:moved");
+                }
+                clear_left_behind(&self.dest);
+                restore()?;
+                crate::signals::stop_point("recover:restored");
+                settled()?;
+                Ok(Stranded::Undone)
             }
-            r["output"] = json!(self.from);
-            if let Some(o) = r.as_object_mut() {
-                o.remove("replaced");
+            Left::Placed => {
+                move_av1(&self.dest, &self.from)?;
+                crate::signals::stop_point("recover:moved");
+                restore()?;
+                crate::signals::stop_point("recover:restored");
+                settled()?;
+                Ok(Stranded::Undone)
             }
-            write_report(report, &r).context("both files are back, but the report could not be updated")?;
-            return Ok(Stranded::Undone);
-        }
-        if self.undoing {
-            // Back to the replacement: the AV1 file in the original's place, and only there.
-            if self.at_dest {
-                remove_copy(&self.from, &self.dest)?;
-            } else {
-                move_av1(&self.from, &self.dest)?;
+            Left::CopiedBack => {
+                remove_copy(&self.from, &self.dest, self.output_bytes, &self.output_sha256)?;
+                crate::signals::stop_point("recover:moved");
+                settled()?;
+                Ok(Stranded::Replaced)
             }
-            sync_dir(&folder(&self.dest));
-            return Ok(Stranded::Replaced);
+            Left::MovedBack | Left::BothBack => {
+                if self.left == Left::MovedBack {
+                    restore()?;
+                    crate::signals::stop_point("recover:restored");
+                }
+                crate::ledger::note_undone(&self.source, &self.dest, &self.from).context("both files are back, but av1opt's own record of that could not be written")?;
+                crate::signals::stop_point("recover:noted");
+                let mut r = r.clone();
+                if r["replaced"]["from"].as_str().is_some_and(|recorded| Path::new(recorded) != self.from) {
+                    r["superseded"] = json!(true);
+                }
+                r["output"] = json!(self.from);
+                if let Some(o) = r.as_object_mut() {
+                    o.remove("replaced");
+                }
+                write_report_held(report, &r, held).context("both files are back, but the report could not be updated")?;
+                Ok(Stranded::Undone)
+            }
+            Left::Unknown => unreachable!("refused above"),
         }
-        // Back to before the replacement: the AV1 file in the output folder, the original in its place.
-        if self.at_dest && self.at_from {
-            remove_copy(&self.dest, &self.from)?;
-        } else if self.at_dest {
-            move_av1(&self.dest, &self.from)?;
-        }
-        clear_left_behind(&self.dest);
-        let original = OpenFile::open(&self.trash, self.source_bytes).context("the file in the trash is not the original")?;
-        if !trash::is_open_file_recorded(&original.file, &self.original) {
-            bail!("the file in the trash is not the original: it changed after the original went there");
-        }
-        trash::restore_if(&self.trash, &self.source, &|m| original.is(m))?;
-        sync_dir(&folder(&self.source));
-        sync_dir(&folder(&self.from));
-        Ok(Stranded::Undone)
     }
 }
 
-/// Whether the files at `a` and `b`, both of `bytes` bytes, hold the same.
-fn same_contents(a: &Path, b: &Path, bytes: u64) -> bool {
-    let hash = |p: &Path| OpenFile::open(p, bytes).ok().and_then(|f| f.sha256().ok());
-    hash(a).is_some_and(|x| Some(x) == hash(b))
+/// Whether `a` and `b` are one file under two names, not following a link at the end of either.
+fn one_file(a: &Path, b: &Path) -> bool {
+    let id = |p: &Path| std::fs::symlink_metadata(p).ok().map(|m| (m.dev(), m.ino()));
+    id(a).is_some_and(|x| Some(x) == id(b))
+}
+
+/// Removes `copy`, a second whole file of what `kept` holds, both with the full hash `hash`.
+/// One file reached by two names (its folder mounted twice) is no copy of itself: then nothing
+/// is removed. The copy first goes to a hidden name beside it, and only if `kept` is still there
+/// under its name, unchanged, and still another file, does it go; otherwise it gets its name back.
+fn remove_copy(copy: &Path, kept: &Path, bytes: u64, hash: &str) -> Result<()> {
+    let file = OpenFile::open(copy, bytes)?;
+    let other = OpenFile::open(kept, bytes)?;
+    let not_a_copy = || anyhow!("{} is not a copy of {}, so it was left where it is", copy.display(), kept.display());
+    if other.file.metadata().is_ok_and(|m| file.is(&m)) {
+        bail!("{} and {} are one file under two names, so it was left where it is", copy.display(), kept.display());
+    }
+    if file.sha256().ok().as_deref() != Some(hash) || other.sha256().ok().as_deref() != Some(hash) {
+        return Err(not_a_copy());
+    }
+    let hidden = staging_name(copy);
+    trash::rename_new(copy, &hidden).with_context(|| format!("cannot remove {}, a copy of {}", copy.display(), kept.display()))?;
+    crate::signals::stop_point("recover:hidden");
+    if !(file.is_at(&hidden) && other.is_at(kept) && other.untouched() && !one_file(&hidden, kept)) {
+        let back = trash::rename_new(&hidden, copy);
+        return Err(match back {
+            Ok(()) => not_a_copy(),
+            Err(e) => anyhow!("{} changed while its copy was being removed, so the copy was kept, at {} ({e})", kept.display(), hidden.display()),
+        });
+    }
+    std::fs::remove_file(&hidden).with_context(|| format!("cannot remove {}, a copy of {}", hidden.display(), kept.display()))?;
+    sync_dir(crate::files::folder_of(copy));
+    Ok(())
 }
 
 fn check_judging(report: &Path, judging: Judging) -> Check {
@@ -824,20 +970,41 @@ fn sync_dir(dir: &Path) {
 /// Rewrites the report through a second file, so a crash leaves the old or the new one. The
 /// report keeps its date: that is when the encode was made, and History sorts by it.
 fn write_report(report: &Path, r: &Value) -> Result<()> {
+    write_report_locking(report, r, None)
+}
+
+/// [`write_report`] while the pair's files are still to be moved: the new report is locked
+/// before it takes the report's name, and the lock goes into `held`. The lock on the old one
+/// holds a file that no longer has the name, and another run would find the new one free.
+fn write_report_held(report: &Path, r: &Value, held: &mut Vec<Lock>) -> Result<()> {
+    write_report_locking(report, r, Some(held))
+}
+
+fn write_report_locking(report: &Path, r: &Value, held: Option<&mut Vec<Lock>>) -> Result<()> {
+    use std::os::fd::AsRawFd;
     let date = std::fs::metadata(report).and_then(|m| m.modified()).ok();
     let part = crate::files::save_name(report);
-    let write = || -> Result<()> {
+    let write = || -> Result<File> {
         // (Made anew: a link left at that name is not written through.)
         let _ = std::fs::remove_file(&part);
         let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&part)?;
+        // SAFETY: flock on a descriptor we own; no memory is involved. Nobody else has this new
+        // file open; a filesystem without locks is carried on with, as `lock` does.
+        unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         std::io::Write::write_all(&mut f, &serde_json::to_vec_pretty(r)?)?;
         if let Some(date) = date {
             let _ = f.set_modified(date);
         }
         f.sync_all()?;
-        Ok(std::fs::rename(&part, report)?)
+        std::fs::rename(&part, report)?;
+        Ok(f)
     };
-    write().inspect_err(|_| drop(std::fs::remove_file(&part)))
+    let f = write().inspect_err(|_| drop(std::fs::remove_file(&part)))?;
+    sync_dir(crate::files::folder_of(report));
+    if let Some(held) = held {
+        held.push(Lock(f));
+    }
+    Ok(())
 }
 
 /// Held while the files of a report are moved, so that two runs (two clicks, or the command
@@ -884,7 +1051,7 @@ impl Drop for Lock {
 /// that is what ends up at the destination, or nothing does.
 #[cfg(feature = "ui")]
 pub fn apply_if(report: &Path, allow_zfs: bool, accept: AcceptOutput) -> Result<Done> {
-    apply_judging(report, allow_zfs, Judging::default(), &trash::trash, accept, &|| {})
+    apply_judging(report, allow_zfs, Judging::default(), &trash::trash_noting, accept, &|| {})
 }
 
 /// [`check_for_list`] on behalf of someone who says that only the original's date changed, as
@@ -899,30 +1066,35 @@ pub fn check_for_list_accepting_changed_date(report: &Path, ledger: &crate::ledg
 /// known to differ is still refused.
 #[cfg(feature = "ui")]
 pub fn apply_if_date_accepted(report: &Path, allow_zfs: bool, accept: AcceptOutput) -> Result<Done> {
-    apply_judging(report, allow_zfs, Judging { accept_changed_date: true, ..Judging::default() }, &trash::trash, accept, &|| {})
+    apply_judging(report, allow_zfs, Judging { accept_changed_date: true, ..Judging::default() }, &trash::trash_noting, accept, &|| {})
 }
 
 #[cfg(test)]
-fn apply_with(report: &Path, allow_zfs: bool, to_trash: &dyn Fn(&Path) -> Result<PathBuf>) -> Result<Done> {
+fn apply_with(report: &Path, allow_zfs: bool, to_trash: ToTrash) -> Result<Done> {
     apply_judging(report, allow_zfs, Judging::default(), to_trash, &|_, _| Ok(()), &|| {})
 }
 
 /// Has the last word on what a report comes to, or says why not.
 type Accept<'a, T> = &'a dyn Fn(&T) -> Result<(), String>;
 
+/// What sends the original to the trash ([`trash::trash_noting`] but in tests), telling the
+/// function it is given the name the original is about to have there.
+type ToTrash<'a> = &'a dyn Fn(&Path, trash::BeforeMove) -> Result<PathBuf>;
+
 /// [`Accept`] for a replacement, with the output as it was opened to be moved.
 type AcceptOutput<'a> = &'a dyn Fn(&Plan, &OpenFile) -> Result<(), String>;
 
 /// `before_report` is called once the files are in place and on record, before the report is
 /// rewritten.
-fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: &dyn Fn(&Path) -> Result<PathBuf>, accept: AcceptOutput, before_report: &dyn Fn()) -> Result<Done> {
-    let _lock = lock(report)?;
+fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: ToTrash, accept: AcceptOutput, before_report: &dyn Fn()) -> Result<Done> {
+    let mut held = vec![lock(report)?];
     let reads_of_this_one = WholeReads::default();
-    // The report as it is on disk: one that is behind the record is set right, and then read.
+    // The report as it is on disk: one that is behind the record is set right, and then read,
+    // and so is a pair whose last move on record was cut off.
     let judging = Judging { acting: true, remember: judging.remember.or(Some(&reads_of_this_one)), ledger: None, ..judging };
     let mut checked = check_judging(report, judging);
-    if !matches!(checked, Check::Ready(_)) {
-        match set_right(report)? {
+    if !matches!(checked, Check::Ready(_)) || under_way(report) {
+        match set_right(report, allow_zfs, &mut held)? {
             Some(Stranded::Undone) => checked = check_judging(report, judging),
             Some(Stranded::Replaced) => bail!("already replaced: av1opt's record and the files show that this original went to the trash, and its report now says so too"),
             None => {}
@@ -943,6 +1115,15 @@ fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: &dy
     if !output.is_at(&p.output) || !output.untouched() {
         bail!("the output was changed or replaced by another file while it was being checked, so nothing was changed");
     }
+    // On record before the first move, with what tells this run's moves from anyone else's.
+    let on_record = crate::ledger::load().entry(&p.output, &p.source).and_then(|e| e.made.clone()).filter(|m| m.output_bytes == p.output_bytes).and_then(|m| m.output_sha256);
+    let output_sha256 = match on_record {
+        Some(hash) => hash,
+        None => output.sha256().with_context(|| format!("cannot read {}, so nothing was changed", p.output.display()))?,
+    };
+    let replacing = crate::ledger::Replacing { source: &p.source, from: &p.output, dest: &p.dest, source_bytes: p.source_bytes, known: &p.original, output_bytes: p.output_bytes, output_sha256: &output_sha256 };
+    crate::ledger::note_replacing(&replacing).context("av1opt's own record could not be written, and a replacement stopped half-way could not be put right without it, so nothing was changed")?;
+    crate::signals::stop_point("replace:begun");
     let in_place = p.dest == p.output;
     let staged = staging_name(&p.dest);
     let stage = || {
@@ -963,7 +1144,7 @@ fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: &dy
         }
         bail!("{CHANGED_WHILE_CHECKED}, so nothing was changed");
     }
-    let trashed = match to_trash(&p.source) {
+    let trashed = match to_trash(&p.source, &|t| crate::ledger::note_trashing(&p.source, t)) {
         Ok(t) => t,
         Err(e) => {
             if staged_first.is_some() {
@@ -1013,12 +1194,6 @@ fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: &dy
     };
 
     crate::signals::stop_point("replace:placed");
-    // From here on both files are where they belong. On record first: if what follows does
-    // not get done, the record is what the report can be set right by.
-    let source_mtime = std::fs::symlink_metadata(&trashed).ok().and_then(|m| crate::source::modified_seconds(&m));
-    let went = Recorded { modified: source_mtime.or(p.original.modified), ..p.original.clone() };
-    let move_noted = crate::ledger::note_replaced(&crate::ledger::Replacement { original: &p.source, trash: &trashed, output: &p.dest, from: &p.output, source_bytes: p.source_bytes, known: &went, output_bytes: p.output_bytes });
-    crate::signals::stop_point("replace:noted");
     let mut warnings = Vec::new();
     // Through the open file: by name, this would reach whatever has been put there since.
     if copy.as_ref().unwrap_or(&output).file.set_permissions(source_meta.permissions()).is_err() {
@@ -1030,8 +1205,18 @@ fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: &dy
             warnings.push(format!("the copy is in place, but {} is another file by now, so it was left there", p.output.display()));
         } else if let Err(e) = std::fs::remove_file(&p.output) {
             warnings.push(format!("the copy is in place, but {} could not be removed: {e}", p.output.display()));
+        } else {
+            sync_dir(crate::files::folder_of(&p.output));
         }
+        crate::signals::stop_point("replace:removed");
     }
+    // From here on both files are where they belong, and the line on record says that the
+    // replacement is over. If what follows does not get done, the record is what the report
+    // can be set right by.
+    let source_mtime = std::fs::symlink_metadata(&trashed).ok().and_then(|m| crate::source::modified_seconds(&m));
+    let went = Recorded { modified: source_mtime.or(p.original.modified), ..p.original.clone() };
+    let move_noted = crate::ledger::note_replaced(&crate::ledger::Replacement { original: &p.source, trash: &trashed, output: &p.dest, from: &p.output, source_bytes: p.source_bytes, known: &went, output_bytes: p.output_bytes });
+    crate::signals::stop_point("replace:noted");
     if let Err(e) = &move_noted {
         warnings.push(format!("av1opt's own record of this could not be written ({e:#}), so the page will not offer to put the original back; `av1opt replace --undo` in a terminal can"));
     }
@@ -1070,11 +1255,11 @@ pub fn undo_if(report: &Path, allow_zfs: bool, accept: Accept<Replaced>) -> Resu
 /// [`undo_if`], with `before_moving` called when everything has been checked and nothing moved,
 /// and `before_report` once both files are back and on record, before the report is rewritten.
 fn undo_watched(report: &Path, allow_zfs: bool, accept: Accept<Replaced>, before_moving: &dyn Fn(), before_report: &dyn Fn()) -> Result<Replaced> {
-    let _lock = lock(report)?;
+    let mut held = vec![lock(report)?];
     let first = check(report);
     let d = match first {
-        Check::Replaced(d) if d.can_undo => d,
-        first => match set_right(report)? {
+        Check::Replaced(d) if d.can_undo && !under_way(report) => d,
+        first => match set_right(report, allow_zfs, &mut held)? {
             // What was asked is done already, by an undo whose report was left behind: what
             // `accept` would compare with the record, the record has been compared with.
             Some(Stranded::Undone) => match first {
@@ -1131,6 +1316,14 @@ fn undo_watched(report: &Path, allow_zfs: bool, accept: Accept<Replaced>, before
     if !original.is_at(&d.trash) || !original.untouched() {
         bail!("the file in the trash was changed or replaced while it was being checked, so nothing was moved");
     }
+    let on_record = crate::ledger::load().entry(&d.dest, &d.source).and_then(|e| e.made.clone()).filter(|m| m.output_bytes == d.output_bytes).and_then(|m| m.output_sha256);
+    let output_sha256 = match on_record {
+        Some(hash) => hash,
+        None => av1.sha256().with_context(|| format!("cannot read {}, so nothing was moved", d.dest.display()))?,
+    };
+    let undoing = crate::ledger::Undoing { source: &d.source, dest: &d.dest, back_to: &d.from, trash: &d.trash, source_bytes: d.source_bytes, known: &d.original, output_bytes: d.output_bytes, output_sha256: &output_sha256 };
+    crate::ledger::note_undoing(&undoing).context("av1opt's own record could not be written, and an undo stopped half-way could not be put right without it, so nothing was moved")?;
+    crate::signals::stop_point("undo:begun");
     let moved = if d.from == d.dest { None } else { Some(move_open(&av1, &d.dest, &d.from, d.output_bytes)?) };
     crate::signals::stop_point("undo:moved");
     if let Err(e) = trash::restore_if(&d.trash, &d.source, &|m| original.is(m)) {
@@ -1164,6 +1357,13 @@ fn undo_watched(report: &Path, allow_zfs: bool, accept: Accept<Replaced>, before
     }
     write_report(report, &r).context("both files are back, but the report could not be updated, so it still says that the original was replaced; `av1opt replace` or the page sets it right by av1opt's record")?;
     Ok(d)
+}
+
+/// Whether av1opt's record has a replacement or an undo of the original of `report` under way:
+/// its line was written before its first move, and nothing after it says it ended.
+fn under_way(report: &Path) -> bool {
+    let source = read_report(report).ok().and_then(|r| full_path(&r, "input").ok());
+    source.is_some_and(|s| crate::ledger::load().under_way(&s).is_some())
 }
 
 /// The reports under some folders (never looking into av1opt's own work folders).
@@ -1265,7 +1465,7 @@ fn run_watched(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_
     // A pair whose report was left behind, or whose last move was cut off half-way, is set right
     // first when files may be changed, so that what is listed and done goes by where the files
     // are; when they may not, the list says what would be done about it.
-    let mut set_right_any = false;
+    let (mut set_right_any, mut not_set_right) = (false, 0);
     for report in &reports {
         let Ok(r) = read_report(report) else { continue };
         let behind = stranded(report, &r, &ledger, false).is_some();
@@ -1273,22 +1473,43 @@ fn run_watched(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_
         if !behind && cut.is_none() {
             continue;
         }
-        if !go {
-            if let Some(cut) = cut {
-                println!("{}: {}", report.display(), cut.told());
+        if let Some(cut) = &cut
+            && let Some(told) = cut.told()
+        {
+            if cut.left == Left::Unknown {
+                println!("{}: {told}", report.display());
+                continue;
             }
+            if !allow_zfs && cut.on_zfs() {
+                println!("{}: {told}; that is on ZFS, so it is left as it is (--allow-zfs puts it right there too)", report.display());
+                continue;
+            }
+            if !go {
+                println!("{}: {told}; --apply does that first", report.display());
+                continue;
+            }
+        }
+        if !go {
             continue;
         }
-        match lock(report).and_then(|_held| set_right(report)) {
+        let mut held = Vec::new();
+        match lock(report).and_then(|l| {
+            held.push(l);
+            set_right(report, allow_zfs, &mut held)
+        }) {
             Ok(Some(_)) => {
                 set_right_any = true;
-                match cut {
-                    Some(cut) => println!("set right {}: {}", report.display(), cut.told().replace("with --apply the files are put back", "the files were put back")),
-                    None => println!("set right {}: its report was behind what av1opt's record and the files show", report.display()),
+                match cut.as_ref().and_then(CutOff::done) {
+                    Some(done) => println!("put right {}: {done}", report.display()),
+                    None if behind => println!("put right {}: its report was behind what av1opt's record and the files show", report.display()),
+                    None => {}
                 }
             }
             Ok(None) => {}
-            Err(e) => eprintln!("warning: {} could not be set right: {e:#}", report.display()),
+            Err(e) => {
+                not_set_right += 1;
+                eprintln!("FAILED to put right {}: {e:#}", report.display());
+            }
         }
     }
     if set_right_any {
@@ -1394,7 +1615,7 @@ fn run_watched(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_
         for p in &ready {
             // Outside the folders named, all of the output has to be what the record says.
             let accept = |p: &Plan, output: &OpenFile| if named.holds(&p.source) { Ok(()) } else { crate::ledger::load().check_ready(p, Some(output)).map_err(|why| format!("{} ({why})", outside_named(&p.source))) };
-            match apply_judging(&p.report, allow_zfs, judging, &trash::trash, &accept, before_report) {
+            match apply_judging(&p.report, allow_zfs, judging, &trash::trash_noting, &accept, before_report) {
                 Ok(Done { report_behind: Some(why), source_bytes, .. }) => {
                     (done, behind) = (done + 1, behind + 1);
                     trashed += source_bytes;
@@ -1422,6 +1643,9 @@ fn run_watched(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_
     }
     if behind > 0 {
         bail!("{} not be updated, and still say that nothing was replaced; the lines starting with FAILED above say where each file is and what puts it back", plural(behind, "report could", "reports could"));
+    }
+    if not_set_right > 0 {
+        bail!("{} stopped half-way could not be put right; the lines starting with FAILED above say which and why", plural(not_set_right, "pair", "pairs"));
     }
     Ok(())
 }
@@ -1691,7 +1915,7 @@ mod tests {
 
         fn apply(&self, report: &Path) -> Result<Done> {
             let home = self.dir.join("Trash");
-            apply_with(report, true, &|p| trash::trash_with(p, Some(&home), 1000, "2026-11-10T22:15:03".into()))
+            apply_with(report, true, &|p, n| trash::trash_with_noting(p, Some(&home), 1000, "2026-11-10T22:15:03".into(), n))
         }
 
         fn lib(&self, name: &str) -> PathBuf {
@@ -1760,7 +1984,7 @@ mod tests {
         let report = f.encode("a.mp4", "a.mkv", 1000, 400);
         let output = f.out("a.mkv");
         let hash_seen = std::cell::RefCell::new(String::new());
-        let err = apply_judging(&report, true, Judging::default(), &trash::trash, &|_, opened| {
+        let err = apply_judging(&report, true, Judging::default(), &trash::trash_noting, &|_, opened| {
             *hash_seen.borrow_mut() = opened.sha256().unwrap();
             swap_for_another_file(&output);
             Ok(())
@@ -1781,7 +2005,7 @@ mod tests {
         // File times move with the kernel's clock tick: a write in the tick that made the file
         // would leave no mark to go by.
         std::thread::sleep(std::time::Duration::from_millis(30));
-        let err = apply_judging(&report, true, Judging::default(), &trash::trash, &|_, _| {
+        let err = apply_judging(&report, true, Judging::default(), &trash::trash_noting, &|_, _| {
             std::fs::write(&output, vec![b'e'; 400]).unwrap();
             Ok(())
         }, &|| {})
@@ -1797,8 +2021,8 @@ mod tests {
         let f = Fix::new("swap-file");
         let report = f.encode("a.mp4", "a.mkv", 1000, 400);
         let (output, dest) = (f.out("a.mkv"), f.lib("a.mkv"));
-        let err = apply_with(&report, true, &|p| {
-            let t = trash::trash_with(p, Some(&home(&f)), 1000, "2026-11-10T22:15:03".into())?;
+        let err = apply_with(&report, true, &|p, n| {
+            let t = trash::trash_with_noting(p, Some(&home(&f)), 1000, "2026-11-10T22:15:03".into(), n)?;
             swap_for_another_file(&output);
             Ok(t)
         })
@@ -1818,8 +2042,8 @@ mod tests {
         std::fs::write(&victim, b"private").unwrap();
         std::fs::set_permissions(&victim, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
         std::fs::set_permissions(f.lib("a.mp4"), std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
-        let err = apply_with(&report, true, &|p| {
-            let t = trash::trash_with(p, Some(&home(&f)), 1000, "2026-11-10T22:15:03".into())?;
+        let err = apply_with(&report, true, &|p, n| {
+            let t = trash::trash_with_noting(p, Some(&home(&f)), 1000, "2026-11-10T22:15:03".into(), n)?;
             swap_for_a_link(&output, &victim);
             Ok(t)
         })
@@ -2023,7 +2247,7 @@ mod tests {
         let source = f.lib("a.mp4");
         record_whole_hash(&report, &source);
         std::thread::sleep(std::time::Duration::from_millis(30));
-        let err = apply_judging(&report, true, Judging::default(), &trash::trash, &|_, _| {
+        let err = apply_judging(&report, true, Judging::default(), &trash::trash_noting, &|_, _| {
             std::os::unix::fs::FileExt::write_all_at(&File::options().write(true).open(&source).unwrap(), b"x", 999).unwrap();
             Ok(())
         }, &|| {})
@@ -2038,9 +2262,9 @@ mod tests {
         record_whole_hash(&report, &source);
         std::thread::sleep(std::time::Duration::from_millis(30));
         let home = f.dir.join("Trash");
-        let err = apply_with(&report, true, &|p| {
+        let err = apply_with(&report, true, &|p, n| {
             std::os::unix::fs::FileExt::write_all_at(&File::options().write(true).open(p).unwrap(), b"x", 999).unwrap();
-            trash::trash_with(p, Some(&home), 1000, "2026-11-10T22:15:03".into())
+            trash::trash_with_noting(p, Some(&home), 1000, "2026-11-10T22:15:03".into(), n)
         })
         .unwrap_err();
         assert_eq!(err.to_string(), "the original changed while it was being checked; it is back in its place");
@@ -2055,7 +2279,7 @@ mod tests {
         let run = |f: &Fix, report: &Path, reads: &WholeReads| {
             let judging = Judging { remember: Some(reads), ..Judging::default() };
             assert!(matches!(check_judging(report, judging), Check::Ready(_)), "listed first, as the command does");
-            apply_judging(report, true, judging, &|p| trash::trash_with(p, Some(&home(f)), 1000, "2026-11-10T22:15:03".into()), &|_, _| Ok(()), &|| {})
+            apply_judging(report, true, judging, &|p, n| trash::trash_with_noting(p, Some(&home(f)), 1000, "2026-11-10T22:15:03".into(), n), &|_, _| Ok(()), &|| {})
         };
         // Its date as recorded: the list leaves the reading to the replacement.
         let f = Fix::new("once-same-date");
@@ -2083,7 +2307,7 @@ mod tests {
         let judging = Judging { remember: Some(&reads), ..Judging::default() };
         assert!(matches!(check_judging(&report, judging), Check::Ready(_)));
         set_time(&f.lib("a.mp4"), time - 2000);
-        apply_judging(&report, true, judging, &|p| trash::trash_with(p, Some(&home(&f)), 1000, "2026-11-10T22:15:03".into()), &|_, _| Ok(()), &|| {}).unwrap();
+        apply_judging(&report, true, judging, &|p, n| trash::trash_with_noting(p, Some(&home(&f)), 1000, "2026-11-10T22:15:03".into(), n), &|_, _| Ok(()), &|| {}).unwrap();
         assert_eq!(reads.reads_made(), 2);
     }
 
@@ -2091,7 +2315,7 @@ mod tests {
     fn what_is_refused_at_the_last_moment_moves_nothing() {
         let f = Fix::new("refused");
         let report = f.encode("a.mp4", "a.mkv", 1000, 400);
-        let err = apply_judging(&report, true, Judging::default(), &trash::trash, &|_, _| Err("not this one".into()), &|| {}).unwrap_err();
+        let err = apply_judging(&report, true, Judging::default(), &trash::trash_noting, &|_, _| Err("not this one".into()), &|| {}).unwrap_err();
         assert_eq!(err.to_string(), "not this one");
         assert!(f.lib("a.mp4").exists() && f.out("a.mkv").exists());
         f.apply(&report).unwrap();
@@ -2378,7 +2602,7 @@ mod tests {
         let f = Fix::new("zfs");
         let report = f.encode("pool.mp4", "pool.mkv", 1000, 400);
         let home = f.dir.join("Trash");
-        let to_trash = |p: &Path| trash::trash_with(p, Some(&home), 1000, "2026-11-10T22:15:03".into());
+        let to_trash = |p: &Path, n: trash::BeforeMove| trash::trash_with_noting(p, Some(&home), 1000, "2026-11-10T22:15:03".into(), n);
         let zfs = |dirs: &[&str]| crate::fsguard::ZFS_IN_TESTS.set(dirs.iter().map(|d| f.dir.join(d)).collect());
 
         // The original's folder on ZFS: neither replacing nor the command that lists and
@@ -2425,7 +2649,7 @@ mod tests {
     fn a_trash_that_refuses_changes_nothing() {
         let f = Fix::new("no-trash");
         let report = f.encode("keep.mp4", "keep.mkv", 1000, 400);
-        let err = apply_with(&report, false, &|_| bail!("no trash on this drive")).unwrap_err();
+        let err = apply_with(&report, false, &|_, _| bail!("no trash on this drive")).unwrap_err();
         assert!(format!("{err:#}").contains("nothing was changed"), "{err:#}");
         assert_eq!(std::fs::read(f.lib("keep.mp4")).unwrap(), vec![b's'; 1000]);
         assert_eq!(std::fs::read(f.out("keep.mkv")).unwrap(), vec![b'o'; 400]);
@@ -2439,8 +2663,8 @@ mod tests {
         let report = f.encode("r.mp4", "r.mkv", 1000, 400);
         let (home, dest) = (f.dir.join("Trash"), f.lib("r.mkv"));
         // Something lands on the new name between the check and the rename.
-        let err = apply_with(&report, false, &|p| {
-            let t = trash::trash_with(p, Some(&home), 1000, "2026-11-10T22:15:03".into())?;
+        let err = apply_with(&report, false, &|p, n| {
+            let t = trash::trash_with_noting(p, Some(&home), 1000, "2026-11-10T22:15:03".into(), n)?;
             std::fs::write(&dest, b"someone else's")?;
             Ok(t)
         })
@@ -2802,7 +3026,7 @@ mod tests {
         // A hidden copy left by a killed run is thrown away, never taken for the output; and
         // when the trash refuses, the fresh copy goes too and both files stay.
         std::fs::write(f.lib(".av1opt-far.mkv.part"), b"half a copy").unwrap();
-        assert!(apply_with(&report, false, &|_| bail!("no trash on this drive")).is_err());
+        assert!(apply_with(&report, false, &|_, _| bail!("no trash on this drive")).is_err());
         assert!(o.exists() && f.lib("far.mp4").exists());
         assert_eq!(std::fs::read_dir(f.dir.join("lib")).unwrap().count(), 1);
         std::fs::write(f.lib(".av1opt-far.mkv.part"), b"half a copy").unwrap();
@@ -3012,7 +3236,7 @@ mod tests {
         let report = f.encode("a.mp4", "a.mkv", 1000, 400);
         on_record(&report);
         let home = f.dir.join("Trash");
-        let to_trash = |p: &Path| trash::trash_with(p, Some(&home), 1000, "2026-11-10T22:15:03".into());
+        let to_trash = |p: &Path, n: trash::BeforeMove| trash::trash_with_noting(p, Some(&home), 1000, "2026-11-10T22:15:03".into(), n);
         killed(|kill| drop(apply_judging(&report, true, Judging::default(), &to_trash, &|_, _| Ok(()), kill)));
         assert!(!f.lib("a.mp4").exists() && f.lib("a.mkv").exists() && !says_replaced(&report));
 
@@ -3022,7 +3246,7 @@ mod tests {
         assert!(matches!(check_for_list_on_record(&report, &ledger), Check::Replaced(d) if d.can_undo));
         // Nothing is put right on a word the files do not bear out.
         std::fs::write(f.lib("a.mkv"), vec![b'x'; 400]).unwrap();
-        assert!(set_right(&report).unwrap().is_none() && !says_replaced(&report));
+        assert!(set_right(&report, true, &mut Vec::new()).unwrap().is_none() && !says_replaced(&report));
         std::fs::write(f.lib("a.mkv"), vec![b'o'; 400]).unwrap();
 
         undo(&report, true).unwrap();
@@ -3066,7 +3290,7 @@ mod tests {
         on_record(&report);
         let unreadable = || std::fs::set_permissions(&report, std::fs::Permissions::from_mode(0o000)).unwrap();
         let home = f.dir.join("Trash");
-        let to_trash = |p: &Path| trash::trash_with(p, Some(&home), 1000, "2026-11-10T22:15:03".into());
+        let to_trash = |p: &Path, n: trash::BeforeMove| trash::trash_with_noting(p, Some(&home), 1000, "2026-11-10T22:15:03".into(), n);
         let done = apply_judging(&report, true, Judging::default(), &to_trash, &|_, _| Ok(()), &unreadable).unwrap();
         std::fs::set_permissions(&report, std::fs::Permissions::from_mode(0o644)).unwrap();
         let why = done.report_behind.unwrap();
@@ -3325,21 +3549,16 @@ mod tests {
         }
     }
 
-    // ---- Proofs for the review of `crash-points` -------------------------------------------
-    // Each of these states the behaviour a reviewer expects and FAILS on `crash-points` as it
-    // stands (aa34f6e). They are ignored so that the suite stays green; run them with
-    // `cargo test --release --features ui --lib proof_ -- --ignored --test-threads 1`.
-
     fn hand_trash(f: &Fix, name: &str) -> PathBuf {
         trash::trash_with(&f.lib(name), Some(&f.dir.join("Trash")), 1000, "2026-11-20T10:00:00".into()).unwrap()
     }
 
     /// No run of av1opt was stopped: the person threw the original away with the file manager
-    /// and kept the AV1 file in the output folder. A listing says av1opt was stopped half-way,
-    /// and any `--apply` over these folders takes the file back out of the trash.
+    /// and kept the AV1 file in the output folder. Nothing on record says a replacement was
+    /// under way, so a listing does not say av1opt was stopped half-way, and an `--apply` over
+    /// these folders leaves the file in the trash.
     #[test]
-    #[ignore = "review proof: fails on crash-points aa34f6e until the fault is fixed"]
-    fn proof_an_original_the_person_threw_away_is_not_a_replacement_stopped_half_way() {
+    fn an_original_the_person_threw_away_is_not_taken_for_a_replacement_stopped_half_way() {
         let p = Pair::new("proof-hand-trashed", false, "a.mkv").unwrap();
         let trashed = hand_trash(&p.f, "a.mp4");
         let r = read_report(&p.report).unwrap();
@@ -3348,15 +3567,14 @@ mod tests {
         p.command(true);
         let back = p.f.lib("a.mp4").exists();
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
-        assert!(seen.is_none(), "a listing says: {}", seen.unwrap().told());
+        assert!(seen.is_none(), "a listing says: {:?}", seen.unwrap().told());
         assert!(!back && trashed.exists(), "the original the person threw away is back in the library");
     }
 
-    /// The same, with plain `replace --apply`: the file thrown away comes back, and then goes
-    /// to the trash again with the AV1 file moved out of the output folder into the library.
+    /// The same, with plain `replace --apply`: the pair stays as it is ("the original is gone"),
+    /// the AV1 file in the output folder.
     #[test]
-    #[ignore = "review proof: fails on crash-points aa34f6e until the fault is fixed"]
-    fn proof_an_output_whose_original_was_thrown_away_stays_in_the_output_folder() {
+    fn an_output_whose_original_was_thrown_away_stays_in_the_output_folder() {
         let p = Pair::new("proof-hand-trashed-apply", false, "a.mkv").unwrap();
         hand_trash(&p.f, "a.mp4");
         p.command(false);
@@ -3366,12 +3584,11 @@ mod tests {
     }
 
     /// Two encodes of one original, in two output folders and two containers. The first
-    /// replaced the original, start to finish. The second's report then reads as a replacement
-    /// stopped half-way, and the original is taken out of the first one's trash entry: the
-    /// first replacement can no longer be undone.
+    /// replaced the original, start to finish. The second's report, which says nothing was
+    /// replaced, is not taken for a replacement stopped half-way, and the original stays in
+    /// the first one's trash entry, from where the first replacement can be undone.
     #[test]
-    #[ignore = "review proof: fails on crash-points aa34f6e until the fault is fixed"]
-    fn proof_a_second_output_of_an_original_leaves_the_replacement_by_the_first_alone() {
+    fn a_second_output_of_an_original_leaves_the_replacement_by_the_first_alone() {
         let f = Fix::new("proof-two-outputs");
         record_in(&f);
         let first = f.encode("a.mp4", "a.mkv", 1000, 400);
@@ -3397,10 +3614,9 @@ mod tests {
     }
 
     /// A replacement on ZFS (made with --allow-zfs) was stopped. The next `replace --apply`
-    /// without --allow-zfs moves a file into the folder on ZFS all the same.
+    /// without --allow-zfs leaves it as it is: putting it right writes to that folder.
     #[test]
-    #[ignore = "review proof: fails on crash-points aa34f6e until the fault is fixed"]
-    fn proof_nothing_is_put_back_on_zfs_without_allow_zfs() {
+    fn nothing_of_a_stopped_replacement_is_put_back_on_zfs_without_allow_zfs() {
         let p = Pair::new("proof-zfs", false, "a.mkv").unwrap();
         stopped_at("replace:trashed", || drop(p.f.apply(&p.report)));
         assert!(!p.f.lib("a.mp4").exists());
@@ -3412,11 +3628,10 @@ mod tests {
         assert!(!back, "a file was moved into a folder on ZFS by a run without --allow-zfs");
     }
 
-    /// The same for an undo stopped half-way: the AV1 file is moved (across drives: written)
-    /// into the folder on ZFS by a run without --allow-zfs.
+    /// The same for an undo stopped half-way: the original is not put back into the folder on
+    /// ZFS by a run without --allow-zfs.
     #[test]
-    #[ignore = "review proof: fails on crash-points aa34f6e until the fault is fixed"]
-    fn proof_no_av1_file_is_moved_onto_zfs_without_allow_zfs() {
+    fn nothing_of_a_stopped_undo_is_moved_onto_zfs_without_allow_zfs() {
         let p = Pair::new("proof-zfs-undo", false, "a.mkv").unwrap();
         p.f.apply(&p.report).unwrap();
         stopped_at("undo:moved", || drop(undo(&p.report, true)));
@@ -3431,10 +3646,9 @@ mod tests {
 
     /// What the page calls for "Put the original back" is `undo_if` on that one report. An undo
     /// to another drive that was stopped once its copy was made is still listed as one that can
-    /// be undone, and the page's undo then fails every time: only the command line sets it right.
+    /// be undone, and the page's undo puts that right first and then goes on.
     #[test]
-    #[ignore = "review proof: fails on crash-points aa34f6e until the fault is fixed"]
-    fn proof_the_pages_undo_finishes_an_undo_stopped_after_its_copy() {
+    fn the_pages_undo_goes_on_after_an_undo_stopped_once_its_copy_was_made() {
         let Some(p) = Pair::new("proof-page-undo", true, "a.mkv") else { return crate::tools::skipped("proof-page-undo", "/dev/shm is not another drive here") };
         p.f.apply(&p.report).unwrap();
         stopped_at("move:copied", || drop(undo(&p.report, true)));
@@ -3473,11 +3687,10 @@ mod tests {
 
     /// The output folder is the original's own folder, reached by a second path (a folder
     /// mounted twice; here a link, on a record line written by hand, since `encode` resolves
-    /// links). `from` and `dest` are then one file under two names, it passes for "a copy of
-    /// the one that stays", and the only AV1 file is removed.
+    /// links), and the person threw the original away. `from` and `dest` are one file under two
+    /// names, and the only AV1 file stays.
     #[test]
-    #[ignore = "review proof: fails on crash-points aa34f6e until the fault is fixed"]
-    fn proof_the_only_av1_file_is_not_removed_as_a_copy_of_itself() {
+    fn an_av1_file_reached_by_a_second_path_is_not_taken_for_its_own_copy() {
         let f = Fix::new("proof-one-file-two-names");
         record_in(&f);
         let made = f.encode("a.mp4", "a.mkv", 1000, 400);
@@ -3498,11 +3711,9 @@ mod tests {
 
     /// `replace` on the command line takes pairs that are not on av1opt's record (reports from
     /// before the record, never adopted), and such a replacement can be stopped half-way like
-    /// any other. Nothing puts it right, and nothing says where the original is: the list has
-    /// "the original is gone", as before this branch.
+    /// any other. Its line on record is written all the same, and it is put right.
     #[test]
-    #[ignore = "review proof: fails on crash-points aa34f6e until the fault is fixed"]
-    fn proof_a_replacement_of_a_pair_not_on_record_stopped_half_way_is_at_least_told() {
+    fn a_replacement_of_a_pair_not_on_record_stopped_half_way_is_put_right() {
         let f = Fix::new("proof-not-on-record");
         record_in(&f);
         let report = f.encode("a.mp4", "a.mkv", 1000, 400);
@@ -3510,28 +3721,130 @@ mod tests {
         assert!(!f.lib("a.mp4").exists());
         let named = [f.dir.join("out"), f.dir.join("lib")];
         run_watched(&named, true, true, true, false, false, &|| {}).unwrap();
-        let back = f.lib("a.mp4").exists();
+        let (back, av1) = (std::fs::read(f.lib("a.mp4")).ok(), std::fs::read(f.out("a.mkv")).ok());
         let listed = check(&report);
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
-        assert!(back || matches!(&listed, Check::No(why) if why.contains("trash")), "the original is in the trash and the list says only: {listed:?}");
+        assert_eq!((back, av1), (Some(vec![b's'; 1000]), Some(vec![b'o'; 400])));
+        assert!(matches!(listed, Check::Ready(_)), "{listed:?}");
     }
 
-    /// Not a fault: the recovery is itself stopped (at the one stop point it passes, after its
-    /// copy across drives) and run again, and nothing is lost. The branch has no test of this.
+    /// The recovery is itself stopped at each of its own moves, from each state it puts right,
+    /// and run again, either way: nothing is lost, and the pair ends as asked.
     #[test]
-    fn a_recovery_that_is_itself_stopped_after_its_copy_is_finished_by_the_next_run() {
-        let Some(p) = Pair::new("recovery-stopped", true, "a.mkv") else { return crate::tools::skipped("recovery-stopped", "/dev/shm is not another drive here") };
-        p.f.apply(&p.report).unwrap();
-        stopped_at("undo:moved", || drop(undo(&p.report, true)));
-        p.as_if_its_run_had_ended();
-        // The run that puts it right copies the AV1 file back to the library, and is killed.
-        stopped_at("move:copied", || p.command(true));
-        p.nothing_lost();
-        p.as_if_its_run_had_ended();
-        p.command(true);
-        p.as_before();
-        p.command(false);
-        p.as_replaced();
+    fn a_recovery_that_is_itself_stopped_at_each_of_its_moves_is_finished_by_the_next_run() {
+        let cases: [(&str, bool, bool, &[&'static str]); 7] = [
+            ("replace:trashed", false, false, &["recover:restored"]),
+            ("replace:placed", false, false, &["recover:moved", "recover:restored"]),
+            ("replace:placed", false, true, &["recover:hidden", "recover:moved", "recover:restored"]),
+            ("replace:removed", false, true, &["move:copied", "recover:moved", "recover:restored"]),
+            ("move:copied", true, true, &["recover:hidden", "recover:moved"]),
+            ("undo:moved", true, false, &["recover:restored", "recover:noted"]),
+            ("undo:restored", true, true, &["recover:noted"]),
+        ];
+        for (step, undoing, far, inside) in cases {
+            for &stop in inside {
+                for back in [false, true] {
+                    let name = format!("recovery-{}-{far}-{}-{back}", step.replace(':', "-"), stop.replace(':', "-"));
+                    let Some(p) = Pair::new(&name, far, "a.mkv") else { return crate::tools::skipped(&name, "/dev/shm is not another drive here") };
+                    if undoing {
+                        p.f.apply(&p.report).unwrap();
+                    }
+                    stopped_at(step, || drop(if undoing { undo(&p.report, true).map(drop) } else { p.f.apply(&p.report).map(drop) }));
+                    p.as_if_its_run_had_ended();
+                    stopped_at(stop, || p.command(back));
+                    p.nothing_lost();
+                    p.as_if_its_run_had_ended();
+                    p.command(back);
+                    if back { p.as_before() } else { p.as_replaced() }
+                    p.command(!back);
+                    if back { p.as_replaced() } else { p.as_before() }
+                }
+            }
+        }
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
     }
+
+    #[test]
+    fn a_replacement_stopped_right_after_its_line_on_record_has_moved_nothing_and_goes_on_the_next_time() {
+        goes_on_after("replace:begun", false, false);
+        goes_on_after("replace:begun", false, true);
+    }
+
+    #[test]
+    fn an_undo_stopped_right_after_its_line_on_record_has_moved_nothing_and_goes_on_the_next_time() {
+        goes_on_after("undo:begun", true, false);
+        goes_on_after("undo:begun", true, true);
+    }
+
+    /// Stopped once the original's name in the trash was taken, before it went there: the info
+    /// file of that name, with no file, is this run's, and goes; one of another name stays.
+    #[test]
+    fn an_info_file_a_stopped_replacement_left_in_the_trash_goes_and_no_other() {
+        let p = Pair::new("orphan-info", false, "a.mkv").unwrap();
+        stopped_at("trash:info", || drop(p.f.apply(&p.report)));
+        let info = p.f.dir.join("Trash/info");
+        assert!(info.join("a.mp4.trashinfo").exists());
+        std::fs::write(info.join("b.mp4.trashinfo"), format!("[Trash Info]\nPath={}\nDeletionDate=2026-11-20T10:00:00\n", p.f.lib("b.mp4").display())).unwrap();
+        p.command(true);
+        let left: Vec<String> = std::fs::read_dir(&info).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        assert_eq!(left, ["b.mp4.trashinfo"]);
+        p.as_before();
+    }
+
+    /// The one file at both names (a folder mounted twice: here a link to the folder stands in,
+    /// since a hard link is refused before this is reached) is not removed as a copy of itself.
+    #[test]
+    fn a_file_is_not_removed_as_the_copy_of_itself_under_another_name() {
+        let f = Fix::new("one-file-two-names");
+        std::fs::write(f.lib("a.mkv"), vec![b'o'; 400]).unwrap();
+        std::os::unix::fs::symlink(f.dir.join("lib"), f.dir.join("way")).unwrap();
+        let hash = crate::ledger::sha256_of_file(&f.lib("a.mkv")).unwrap();
+        let e = remove_copy(&f.dir.join("way/a.mkv"), &f.lib("a.mkv"), 400, &hash).unwrap_err();
+        assert!(format!("{e:#}").contains("one file under two names"), "{e:#}");
+        assert_eq!(std::fs::read(f.lib("a.mkv")).unwrap(), vec![b'o'; 400]);
+        // A hard link is no copy either.
+        std::fs::hard_link(f.lib("a.mkv"), f.out("a.mkv")).unwrap();
+        assert!(remove_copy(&f.out("a.mkv"), &f.lib("a.mkv"), 400, &hash).is_err());
+        assert!(f.out("a.mkv").exists() && f.lib("a.mkv").exists());
+        // A real copy goes, and only it.
+        std::fs::remove_file(f.out("a.mkv")).unwrap();
+        std::fs::write(f.out("a.mkv"), vec![b'o'; 400]).unwrap();
+        remove_copy(&f.out("a.mkv"), &f.lib("a.mkv"), 400, &hash).unwrap();
+        assert!(!f.out("a.mkv").exists() && f.lib("a.mkv").exists());
+        assert_eq!(std::fs::read_dir(f.dir.join("out")).unwrap().count(), 0);
+    }
+
+    /// A pair stopped half-way that cannot be put right (here: the original's folder cannot be
+    /// written to) is named, and the run ends in failure, with the files as they were.
+    #[test]
+    fn a_pair_that_could_not_be_put_right_is_named_and_fails_the_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let p = Pair::new("not-put-right", false, "a.mkv").unwrap();
+        stopped_at("replace:trashed", || drop(p.f.apply(&p.report)));
+        let lib = p.f.dir.join("lib");
+        std::fs::set_permissions(&lib, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let done = run_watched(&[p.out.clone(), lib.clone()], true, true, true, false, false, &|| {}).map_err(|e| format!("{e:#}"));
+        std::fs::set_permissions(&lib, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p.nothing_lost();
+        assert!(done.as_ref().is_err_and(|e| e.contains("1 pair stopped half-way could not be put right")), "{done:?}");
+        p.command(true);
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        p.as_before();
+    }
+
+    /// A report rewritten while the pair is being put right is a new file under the report's
+    /// name: it is locked before it takes the name, so that no other run can take the pair then.
+    #[test]
+    fn a_report_set_right_stays_locked_while_the_pair_is_worked_on() {
+        let p = Pair::new("locked-after", false, "a.mkv").unwrap();
+        stopped_at("replace:noted", || drop(p.f.apply(&p.report)));
+        let mut held = vec![lock(&p.report).unwrap()];
+        assert_eq!(set_right(&p.report, true, &mut held).unwrap(), Some(Stranded::Replaced));
+        let second = lock(&p.report).map(drop).map_err(|e| e.to_string());
+        drop(held);
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        assert_eq!(second, Err("this file is being replaced or put back right now".to_string()));
+    }
+
 }

@@ -217,3 +217,12 @@
   don't exist. They go by the video stream's own length now.
 - **ffmpeg ignores `-svtav1-params` names it can't parse.** A typo only prints a warning and the
   encode runs without the option, so parameters are tried on a few generated frames first.
+- **What the files look like is not who left them so.** The first recovery of a replacement
+  stopped half-way went by the files and the record of finished moves alone: an original in
+  the trash, with its AV1 file still in the output folder, was taken for a run stopped
+  between the two moves. That is also what a person leaves who throws the original away by
+  hand and keeps the AV1 file, and the next `replace --apply` took the original back out of
+  the trash; a second output of one original took it out of the trash entry of a finished
+  replacement; one file under two names (a folder mounted twice) passed for a copy of itself.
+  A replacement and an undo now write a line before their first move, and only a pair whose
+  last line is that one is put right.

@@ -54,10 +54,23 @@ pub fn in_a_trash(path: &Path) -> bool {
 }
 
 /// Moves `path` to the trash of the filesystem it is on. Returns where it is now.
+#[cfg(feature = "ui")]
 pub fn trash(path: &Path) -> Result<PathBuf> {
     // SAFETY: getuid has no failure mode and touches no memory.
     let uid = unsafe { libc::getuid() };
     trash_with(path, home_trash().as_deref(), uid, now_local())
+}
+
+/// What is told the name a file is about to have in the trash, before it goes there. If it
+/// fails, the file stays where it is.
+pub type BeforeMove<'a> = &'a dyn Fn(&Path) -> Result<()>;
+
+/// [`trash`], with `before_move` told the file's name in the trash once that name is its own and
+/// before the file goes there.
+pub fn trash_noting(path: &Path, before_move: BeforeMove) -> Result<PathBuf> {
+    // SAFETY: getuid has no failure mode and touches no memory.
+    let uid = unsafe { libc::getuid() };
+    trash_with_noting(path, home_trash().as_deref(), uid, now_local(), before_move)
 }
 
 /// A trash folder and what `Path=` in its info files is relative to (None: absolute paths).
@@ -169,7 +182,12 @@ fn now_local() -> String {
     format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec)
 }
 
+#[cfg(any(feature = "ui", test))]
 pub(crate) fn trash_with(path: &Path, home: Option<&Path>, uid: u32, when: String) -> Result<PathBuf> {
+    trash_with_noting(path, home, uid, when, &|_| Ok(()))
+}
+
+pub(crate) fn trash_with_noting(path: &Path, home: Option<&Path>, uid: u32, when: String, before_move: BeforeMove) -> Result<PathBuf> {
     if !path.is_absolute() {
         bail!("{} is not an absolute path", path.display());
     }
@@ -200,13 +218,14 @@ pub(crate) fn trash_with(path: &Path, home: Option<&Path>, uid: u32, when: Strin
             Err(e) => return Err(e).with_context(|| format!("cannot write to the trash at {}", bin.dir.display())),
         };
         let dest = files.join(&unique);
+        if let Err(e) = f.write_all(text.as_bytes()).and_then(|_| f.sync_all()).map_err(anyhow::Error::from).and_then(|()| before_move(&dest)) {
+            let _ = std::fs::remove_file(&info_path);
+            return Err(e.context(format!("{} was not moved to the trash at {}", path.display(), bin.dir.display())));
+        }
+        crate::signals::stop_point("trash:info");
         // A leftover file without its info file: don't replace it.
         // (In one step: a file put there between a look and the move would be replaced.)
-        let moved = f.write_all(text.as_bytes()).and_then(|_| f.sync_all()).and_then(|_| {
-            crate::signals::stop_point("trash:info");
-            rename_new(path, &dest)
-        });
-        match moved {
+        match rename_new(path, &dest) {
             Ok(()) => return Ok(dest),
             Err(e) => {
                 let _ = std::fs::remove_file(&info_path);
@@ -352,36 +371,19 @@ fn holds_with(trashed: &Path, original: &Path, is_top: &dyn Fn(&Path) -> bool) -
     inner().unwrap_or(false)
 }
 
-/// The files in the trash that say they came from `original`: in the user's own trash and in
-/// the trash folders at the top of the original's drive, where [`trash`] puts a file of that
-/// place. The newest first. What each is has yet to be shown (see [`holds`]): an info file
-/// alone is no proof.
-pub fn entries_from(original: &Path) -> Vec<PathBuf> {
-    // SAFETY: getuid has no failure mode and touches no memory.
-    let uid = unsafe { libc::getuid() };
-    let mut bins: Vec<PathBuf> = home_trash().into_iter().collect();
-    let folder = original.parent().unwrap_or(Path::new("/"));
-    if let Ok(dev) = std::fs::metadata(folder).map(|m| m.dev()) {
-        let top = std::iter::once(folder).chain(folder.ancestors().skip(1)).take_while(|d| std::fs::metadata(d).is_ok_and(|m| m.dev() == dev)).last();
-        if let Some(top) = top {
-            bins.push(top.join(".Trash").join(uid.to_string()));
-            bins.push(top.join(format!(".Trash-{uid}")));
-        }
+/// Removes the info file of `trashed` where no file came with it: what a run stopped between
+/// writing the info file and moving the file leaves. Only for a name av1opt's record says that
+/// run took, and only if the info file says it is for `original`.
+pub fn drop_info_left_alone(trashed: &Path, original: &Path) {
+    let (Some(files), Some(name)) = (trashed.parent().filter(|d| d.file_name().is_some_and(|n| n == "files")), trashed.file_name()) else { return };
+    if std::fs::symlink_metadata(trashed).is_ok() || !says_came_from(trashed, original) {
+        return;
     }
-    let mut found: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-    for bin in bins {
-        for entry in std::fs::read_dir(bin.join("info")).into_iter().flatten().flatten() {
-            use std::os::unix::ffi::OsStrExt;
-            let name = entry.file_name();
-            let Some(stem) = name.as_bytes().strip_suffix(b".trashinfo") else { continue };
-            let trashed = bin.join("files").join(std::ffi::OsStr::from_bytes(stem));
-            if says_came_from(&trashed, original) {
-                found.push((entry.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH), trashed));
-            }
-        }
+    let mut info_name = name.to_os_string();
+    info_name.push(".trashinfo");
+    if let Some(bin) = files.parent() {
+        let _ = std::fs::remove_file(bin.join("info").join(info_name));
     }
-    found.sort_by_key(|f| std::cmp::Reverse(f.0));
-    found.into_iter().map(|(_, p)| p).collect()
 }
 
 /// Puts a file `trash` moved away back at `to` and drops its info file. Nothing at `to` is

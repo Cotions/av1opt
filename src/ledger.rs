@@ -149,6 +149,42 @@ enum Event {
     },
     /// The one look at the encode history, made the first time the page starts with this record.
     TakenOver { history_lines: usize, taken: usize },
+    /// Written, and on the drive, before the first move of a replacement: what the next run
+    /// needs to put the files right if this one is stopped half-way. Only a pair whose last
+    /// line is this one (or the next) was being replaced when it stopped; any other state of
+    /// the files is not av1opt's doing, and is left as it is.
+    Replacing {
+        source: PathBuf,
+        /// Where the AV1 file is.
+        from: PathBuf,
+        /// Where it goes.
+        output: PathBuf,
+        /// The original as it was checked.
+        #[serde(flatten)]
+        original: Original,
+        output_bytes: u64,
+        output_sha256: String,
+    },
+    /// The name the original is about to have in the trash, written once its info file holds
+    /// that name and before the original goes there.
+    Trashing { source: PathBuf, trash: PathBuf },
+    /// Written before the first move of an undo, as [`Event::Replacing`] is.
+    Undoing {
+        source: PathBuf,
+        /// Where the AV1 file is.
+        output: PathBuf,
+        /// Where it goes back to.
+        back_to: PathBuf,
+        trash: PathBuf,
+        /// The original as it went to the trash.
+        #[serde(flatten)]
+        original: Original,
+        output_bytes: u64,
+        output_sha256: String,
+    },
+    /// The replacement or undo under way for this original was put right, or found to have
+    /// moved nothing: nothing is under way for it any more.
+    Settled { source: PathBuf },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,6 +234,25 @@ pub struct Entry {
     pub undone: Option<Moved>,
 }
 
+/// A replacement or an undo that was under way when the record was last written to: its line
+/// was written before its first move, and nothing after it says it ended.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnderWay {
+    /// An undo, not a replacement.
+    pub undoing: bool,
+    /// The AV1 file's place in the output folder: where it was before the replacement, and goes
+    /// back to on an undo.
+    pub from: PathBuf,
+    /// Its place in the original's folder.
+    pub dest: PathBuf,
+    /// Where the original is in the trash, or is about to be; for a replacement, None until
+    /// that was written down.
+    pub trash: Option<PathBuf>,
+    pub original: Original,
+    pub output_bytes: u64,
+    pub output_sha256: String,
+}
+
 /// How an output stands for being taken on record.
 #[derive(Debug, PartialEq)]
 pub enum Standing {
@@ -216,6 +271,8 @@ pub struct Ledger {
     taken_over: bool,
     /// Why the record on disk was not used.
     problem: Option<String>,
+    /// By original.
+    under_way: HashMap<PathBuf, UnderWay>,
 }
 
 impl Ledger {
@@ -233,7 +290,27 @@ impl Ledger {
     }
 
     fn apply(&mut self, event: Event) {
+        // What ends a move under way for an original: its end on record, or a new encode in the
+        // place the AV1 file was to come from.
+        match &event {
+            Event::Replaced { source, .. } | Event::Undone { source, .. } | Event::Settled { source } => drop(self.under_way.remove(source)),
+            Event::Encoded { source, output, .. } if self.under_way.get(source).is_some_and(|u| u.from == *output) => drop(self.under_way.remove(source)),
+            _ => {}
+        }
         match event {
+            Event::Replacing { source, from, output, original, output_bytes, output_sha256 } => {
+                self.under_way.insert(source, UnderWay { undoing: false, from, dest: output, trash: None, original, output_bytes, output_sha256 });
+            }
+            Event::Trashing { source, trash } => {
+                // The last name tried is the one the original went to, if it went.
+                if let Some(u) = self.under_way.get_mut(&source).filter(|u| !u.undoing) {
+                    u.trash = Some(trash);
+                }
+            }
+            Event::Undoing { source, output, back_to, trash, original, output_bytes, output_sha256 } => {
+                self.under_way.insert(source, UnderWay { undoing: true, from: back_to, dest: output, trash: Some(trash), original, output_bytes, output_sha256 });
+            }
+            Event::Settled { .. } => {}
             Event::Encoded { output, report: _, source, original, output_bytes, output_sha256 } => {
                 self.outputs.insert(output, Entry { source, made: Some(Made { original, output_bytes, output_sha256 }), replaced: None, undone: None });
             }
@@ -271,6 +348,12 @@ impl Ledger {
     /// place. An output put back by the command line that av1opt never saw made is not one.
     pub fn entry(&self, output: &Path, source: &Path) -> Option<&Entry> {
         self.known_at(output).filter(|e| e.source == source)
+    }
+
+    /// The replacement or undo of `source` that was under way when the record was last
+    /// written to, if one was.
+    pub fn under_way(&self, source: &Path) -> Option<&UnderWay> {
+        self.under_way.get(source)
     }
 
     /// Why the record on disk is not being used, if it is not.
@@ -546,6 +629,76 @@ pub fn note_replaced(r: &Replacement) -> Result<()> {
 
 pub fn note_undone(source: &Path, output: &Path, back_to: &Path) -> Result<()> {
     add(Event::Undone { source: source.to_path_buf(), output: output.to_path_buf(), back_to: back_to.to_path_buf() })
+}
+
+/// A replacement about to make its first move, as [`Event::Replacing`] records it.
+pub struct Replacing<'a> {
+    pub source: &'a Path,
+    pub from: &'a Path,
+    pub dest: &'a Path,
+    pub source_bytes: u64,
+    pub known: &'a Recorded,
+    pub output_bytes: u64,
+    pub output_sha256: &'a str,
+}
+
+/// Records, on the drive, that a replacement is about to make its first move. A replacement
+/// that cannot be recorded so does not start: if it were stopped half-way, nothing would tell
+/// what it had done from what someone else did to the files.
+pub fn note_replacing(r: &Replacing) -> Result<()> {
+    add_where_kept(Event::Replacing {
+        source: r.source.to_path_buf(),
+        from: r.from.to_path_buf(),
+        output: r.dest.to_path_buf(),
+        original: Original::new(r.source_bytes, r.known),
+        output_bytes: r.output_bytes,
+        output_sha256: r.output_sha256.to_string(),
+    })
+}
+
+/// Records the name the original is about to have in the trash.
+pub fn note_trashing(source: &Path, trash: &Path) -> Result<()> {
+    add_where_kept(Event::Trashing { source: source.to_path_buf(), trash: trash.to_path_buf() })
+}
+
+/// An undo about to make its first move, as [`Event::Undoing`] records it.
+pub struct Undoing<'a> {
+    pub source: &'a Path,
+    pub dest: &'a Path,
+    pub back_to: &'a Path,
+    pub trash: &'a Path,
+    pub source_bytes: u64,
+    pub known: &'a Recorded,
+    pub output_bytes: u64,
+    pub output_sha256: &'a str,
+}
+
+/// Records, on the drive, that an undo is about to make its first move; see [`note_replacing`].
+pub fn note_undoing(u: &Undoing) -> Result<()> {
+    add_where_kept(Event::Undoing {
+        source: u.source.to_path_buf(),
+        output: u.dest.to_path_buf(),
+        back_to: u.back_to.to_path_buf(),
+        trash: u.trash.to_path_buf(),
+        original: Original::new(u.source_bytes, u.known),
+        output_bytes: u.output_bytes,
+        output_sha256: u.output_sha256.to_string(),
+    })
+}
+
+/// Records that nothing is under way for `source` any more.
+pub fn note_settled(source: &Path) -> Result<()> {
+    add_where_kept(Event::Settled { source: source.to_path_buf() })
+}
+
+/// [`add`] for a line a move goes by: with no record to write it to (no data folder) that is an
+/// error, not a line silently left out.
+fn add_where_kept(event: Event) -> Result<()> {
+    #[cfg(not(test))]
+    if folder().is_none() {
+        bail!("there is no folder for av1opt's own record (neither XDG_DATA_HOME nor HOME is set)");
+    }
+    add(event)
 }
 
 /// Gets the record's folder ready for `av1opt adopt`, as the page does when it starts: one an

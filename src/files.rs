@@ -310,11 +310,39 @@ fn has_access_list_open(file: &std::fs::File) -> bool {
     size > 0
 }
 
-/// Whether users other than this one may write to the open file or folder `file`, of mode
-/// `mode` and group `gid`: as [`others_may_rename_in`] judges a folder's group, sticky bit
-/// aside.
-fn others_may_write(file: &std::fs::File, mode: u32, gid: u32) -> bool {
-    mode & 0o002 != 0 || (mode & 0o020 != 0 && (has_access_list_open(file) || !group_is_mine_alone(gid)))
+/// Who besides this user may write to the open file or folder `file`, of mode `mode` and group
+/// `gid`, as [`others_may_rename_in`] judges a folder's group, sticky bit aside; told the way a
+/// person can act on it: everyone, the members of its group (named), or those its access list
+/// names. None if nobody.
+fn who_else_may_write(file: &std::fs::File, mode: u32, gid: u32) -> Option<String> {
+    if mode & 0o002 != 0 {
+        return Some("every user".into());
+    }
+    if mode & 0o020 == 0 {
+        return None;
+    }
+    if has_access_list_open(file) {
+        return Some("the users its access list names".into());
+    }
+    (!group_is_mine_alone(gid)).then(|| match group_name(gid) {
+        Some(name) => format!("the members of the group {name}"),
+        None => format!("the members of group number {gid}"),
+    })
+}
+
+/// The name of the group `gid`, from the system's lists.
+fn group_name(gid: u32) -> Option<String> {
+    let mut buffer = vec![0 as libc::c_char; 1 << 16];
+    // SAFETY: the struct is filled by the call from the buffer given, which outlives the one use
+    // of the pointer in it; a result of null or an error means nothing was found.
+    unsafe {
+        let mut group: libc::group = std::mem::zeroed();
+        let mut found = std::ptr::null_mut();
+        if libc::getgrgid_r(gid, &mut group, buffer.as_mut_ptr(), buffer.len(), &mut found) != 0 || found.is_null() {
+            return None;
+        }
+        Some(std::ffi::CStr::from_ptr(group.gr_name).to_string_lossy().into_owned())
+    }
 }
 
 /// Why a user other than this one may have put the plain file `file`, opened from `path`,
@@ -352,8 +380,8 @@ fn others_may_have_written_of(path: &Path, file: &std::fs::File, me: u32, owners
     if meta.nlink() != 1 {
         return Some("it has other names on the drive too (hard links)".into());
     }
-    if others_may_write(file, meta.mode(), meta.gid()) {
-        return Some("other users can write to it".into());
+    if let Some(who) = who_else_may_write(file, meta.mode(), meta.gid()) {
+        return Some(format!("other users can write to it ({who})"));
     }
     // The folder as it is reached now, links on the way followed (an output folder named by a
     // link in the home folder, say): it is that folder that is judged, and it has to hold this
@@ -384,8 +412,14 @@ fn others_may_have_written_of(path: &Path, file: &std::fs::File, me: u32, owners
     if found.uid() != me && found.uid() != 0 {
         return Some(format!("its folder {} belongs to another user", dir.display()));
     }
-    if found.mode() & 0o1000 == 0 && others_may_write(&folder, found.mode(), found.gid()) {
-        return Some(format!("other users can write to its folder {}, which has no sticky bit to keep them from renaming files of yours there", dir.display()));
+    if found.mode() & 0o1000 == 0
+        && let Some(who) = who_else_may_write(&folder, found.mode(), found.gid())
+    {
+        return Some(format!(
+            "other users can write to its folder {} ({who}), which has no sticky bit to keep them from renaming files of yours there; `chmod +t {}` gives it one, if everyone who uses the folder only ever renames or removes their own files in it",
+            dir.display(),
+            dir.display()
+        ));
     }
     None
 }
@@ -1166,7 +1200,7 @@ pub(crate) mod tests {
         // A file and a folder that look like another user's.
         assert_eq!(judged(my_user() + 1).as_deref(), Some("it belongs to another user"));
         set(&path, 0o666);
-        assert_eq!(judged(my_user()).as_deref(), Some("other users can write to it"));
+        assert_eq!(judged(my_user()).as_deref(), Some("other users can write to it (every user)"));
         set(&path, 0o644);
         set(&dir, 0o777);
         assert!(judged(my_user()).is_some_and(|why| why.starts_with("other users can write to its folder")));
@@ -1183,6 +1217,35 @@ pub(crate) mod tests {
         std::fs::rename(&path, dir.join("moved")).unwrap();
         std::fs::write(&path, b"{}").unwrap();
         assert!(others_may_have_written(&path, &opened).is_some_and(|why| why.contains("moved or replaced")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A group this user is in besides their own, if there is one.
+    fn shared_group() -> Option<u32> {
+        let mut groups = vec![0 as libc::gid_t; 256];
+        // SAFETY: getgroups writes at most as many numbers as it is told there is room for, and
+        // getegid has no failure mode.
+        let (count, own) = unsafe { (libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()), libc::getegid()) };
+        groups[..count.max(0) as usize].iter().copied().find(|g| *g != own && !group_is_mine_alone(*g))
+    }
+
+    #[test]
+    fn a_folder_shared_with_a_group_is_told_by_the_groups_name_with_the_ways_out() {
+        let Some(group) = shared_group() else { return crate::tools::skipped("group-share", "this user is in no group but their own") };
+        let dir = room("group-share");
+        let path = dir.join("a.av1opt.json");
+        std::fs::write(&path, b"{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::chown(&dir, None, Some(group)).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o2775)).unwrap();
+        let why = others_may_have_written(&path, &std::fs::File::open(&path).unwrap()).unwrap();
+        let name = group_name(group).unwrap();
+        assert!(why.contains(&format!("({})", format_args!("the members of the group {name}"))) && why.contains(&format!("`chmod +t {}`", dir.display())), "{why}");
+        // Which, done, settles it.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o3775)).unwrap();
+        assert_eq!(others_may_have_written(&path, &std::fs::File::open(&path).unwrap()), None);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(others_may_have_written(&path, &std::fs::File::open(&path).unwrap()).unwrap().contains("(every user)"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

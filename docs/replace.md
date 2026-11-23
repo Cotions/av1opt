@@ -49,7 +49,10 @@ single output files.
   are your own files in a folder nobody else can write to, or one with the sticky bit, which
   keeps everyone to their own files. Anyone who can put files in the output folder can copy a
   genuine report there, fingerprint of the original and all, and put a file of their own of the
-  stated size beside it. `--trust-reports` takes such reports at their word all the same. On
+  stated size beside it. A folder shared with a group (mode `2775`, say) counts as one others
+  can write to; the list names the group, and either `chmod +t` on the folder (where everyone
+  who uses it only renames or removes their own files) or `--trust-reports` (if you trust
+  everyone in the group) lets the pairs through. `--trust-reports` takes such reports at their word all the same. On
   a drive that keeps no owners or permissions of its own it is the only way: FAT, exFAT and
   NTFS drives, SMB (Windows) shares and FUSE drives (ntfs-3g, rclone, sshfs and the like) show
   every file as the mount says, often as your own in a private folder, whoever put it there,

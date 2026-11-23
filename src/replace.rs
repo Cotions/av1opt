@@ -1249,7 +1249,7 @@ fn outside_named(source: &Path) -> String {
 const NOT_YOURS: &str = "av1opt has no record of this pair, and naming its folders vouches only for a report and an output that are your own files, in a folder nobody else can write to (or one with the sticky bit)";
 
 /// What is said after the reason: the way through.
-const TRUST_REPORTS: &str = "if you trust this report all the same, add --trust-reports";
+const TRUST_REPORTS: &str = "if you trust this report, and everyone who can write where it is, add --trust-reports";
 
 /// Why naming the folders does not vouch for the pair of `p`, which the record holds nothing
 /// of, if it does not: its report and its output have to be this user's own files in a folder

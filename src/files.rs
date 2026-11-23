@@ -607,10 +607,30 @@ impl std::fmt::Display for Named<'_> {
 /// Puts `data` at `path` by way of a file beside it that then takes its name: a reader
 /// finds the old file or the new one, whole. The file beside it carries this process's
 /// number and a count of its saves, so two programs or two threads saving at once do not
-/// take each other's away.
+/// take each other's away. The new file is on the drive before it takes the name, and the name
+/// after: a power cut leaves the old file or the new one there too, never an empty one.
 pub fn replace_with(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let tmp = save_name(path);
-    write_new(&tmp, data).and_then(|()| std::fs::rename(&tmp, path)).inspect_err(|_| drop(std::fs::remove_file(&tmp)))
+    let write = || -> std::io::Result<()> {
+        let mut f = create_new(&tmp)?;
+        f.write_all(data)?;
+        sync_unless_refused(&f)?;
+        std::fs::rename(&tmp, path)
+    };
+    write().inspect_err(|_| drop(std::fs::remove_file(&tmp)))?;
+    if let Ok(dir) = std::fs::File::open(folder_of(path)) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+/// Flushes `file` to the drive. A filesystem that does not do that at all (some network and
+/// FUSE ones answer `EINVAL` or `ENOTSUP`) is not an error: there is nothing more to be done.
+pub fn sync_unless_refused(file: &std::fs::File) -> std::io::Result<()> {
+    match file.sync_all() {
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENOTSUP)) => Ok(()),
+        done => done,
+    }
 }
 
 /// The most bytes a file name can have in `folder`: 255 on most filesystems, 143 in an

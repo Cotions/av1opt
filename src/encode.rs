@@ -1160,7 +1160,13 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
     // On the drive before it has the output's name: after a power cut, a file of the right size
     // that was never written out (zeros, on some filesystems) would pass for the encode, and
     // `replace` goes by its size.
-    made_file.sync_all().with_context(|| format!("cannot write the finished encode {} out to the drive", crate::files::Named(&partial)))?;
+    // A filesystem that does not flush on request at all is told of, not a failed encode.
+    match made_file.sync_all() {
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENOTSUP)) => {
+            eprintln!("warning: the drive of {} does not flush files on request ({e}), so a power cut soon after this could leave the output not whole", crate::files::Named(&partial));
+        }
+        flushed => flushed.with_context(|| format!("cannot write the finished encode {} out to the drive", crate::files::Named(&partial)))?,
+    }
     crate::signals::stop_point("encode:ready");
     // The place was free when the encode began, hours ago perhaps. A file that has turned up
     // there since is not this run's to write over: the encode is kept under another name.

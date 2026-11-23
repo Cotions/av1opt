@@ -801,6 +801,8 @@ fn move_open(file: &OpenFile, from: &Path, to: &Path, bytes: u64) -> Result<Move
             clear_left_behind(to);
             let copy = copy_new(file, &part, bytes)?;
             land(&part, to, &copy).inspect_err(|_| drop(std::fs::remove_file(&part))).with_context(|| format!("cannot name the copy {}", to.display()))?;
+            // The copy's name on the drive before the only other name goes.
+            sync_dir(crate::files::folder_of(to));
             crate::signals::stop_point("move:copied");
             if !file.is_at(from) {
                 eprintln!("warning: copied, but {} is another file by now, so it was left there", from.display());

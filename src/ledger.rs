@@ -486,7 +486,14 @@ fn add(event: Event) -> Result<()> {
     }
     let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let line = serde_json::to_string(&Line { format: FORMAT, time, event })?;
-    crate::files::append_line(&path, &line, false).with_context(|| format!("cannot write to {}", path.display()))
+    crate::files::append_line(&path, &line, false).with_context(|| format!("cannot write to {}", path.display()))?;
+    // On the drive before what it records is done or said to be done: one line for each encode,
+    // replacement or undo, so this costs little. The folder too, for a record just made.
+    crate::files::sync_unless_refused(&file).with_context(|| format!("cannot write {} out to the drive", path.display()))?;
+    if let Ok(d) = std::fs::File::open(crate::files::folder_of(&path)) {
+        let _ = d.sync_all();
+    }
+    Ok(())
 }
 
 /// What an encode leaves on record once its output and report are in place.

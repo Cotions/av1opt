@@ -223,7 +223,9 @@ spot check compares the frames of one kept part with the same frames where the o
 The finished cut is scored along its whole length and its weak stretches encoded again, as a
 one-pass encode is (see [encode](#encode), step 5), so its CRF does not have to carry its
 worst sample: the source is decoded through the same `select`/`setpts`, its times counted
-from the start of the file as the encode counted them (`-copyts -start_at_zero`), the frames
+from the start of the file as the encode counted them (`-copyts -start_at_zero`, and the
+sound read beside the picture as the encode read it: ffmpeg starts a transport stream at the
+first packet of what it reads), the frames
 are counted on both sides, and a group of pictures that holds a join is encoded again from
 the frames the output shows there, the end of one kept part and the start of the next. Only
 the video stream of the cut is then replaced: its sound, subtitles, chapters and marks stay

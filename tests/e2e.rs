@@ -883,6 +883,25 @@ fn a_variable_rate_video_cut_between_its_frames_is_repaired_frame_for_frame() {
 
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_cut_transport_stream_whose_sound_starts_first_is_repaired_from_the_frames_it_shows() {
+    let c = Case::new("cut-repair-ts");
+    weak_numbered_clip(&c, "weak.mp4");
+    // As ffmpeg writes a transport stream, the sound starts 23 ms before the picture: more
+    // than the quarter of a frame the kept parts are picked by. ffmpeg counts such a file's
+    // time from the first packet of what it reads, and the check and the stretches encoded
+    // again, which read the picture alone, took frame 48 for kept and frame 144 for removed.
+    c.ffmpeg(&["-i", "weak.mp4", "-c", "copy", "weak.ts"]);
+    let src = c.videos().join("weak.ts");
+    let starts = |kind: &str| streams(&probe(&src), kind)[0]["start_time"].as_str().unwrap().parse::<f64>().unwrap();
+    assert!(starts("video") - starts("audio") > 0.25 / 24.0, "sound at {}, picture at {}", starts("audio"), starts("video"));
+    let r = c.encode(&[&src], &["--remove", "2-6"]);
+    r.ok().has("verifying: the whole video against its source").has("encoding again:").lacks("spot check at");
+    let out = c.out().join("weak.mp4");
+    assert_eq!(frame_numbers(&out), (0..576).filter(|n| *n < 48 || *n >= 144).collect::<Vec<u32>>());
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn a_cut_video_that_needs_nothing_is_checked_whole_and_kept_as_encoded() {
     let c = Case::new("cut-whole");
     let src = c.clip("easy.mp4", "320x180", 16);

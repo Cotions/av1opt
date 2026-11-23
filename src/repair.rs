@@ -155,7 +155,13 @@ pub fn survey(tools: &Tools, input: &Path, info: &MediaInfo, output: &Path, cut:
     if cut.is_some() {
         args.push("-start_at_zero".into());
     }
-    args.extend(["-i", &path_arg(output), "-i", &path_arg(&std::path::absolute(input)?), "-lavfi", &filter, "-an", "-sn", "-dn", "-f", "null", "-"].map(String::from));
+    args.extend(["-i", &path_arg(output), "-i", &path_arg(&std::path::absolute(input)?), "-lavfi", &filter].map(String::from));
+    // And the start of the file is where the encode had it (see `Sections::sound_read_too`).
+    match cut.filter(|_| !info.audio.is_empty()) {
+        Some(_) => args.extend(Sections::sound_read_too(1, None)),
+        None => args.push("-an".into()),
+    }
+    args.extend(["-sn", "-dn", "-f", "null", "-"].map(String::from));
     // The scored frames are numbered in seconds (`settb=1`), so the output's clock reads
     // frames where it says seconds.
     tools.run_with_progress_in(Some(dir), &args, keys.len() as f64, "checking")?;

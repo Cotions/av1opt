@@ -295,6 +295,27 @@ impl Sections {
         [format!("select='{}'", pick.join("+")), format!("setpts='round(PTS-({shift})/TB)'")]
     }
 
+    /// Output arguments that make an ffmpeg which decodes the picture of input `input` read
+    /// that input's sound as well, without decoding it: all of it, or `packets` of each track
+    /// into an output of their own.
+    ///
+    /// ffmpeg counts the time of an MPEG transport or program stream from the first packet of
+    /// the streams it reads, not from where the file says it starts. The encode of a cut reads
+    /// the sound and the picture; the whole-video check and the stretches encoded again read
+    /// the picture alone, and where the sound starts first their clock ran behind the
+    /// encode's by that lead. In a transport stream whose sound starts 23 ms before its
+    /// picture, at 24 frames a second, they took the first frame of each removed section for
+    /// a kept one and left out the first frame after it: the same number of frames, so the
+    /// count told nothing, and a group of pictures encoded again at a join put the removed
+    /// frame into the file. Reading what the encode read gives them the encode's clock.
+    pub fn sound_read_too(input: usize, packets: Option<u32>) -> Vec<String> {
+        let mut a = vec!["-map".to_string(), format!("{input}:a"), "-c:a".into(), "copy".into()];
+        if let Some(n) = packets {
+            a.extend(["-frames:a".into(), n.to_string()]);
+        }
+        a
+    }
+
     /// Source time of output time `t`: inside the kept part that shows it, the part after a
     /// join at the join itself.
     pub fn to_source(&self, t: f64) -> f64 {

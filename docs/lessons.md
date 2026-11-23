@@ -215,5 +215,16 @@
 - **A container's length is not the picture's.** One recording had 7:40 of video under 17:32
   of sound. Samples and spot checks were placed along the 17:32 and asked for frames that
   don't exist. They go by the video stream's own length now.
+- **Where a transport stream starts depends on what is read from it.** ffmpeg counts the time
+  of an MPEG transport or program stream from the first packet of the streams it reads, not
+  from where the file says it starts. The encode of a video with sections removed reads sound
+  and picture; the whole-video check and the stretches encoded again read the picture alone,
+  and picked the kept frames by a clock that ran behind the encode's by as much as the sound
+  starts before the picture. With 23 ms of that (what ffmpeg itself writes) at 24 frames a
+  second, they took the first frame of each removed section for a kept one and left out the
+  first frame after it: as many frames on both sides, so the count told nothing, and a group
+  of pictures encoded again at a join put a removed frame into the file. Both read the sound
+  as well now (one packet of it for a stretch, copied to nowhere), which gives them the
+  encode's clock by the same rule that gave the encode its own.
 - **ffmpeg ignores `-svtav1-params` names it can't parse.** A typo only prints a warning and the
   encode runs without the option, so parameters are tried on a few generated frames first.

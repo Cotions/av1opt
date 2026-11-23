@@ -2091,6 +2091,7 @@ fn every_job_taken_is_in_the_queue_a_killed_server_leaves() {
                 std::fs::write(d.join(format!("videos/v{i}.mp4")), b"xx").unwrap();
             }
         });
+        let count = std::sync::atomic::AtomicUsize::new(0);
         let taken = std::thread::scope(|scope| {
             let poster = scope.spawn(|| {
                 let mut taken = Vec::new();
@@ -2099,7 +2100,10 @@ fn every_job_taken_is_in_the_queue_a_killed_server_leaves() {
                     let body = json!({ "inputs": [&input], "out_dir": s.dir.join("out") }).to_string();
                     let request = format!("POST /api/jobs HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\nCookie: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", s.port, s.cookie(), body.len());
                     match s.try_raw(&request) {
-                        Ok(r) if r.status == 200 => taken.push(input),
+                        Ok(r) if r.status == 200 => {
+                            taken.push(input);
+                            count.store(taken.len(), std::sync::atomic::Ordering::SeqCst);
+                        }
                         Ok(r) if r.status == 0 => break,
                         Ok(r) => panic!("{} {}", r.status, r.body),
                         Err(_) => break,
@@ -2107,9 +2111,14 @@ fn every_job_taken_is_in_the_queue_a_killed_server_leaves() {
                 }
                 taken
             });
-            // A different moment each round, a good while into the posting.
+            // A different moment each round, a good while into the posting: past the second job
+            // taken (each one is saved to the drive, which takes longer while other tests write).
+            let start = std::time::Instant::now();
+            while count.load(std::sync::atomic::Ordering::SeqCst) < 2 && start.elapsed() < Duration::from_secs(20) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
             let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos();
-            std::thread::sleep(Duration::from_millis(150 + u64::from(nanos % 300)));
+            std::thread::sleep(Duration::from_millis(100 + u64::from(nanos % 300)));
             unsafe { libc::kill(s.child.id() as i32, libc::SIGKILL) };
             poster.join().unwrap()
         });
@@ -2546,9 +2555,9 @@ fn inputs_left_out_of_a_job_outlive_it() {
     assert_eq!(job["status"], "done", "{job}");
     assert!(job["note"].is_null(), "they are not this job's any more: {job}");
     // Saved on their own, with the settings of the job, and shown with the way to forget them.
-    soon("the left-out input is saved", || saved_jobs(&s) == 1);
+    // The queue written before the start holds one job too: what counts is the one saved since.
+    soon("the left-out input is saved", || saved_jobs(&s) == 1 && saved_queue(&s)["jobs"][0]["inputs"] == json!([s.dir.join("videos/b.mkv")]));
     let saved = saved_queue(&s)["jobs"][0].clone();
-    assert_eq!(saved["inputs"], json!([s.dir.join("videos/b.mkv")]), "{saved}");
     assert_eq!(saved["options"]["preset"], 9, "{saved}");
     let unrestored = s.get("/api/jobs").json()["unrestored"].clone();
     assert_eq!(unrestored[0]["inputs"], json!([s.dir.join("videos/b.mkv")]), "{unrestored}");

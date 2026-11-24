@@ -689,6 +689,14 @@ pub fn restore_original(app: &App, body: &Value) -> Result<Value> {
     let r: ReplaceRequest = serde_json::from_value(body.clone())?;
     let report = known_report(app, &r.report)?;
     refuse_unless_on_record(&app.ledger.current(), &report)?;
+    // As for a replacement, nothing the encode queue is waiting on is moved: an original put
+    // back into a folder the queue is about to read would be encoded again, and with
+    // `--overwrite` that encode would be written over the AV1 file just taken back.
+    if let Check::Replaced(d) = replace::check_for_list_on_record(&report, &app.ledger.current())
+        && let Some(busy) = [&d.source, &d.dest, &d.from].into_iter().find(|p| crate::ui::jobs::waiting_on(app, p))
+    {
+        bail!("{} is in the encode queue, so nothing was put back", busy.display());
+    }
     let d = replace::undo_if(&report, r.allow_zfs, &|d| app.ledger.current().check_replaced(d))?;
     Ok(json!({ "source": d.source, "output": d.from }))
 }

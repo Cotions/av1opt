@@ -3689,3 +3689,44 @@ fn history_says_what_the_whole_video_check_encoded_again() {
     let second = row("second");
     assert_eq!((&second["crf"], &second["first_crf"]), (&json!(41.0), &json!(45.25)), "{second}");
 }
+
+/// The page's undo moves nothing the encode queue is waiting on, as its replace and its
+/// put-right do not: with a saved queue of the library folder waiting, an undo used to move
+/// the original back into that folder and the AV1 file into the output folder all the same.
+#[test]
+fn an_undo_is_refused_while_the_encode_queue_waits_on_its_files() {
+    let s = Server::start("undo-queued", |d| {
+        let (original, output, placed) = (d.join("videos/movie.mp4"), d.join("out/movie.mkv"), d.join("videos/movie.mkv"));
+        std::fs::write(&original, vec![b's'; 3000]).unwrap();
+        std::fs::create_dir_all(d.join("out")).unwrap();
+        std::fs::write(&output, vec![b'o'; 1000]).unwrap();
+        let encoded = encoded_line(&original, &output);
+        let report = knowing(&original, json!({ "format": 1, "input": original, "output": output, "source_bytes": 3000, "output_bytes": 1000 }));
+        let trash = in_the_trash(d, &original, 3000);
+        std::fs::remove_file(&original).unwrap();
+        std::fs::rename(&output, &placed).unwrap();
+        let replaced = json!({
+            "format": 1, "time": 2, "event": "replaced", "source": original, "trash": trash, "output": placed, "from": output,
+            "source_bytes": 3000, "source_mtime": report["source_mtime"], "source_fingerprint": report["source_fingerprint"], "output_bytes": 1000,
+        });
+        write_record(d, &[encoded, replaced]);
+        let mut r = report.clone();
+        r["output"] = json!(placed);
+        r["replaced"] = json!({ "time": 2, "from": output, "trash": trash, "source_mtime": report["source_mtime"] });
+        write_report(&d.join("out/movie.av1opt.json"), r);
+        // A queue saved by an earlier session, held for want of tools, of the library folder.
+        let saved = json!({ "format": 1, "jobs": [{ "inputs": [d.join("videos")], "roots": [], "out_dir": d.join("again"), "options": {} }] });
+        std::fs::create_dir_all(d.join("data/av1opt")).unwrap();
+        std::fs::write(d.join("data/av1opt/ui-queue.json"), saved.to_string()).unwrap();
+    });
+    add_history_folder(&s, "out");
+    assert_eq!(s.get("/api/jobs/heads").json()["jobs"][0]["status"], "queued");
+    let report = s.dir.join("out/movie.av1opt.json");
+    let names = ["videos/movie.mp4", "out/movie.mkv", "videos/movie.mkv", "data/Trash/files/movie.mp4"];
+    let files = || names.map(|n| std::fs::read(s.dir.join(n)).ok().map(|b| b.len()));
+    let before = files();
+    let r = s.post("/api/replace/undo", &json!({ "report": report }));
+    eprintln!("undo answered {} {}; files before {before:?}, after {:?}", r.status, r.body, files());
+    assert!(r.status == 400 && r.body.contains("encode queue"), "{} {}", r.status, r.body);
+    assert!(files() == before, "files were moved");
+}

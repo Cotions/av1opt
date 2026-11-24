@@ -283,12 +283,44 @@ pub struct Ledger {
     seen: std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<crate::files::OneFile>>>,
 }
 
+impl Event {
+    /// The event with the folder of every file it names resolved as [`crate::files::in_real_folder`]
+    /// does, `real` being what that comes to for a folder. What av1opt writes now is so already,
+    /// but a folder can have been moved since and a link left at its old name, and earlier
+    /// versions wrote some lines with the folders as a report spelled them: two lines of one
+    /// file must land on one entry. The trash is left as the trash names it.
+    fn in_real_folders(self, real: &mut impl FnMut(&Path) -> PathBuf) -> Event {
+        let mut r = |p: PathBuf| match (p.parent(), p.file_name()) {
+            (Some(d), Some(name)) if !d.as_os_str().is_empty() => real(d).join(name),
+            _ => p,
+        };
+        match self {
+            Event::Encoded { output, report, source, original, output_bytes, output_sha256 } => Event::Encoded { output: r(output), report, source: r(source), original, output_bytes, output_sha256 },
+            Event::Replaced { source, trash, output, from, original, output_bytes } => Event::Replaced { source: r(source), trash, output: r(output), from: r(from), original, output_bytes },
+            Event::Undone { source, output, back_to } => Event::Undone { source: r(source), output: r(output), back_to: r(back_to) },
+            Event::Adopted { output, report, source, original, output_bytes, output_sha256, replaced } => {
+                let replaced = replaced.map(|m| WentToTrash { from: r(m.from), ..m });
+                Event::Adopted { output: r(output), report, source: r(source), original, output_bytes, output_sha256, replaced }
+            }
+            Event::Replacing { source, from, output, original, output_bytes, output_sha256 } => Event::Replacing { source: r(source), from: r(from), output: r(output), original, output_bytes, output_sha256 },
+            Event::Trashing { source, trash } => Event::Trashing { source: r(source), trash },
+            Event::Undoing { source, output, back_to, trash, original, output_bytes, output_sha256 } => Event::Undoing { source: r(source), output: r(output), back_to: r(back_to), trash, original, output_bytes, output_sha256 },
+            Event::Settled { source } => Event::Settled { source: r(source) },
+            e @ Event::TakenOver { .. } => e,
+        }
+    }
+}
+
 impl Ledger {
     fn from_lines(bytes: &[u8]) -> Ledger {
         let mut ledger = Ledger::default();
         let lines = bytes.split(|b| *b == b'\n').filter_map(|l| serde_json::from_slice::<Line>(l).ok()).filter(|l| l.format <= FORMAT);
+        // A record names thousands of files in a few folders: each folder is asked of the
+        // drive once.
+        let mut folders: HashMap<PathBuf, PathBuf> = HashMap::new();
+        let mut real = |d: &Path| folders.entry(d.to_path_buf()).or_insert_with(|| std::fs::canonicalize(d).unwrap_or_else(|_| d.to_path_buf())).clone();
         for line in lines {
-            ledger.apply(line.event);
+            ledger.apply(line.event.in_real_folders(&mut real));
         }
         // The page asks with links resolved. Sources and outputs are recorded that way; the
         // trash is recorded as the trash names it, and its folder may lie behind a link.
@@ -880,7 +912,7 @@ impl Held {
         let unchanged = stamp() == self.stamp;
         add(event.clone())?;
         if unchanged {
-            self.ledger.apply(event);
+            self.ledger.apply(event.in_real_folders(&mut |d| std::fs::canonicalize(d).unwrap_or_else(|_| d.to_path_buf())));
             self.stamp = stamp();
         } else {
             *self = Held::load();
@@ -1318,6 +1350,29 @@ mod tests {
         assert_eq!(ledger.entry(&output, &source).unwrap().replaced, None);
         assert!(ledger.entry(&dest, &source).is_none());
         assert!(ledger.entry(&output, &source).unwrap().made.is_some(), "what was known of the encode is kept");
+    }
+
+    /// A folder moved since and a link left at its old name, or a line of an earlier version
+    /// written as a report spelled the folders: lines of one file under two spellings are of
+    /// one entry, under the path the folder has now.
+    #[test]
+    fn lines_of_one_file_under_two_spellings_of_its_folder_are_of_one_entry() {
+        let s = Scratch::new("spellings");
+        let (source, output) = s.encoded("a");
+        let (lib_link, out_link) = (s.0.join("lib-link"), s.0.join("out-link"));
+        std::os::unix::fs::symlink(&s.0, &lib_link).unwrap();
+        std::os::unix::fs::symlink(s.0.join("out"), &out_link).unwrap();
+        let (dest, trash) = (source.with_extension("mkv"), s.0.join("Trash/files/a.mp4"));
+        // Replaced as a report naming the folders through the links had it, then undone as
+        // av1opt writes it now.
+        moved(&lib_link.join("a.mp4"), &trash, &lib_link.join("a.mkv"), &out_link.join("a.mkv")).unwrap();
+        let ledger = load();
+        let e = ledger.entry(&dest, &source).unwrap();
+        assert!(e.made.is_some() && e.replaced.as_ref().is_some_and(|m| m.from == output), "{e:?}");
+        note_undone(&source, &dest, &output).unwrap();
+        let ledger = load();
+        let e = ledger.entry(&output, &source).unwrap();
+        assert!(e.made.is_some() && e.replaced.is_none() && e.undone.is_some(), "{e:?}");
     }
 
     #[test]

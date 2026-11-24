@@ -4919,13 +4919,18 @@ mod tests {
         assert!(put.is_ok() && !open, "{put:?}");
     }
 
-    // Proofs from the second review of the recovery (brief 16). Each states what should hold
-    // and fails on 6903cb7; run them with `-- --ignored proof_`.
-
     /// A report left behind its replacement (killed between the record's line and the report),
     /// where the record's line of the encode and the report name the two folders through
     /// links (the folders were moved since and links left at the old names) or not.
     fn report_behind_its_replacement(name: &str, through_links: bool) -> Check {
+        let (seen, set) = report_behind(name, through_links, false);
+        assert!(!matches!(seen, Check::Replaced(_)) || set == Ok(Some(Stranded::Replaced)), "listed as replaced but set right as {set:?}");
+        seen
+    }
+
+    /// As [`report_behind_its_replacement`], with the report left behind its replacement or,
+    /// when `undone`, behind the undo of it; with what setting it right then comes to.
+    fn report_behind(name: &str, through_links: bool, undone: bool) -> (Check, Result<Option<Stranded>, String>) {
         let f = Fix::new(name);
         record_in(&f);
         let report = f.encode("a.mp4", "a.mkv", 1000, 400);
@@ -4945,22 +4950,36 @@ mod tests {
         let encode = crate::ledger::Encode { output: &out.join("a.mkv"), report: &report, source: &lib.join("a.mp4"), source_bytes: 1000, original: &Recorded::in_report(&r), output_bytes: 400, output_sha256 };
         crate::ledger::note_encoded(&encode).unwrap();
         f.apply(&report).unwrap();
-        std::fs::write(&report, &before).unwrap();
+        let replaced = std::fs::read(&report).unwrap();
+        if undone {
+            undo(&report, true).unwrap();
+        }
+        std::fs::write(&report, if undone { &replaced } else { &before }).unwrap();
         let seen = check_for_list_on_record(&report, &crate::ledger::load());
+        // What acts on it sets the report right first, as the list shows it.
+        let mut held = vec![lock(&report).unwrap()];
+        let set = set_right(&report, true, &mut held).map_err(|e| format!("{e:#}"));
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
-        seen
+        (seen, set)
     }
 
     #[test]
-    fn proof_control_a_report_behind_its_replacement_is_seen_as_replaced() {
-        let seen = report_behind_its_replacement("proof-behind", false);
+    fn a_report_behind_its_replacement_is_seen_as_replaced() {
+        let seen = report_behind_its_replacement("behind", false);
         assert!(matches!(&seen, Check::Replaced(d) if d.can_undo), "{seen:?}");
     }
 
     #[test]
-    #[ignore = "fails on 6903cb7: said to be an original that is gone, and undo finds nothing"]
-    fn proof_a_report_behind_its_replacement_is_seen_as_replaced_where_the_record_names_folders_through_links() {
-        let seen = report_behind_its_replacement("proof-behind-links", true);
+    fn a_report_behind_its_replacement_is_seen_as_replaced_where_the_record_names_folders_through_links() {
+        let seen = report_behind_its_replacement("behind-links", true);
         assert!(matches!(&seen, Check::Replaced(d) if d.can_undo), "{seen:?}");
+    }
+
+    #[test]
+    fn a_report_behind_its_undo_is_seen_as_ready_where_the_record_names_folders_through_links_or_not() {
+        for through_links in [false, true] {
+            let (seen, set) = report_behind(&format!("behind-undo-{through_links}"), through_links, true);
+            assert!(matches!(&seen, Check::Ready(_)) && set == Ok(Some(Stranded::Undone)), "{through_links}: {seen:?} {set:?}");
+        }
     }
 }

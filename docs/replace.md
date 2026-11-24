@@ -40,7 +40,9 @@ single output files.
   is not followed (if both are encodes you made, keep the one on record and remove the other
   output and its report). A report cannot
   get past the record by naming a file another way (through a link to its folder, or
-  `/proc/self/root`): paths are compared with their folders resolved, and every output and
+  `/proc/self/root`): paths are compared with their folders resolved (the record's own too,
+  as it is read: a folder moved since with a link left at its old name, or a line an earlier
+  version wrote as a report spelled it, is still one file), and every output and
   original on record is also compared by the file itself, so a second mount of a folder, a
   second link, or a drive that takes two spellings of a name for one (letter case, accents
   written two ways) does not make one file two. (A folder reached once on its drive and once

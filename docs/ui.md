@@ -112,7 +112,8 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
   the power went) is shown as such, with where the files are and what putting them right
   does, and a **Put right** button that does it (the rules of [replace](replace.md)); nothing
   is moved before that is pressed, and files no longer where that run would have left them
-  get no button.
+  get no button. Until then neither file is played: they are not where the report says, and
+  the AV1 file can be at the original's name.
 - **Benchmark**: the `bench` comparison with progress and a Stop button, results while it
   runs, and a chart of size against encode time per size class (hover a dot for its numbers;
   the table below has them all). "Use for…" on a row makes that setting the tuned one for the
@@ -128,7 +129,8 @@ A local web app in the browser (Chrome or Firefox), built from the same scan and
   (marked, and said above the list): those are replaced only when ticked one by one, and
   **All / none** leaves them alone. It works through the ticked ones one by one and keeps the ones
   that failed on screen with the reason. Replaced encodes carry a "replaced" mark, and pairs
-  stopped half-way a "stopped half-way" one. An original
+  stopped half-way a "stopped half-way" one (and no "source gone" or "output gone": its files
+  are where that mark's hover text says). An original
   that is still in the encode queue is refused. The page acts only on outputs in av1opt's private
   record (see `replace`). Others are marked "not made here" until `av1opt adopt` has been run on
   their folder in a terminal.

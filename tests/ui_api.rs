@@ -1511,6 +1511,15 @@ fn a_pair_stopped_half_way_is_shown_so_and_put_right_only_when_asked() {
     assert!(st["why"].as_str().unwrap().contains("stopped half-way"), "{st}");
     let shown = s.get(&format!("/api/report?path={}", report.display())).json();
     assert_eq!(shown["replace"]["state"], "stopped", "{shown}");
+    // Neither file is where the report and the record say until it is put right: the AV1 file
+    // has the original's place and the original is in the trash. Neither is said gone, and
+    // nothing at those paths is probed or played as the source or the output.
+    let row = &s.get("/api/history").json()["reports"][0];
+    assert!(row["input_exists"].is_null() && row["output_exists"].is_null(), "{row}");
+    for info in ["input_info", "output_info"] {
+        let said = shown[info]["error"].as_str().unwrap_or_default();
+        assert!(said.contains("stopped half-way") && !said.contains("gone"), "{info}: {}", shown[info]);
+    }
     assert!(files() == as_stopped, "a listing moved files");
 
     // Only a report in a history folder is put right.

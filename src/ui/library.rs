@@ -556,15 +556,18 @@ pub fn history(app: &App) -> Value {
             let output = shown_path(&p, r["output"].as_str()?, true);
             let mtime = std::fs::metadata(&p).ok()?.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_secs();
             let entry = ledger.entry(&output, &input);
+            let replace = replace_state(&ledger, &p, entry.is_some());
+            // Not asked of paths only a report names, nor of a pair stopped half-way, whose
+            // files are not where the record says until it is put right (null: not looked at).
+            let looked_at = entry.filter(|_| replace["state"] != "stopped");
             Some(json!({
                 "report": p,
                 "input": input,
                 "output": output,
                 "on_record": entry.is_some(),
-                "replace": replace_state(&ledger, &p, entry.is_some()),
-                // Not asked of paths only a report names (null: not looked at).
-                "input_exists": entry.map(|e| source_on_record(e).exists()),
-                "output_exists": entry.map(|_| output.exists()),
+                "replace": replace,
+                "input_exists": looked_at.map(|e| source_on_record(e).exists()),
+                "output_exists": looked_at.map(|_| output.exists()),
                 "source_bytes": r["source_bytes"],
                 "output_bytes": r["output_bytes"],
                 "savings": r["savings"],
@@ -738,6 +741,9 @@ pub fn media_info(app: &App, p: &Path) -> Value {
     }
 }
 
+/// What the compare view says in place of either file of a pair stopped half-way.
+const STOPPED_NOT_SHOWN: &str = "not shown: av1opt was stopped half-way with these files, so they are not where the report says; put them right first (see Original)";
+
 /// What the compare view gets to know of a file: only one the page may serve is opened.
 fn listed_media_info(app: &App, p: &Path, on_record: bool, gone: &str) -> Value {
     match app.is_allowed(p) {
@@ -760,8 +766,17 @@ pub fn report(app: &App, path: &str) -> Result<Value> {
     r["report_path"] = json!(p);
     r["input_path"] = json!(shown_input);
     r["output_path"] = json!(output);
-    r["input_info"] = listed_media_info(app, &shown_input, entry.is_some(), "source file is gone");
-    r["output_info"] = listed_media_info(app, &output, entry.is_some(), "output file is gone");
+    if r["replace"]["state"] == "stopped" {
+        // The files of a pair stopped half-way are not where the report says: the AV1 file can
+        // be at the original's name, or the original back at its own while the output folder
+        // still lacks the AV1 file. Probing those paths would show one file as the other.
+        let stopped = json!({ "error": STOPPED_NOT_SHOWN });
+        r["input_info"] = stopped.clone();
+        r["output_info"] = stopped;
+    } else {
+        r["input_info"] = listed_media_info(app, &shown_input, entry.is_some(), "source file is gone");
+        r["output_info"] = listed_media_info(app, &output, entry.is_some(), "output file is gone");
+    }
     Ok(r)
 }
 

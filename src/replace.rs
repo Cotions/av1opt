@@ -303,7 +303,7 @@ fn set_right(report: &Path, allow_zfs: bool, held: &mut Vec<Lock>) -> Result<Opt
     // A report set right can show a move that was cut off, and the other way round.
     for _ in 0..3 {
         let Ok(r) = read_report(report) else { break };
-        let ledger = crate::ledger::load();
+        let ledger = crate::ledger::current();
         if let Some((fixed, what)) = stranded(report, &r, &ledger, true) {
             write_report_held(report, &fixed, held).context("the report is behind what av1opt's record and the files show, and could not be set right")?;
             done = Some(what);
@@ -347,7 +347,7 @@ pub fn stopped_for_list(report: &Path, ledger: &crate::ledger::Ledger) -> Option
 pub fn put_right_stopped(report: &Path, allow_zfs: bool) -> Result<String> {
     let mut held = vec![lock(report)?];
     let r = read_report(report).map_err(anyhow::Error::msg)?;
-    let ledger = crate::ledger::load();
+    let ledger = crate::ledger::current();
     let r = stranded(report, &r, &ledger, true).map_or(r, |(fixed, _)| fixed);
     let cut = CutOff::of(report, &r, &ledger, true).context("nothing of this pair was stopped half-way")?;
     set_right(report, allow_zfs, &mut held)?;
@@ -1230,7 +1230,7 @@ fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: ToT
         bail!("the output was changed or replaced by another file while it was being checked, so nothing was changed");
     }
     // On record before the first move, with what tells this run's moves from anyone else's.
-    let on_record = crate::ledger::load().entry(&p.output, &p.source).and_then(|e| e.made.clone()).filter(|m| m.output_bytes == p.output_bytes).and_then(|m| m.output_sha256);
+    let on_record = crate::ledger::current().entry(&p.output, &p.source).and_then(|e| e.made.clone()).filter(|m| m.output_bytes == p.output_bytes).and_then(|m| m.output_sha256);
     let output_sha256 = match on_record {
         Some(hash) => hash,
         None => output.sha256().with_context(|| format!("cannot read {}, so nothing was changed", p.output.display()))?,
@@ -1433,7 +1433,7 @@ fn undo_watched(report: &Path, allow_zfs: bool, accept: Accept<Replaced>, before
     if !original.is_at(&d.trash) || !original.untouched() {
         bail!("the file in the trash was changed or replaced while it was being checked, so nothing was moved");
     }
-    let on_record = crate::ledger::load().entry(&d.dest, &d.source).and_then(|e| e.made.clone()).filter(|m| m.output_bytes == d.output_bytes).and_then(|m| m.output_sha256);
+    let on_record = crate::ledger::current().entry(&d.dest, &d.source).and_then(|e| e.made.clone()).filter(|m| m.output_bytes == d.output_bytes).and_then(|m| m.output_sha256);
     let output_sha256 = match on_record {
         Some(hash) => hash,
         None => av1.sha256().with_context(|| format!("cannot read {}, so nothing was moved", d.dest.display()))?,
@@ -1497,7 +1497,7 @@ fn nothing_under_way(source: &Path, e: anyhow::Error) -> anyhow::Error {
 /// its line was written before its first move, and nothing after it says it ended.
 fn under_way(report: &Path) -> bool {
     let source = read_report(report).ok().and_then(|r| file_path(&r, "input").ok());
-    source.is_some_and(|s| crate::ledger::load().under_way(&s).is_some())
+    source.is_some_and(|s| crate::ledger::current().under_way(&s).is_some())
 }
 
 /// The reports under some folders (never looking into av1opt's own work folders).
@@ -1707,6 +1707,8 @@ pub fn run(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_chan
 #[allow(clippy::too_many_arguments)]
 fn run_watched(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_changed_date: bool, anywhere: bool, trust_reports: bool, before_report: &dyn Fn()) -> Result<()> {
     use crate::report::gb;
+    // The record is read whole once for the run, and after that only what is added to it.
+    let _run = crate::ledger::Run::begin();
     // Only what is going to be replaced is worth keeping reads for.
     let reads = WholeReads::default();
     let reports = reports_for(paths);
@@ -1714,7 +1716,7 @@ fn run_watched(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_
         bail!("no av1opt reports (*.av1opt.json) found there");
     }
     let named = NamedFolders::of(paths, anywhere);
-    let mut ledger = crate::ledger::load();
+    let mut ledger = crate::ledger::current();
     // A pair whose report was left behind, or whose last move was cut off half-way, is set right
     // first when files may be changed, so that what is listed and done goes by where the files
     // are; when they may not, the list says what would be done about it.
@@ -1766,9 +1768,9 @@ fn run_watched(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_
         }
     }
     if set_right_any {
-        ledger = crate::ledger::load();
+        ledger = crate::ledger::current();
     }
-    let judging = Judging { accept_changed_date, on_command_line: true, remember: go.then_some(&reads), listing: true, ledger: Some(&ledger), ..Judging::default() };
+    let judging = Judging { accept_changed_date, on_command_line: true, remember: go.then_some(&reads), listing: true, ledger: Some(&*ledger), ..Judging::default() };
     let (mut ready, mut replaced, mut stay) = (Vec::new(), Vec::new(), Vec::new());
     let checked: Vec<(&PathBuf, Check)> = reports.iter().map(|r| (r, check_judging(r, judging))).collect();
     // Two reports in the folders named for one original that the record knows nothing of: one
@@ -1826,7 +1828,7 @@ fn run_watched(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_
         let mut done = 0;
         for d in &can {
             // Asked again here: the record may have changed since the list was made.
-            let accept = |d: &Replaced| admitted_back(d, &crate::ledger::load(), &named, trust_reports);
+            let accept = |d: &Replaced| admitted_back(d, &crate::ledger::current(), &named, trust_reports);
             match undo_if(&d.report, allow_zfs, &accept) {
                 Ok(_) => done += 1,
                 Err(e) => {
@@ -1878,7 +1880,7 @@ fn run_watched(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_
             // Asked again here, of the output about to be moved: the record may have changed
             // since the list was made, and where it holds the pair all of the output has to be
             // what it says.
-            let accept = |p: &Plan, output: &OpenFile| admitted(p, Some(output), &crate::ledger::load(), &named, trust_reports);
+            let accept = |p: &Plan, output: &OpenFile| admitted(p, Some(output), &crate::ledger::current(), &named, trust_reports);
             match apply_judging(&p.report, allow_zfs, judging, &trash::trash_noting, &accept, before_report) {
                 Ok(Done { report_behind: Some(why), source_bytes, .. }) => {
                     (done, behind) = (done + 1, behind + 1);
@@ -3396,6 +3398,30 @@ mod tests {
     fn record_in(f: &Fix) -> PathBuf {
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = Some(f.dir.join("data/av1opt")));
         f.dir.join("data/av1opt/ledger.jsonl")
+    }
+
+    #[test]
+    fn a_run_over_many_pairs_reads_the_record_whole_once() {
+        let f = Fix::new("run-once");
+        let record = record_in(&f);
+        for i in 0..40 {
+            on_record(&f.encode(&format!("v{i}.mp4"), &format!("v{i}.mkv"), 1000, 400));
+        }
+        let loads = || crate::ledger::LOADS.with(std::cell::Cell::get);
+        let mut read = Vec::new();
+        for back in [false, true] {
+            let before = loads();
+            run_watched(&[f.dir.join("out"), f.dir.join("lib")], true, back, true, false, false, false, &|| {}).unwrap();
+            read.push(loads() - before);
+        }
+        let text = std::fs::read_to_string(&record).unwrap();
+        let back = (0..40).filter(|i| f.lib(&format!("v{i}.mp4")).exists()).count();
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        // Each pair sees what the ones before it wrote, as the lines it had to go by.
+        assert_eq!(text.lines().filter(|l| l.contains("\"replaced\"")).count(), 40);
+        assert_eq!(text.lines().filter(|l| l.contains("\"undone\"")).count(), 40);
+        assert_eq!(back, 40);
+        assert_eq!(read, [1, 1], "the record was read whole for each pair");
     }
 
     #[test]

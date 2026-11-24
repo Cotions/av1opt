@@ -920,6 +920,16 @@ impl OneFile {
     pub fn same_path(&self, other: &OneFile) -> bool {
         self.real == other.real
     }
+
+    /// The path, with its folder resolved, that [`OneFile::same_path`] compares.
+    pub fn real(&self) -> &Path {
+        &self.real
+    }
+
+    /// The file's device and number, where it is there, that [`OneFile::is`] also compares.
+    pub fn number(&self) -> Option<(u64, u64)> {
+        self.number
+    }
 }
 
 /// Whether `a` and `b` name the same file (see [`OneFile`]).

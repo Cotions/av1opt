@@ -243,3 +243,10 @@
   replacement; one file under two names (a folder mounted twice) passed for a copy of itself.
   A replacement and an undo now write a line before their first move, and only a pair whose
   last line is that one is put right.
+- **A record asked of for each pair is not to be read for each pair.** `replace` judged each
+  pair by av1opt's record read anew for it, and compared a path not on record as given with
+  every entry, looking at each file the record names again. With 9000 encodes on record,
+  listing 300 pairs took 25 seconds and replacing them five minutes, where it had taken a
+  fifth of a second and five seconds. A run now reads the record once and after that only the
+  lines added to it, and finds the entries a path may be by an index of resolved paths and
+  file numbers.

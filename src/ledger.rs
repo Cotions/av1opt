@@ -16,8 +16,7 @@ use std::sync::atomic::Ordering;
 
 use crate::replace::{OpenFile, Plan, Replaced};
 use std::collections::{HashMap, HashSet};
-#[cfg(any(feature = "ui", test))]
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Version of a line. Lines newer than this are ignored rather than misread.
 const FORMAT: u32 = 1;
@@ -276,8 +275,9 @@ pub enum Standing {
 #[derive(Debug, Default)]
 pub struct Ledger {
     outputs: HashMap<PathBuf, Entry>,
+    /// The files [`Ledger::covers`] covers, made the first time it is asked.
     #[cfg_attr(not(any(feature = "ui", test)), allow(dead_code))]
-    files: HashSet<PathBuf>,
+    files: std::sync::OnceLock<HashSet<PathBuf>>,
     #[cfg_attr(not(any(feature = "ui", test)), allow(dead_code))]
     taken_over: bool,
     /// Why the record on disk was not used.
@@ -285,11 +285,85 @@ pub struct Ledger {
     /// By original.
     under_way: HashMap<PathBuf, UnderWay>,
     /// The paths on record as the drive has them, each asked of it once for as long as this
-    /// reading of the record is held: a path a report gives is compared with every one of them.
+    /// reading of the record is held: a path a report gives is compared with them.
     seen: std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<crate::files::OneFile>>>,
+    /// Which of them to compare a path with, made the first time a path is not on record as
+    /// it is given: one question then costs a look-up or two, not a look at every entry.
+    index: std::sync::Mutex<Option<Index>>,
+}
+
+/// Where the outputs on record are, by what tells their files from others (see
+/// [`crate::files::OneFile`]): the path with its folder resolved, and the file's number on its
+/// drive. It only ever narrows down which entries are compared, and every one it gives is
+/// compared as before: an entry it names in vain is passed over.
+#[derive(Debug, Default, Clone)]
+struct Index {
+    /// The outputs on record, by their own file.
+    outputs: Lookup,
+    /// The same outputs, by the file of their original.
+    sources: Lookup,
+    /// The same outputs, by their original's path as recorded.
+    of_source: HashMap<PathBuf, Vec<PathBuf>>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct Lookup {
+    by_path: HashMap<PathBuf, Vec<PathBuf>>,
+    by_number: HashMap<(u64, u64), Vec<PathBuf>>,
+}
+
+impl Lookup {
+    fn add(&mut self, file: &crate::files::OneFile, output: &Path) {
+        let put = |list: &mut Vec<PathBuf>| {
+            if !list.iter().any(|o| o == output) {
+                list.push(output.to_path_buf());
+            }
+        };
+        put(self.by_path.entry(file.real().to_path_buf()).or_default());
+        if let Some(number) = file.number() {
+            put(self.by_number.entry(number).or_default());
+        }
+    }
+
+    /// The outputs that may be of `given`, each once.
+    fn candidates(&self, given: &crate::files::OneFile) -> Vec<PathBuf> {
+        let by_number = given.number().and_then(|n| self.by_number.get(&n));
+        let mut all: Vec<PathBuf> = self.by_path.get(given.real()).into_iter().chain(by_number).flatten().cloned().collect();
+        all.sort();
+        all.dedup();
+        all
+    }
+}
+
+impl Clone for Ledger {
+    fn clone(&self) -> Ledger {
+        fn held<T: Clone>(m: &std::sync::Mutex<T>) -> T {
+            m.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        }
+        Ledger {
+            outputs: self.outputs.clone(),
+            files: std::sync::OnceLock::new(),
+            taken_over: self.taken_over,
+            problem: self.problem.clone(),
+            under_way: self.under_way.clone(),
+            seen: std::sync::Mutex::new(held(&self.seen)),
+            index: std::sync::Mutex::new(held(&self.index)),
+        }
+    }
 }
 
 impl Event {
+    /// The originals and the places of AV1 files this line names (not the trash or reports).
+    fn named(&self) -> Vec<&Path> {
+        match self {
+            Event::Encoded { output, source, .. } | Event::Adopted { output, source, .. } => vec![output, source],
+            Event::Replaced { source, output, from, .. } | Event::Replacing { source, from, output, .. } => vec![source, output, from],
+            Event::Undone { source, output, back_to } | Event::Undoing { source, output, back_to, .. } => vec![source, output, back_to],
+            Event::Trashing { source, .. } | Event::Settled { source } => vec![source],
+            Event::TakenOver { .. } => vec![],
+        }
+    }
+
     /// The event with the folder of every file it names resolved as [`crate::files::in_real_folder`]
     /// does, `real` being what that comes to for a folder. What av1opt writes now is so already,
     /// but a folder can have been moved since and a link left at its old name, and earlier
@@ -328,14 +402,74 @@ impl Ledger {
         for line in lines {
             ledger.apply(line.event.in_real_folders(&mut real));
         }
-        // The page asks with links resolved. Sources and outputs are recorded that way; the
-        // trash is recorded as the trash names it, and its folder may lie behind a link.
-        let beside = |e: &Entry| e.replaced.as_ref().map_or_else(|| e.source.clone(), |m| std::fs::canonicalize(&m.trash).unwrap_or_else(|_| m.trash.clone()));
-        ledger.files = ledger.outputs.iter().flat_map(|(output, e)| [output.clone(), beside(e)]).collect();
         ledger
     }
 
+    /// The files [`Ledger::covers`] covers. The page asks with links resolved. Sources and
+    /// outputs are recorded that way; the trash is recorded as the trash names it, and its
+    /// folder may lie behind a link.
+    #[cfg(any(feature = "ui", test))]
+    fn files(&self) -> &HashSet<PathBuf> {
+        self.files.get_or_init(|| {
+            let beside = |e: &Entry| e.replaced.as_ref().map_or_else(|| e.source.clone(), |m| std::fs::canonicalize(&m.trash).unwrap_or_else(|_| m.trash.clone()));
+            self.outputs.iter().flat_map(|(output, e)| [output.clone(), beside(e)]).collect()
+        })
+    }
+
+    /// Takes a line on, and with it what is learnt of the files it names: they are where it
+    /// moved them, and are asked of the drive again.
     fn apply(&mut self, event: Event) {
+        let named: Vec<PathBuf> = event.named().into_iter().map(Path::to_path_buf).collect();
+        let seen = self.seen.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for p in &named {
+            seen.remove(p);
+        }
+        self.take_on(event);
+        self.files = std::sync::OnceLock::new();
+        if self.index.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() {
+            for output in named.iter().filter(|p| self.outputs.contains_key(*p)) {
+                self.index_output(output);
+            }
+        }
+    }
+
+    /// Adds the output on record at `output` to the index.
+    fn index_output(&self, output: &Path) {
+        let Some(e) = self.outputs.get(output).filter(|e| e.made.is_some() || e.replaced.is_some()) else { return };
+        let (of_output, of_source) = (self.recorded(output), self.recorded(&e.source));
+        let mut index = self.index.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(index) = index.as_mut() else { return };
+        index.outputs.add(&of_output, output);
+        index.sources.add(&of_source, output);
+        let list = index.of_source.entry(e.source.clone()).or_default();
+        if !list.iter().any(|o| o == output) {
+            list.push(output.to_path_buf());
+        }
+    }
+
+    /// The outputs on record that may be of the file `given`: by their own file, or, with the
+    /// path `source` it was given by, by their original's (and then those recorded with that
+    /// very path too).
+    fn candidates(&self, given: &crate::files::OneFile, source: Option<&Path>) -> Vec<PathBuf> {
+        let index = || self.index.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if index().is_none() {
+            // Made with the lock let go, as each path is asked of the drive (see `recorded`).
+            *index() = Some(Index::default());
+            for output in self.outputs.keys() {
+                self.index_output(output);
+            }
+        }
+        let index = index();
+        let index = index.as_ref().expect("made above");
+        let Some(source) = source else { return index.outputs.candidates(given) };
+        let mut all = index.sources.candidates(given);
+        all.extend(index.of_source.get(source).into_iter().flatten().cloned());
+        all.sort();
+        all.dedup();
+        all
+    }
+
+    fn take_on(&mut self, event: Event) {
         // What ends a move under way for an original: its end on record, or a new encode in the
         // place the AV1 file was to come from.
         match &event {
@@ -415,7 +549,16 @@ impl Ledger {
         }
         let now = std::sync::Arc::new(crate::files::OneFile::of_recorded(recorded));
         let same = now.is(given);
-        self.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(recorded.to_path_buf(), now);
+        self.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(recorded.to_path_buf(), now.clone());
+        // What the index has of it is as it was learnt then: it is found by what it is now too.
+        if let Some(index) = self.index.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_mut() {
+            if self.outputs.contains_key(recorded) {
+                index.outputs.add(&now, recorded);
+            }
+            for output in index.of_source.get(recorded).cloned().unwrap_or_default() {
+                index.sources.add(&now, &output);
+            }
+        }
         same
     }
 
@@ -427,9 +570,10 @@ impl Ledger {
     fn known_as(&self, output: &Path) -> Option<&Entry> {
         let other_path = || {
             let given = crate::files::OneFile::of(output);
-            self.outputs.iter().find(|(o, e)| (e.made.is_some() || e.replaced.is_some()) && self.is_recorded(o, &given))
+            let candidates = self.candidates(&given, None);
+            candidates.into_iter().find_map(|o| self.outputs.get(&o).filter(|e| (e.made.is_some() || e.replaced.is_some()) && self.is_recorded(&o, &given)))
         };
-        self.known_at(output).or_else(|| other_path().map(|(_, e)| e))
+        self.known_at(output).or_else(other_path)
     }
 
     /// Whether `e` is of the original at `source`, by any of its paths.
@@ -492,7 +636,7 @@ impl Ledger {
     /// the trash on record, and a plain file now.
     #[cfg(any(feature = "ui", test))]
     pub fn covers(&self, file: &Path) -> bool {
-        self.files.contains(file) && std::fs::symlink_metadata(file).is_ok_and(|m| m.is_file())
+        self.files().contains(file) && std::fs::symlink_metadata(file).is_ok_and(|m| m.is_file())
     }
 
     /// What to tell someone asking the page to act on an output that is not on record.
@@ -550,7 +694,8 @@ impl Ledger {
     fn outputs_of(&self, source: &Path) -> Option<String> {
         let given = crate::files::OneFile::of(source);
         let of_it = |e: &Entry| e.source == source || self.is_recorded(&e.source, &given);
-        let mut others: Vec<String> = self.outputs.iter().filter(|(_, e)| (e.made.is_some() || e.replaced.is_some()) && of_it(e)).map(|(o, _)| o.display().to_string()).collect();
+        let candidates = self.candidates(&given, Some(source));
+        let mut others: Vec<String> = candidates.into_iter().filter_map(|o| self.outputs.get_key_value(&o)).filter(|(_, e)| (e.made.is_some() || e.replaced.is_some()) && of_it(e)).map(|(o, _)| o.display().to_string()).collect();
         others.sort();
         (!others.is_empty()).then(|| others.join(" and "))
     }
@@ -589,7 +734,7 @@ const ONE_ON_RECORD: &str = "if both are encodes you made, keep the one on recor
 /// request a player makes.
 #[cfg(any(feature = "ui", test))]
 #[derive(Default)]
-pub struct Shared(Mutex<Option<(Option<Stamp>, Arc<Ledger>)>>);
+pub struct Shared(std::sync::Mutex<Option<(Option<Stamp>, Arc<Ledger>)>>);
 
 type Stamp = [u64; 7];
 
@@ -646,13 +791,145 @@ fn file_problem(meta: &std::fs::Metadata, path: &Path) -> Option<String> {
     (meta.mode() & 0o077 != 0).then(|| format!("others can reach {}", path.display()))
 }
 
+/// The record as of now, for a run that asks of it pair after pair (`replace`): within a
+/// [`Run`], read whole the first time, and then, as long as it is the same file and has only
+/// grown, only the lines added to it since, most of them the run's own. Each pair sees what the
+/// pairs before it wrote, as a record read anew for it would show, without the cost of reading
+/// it all and looking at every file it names again. Outside a run it is read anew each time:
+/// what is learnt of the files it names is then not kept past the question (the page keeps its
+/// own reading, [`Shared`], for what it shows, and reads the record anew for what it does).
+pub fn current() -> Arc<Ledger> {
+    let fresh = || Arc::new(load());
+    RUN.with(|run| {
+        let mut run = run.borrow_mut();
+        let Some(held) = run.as_mut() else { return fresh() };
+        let (Some(dir), Some(now)) = (folder(), stamp()) else {
+            *held = None;
+            return fresh();
+        };
+        let reading = match held.take() {
+            Some(r) if r.dir == dir && r.stamp == now => r,
+            Some(r) if r.dir == dir => r.grown(now).unwrap_or_else(|| Reading::whole(dir, now)),
+            _ => Reading::whole(dir, now),
+        };
+        let ledger = reading.ledger.clone();
+        *held = Some(reading);
+        ledger
+    })
+}
+
+thread_local! {
+    /// The reading [`current`] keeps while a [`Run`] lasts: `None` outside one.
+    static RUN: std::cell::RefCell<Option<Option<Reading>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// While it is held, [`current`] keeps its reading of the record from one question to the
+/// next on this thread. A run inside a run is part of it.
+pub struct Run {
+    outer: bool,
+}
+
+impl Run {
+    pub fn begin() -> Run {
+        let outer = RUN.with(|run| {
+            let mut run = run.borrow_mut();
+            let outer = run.is_none();
+            if outer {
+                *run = Some(None);
+            }
+            outer
+        });
+        Run { outer }
+    }
+}
+
+impl Drop for Run {
+    fn drop(&mut self) {
+        if self.outer {
+            RUN.with(|run| *run.borrow_mut() = None);
+        }
+    }
+}
+
+/// What [`current`] holds of the record.
+struct Reading {
+    dir: PathBuf,
+    /// Of the file as it was read.
+    stamp: Stamp,
+    /// How far it was read: up to the end of its last whole line.
+    read: u64,
+    /// The last bytes read, which the file has to hold still for what follows to be lines
+    /// added to it.
+    tail: Vec<u8>,
+    /// Each folder named, as it resolves (see [`Event::in_real_folders`]).
+    folders: HashMap<PathBuf, PathBuf>,
+    ledger: Arc<Ledger>,
+}
+
+impl Reading {
+    /// How much of what was read is kept to compare.
+    const TAIL: usize = 4096;
+
+    fn whole(dir: PathBuf, stamp: Stamp) -> Reading {
+        let (ledger, read, tail) = match read_record(Some(stamp[2])) {
+            Ok(bytes) => {
+                let whole = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+                (Ledger::from_lines(&bytes[..whole]), whole as u64, bytes[whole.saturating_sub(Self::TAIL)..whole].to_vec())
+            }
+            Err(not) => (*not, 0, Vec::new()),
+        };
+        Reading { dir, stamp, read, tail, folders: HashMap::new(), ledger: Arc::new(ledger) }
+    }
+
+    /// The reading taken on to the record as it is now, if all that changed is lines added.
+    fn grown(mut self, now: Stamp) -> Option<Reading> {
+        let same_file = (0..now.len()).filter(|&i| i != 2).all(|i| now[i] == self.stamp[i]);
+        if !same_file || now[2] < self.stamp[2] || self.ledger.problem.is_some() {
+            return None;
+        }
+        let path = self.dir.join(FILE_NAME);
+        let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(&path).ok()?;
+        let meta = file.metadata().ok()?;
+        if file_problem(&meta, &path).is_some() || (meta.dev(), meta.ino()) != (now[0], now[1]) {
+            return None;
+        }
+        let from = self.read - self.tail.len() as u64;
+        let mut bytes = vec![0; usize::try_from(now[2].checked_sub(from)?).ok()?];
+        file.read_exact_at(&mut bytes, from).ok()?;
+        if !bytes.starts_with(&self.tail) {
+            return None;
+        }
+        let added = &bytes[self.tail.len()..];
+        let whole = added.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+        let mut ledger = Arc::unwrap_or_clone(self.ledger);
+        let lines = added[..whole].split(|b| *b == b'\n').filter_map(|l| serde_json::from_slice::<Line>(l).ok()).filter(|l| l.format <= FORMAT);
+        let folders = &mut self.folders;
+        let mut real = |d: &Path| folders.entry(d.to_path_buf()).or_insert_with(|| std::fs::canonicalize(d).unwrap_or_else(|_| d.to_path_buf())).clone();
+        for line in lines {
+            ledger.apply(line.event.in_real_folders(&mut real));
+        }
+        let read_to = self.tail.len() + whole;
+        self.tail = bytes[read_to.saturating_sub(Self::TAIL)..read_to].to_vec();
+        Some(Reading { stamp: now, read: self.read + whole as u64, ledger: Arc::new(ledger), ..self })
+    }
+}
+
 /// Reads the record. One that is missing is empty; one others could have written to is not
 /// believed, and the page then acts as if nothing were on record.
 pub fn load() -> Ledger {
+    match read_record(None) {
+        Ok(bytes) => Ledger::from_lines(&bytes),
+        Err(not) => *not,
+    }
+}
+
+/// The bytes of the record, or of its first `upto` bytes; where they cannot be used, the
+/// record [`load`] gives instead.
+fn read_record(upto: Option<u64>) -> Result<Vec<u8>, Box<Ledger>> {
     #[cfg(test)]
     LOADS.with(|n| n.set(n.get() + 1));
-    let Some(dir) = folder() else { return Ledger::default() };
-    let unusable = |why: String| Ledger { problem: Some(why), ..Ledger::default() };
+    let Some(dir) = folder() else { return Err(Box::default()) };
+    let unusable = |why: String| Err(Box::new(Ledger { problem: Some(why), ..Ledger::default() }));
     let path = dir.join(FILE_NAME);
     match std::fs::metadata(&dir) {
         Ok(meta) => {
@@ -660,13 +937,13 @@ pub fn load() -> Ledger {
                 return unusable(why);
             }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ledger::default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Box::default()),
         Err(e) => return unusable(format!("cannot look at {}: {e}", dir.display())),
     }
     let opened = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(&path);
-    let mut file = match opened {
+    let file = match opened {
         Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ledger::default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Box::default()),
         Err(e) => return unusable(format!("cannot open {}: {e}", path.display())),
     };
     match file.metadata() {
@@ -678,8 +955,8 @@ pub fn load() -> Ledger {
         Err(e) => return unusable(format!("cannot look at {}: {e}", path.display())),
     }
     let mut bytes = Vec::new();
-    match file.read_to_end(&mut bytes) {
-        Ok(_) => Ledger::from_lines(&bytes),
+    match file.take(upto.unwrap_or(u64::MAX)).read_to_end(&mut bytes) {
+        Ok(_) => Ok(bytes),
         Err(e) => unusable(format!("cannot read {}: {e}", path.display())),
     }
 }
@@ -1314,6 +1591,57 @@ mod tests {
         note_settled(Path::new("/v/c.mp4")).unwrap();
         assert_eq!(FOLDER_SYNCS.with(std::cell::Cell::get) - before, 1);
         assert_eq!(std::fs::read_to_string(s.file()).unwrap().lines().count(), 3);
+    }
+
+    #[test]
+    fn a_run_reads_the_record_whole_once_and_then_what_is_added_to_it() {
+        let s = Scratch::new("one-reading");
+        let loads = || LOADS.with(std::cell::Cell::get);
+        let (a, a_out) = s.encoded("a");
+        let run = Run::begin();
+        let before = loads();
+        assert!(current().entry(&a_out, &a).is_some());
+        let first = current();
+        assert_eq!(loads() - before, 1);
+        // What is written meanwhile, by this run or another, is seen without reading it all.
+        let (b, b_out) = s.encoded("b");
+        note_settled(&a).unwrap();
+        let now = current();
+        assert!(now.entry(&b_out, &b).is_some() && now.entry(&a_out, &a).is_some());
+        assert_eq!(loads() - before, 1);
+        // An end of a line still being written is taken on once the line is whole.
+        let held = std::fs::metadata(s.file()).unwrap().len();
+        let (c, c_out) = s.encoded("c");
+        let line = std::fs::read(s.file()).unwrap().split_off(usize::try_from(held).unwrap());
+        let file = std::fs::OpenOptions::new().write(true).open(s.file()).unwrap();
+        file.set_len(held).unwrap();
+        file.write_all_at(&line[..20], held).unwrap();
+        assert!(current().entry(&c_out, &c).is_none());
+        file.write_all_at(&line[20..], held + 20).unwrap();
+        assert!(current().entry(&c_out, &c).is_some());
+        assert_eq!(loads() - before, 1);
+        // A record put in its place, or rewritten, is read anew.
+        let text = std::fs::read_to_string(s.file()).unwrap();
+        let kept: String = text.lines().filter(|l| !l.contains("b.mp4")).map(|l| format!("{l}\n")).collect();
+        std::fs::write(s.0.join("new"), &kept).unwrap();
+        std::fs::set_permissions(s.0.join("new"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::rename(s.0.join("new"), s.file()).unwrap();
+        assert!(current().entry(&b_out, &b).is_none());
+        assert_eq!(loads() - before, 2);
+        // Lines are only ever added: one written over shows in what was read last.
+        let file = std::fs::OpenOptions::new().write(true).open(s.file()).unwrap();
+        file.write_all_at(&[b' '; 40], 0).unwrap();
+        file.write_all_at(b"\n", file.metadata().unwrap().len()).unwrap();
+        drop(file);
+        let cut = current();
+        assert_eq!(loads() - before, 3);
+        assert!(cut.entry(&a_out, &a).is_none(), "a line overwritten was kept");
+        drop((first, now, cut, run));
+        // Outside a run each question reads it anew.
+        let before = loads();
+        current();
+        current();
+        assert_eq!(loads() - before, 2);
     }
 
     #[test]

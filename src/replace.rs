@@ -489,10 +489,13 @@ impl CutOff {
         let in_trash = u.trash.as_deref().is_some_and(|t| if full { trash::holds(t, &source, &original) } else { trash::holds_for_list(t, &source, &original) });
         let is_av1 = |p: &Path| if full { OpenFile::open(p, bytes).ok().and_then(|f| f.sha256().ok()).is_some_and(|now| now == hash) } else { file_size(p) == Some(bytes) };
         let taken = |p: &Path| std::fs::symlink_metadata(p).is_ok();
+        // The original's name in the trash free, or taken by the entry of a later file once the
+        // original was emptied from the trash (its info file names another place).
+        let trash_free = |t: &Path| !taken(t) || trash::says_came_from_elsewhere(t, &source);
         // The original's entry in the trash gone, from a trash and a folder of the original that
         // are both there: a drive not mounted just now has neither, and is waited for.
         let folder_there = |p: &Path| p.parent().is_some_and(Path::is_dir);
-        let emptied = u.trash.as_deref().is_some_and(|t| !taken(t) && folder_there(t)) && folder_there(&source);
+        let emptied = u.trash.as_deref().is_some_and(|t| trash_free(t) && folder_there(t)) && folder_there(&source);
         // Two names of one file (a folder mounted twice) are not two copies of it.
         let at_dest = is_av1(dest);
         let at_from = from != dest && !one_file(from, dest) && is_av1(from);
@@ -522,9 +525,9 @@ impl CutOff {
             // the AV1 file in the original's folder too, the run had got as far as placing it,
             // and the original was taken out of the trash by hand since.
             let placed_here = from != dest && at_dest && (at_from || !taken(from));
-            if u.trash.as_deref().is_none_or(|t| !taken(t)) && !source_free && placed_here {
+            if u.trash.as_deref().is_none_or(trash_free) && !source_free && placed_here {
                 Left::TakenOutByHand { copy_placed: at_from }
-            } else if u.trash.as_deref().is_none_or(|t| !taken(t)) && !source_free {
+            } else if u.trash.as_deref().is_none_or(trash_free) && !source_free {
                 Left::Nothing
             } else if in_trash && source_free && still_out {
                 if from == dest || !taken(dest) {
@@ -546,10 +549,10 @@ impl CutOff {
                 Left::Unknown
             }
         } else {
-            let back = u.trash.as_deref().is_some_and(|t| !taken(t)) && is_original(&source);
+            let back = u.trash.as_deref().is_some_and(trash_free) && is_original(&source);
             // The AV1 file is the first to move: still in the original's place, with nothing
             // in the place it goes back to and the trash entry still there, it never left.
-            if at_dest && u.trash.as_deref().is_some_and(taken) && (from == dest || !taken(from)) {
+            if at_dest && u.trash.as_deref().is_some_and(|t| !trash_free(t)) && (from == dest || !taken(from)) {
                 Left::Nothing
             } else if (in_trash || (emptied && (!taken(&source) || *dest == source))) && at_dest && at_from {
                 // With the trash emptied too: a copy made by the undo, or by putting right an
@@ -661,7 +664,7 @@ impl CutOff {
 
     /// Nothing is at the original's name in the trash any more, for what is said of a pair.
     fn original_gone(&self) -> bool {
-        self.trash.as_deref().is_some_and(|t| std::fs::symlink_metadata(t).is_err())
+        self.trash.as_deref().is_some_and(|t| std::fs::symlink_metadata(t).is_err() || trash::says_came_from_elsewhere(t, &self.source))
     }
 
     /// Where the AV1 file is and where it goes back to, for an undo whose original is gone
@@ -5592,6 +5595,44 @@ mod tests {
         }
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
         assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// The original of a pair stopped half-way was emptied from the trash, and a later file
+    /// from another folder went to the trash under the same name. That entry is not the
+    /// original's: the pair is put right as one whose trash was emptied, and the other file's
+    /// entry is left as it is. It used to be "not as that run left it" for ever, and every
+    /// `--apply` ended in failure.
+    #[test]
+    fn a_pair_whose_name_in_the_trash_a_later_file_took_once_it_was_emptied_is_put_right_as_emptied() {
+        for step in ["replace:trashed", "replace:placed", "undo:begun", "undo:moved"] {
+            let undoing = step.starts_with("undo");
+            let p = Pair::new(&format!("reused-{}", step.replace(':', "-")), false, "a.mkv").unwrap();
+            if undoing {
+                p.f.apply(&p.report).unwrap();
+                stopped_at(step, || drop(undo(&p.report, true)));
+            } else {
+                stopped_at(step, || drop(p.f.apply(&p.report)));
+            }
+            let bin = p.f.dir.join("Trash");
+            let info = std::fs::read_to_string(bin.join("info/a.mp4.trashinfo")).unwrap();
+            for e in ["files", "info"].iter().flat_map(|d| std::fs::read_dir(bin.join(d)).unwrap().flatten()) {
+                std::fs::remove_file(e.path()).unwrap();
+            }
+            // Another file of that name, from another folder.
+            let elsewhere = p.f.dir.join("elsewhere/a.mp4");
+            let theirs = info.lines().map(|l| if l.starts_with("Path=") { format!("Path={}", elsewhere.display()) } else { l.to_string() }).collect::<Vec<_>>().join("\n");
+            std::fs::write(bin.join("info/a.mp4.trashinfo"), &theirs).unwrap();
+            std::fs::write(bin.join("files/a.mp4"), b"someone else's file").unwrap();
+            let listed = stopped_for_list(&p.report, &crate::ledger::load()).unwrap();
+            assert!(listed.can_put_right && listed.told.contains("is no longer in the trash"), "{step}: {}", listed.told);
+            put_right_stopped(&p.report, true).unwrap();
+            assert!(crate::ledger::load().under_way(&p.f.lib("a.mp4")).next().is_none(), "{step}");
+            assert!(stopped_for_list(&p.report, &crate::ledger::load()).is_none(), "{step}");
+            assert_eq!(std::fs::read(bin.join("files/a.mp4")).unwrap(), b"someone else's file", "{step}");
+            assert_eq!(std::fs::read_to_string(bin.join("info/a.mp4.trashinfo")).unwrap(), theirs, "{step}");
+            assert!(!p.f.lib("a.mp4").exists(), "{step}: the other file came out of the trash");
+        }
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
     }
 
     /// Putting right a replacement whose original was emptied from the trash writes the report

@@ -132,8 +132,9 @@ single output files.
   yet), has the AV1 file taken back to the output folder (a copy of it left in the
   original's folder by a move across drives is removed instead), and an undo is then written
   down as done. One
-  stopped half-way whose original was since emptied from the trash, with the AV1 file at one
-  of its two places, has nothing left to put back: that is said, and putting it right has
+  stopped half-way whose original was since emptied from the trash (a later file from another
+  folder may have its name there now: that entry is not the original's, and stays as it is),
+  with the AV1 file at one of its two places, has nothing left to put back: that is said, and putting it right has
   the record and the report say where the only video left of the two is. An AV1 file a
   replacement had placed stays in the original's folder, and the pair is written down as
   replaced (one copied there from another drive, with the AV1 file still in the output folder

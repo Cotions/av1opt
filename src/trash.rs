@@ -336,17 +336,34 @@ pub fn holds_for_list(trashed: &Path, original: &Path, known: &Recorded) -> bool
 /// specification has it, so a `.Trash-1000` somebody put into a folder of downloads can only
 /// ever give files back to that folder.
 pub fn says_came_from(trashed: &Path, original: &Path) -> bool {
-    holds_with(trashed, original, &|top| {
-        // The top of a filesystem: its parent is on another one (or it has none).
-        let dev = |p: &Path| std::fs::metadata(p).map(|m| m.dev()).ok();
-        top.parent().is_none_or(|up| dev(top).is_some() && dev(top) != dev(up))
-    })
+    came_from(trashed, original, &is_drive_top) == Some(true)
+}
+
+/// Whether the info file of `trashed` is there and says it came from another place than
+/// `original` (or from one not worth believing): the entry of a later file, under the name an
+/// earlier one had before it was emptied from the trash. An info file that is missing or cannot
+/// be read says nothing either way.
+pub fn says_came_from_elsewhere(trashed: &Path, original: &Path) -> bool {
+    came_from(trashed, original, &is_drive_top) == Some(false)
+}
+
+/// The top of a filesystem: its parent is on another one (or it has none).
+fn is_drive_top(top: &Path) -> bool {
+    let dev = |p: &Path| std::fs::metadata(p).map(|m| m.dev()).ok();
+    top.parent().is_none_or(|up| dev(top).is_some() && dev(top) != dev(up))
 }
 
 /// [`says_came_from`], with what counts as the top of a drive passed in (tests have no drive of their
 /// own). A trash folder anywhere else is only a folder with that name: this module never
 /// makes one there, and anybody can.
+#[cfg(test)]
 fn holds_with(trashed: &Path, original: &Path, is_top: &dyn Fn(&Path) -> bool) -> bool {
+    came_from(trashed, original, is_top) == Some(true)
+}
+
+/// Whether the info file of `trashed` says it came from `original`, and is worth believing;
+/// nothing where there is no info file to read.
+fn came_from(trashed: &Path, original: &Path, is_top: &dyn Fn(&Path) -> bool) -> Option<bool> {
     let inner = || -> Option<bool> {
         let files = trashed.parent().filter(|d| d.file_name().is_some_and(|n| n == "files"))?;
         let bin = files.parent()?;
@@ -368,7 +385,7 @@ fn holds_with(trashed: &Path, original: &Path, is_top: &dyn Fn(&Path) -> bool) -
         let plain = recorded.components().next().is_some() && recorded.components().all(|c| matches!(c, std::path::Component::Normal(_)));
         Some(plain && is_top(top) && top.join(recorded) == original)
     };
-    inner().unwrap_or(false)
+    inner()
 }
 
 /// Removes the info file of `trashed` where no file came with it: what a run stopped between

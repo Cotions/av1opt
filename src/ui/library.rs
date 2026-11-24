@@ -698,7 +698,8 @@ pub fn restore_original(app: &App, body: &Value) -> Result<Value> {
 pub fn put_right_stopped(app: &App, body: &Value) -> Result<Value> {
     let r: ReplaceRequest = serde_json::from_value(body.clone())?;
     let report = known_report(app, &r.report)?;
-    let done = replace::put_right_stopped(&report, r.allow_zfs)?;
+    // As for a replacement, nothing the encode queue is waiting on is moved.
+    let done = replace::put_right_stopped_unless(&report, r.allow_zfs, &|p| crate::ui::jobs::waiting_on(app, p))?;
     Ok(json!({ "done": done }))
 }
 

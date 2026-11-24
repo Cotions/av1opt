@@ -340,16 +340,26 @@ pub fn stopped_for_list(report: &Path, ledger: &crate::ledger::Ledger) -> Option
     Some(Stopped { told: cut.told()?, can_put_right: cut.left != Left::Unknown, zfs: cut.on_zfs() })
 }
 
+/// [`put_right_stopped_unless`] with no file in use.
+#[cfg(test)]
+fn put_right_stopped(report: &Path, allow_zfs: bool) -> Result<String> {
+    put_right_stopped_unless(report, allow_zfs, &|_| false)
+}
+
 /// Puts right a pair whose replacement or undo was stopped half-way (see [`CutOff`]), reading in
 /// full what that rests on, as `replace --apply` does first: for the page's button, which is
-/// the only thing on the page that does it. Says what was done.
+/// the only thing on the page that does it. Says what was done. Where a file it would move is
+/// `in_use` (the page's encode queue is waiting on it), nothing is done.
 #[cfg(any(feature = "ui", test))]
-pub fn put_right_stopped(report: &Path, allow_zfs: bool) -> Result<String> {
+pub fn put_right_stopped_unless(report: &Path, allow_zfs: bool, in_use: &dyn Fn(&Path) -> bool) -> Result<String> {
     let mut held = vec![lock(report)?];
     let r = read_report(report).map_err(anyhow::Error::msg)?;
     let ledger = crate::ledger::current();
     let r = stranded(report, &r, &ledger, true).map_or(r, |(fixed, _)| fixed);
     let cut = CutOff::of(report, &r, &ledger, true).context("nothing of this pair was stopped half-way")?;
+    if let Some(busy) = [&cut.source, &cut.from, &cut.dest].into_iter().find(|p| in_use(p)) {
+        bail!("{} is in the encode queue, so nothing was put right", busy.display());
+    }
     set_right(report, allow_zfs, &mut held)?;
     Ok(cut.done().unwrap_or_else(|| "av1opt had been stopped before it moved anything of this pair; its record says so now".to_string()))
 }

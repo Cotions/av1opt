@@ -1510,6 +1510,27 @@ fn a_pair_stopped_half_way_is_shown_so_and_put_right_only_when_asked() {
 }
 
 #[test]
+fn a_pair_stopped_half_way_is_not_put_right_while_the_encode_queue_waits_on_its_files() {
+    let s = Server::start("stopped-queued", |d| {
+        stopped_once_placed(d);
+        // A queue saved by an earlier session, held here for want of tools, of the folder the
+        // AV1 file is in now, in the original's place.
+        let saved = json!({ "format": 1, "jobs": [{ "inputs": [d.join("videos")], "roots": [], "out_dir": d.join("again"), "options": {} }] });
+        std::fs::create_dir_all(d.join("data/av1opt")).unwrap();
+        std::fs::write(d.join("data/av1opt/ui-queue.json"), saved.to_string()).unwrap();
+    });
+    add_history_folder(&s, "out");
+    assert_eq!(s.get("/api/jobs/heads").json()["jobs"][0]["status"], "queued");
+    let report = s.dir.join("out/movie.av1opt.json");
+    let names = ["videos/movie.mp4", "out/movie.mkv", "videos/movie.mkv", "data/Trash/files/movie.mp4", "out/movie.av1opt.json"];
+    let files = || names.map(|n| std::fs::read(s.dir.join(n)).ok());
+    let as_stopped = files();
+    let r = s.post("/api/replace/put-right", &json!({ "report": report }));
+    assert!(r.status == 400 && r.body.contains("is in the encode queue"), "{}", r.body);
+    assert!(files() == as_stopped, "files were moved");
+}
+
+#[test]
 fn a_pair_stopped_half_way_whose_files_changed_since_stays_as_it_is() {
     let s = Server::start("stopped-moved", |d| {
         stopped_once_placed(d);

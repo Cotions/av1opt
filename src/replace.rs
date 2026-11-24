@@ -536,6 +536,18 @@ impl CutOff {
         Some(format!("av1opt had been stopped half-way through {what}; {now}"))
     }
 
+    /// Why putting it right was refused, writing as it does to `folder` on ZFS.
+    fn not_on_zfs(&self, folder: &Path) -> String {
+        match self.told() {
+            Some(told) => format!("{told}, which is not done there without --allow-zfs"),
+            None => format!(
+                "av1opt was stopped while {}, before it moved anything; putting that right removes the entry it had begun in the trash at {}, which is not done there without --allow-zfs",
+                if self.undoing { "putting this original back" } else { "replacing this original" },
+                folder.display()
+            ),
+        }
+    }
+
     /// Whether putting it right writes to a folder on ZFS.
     fn on_zfs(&self) -> bool {
         self.folders_written().iter().any(|f| crate::fsguard::ensure_writable_location(f, false).is_err())
@@ -567,7 +579,7 @@ impl CutOff {
             bail!("{}", self.told().unwrap_or_default());
         }
         for folder in self.folders_written() {
-            crate::fsguard::ensure_writable_location(&folder, allow_zfs).with_context(|| format!("{}, which is not done there without --allow-zfs", self.told().unwrap_or_default()))?;
+            crate::fsguard::ensure_writable_location(&folder, allow_zfs).with_context(|| self.not_on_zfs(&folder))?;
         }
         crate::signals::stop_point("recover:checked");
         let folder = |p: &Path| p.parent().unwrap_or(Path::new("/")).to_path_buf();
@@ -3982,6 +3994,28 @@ mod tests {
         let back = p.f.lib("a.mp4").exists();
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
         assert!(!back, "a file was moved into a folder on ZFS by a run without --allow-zfs");
+    }
+
+    /// A replacement stopped once it had begun the original's entry in a trash on ZFS: the run
+    /// without --allow-zfs says in a whole sentence why it leaves that entry.
+    #[test]
+    fn a_replacement_stopped_before_the_original_moved_on_zfs_is_left_with_a_whole_sentence() {
+        let p = Pair::new("zfs-nothing", false, "a.mkv").unwrap();
+        stopped_at("trash:info", || drop(p.f.apply(&p.report)));
+        p.as_if_its_run_had_ended();
+        crate::fsguard::ZFS_IN_TESTS.with_borrow_mut(|z| z.push(p.f.dir.join("Trash")));
+        let page = put_right_stopped(&p.report, false).map(drop).map_err(|e| format!("{e:#}"));
+        let set = set_right(&p.report, false, &mut vec![lock(&p.report).unwrap()]).map(drop).map_err(|e| format!("{e:#}"));
+        crate::fsguard::ZFS_IN_TESTS.with_borrow_mut(Vec::clear);
+        let open = crate::ledger::load().under_way(&p.f.lib("a.mp4")).is_some();
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        assert_eq!(std::fs::read(p.f.lib("a.mp4")).unwrap(), vec![b's'; 1000]);
+        for said in [page, set] {
+            let said = said.unwrap_err();
+            assert!(said.starts_with("av1opt was stopped while replacing this original, before it moved anything; putting that right removes the entry"), "{said}");
+            assert!(said.contains("without --allow-zfs: "), "{said}");
+        }
+        assert!(open, "settled on ZFS without --allow-zfs");
     }
 
     /// The same for an undo stopped half-way: the original is not put back into the folder on

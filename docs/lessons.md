@@ -248,5 +248,12 @@
   marked "gpmd"; it reads the cover of a Matroska file, an attachment, as a video stream and
   wrote it back as a second video track of one frame. The streams are now named one by one,
   the chapter track left to `-map_chapters` and the cover attached from its file.
+- **A file says one picture size and can hold several.** A recorder of a live stream writes
+  on when the stream changes quality, and the file's description gives the first size only.
+  ffmpeg then scales every later frame to that size without a word: the encode of a file that
+  begins at 640x360 and goes on at 854x480 came out whole, at 640x360, with the check of the
+  whole video failing on "Invalid argument" and two spot checks in the first half passing.
+  When that check fails, the key frames are now read for their sizes (a size begins with a
+  key frame), and a video with more than one is refused with the sizes named.
 - **ffmpeg ignores `-svtav1-params` names it can't parse.** A typo only prints a warning and the
   encode runs without the option, so parameters are tried on a few generated frames first.

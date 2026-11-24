@@ -169,7 +169,10 @@ For each file:
    video of ten seconds or less, once). So it is where stretches can't be encoded again (no
    room for them on the drive, say), and the report then says so. A spot check more than 4
    below the target leads to the same second search, with sections removed as well; a video
-   encoded per scene fails instead. Nothing is written unless all checks pass. The source
+   encoded per scene fails instead. A video whose picture changes size on the way (a
+   recording of a live stream that changed quality, parts joined without encoding them) is
+   refused when the check of the whole video stops at the change: an encode has one size,
+   the first, and would stretch or shrink the rest. Nothing is written unless all checks pass. The source
    has to be as it was, too. It counts as changed if its size is different, or if its
    modification time is more than two seconds off and a fingerprint of its contents (a hash
    of its size and of a megabyte at its start, middle and end) differs as well; a file only

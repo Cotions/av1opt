@@ -1005,6 +1005,42 @@ fn last_ends(lines: &str, video: &str, frame: f64) -> (Option<f64>, Option<f64>)
     (file, picture)
 }
 
+/// How long reading a video's key frames may take: the whole file is read, and one frame of
+/// each GOP is decoded.
+const KEY_FRAMES_LIMIT: Duration = Duration::from_secs(1200);
+
+/// The sizes the picture of a video has, each once, in the order they first come: one size,
+/// for nearly every video. A recording of a live stream, or parts joined without encoding
+/// them, can change size on the way, which the file's own description does not tell (it
+/// gives the first). Read from the key frames, since a size begins with one. None if ffprobe
+/// fails or takes too long.
+pub fn picture_sizes(ffprobe: &str, path: &Path, stream: usize) -> Option<Vec<(u32, u32)>> {
+    let mut command = crate::tools::probe_command(ffprobe);
+    command.args(["-v", "error", "-select_streams", &stream.to_string(), "-skip_frame", "nokey", "-show_entries", "frame=width,height", "-of", "csv=p=0"]);
+    command.arg(crate::tools::probe_arg(path));
+    let limit = KEY_FRAMES_LIMIT;
+    #[cfg(test)]
+    let limit = LIMIT_IN_TESTS.get().unwrap_or(limit);
+    let out = run_within(command, limit).ok()??;
+    if !out.status.success() {
+        return None;
+    }
+    Some(sizes_listed(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// The sizes in ffprobe's "width,height" lines, each once, in the order they first come.
+fn sizes_listed(lines: &str) -> Vec<(u32, u32)> {
+    let mut sizes: Vec<(u32, u32)> = Vec::new();
+    for line in lines.lines() {
+        let mut fields = line.trim().split(',');
+        let (Some(Ok(w)), Some(Ok(h))) = (fields.next().map(str::parse::<u32>), fields.next().map(str::parse::<u32>)) else { continue };
+        if w > 0 && h > 0 && !sizes.contains(&(w, h)) {
+            sizes.push((w, h));
+        }
+    }
+    sizes
+}
+
 /// The packet lines ffprobe prints for `what`, or None if it fails or takes too long.
 fn packets(ffprobe: &str, path: &Path, what: &[&str]) -> Option<String> {
     let mut command = crate::tools::probe_command(ffprobe);
@@ -1033,6 +1069,15 @@ fn clock_secs(s: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_sizes_of_a_video_are_each_named_once_in_the_order_they_come() {
+        assert_eq!(sizes_listed("640,360\n640,360\n"), [(640, 360)]);
+        assert_eq!(sizes_listed("640,360\n854,480\n640,360\n854,480,\n"), [(640, 360), (854, 480)]);
+        // Lines that are no size (side data, a frame that could not be read) are passed over.
+        assert_eq!(sizes_listed("\nN/A,N/A\n0,0\nside_data,x\n1920,1080\r\n"), [(1920, 1080)]);
+        assert_eq!(sizes_listed(""), []);
+    }
 
     #[test]
     fn marks_shown_only_on_frames_are_found() {

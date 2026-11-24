@@ -1523,6 +1523,26 @@ fn a_picture_inside_longer_sound_keeps_its_place_in_every_container() {
 
 #[test]
 #[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_video_whose_picture_changes_size_on_the_way_is_refused_with_the_sizes() {
+    let c = Case::new("sizes");
+    // Two recordings joined without encoding them, as a recorder of a live stream leaves them
+    // when the stream changes quality: the file says 320x180, and its second half is 480x270.
+    for (name, size) in [("a.ts", "320x180"), ("b.ts", "480x270")] {
+        c.ffmpeg(&["-f", "lavfi", "-i", &format!("testsrc2=s={size}:r=24:d=6"), "-f", "lavfi", "-i", "sine=f=440:d=6", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "16", "-g", "24", "-pix_fmt", "yuv420p", "-c:a", "aac", "-f", "mpegts", name]);
+    }
+    std::fs::write(c.videos().join("list.txt"), "file a.ts\nfile b.ts\n").unwrap();
+    c.ffmpeg(&["-f", "concat", "-i", "list.txt", "-c", "copy", "-f", "mpegts", "live.ts"]);
+    for part in ["a.ts", "b.ts", "list.txt"] {
+        std::fs::remove_file(c.videos().join(part)).unwrap();
+    }
+    let live = c.videos().join("live.ts");
+    let r = c.encode(&[&live], &[]);
+    r.has("failed 1").has("the picture changes size during the video (320x180, then 480x270)").has("no output was written");
+    assert!(!c.out().join("live.mp4").exists() && !c.out().join("live.av1opt.json").exists());
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
 fn a_file_cut_off_is_refused_with_the_reason_and_leaves_nothing() {
     let c = Case::new("cutoff");
     // Far before its stated end: the samples have no frames to come from.

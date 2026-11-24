@@ -635,6 +635,11 @@ impl CutOff {
                 Ok(Stranded::Undone)
             }
             Left::Placed => {
+                // The output folder was there when the files were looked at (its report is in
+                // it), but may have gone since: as for an undo, it is made again, and the AV1
+                // file is not left in the original's place with the original in the trash.
+                let out_dir = folder(&self.from);
+                std::fs::create_dir_all(&out_dir).with_context(|| format!("cannot make {}", out_dir.display()))?;
                 move_av1(&self.dest, &self.from)?;
                 crate::signals::stop_point("recover:moved");
                 restore()?;
@@ -3979,6 +3984,29 @@ mod tests {
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
         assert!(!original_back, "the original left the trash entry of a replacement that had gone through");
         assert!(matches!(first_now, Check::Replaced(ref d) if d.can_undo), "{first_now:?}");
+    }
+
+    /// A replacement stopped once the AV1 file took the original's place, whose output folder
+    /// (and the report in it) went between the look at the files and putting them right.
+    #[test]
+    fn a_replacement_stopped_once_placed_is_put_right_into_its_output_folder_made_again() {
+        let p = Pair::new("placed-folder-gone", false, "a.mkv").unwrap();
+        stopped_at("replace:placed", || drop(p.f.apply(&p.report)));
+        p.as_if_its_run_had_ended();
+        let r = read_report(&p.report).unwrap();
+        let cut = CutOff::of(&p.report, &r, &crate::ledger::load(), true).unwrap();
+        assert_eq!(cut.left, Left::Placed);
+        let mut held = vec![lock(&p.report).unwrap()];
+        let kept = p.f.dir.join("a.av1opt.json");
+        std::fs::rename(&p.report, &kept).unwrap();
+        std::fs::remove_dir_all(&p.out).unwrap();
+        let done = cut.put_right(&kept, &r, true, &mut held).map_err(|e| format!("{e:#}"));
+        let open = crate::ledger::load().under_way(&p.f.lib("a.mp4")).is_some();
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        assert_eq!(done, Ok(Stranded::Undone));
+        assert_eq!(std::fs::read(p.f.lib("a.mp4")).unwrap(), vec![b's'; 1000]);
+        assert_eq!(std::fs::read(p.out.join("a.mkv")).unwrap(), vec![b'o'; 400]);
+        assert!(!p.f.lib("a.mkv").exists() && p.in_trash().is_empty() && !open);
     }
 
     /// A replacement on ZFS (made with --allow-zfs) was stopped. The next `replace --apply`

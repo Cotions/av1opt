@@ -656,7 +656,7 @@ impl CutOff {
                 crate::ledger::note_undone(&self.source, &self.dest, &self.from).context("both files are back, but av1opt's own record of that could not be written")?;
                 crate::signals::stop_point("recover:noted");
                 let mut r = r.clone();
-                if r["replaced"]["from"].as_str().is_some_and(|recorded| Path::new(recorded) != self.from) {
+                if file_path(&r["replaced"], "from").is_ok_and(|recorded| recorded != self.from) {
                     r["superseded"] = json!(true);
                 }
                 r["output"] = json!(self.from);
@@ -5172,6 +5172,31 @@ mod tests {
         let set = set_right(&report, true, &mut held).map_err(|e| format!("{e:#}"));
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
         (seen, set)
+    }
+
+    /// An undo stopped half-way whose report names the output folder through a link (the
+    /// folder was moved since and a link left at its old name): put right, the report is of the
+    /// AV1 file back where it came from, not one set aside for a newer encode.
+    #[test]
+    fn an_undo_stopped_half_way_whose_report_names_its_folder_through_a_link_is_not_set_aside() {
+        for (step, page) in [("undo:moved", true), ("undo:moved", false), ("undo:restored", true), ("undo:restored", false)] {
+            let p = Pair::new(&format!("undo-link-{}-{page}", step.replace(':', "-")), false, "a.mkv").unwrap();
+            p.f.apply(&p.report).unwrap();
+            std::os::unix::fs::symlink(&p.out, p.f.dir.join("out-link")).unwrap();
+            let mut r = read_report(&p.report).unwrap();
+            r["replaced"]["from"] = json!(p.f.dir.join("out-link/a.mkv"));
+            std::fs::write(&p.report, serde_json::to_vec_pretty(&r).unwrap()).unwrap();
+            stopped_at(step, || drop(undo(&p.report, true)));
+            if page {
+                put_right_stopped(&p.report, true).unwrap();
+            } else {
+                p.command(true);
+            }
+            let r = read_report(&p.report).unwrap();
+            assert_eq!(r.get("superseded"), None, "{step} {page}: {r}");
+            p.as_before();
+        }
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
     }
 
     #[test]

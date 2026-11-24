@@ -49,6 +49,12 @@ thread_local! {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// How often this thread has written the record's folder out to the drive.
+    static FOLDER_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 fn folder() -> Option<PathBuf> {
     TEST_FOLDER.with(|f| f.borrow().clone())
 }
@@ -696,13 +702,13 @@ fn private_folder() -> Result<Option<PathBuf>> {
 
 fn add(event: Event) -> Result<()> {
     let Some(path) = private_folder()? else { return Ok(()) };
-    let file = std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(&path)
-        .with_context(|| format!("cannot open {}", path.display()))?;
+    let open = |create: bool| std::fs::OpenOptions::new().append(true).create(create).mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(&path);
+    // Made here only if it is not there yet: then its name has to reach the drive too.
+    let (file, made) = match open(false) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (open(true), true),
+        opened => (opened, false),
+    };
+    let file = file.with_context(|| format!("cannot open {}", path.display()))?;
     let mut meta = file.metadata()?;
     if meta.is_file() && meta.uid() == my_user() && meta.mode() & 0o077 != 0 {
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
@@ -714,10 +720,12 @@ fn add(event: Event) -> Result<()> {
     let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let line = serde_json::to_string(&Line { format: FORMAT, time, event })?;
     crate::files::append_line(&path, &line, false).with_context(|| format!("cannot write to {}", path.display()))?;
-    // On the drive before what it records is done or said to be done: one line for each encode,
-    // replacement or undo, so this costs little. The folder too, for a record just made.
+    // On the drive before what it records is done or said to be done: a few lines for each
+    // encode, replacement or undo, so this costs little. The folder too, for a record just made.
     crate::files::sync_unless_refused(&file).with_context(|| format!("cannot write {} out to the drive", path.display()))?;
-    if let Ok(d) = std::fs::File::open(crate::files::folder_of(&path)) {
+    if made && let Ok(d) = std::fs::File::open(crate::files::folder_of(&path)) {
+        #[cfg(test)]
+        FOLDER_SYNCS.with(|n| n.set(n.get() + 1));
         let _ = d.sync_all();
     }
     Ok(())
@@ -1293,6 +1301,19 @@ mod tests {
         let replaced = s.0.join("a.mkv");
         moved(&source, &s.0.join("Trash/files/a.mp4"), &replaced, &output).unwrap();
         assert!(load().judges(&s.plan(&source, &replaced), None).is_some_and(|j| j.is_err()));
+    }
+
+    /// A line is written out to the drive before it is gone by, and the folder only when the
+    /// record is new: its name is then on the drive too, and does not change after.
+    #[test]
+    fn the_folder_is_written_out_only_when_the_record_is_made() {
+        let s = Scratch::new("folder-synced");
+        let before = FOLDER_SYNCS.with(std::cell::Cell::get);
+        s.encoded("a");
+        s.encoded("b");
+        note_settled(Path::new("/v/c.mp4")).unwrap();
+        assert_eq!(FOLDER_SYNCS.with(std::cell::Cell::get) - before, 1);
+        assert_eq!(std::fs::read_to_string(s.file()).unwrap().lines().count(), 3);
     }
 
     #[test]

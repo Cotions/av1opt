@@ -1070,13 +1070,18 @@ fn write_report_locking(report: &Path, r: &Value, held: Option<&mut Vec<Lock>>) 
     use std::os::fd::AsRawFd;
     let date = std::fs::metadata(report).and_then(|m| m.modified()).ok();
     let part = crate::files::save_name(report);
+    // Locked only to be held: a lock taken here and let go of by closing the file would stay
+    // for as long as a program another thread is starting holds a copy of the descriptor.
+    let locking = held.is_some();
     let write = || -> Result<File> {
         // (Made anew: a link left at that name is not written through.)
         let _ = std::fs::remove_file(&part);
         let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&part)?;
-        // SAFETY: flock on a descriptor we own; no memory is involved. Nobody else has this new
-        // file open; a filesystem without locks is carried on with, as `lock` does.
-        unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if locking {
+            // SAFETY: flock on a descriptor we own; no memory is involved. Nobody else has this
+            // new file open; a filesystem without locks is carried on with, as `lock` does.
+            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        }
         std::io::Write::write_all(&mut f, &serde_json::to_vec_pretty(r)?)?;
         if let Some(date) = date {
             let _ = f.set_modified(date);
@@ -1086,11 +1091,20 @@ fn write_report_locking(report: &Path, r: &Value, held: Option<&mut Vec<Lock>>) 
         Ok(f)
     };
     let f = write().inspect_err(|_| drop(std::fs::remove_file(&part)))?;
+    #[cfg(test)]
+    COPY_OF_WRITTEN.with(|c| c.borrow_mut().as_mut().map(|kept| kept.push(f.try_clone().unwrap())));
     sync_dir(crate::files::folder_of(report));
     if let Some(held) = held {
         held.push(Lock(f));
     }
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Where the tests that ask for it keep a copy of the descriptor of each report written, as
+    /// a program started by another thread at that moment holds one until it execs.
+    static COPY_OF_WRITTEN: std::cell::RefCell<Option<Vec<File>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// How long [`lock`] waits for a report another run holds.
@@ -4187,6 +4201,24 @@ mod tests {
     /// started (here another descriptor of the report, let go of a little later): the next run
     /// waits for it rather than say the pair is busy. With every test of this program in one
     /// process, starting tools as they go, runs one after the other on one pair were refused.
+    /// A report rewritten when nothing more is to be done with its pair is not left locked,
+    /// whoever holds a copy of the descriptor it was written through.
+    #[test]
+    fn a_report_rewritten_with_nothing_more_to_do_is_not_left_locked() {
+        let f = Fix::new("written-unlocked");
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        let r = read_report(&report).unwrap();
+        COPY_OF_WRITTEN.with(|c| *c.borrow_mut() = Some(Vec::new()));
+        write_report(&report, &r).unwrap();
+        let free = lock(&report).map(drop).map_err(|e| format!("{e:#}"));
+        let mut held = Vec::new();
+        write_report_held(&report, &r, &mut held).unwrap();
+        let after_held = lock(&report).map(drop).is_err();
+        COPY_OF_WRITTEN.with(|c| *c.borrow_mut() = None);
+        assert!(free.is_ok(), "{free:?}");
+        assert!(after_held, "a report written to be held is locked");
+    }
+
     #[test]
     fn a_lock_let_go_of_a_moment_ago_is_waited_for() {
         use std::os::fd::AsRawFd;

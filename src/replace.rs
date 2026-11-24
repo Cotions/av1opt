@@ -2149,7 +2149,7 @@ fn run_watched(paths: &[PathBuf], go: bool, back: bool, allow_zfs: bool, accept_
         println!("\n{} back in place", plural(done, "original", "originals"));
     } else {
         let (bytes_in, bytes_out) = ready.iter().fold((0u64, 0u64), |a, p| (a.0 + p.source_bytes, a.1 + p.output_bytes));
-        println!("{} can take their original's place", plural(ready.len(), "output", "outputs"));
+        println!("{} can take {} original's place", plural(ready.len(), "output", "outputs"), if ready.len() == 1 { "its" } else { "their" });
         for p in &ready {
             let name = p.dest.file_name().unwrap_or_default().to_string_lossy();
             let mut notes = Vec::new();

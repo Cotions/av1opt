@@ -2201,7 +2201,7 @@ fn replace_goes_by_the_record_and_otherwise_only_by_reports_nobody_else_could_ha
     untouched();
     // In a folder only its user can write to, the user's own report is followed.
     std::fs::set_permissions(c.out(), std::fs::Permissions::from_mode(0o755)).unwrap();
-    replace(&[]).ok().has("1 output can take their original's place");
+    replace(&[]).ok().has("1 output can take its original's place");
     // And where others could write, on the user's word.
     std::fs::set_permissions(c.out(), std::fs::Permissions::from_mode(0o777)).unwrap();
     replace(&["--apply", "--trust-reports"]).ok().has("1 original replaced");

@@ -116,7 +116,10 @@ single output files.
   and are the recorded files; then it can be put back. An original with two outputs (two
   output folders) is replaced by one run at a time: a run that finds, once its own line is
   written, a run of another of its outputs under way or stopped half-way leaves the original
-  to that one and says so, and each run's end on record closes its own line only. `--apply`
+  to that one and says so, and each run's end on record closes its own line only. A run of
+  the other output that was stopped before its first move (nothing of it moved, and no
+  process holds its report, or the report is gone with its folder) is no run to wait for:
+  it is written down as over, and this one goes on. `--apply`
   then does what was asked; without it the list says what was stopped half-way and where the
   original is. A pair with no such line, or whose files are no longer as that run would have
   left them (moved by hand since, or not the recorded files), is left as it is and said to
@@ -131,9 +134,12 @@ single output files.
   original's folder (a replacement that had placed it, an undo that had not taken it back
   yet), has the AV1 file taken back to the output folder (a copy of it left in the
   original's folder by a move across drives is removed instead), and an undo is then written
-  down as done. One
+  down as done; any other file at the original's place is not taken for the original, and
+  the pair is said and left as it is. One
   stopped half-way whose original was since emptied from the trash (a later file from another
-  folder may have its name there now: that entry is not the original's, and stays as it is),
+  folder may have its name there now: an entry whose info names another place and whose file
+  is not the original is not the original's, and stays as it is; an entry that is the
+  original, whatever its info says, is never taken for emptied),
   with the AV1 file at one of its two places, has nothing left to put back: that is said, and putting it right has
   the record and the report say where the only video left of the two is. An AV1 file a
   replacement had placed stays in the original's folder, and the pair is written down as

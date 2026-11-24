@@ -490,7 +490,20 @@ impl Ledger {
         // What ends a move under way for an original: its end on record, or a new encode in the
         // place the AV1 file was to come from. Each ends the run of that place only.
         match &event {
-            Event::Replaced { source, from, .. } | Event::Undone { source, back_to: from, .. } | Event::Encoded { source, output: from, .. } | Event::Settled { source, from: Some(from) } => self.end_under_way(source, Some(from)),
+            Event::Replaced { source, from, .. } => {
+                self.end_under_way(source, Some(from));
+                // The original went to the trash with this run. Another replacement of it
+                // still open with no name in the trash on record had not moved it, then: a
+                // run stopped before its first move, which records of the version before runs
+                // were told apart by their output took as ended by the next run's line.
+                if let Some(runs) = self.under_way.get_mut(source) {
+                    runs.retain(|u| u.undoing || u.trash.is_some());
+                    if runs.is_empty() {
+                        self.under_way.remove(source);
+                    }
+                }
+            }
+            Event::Undone { source, back_to: from, .. } | Event::Encoded { source, output: from, .. } | Event::Settled { source, from: Some(from) } => self.end_under_way(source, Some(from)),
             Event::Settled { source, from: None } => self.end_under_way(source, None),
             _ => {}
         }

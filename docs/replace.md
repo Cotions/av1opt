@@ -110,7 +110,10 @@ single output files.
   files read whole, never by the report's word: a replacement is put back as it was before it
   (the original back in its place, the AV1 file back in the output folder, a copy of it on
   another drive removed), an undo with the AV1 file still in the original's place goes back
-  to the replacement, and one with the AV1 file back in the output folder is finished. `--apply`
+  to the replacement, and one with the AV1 file back in the output folder is finished. A
+  replacement that went through, with its report saying so, whose own line on record of that
+  could not be written is written down once the trash entry and the AV1 file are read whole
+  and are the recorded files; then it can be put back. `--apply`
   then does what was asked; without it the list says what was stopped half-way and where the
   original is. A pair with no such line, or whose files are no longer as that run would have
   left them (moved by hand since, or not the recorded files), is left as it is and said to

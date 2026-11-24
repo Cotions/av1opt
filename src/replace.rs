@@ -1752,7 +1752,7 @@ fn nothing_under_way(source: &Path, from: &Path, e: anyhow::Error) -> anyhow::Er
 /// original from ever replacing it, with nothing left to put right.
 fn other_run_under_way(source: &Path, from: &Path) -> Option<String> {
     let ledger = crate::ledger::current();
-    let other = ledger.under_way(source).filter(|u| u.from != from).find(|u| !over_with_nothing_moved(source, u))?;
+    let other = ledger.under_way(source).filter(|u| u.from != from).find(|u| !over_with_nothing_moved(source, &u.from))?;
     Some(format!(
         "another {} of this original, with the AV1 file at {}, is under way or was stopped half-way, so nothing was changed; once that one is over or put right (the page's \"Put right\", or `av1opt replace --apply` over its folder), this can be tried again",
         if other.undoing { "undo" } else { "replacement" },
@@ -1760,25 +1760,46 @@ fn other_run_under_way(source: &Path, from: &Path) -> Option<String> {
     ))
 }
 
-/// Whether `other`, a run on record of another output of the original at `source`, moved
-/// nothing and is in no process any more, and is now written down as over. Nothing moved: a
-/// replacement with the original still at its place, no file at the name it wrote down for
-/// the trash (or none written down), and nothing at the place its AV1 file was to take. In no
-/// process: a run holds the lock of its report from before its line is written to its end, so
-/// a report that can be locked, or that is gone, has no run. (On a filesystem without locks
-/// two runs are not kept apart by anything, here as elsewhere.)
-fn over_with_nothing_moved(source: &Path, other: &crate::ledger::UnderWay) -> bool {
+/// Whether the run on record of another output of the original at `source`, of the AV1 file
+/// whose place in the output folder is `from`, moved nothing and is in no process any more,
+/// and is now written down as over (or was, meanwhile).
+///
+/// In no process: a run holds the lock of its report from before its line is written to its
+/// end, so a report whose lock is free at this moment, or that is gone, has no run. The lock
+/// is not waited for (a run that is there may move the original while it is, and end with
+/// its line open), and where it cannot be had for any other reason (a filesystem without
+/// locks) nothing can be told, and the run is taken to be there.
+///
+/// Nothing moved, looked at with that lock held and the record read again: a replacement with
+/// the original still at its place, no file at the name it wrote down for the trash (or none
+/// written down), and nothing at the place its AV1 file was to take. What such a run leaves
+/// (the info file of a name it reserved in the trash, a hidden copy on its way to the
+/// original's folder) is cleared as putting it right would.
+fn over_with_nothing_moved(source: &Path, from: &Path) -> bool {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let report = from.with_extension("av1opt.json");
+    let _held = match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&report) {
+        // SAFETY: flock on a descriptor we own; no memory is involved.
+        Ok(f) if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 => Some(Lock(f)),
+        Ok(_) => return false,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return false,
+    };
+    let ledger = crate::ledger::current();
+    let Some(other) = ledger.under_way(source).find(|u| u.from == from) else { return true };
     let there = |p: &Path| std::fs::symlink_metadata(p).is_ok();
     if other.undoing || !there(source) || other.trash.as_deref().is_some_and(there) || (other.dest != source && there(&other.dest)) {
         return false;
     }
-    let report = other.from.with_extension("av1opt.json");
-    let _held = match lock(&report) {
-        Ok(held) => Some(held),
-        Err(_) if !there(&report) => None,
-        Err(_) => return false,
-    };
-    crate::ledger::note_settled(source, &other.from).is_ok()
+    if crate::ledger::note_settled(source, from).is_err() {
+        return false;
+    }
+    if let Some(trash) = &other.trash {
+        trash::drop_info_left_alone(trash, source);
+    }
+    clear_left_behind(&other.dest);
+    true
 }
 
 /// Whether av1opt's record has a replacement or an undo of the original of `report` under way:
@@ -6094,7 +6115,7 @@ mod tests {
         let open: Vec<_> = crate::ledger::load().under_way(&f.lib("a.mp4")).map(|u| u.from.clone()).collect();
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
         eprintln!("first try: {tried:?}\nlisted: {listed:?}\nput right of the second: {page:?}\nreplace --apply: {command:?}\nagain: {again:?}\nopen: {open:?}");
-        assert!(again.is_ok() || command.is_ok() && says_replaced(&second), "the original can never be replaced from its other output: {again:?}");
+        assert!(tried.is_ok() && says_replaced(&second) && open.is_empty(), "the original was not replaced from its other output at the first try: {tried:?} {open:?}");
     }
 
     /// A replacement stopped with the original in the trash, whose library folder was then
@@ -6329,7 +6350,7 @@ mod tests {
                         let n = e.file_name().to_string_lossy().into_owned();
                         let mine = format!(".{}.", std::process::id());
                         if n.starts_with('.') && n.contains(&mine) {
-                            std::fs::rename(e.path(), d.join(n.replace(&mine, ".4000000."))).unwrap();
+                            std::fs::rename(e.path(), d.join(n.replace(&mine, ".4194305."))).unwrap();
                         }
                     }
                 }
@@ -6427,4 +6448,59 @@ mod tests {
         eprintln!("open: {open:?}\nlisted: {listed:?}\nreplace --apply: {command:?}");
         assert!(open.is_empty() && listed.is_none() && command.is_ok(), "{open:?}");
     }
+    /// A run of the second output that meets the first's line while the first is alive does not
+    /// wait for its report. It used to, for up to a second: the first could trash the original
+    /// in that second and end (killed, or an error that leaves its line open) with it there,
+    /// and the second then took the lock and wrote the first down as over from what it had
+    /// seen before it waited, leaving the original in the trash with nothing naming it.
+    #[test]
+    fn a_run_that_moves_while_the_other_output_looks_at_it_is_not_written_down_as_over() {
+        let f = Fix::new("moves-while-looked-at");
+        let _record = record_in(&f);
+        let first = f.encode("a.mp4", "a.mkv", 1000, 400);
+        on_record(&first);
+        let second = second_output(&f, &first);
+        stopped_at("replace:begun", || drop(f.apply(&first)));
+        // The first run, alive: its line on record, its report held, nothing moved yet.
+        let held = lock(&first).unwrap();
+        let (src, from, home, data) = (f.lib("a.mp4"), f.out("a.mkv"), f.dir.join("Trash"), f.dir.join("data/av1opt"));
+        let t = std::thread::spawn(move || {
+            crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = Some(data));
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let went = trash::trash_with_noting(&src, Some(&home), 1000, "2026-11-10T22:15:03".into(), &|t| crate::ledger::note_trashing(&src, &from, t)).unwrap();
+            drop(held);
+            went
+        });
+        let tried = f.apply(&second).map(drop).map_err(|e| format!("{e:#}"));
+        let went = t.join().unwrap();
+        let open: Vec<_> = crate::ledger::load().under_way(&f.lib("a.mp4")).map(|u| (u.from.clone(), u.trash.clone())).collect();
+        let recovered = run_watched(&[f.dir.join("out"), f.dir.join("out2"), f.dir.join("lib")], true, false, true, false, false, false, &|| {}).map_err(|e| format!("{e:#}"));
+        let (back, in_trash) = (f.lib("a.mp4").exists(), went.exists());
+        let open_after: Vec<_> = crate::ledger::load().under_way(&f.lib("a.mp4")).map(|u| u.from.clone()).collect();
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        eprintln!("second: {tried:?}\nopen after the second: {open:?}\nrecovery: {recovered:?}\nback {back}, in the trash {in_trash}, open after recovery {open_after:?}");
+        assert!(tried.is_err() && open.iter().any(|(from, _)| *from == f.out("a.mkv")), "a run that holds its report was not waited for: {tried:?} {open:?}");
+        assert!(back || !open_after.is_empty() || says_replaced(&first) || says_replaced(&second), "the original was left in the trash with nothing naming it");
+    }
+
+    /// A run stopped once it had reserved the original's name in the trash (its info
+    /// file written, the original not moved), its output folder then thrown away: the other
+    /// output writes it down as over, and clears the info file it left as putting it right would.
+    #[test]
+    fn a_stale_run_written_down_as_over_by_the_other_output_leaves_no_info_file_in_the_trash() {
+        let f = Fix::new("stale-info-left");
+        let _record = record_in(&f);
+        let first = f.encode("a.mp4", "a.mkv", 1000, 400);
+        on_record(&first);
+        let second = second_output(&f, &first);
+        stopped_at("trash:info", || drop(f.apply(&first)));
+        std::fs::remove_dir_all(f.dir.join("out")).unwrap();
+        let done = f.apply(&second).map(|d| d.trash).map_err(|e| format!("{e:#}"));
+        let names = |d: &str| std::fs::read_dir(f.dir.join("Trash").join(d)).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect::<Vec<_>>();
+        let (files, info) = (names("files"), names("info"));
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        eprintln!("second: {done:?}\n  trash files {files:?}\n  trash info {info:?}");
+        assert_eq!(files.len(), info.len(), "an info file with no file in the trash");
+    }
+
 }

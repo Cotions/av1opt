@@ -117,9 +117,12 @@ single output files.
   output folders) is replaced by one run at a time: a run that finds, once its own line is
   written, a run of another of its outputs under way or stopped half-way leaves the original
   to that one and says so, and each run's end on record closes its own line only. A run of
-  the other output that was stopped before its first move (nothing of it moved, and no
-  process holds its report, or the report is gone with its folder) is no run to wait for:
-  it is written down as over, and this one goes on. `--apply`
+  the other output that was stopped before its first move is no run to wait for: when no
+  process holds its report (looked at once, not waited for), or the report is gone with its
+  folder, and with that known nothing of it has moved, it is written down as over, what it
+  left (a name reserved in the trash, a hidden copy) is cleared, and this one goes on. On a
+  filesystem that has no locks this cannot be told, and the other run is put right first.
+  `--apply`
   then does what was asked; without it the list says what was stopped half-way and where the
   original is. A pair with no such line, or whose files are no longer as that run would have
   left them (moved by hand since, or not the recorded files), is left as it is and said to

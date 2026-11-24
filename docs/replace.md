@@ -43,7 +43,9 @@ single output files.
   `/proc/self/root`): paths are compared with their folders resolved, and every output and
   original on record is also compared by the file itself, so a second mount of a folder, a
   second link, or a drive that takes two spellings of a name for one (letter case, accents
-  written two ways) does not make one file two. `--trust-reports` never counts against the
+  written two ways) does not make one file two. (A folder reached once on its drive and once
+  over the network is two drives to the system: a pair named the second way is judged as one
+  the record knows nothing of, by the rule below.) `--trust-reports` never counts against the
   record.
 - A report the record knows nothing of is followed only to originals inside the folders you
   name (name the originals' folder as well, or add `--anywhere`), and only if it and its output

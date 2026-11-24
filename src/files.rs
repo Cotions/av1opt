@@ -899,9 +899,26 @@ impl OneFile {
         OneFile { real: in_real_folder(path), number: std::fs::symlink_metadata(path).ok().map(|m| (m.dev(), m.ino())) }
     }
 
+    /// [`OneFile::of`] for a path on record, whose folder was resolved when it was written
+    /// down: where the file is there its number tells it, and the folder is looked at again
+    /// only where it is not (the folder may have become a link since). A record of ten
+    /// thousand videos is ten thousand such paths, and resolving the folder of each took ten
+    /// times the calls of the one that asks for the number.
+    pub fn of_recorded(path: &Path) -> OneFile {
+        match std::fs::symlink_metadata(path) {
+            Ok(m) => OneFile { real: path.to_path_buf(), number: Some((m.dev(), m.ino())) },
+            Err(_) => OneFile { real: in_real_folder(path), number: None },
+        }
+    }
+
     /// Whether the two are one file: one path, or, where both are there, one file on the drive.
     pub fn is(&self, other: &OneFile) -> bool {
-        self.real == other.real || (self.number.is_some() && self.number == other.number)
+        self.same_path(other) || (self.number.is_some() && self.number == other.number)
+    }
+
+    /// Whether the two are one path, which needs nothing of the drive to hold.
+    pub fn same_path(&self, other: &OneFile) -> bool {
+        self.real == other.real
     }
 }
 

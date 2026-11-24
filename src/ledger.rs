@@ -354,8 +354,31 @@ impl Ledger {
 
     /// The file at a path on record (see `seen`).
     fn recorded(&self, path: &Path) -> std::sync::Arc<crate::files::OneFile> {
-        let mut seen = self.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        seen.entry(path.to_path_buf()).or_insert_with(|| std::sync::Arc::new(crate::files::OneFile::of(path))).clone()
+        let seen = || self.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(known) = seen().get(path) {
+            return known.clone();
+        }
+        // The drive is asked with the lock let go: one that does not answer (a network share
+        // that went away) then holds up this question only, not every other one of the page.
+        let file = std::sync::Arc::new(crate::files::OneFile::of_recorded(path));
+        seen().entry(path.to_path_buf()).or_insert(file).clone()
+    }
+
+    /// Whether the path `recorded`, which is on record, is the file `given`. What was learnt
+    /// of the recorded path earlier is believed where it says no, and where the paths are
+    /// one. Where only the file's number says yes, the drive is asked again: a number learnt
+    /// a while ago can by now be another file's (a file deleted since gives its number to the
+    /// next one made in its folder), and the page keeps one reading of the record for as long
+    /// as the record does not change.
+    fn is_recorded(&self, recorded: &Path, given: &crate::files::OneFile) -> bool {
+        let known = self.recorded(recorded);
+        if known.same_path(given) || !known.is(given) {
+            return known.same_path(given);
+        }
+        let now = std::sync::Arc::new(crate::files::OneFile::of_recorded(recorded));
+        let same = now.is(given);
+        self.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(recorded.to_path_buf(), now);
+        same
     }
 
     /// What is recorded of whatever output is at `output`, under that path or under another
@@ -366,14 +389,14 @@ impl Ledger {
     fn known_as(&self, output: &Path) -> Option<&Entry> {
         let other_path = || {
             let given = crate::files::OneFile::of(output);
-            self.outputs.iter().find(|(o, e)| (e.made.is_some() || e.replaced.is_some()) && self.recorded(o).is(&given))
+            self.outputs.iter().find(|(o, e)| (e.made.is_some() || e.replaced.is_some()) && self.is_recorded(o, &given))
         };
         self.known_at(output).or_else(|| other_path().map(|(_, e)| e))
     }
 
     /// Whether `e` is of the original at `source`, by any of its paths.
     fn of_source(&self, e: &Entry, source: &Path) -> bool {
-        e.source == source || self.recorded(&e.source).is(&crate::files::OneFile::of(source))
+        e.source == source || self.is_recorded(&e.source, &crate::files::OneFile::of(source))
     }
 
     /// What is recorded of the output at `output`, if it was made from `source` or took its
@@ -488,7 +511,7 @@ impl Ledger {
     /// its paths, as they are told; None if there are none.
     fn outputs_of(&self, source: &Path) -> Option<String> {
         let given = crate::files::OneFile::of(source);
-        let of_it = |e: &Entry| e.source == source || self.recorded(&e.source).is(&given);
+        let of_it = |e: &Entry| e.source == source || self.is_recorded(&e.source, &given);
         let mut others: Vec<String> = self.outputs.iter().filter(|(_, e)| (e.made.is_some() || e.replaced.is_some()) && of_it(e)).map(|(o, _)| o.display().to_string()).collect();
         others.sort();
         (!others.is_empty()).then(|| others.join(" and "))

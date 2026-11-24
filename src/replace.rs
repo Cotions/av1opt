@@ -4515,6 +4515,29 @@ mod tests {
     }
 
     #[test]
+    fn an_output_on_record_reached_by_a_name_other_than_its_own_is_held_to_the_record() {
+        // The output av1opt made from one original, named by a report under a name the record
+        // does not hold, as the original of another: on a drive that folds names, the record
+        // must still know the file. A hard link under another name stands in for that name
+        // (`replace` would not move a file with two links, so this asks the record itself).
+        let f = Fix::new("output-other-name");
+        record_in(&f);
+        let report = f.encode("a.mp4", "a.mkv", 1000, 400);
+        on_record(&report);
+        let other = f.encode("c.mp4", "c.mkv", 1000, 400);
+        std::fs::hard_link(f.out("a.mkv"), f.out("0.mkv")).unwrap();
+        let mut planted = read_report(&other).unwrap();
+        planted["output"] = json!(f.out("0.mkv"));
+        write_report(&f.out("0.av1opt.json"), &planted).unwrap();
+        let Check::Ready(p) = check(&f.out("0.av1opt.json")) else { panic!("{:?}", check(&f.out("0.av1opt.json"))) };
+        let ledger = crate::ledger::load();
+        let judged = ledger.judges(&p, None);
+        assert!(judged.as_ref().is_some_and(|j| j.as_ref().is_err_and(|why| why.contains("made from another original"))), "the record says {judged:?}");
+        assert!(matches!(ledger.adopting(&p), crate::ledger::Standing::Refused(_)), "adopt would take it");
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
+
+    #[test]
     fn two_reports_naming_one_original_by_two_paths_are_both_refused() {
         let f = Fix::new("twice-two-paths");
         record_in(&f);

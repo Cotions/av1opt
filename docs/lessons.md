@@ -178,6 +178,22 @@
   at 93.2 instead of 429.7 MB at 94.2 (CRF 39 instead of 37, 1:56 encoded again instead
   of 1:05), and a third 205.1 MB at 93.2 instead of 220.1 MB at 94.1. The three together
   are a tenth smaller, and their lowest five seconds stayed at 89.1 to 89.5.
+- **A decoder can hand over a wrecked picture and say nothing.** One of four runs of the same
+  five-minute 1080p HEVC video, made while the machine was very busy, scored eight frames in
+  a row at VMAF 9 to 54 where the other three runs had 91 to 94, and one frame six points
+  low 22 seconds earlier. The encode was not at fault. Every other score matched the other
+  runs to the last digit; the low frames ran from twelve frames into one group of pictures
+  of the source to its next key frame, while the AV1 group around them went on for 200
+  frames more; and that encode made five times over came out the same byte for byte. The
+  check had been handed those frames of the source wrecked, by ffmpeg's HEVC decoder with
+  its frame threads. Of 90 more decodes of that source with frame threads beside other work,
+  two came out unlike a decode with one thread, with no error and no warning: one in a
+  single key frame; one in a frame nothing refers to and, 19 seconds on, in the last four
+  frames before a key frame, which is the shape of the first fault. Ten decodes with one
+  thread and ten with slice threads came out the same. So a check can read a fault that is
+  in neither video, and a first encode or a clip cut from the source can hold one that the
+  source does not have. A frame far below the frames around it now has its group encoded
+  again from a fresh cut (see [encode](encode.md)).
 - **A key frame every 10 seconds, and quantization matrices.** SVT-AV1 puts a key frame
   about every 5 seconds and leaves quantization matrices off. At equal VMAF, 10 seconds
   took 3.3% less on eight 10-second clips and 2.6% less on four of 40 seconds (20 seconds:

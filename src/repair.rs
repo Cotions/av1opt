@@ -106,11 +106,11 @@ const MEAN_EXTRA: f64 = 0.01;
 /// the encode, or in the decoding of either video for the check. Its GOP is encoded again as
 /// one with a window below the floor is. In one run of four of the same five-minute video,
 /// made while the machine was very busy, eight scored frames in a row read VMAF 9 to 54 among
-/// frames at 91 to 94: the rest of one GOP of the source, which ffmpeg's HEVC decoder had
-/// handed to the check wrecked, without a word (see docs/lessons.md). In the first encodes
-/// of 21 runs on 9 sources (95,000 scored frames) nothing else lay more than 19.2 under, and
-/// the eight lay 38 to 83 under. One such scored frame takes 1.6 off the mean of a
-/// five-second window, which a window at 91 does not show.
+/// frames at 91 to 94: the rest of one GOP of the source, which the check had been handed
+/// wrecked, without a word, by a bit lost in that machine's memory (see docs/lessons.md). In
+/// the first encodes of 21 runs on 9 sources (95,000 scored frames) nothing else lay more
+/// than 19.2 under, and the eight lay 38 to 83 under. One such scored frame takes 1.6 off the
+/// mean of a five-second window, which a window at 91 does not show.
 const FAR_BELOW: f64 = 25.0;
 /// The frames around a frame: the scored ones shown within this long of it, either side (at
 /// the ends of the video, the two seconds it begins or ends with). A burst is seen while it is

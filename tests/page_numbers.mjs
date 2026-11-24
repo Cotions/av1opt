@@ -9,7 +9,7 @@ const source = readFileSync(new URL("../ui/app.js", import.meta.url), "utf8");
 const from = source.indexOf("// ---------- numbers and names ----------");
 const to = source.indexOf("// ---------- end of the part that runs alone ----------");
 assert.ok(from >= 0 && to > from, "the markers of the part that runs alone are in ui/app.js");
-const names = ["bytes", "pct", "floorPct", "sizeChange", "savedPct", "num", "rel", "times", "plural", "pathList", "leftOutOfList", "shownPath", "copiesLeft", "newestOnly", "refusalText", "presetFrom", "NAME_ORDER", "rowOrder", "numberProblem", "RANGES", "sameKind", "allowedValue", "rememberedForm", "rememberedOptions", "oneCrfText", "searchShift"];
+const names = ["bytes", "pct", "floorPct", "sizeChange", "savedPct", "num", "rel", "times", "plural", "pathList", "leftOutOfList", "shownPath", "copiesLeft", "newestOnly", "refusalText", "presetFrom", "NAME_ORDER", "rowOrder", "numberProblem", "RANGES", "sameKind", "allowedValue", "rememberedForm", "rememberedOptions", "oneCrfText", "searchShift", "keptParts", "outToSrc", "usableParts"];
 const page = new Function(`"use strict";\n${source.slice(from, to)}\nreturn { ${names.join(", ")} };`)();
 
 // Each case is [argument, what is shown]; arguments in an array are spread.
@@ -273,4 +273,26 @@ test("an encode's own files move only to a frame that is clearly better", async 
   const seen = new Set();
   await searchShift({ ...common, base: 0.4, diff: async (t, s) => { seen.add(Math.round(s * 25)); return 1; } });
   assert.deepEqual([...seen].sort((a, b) => a - b), [7, 8, 9, 10, 11, 12, 13]);
+});
+
+test("the source's moment for a moment of a cut video comes from the parts the encode wrote down", () => {
+  const { keptParts, outToSrc, usableParts } = page;
+  // As asked for: 1.001 to 2 and 3.001 to 4 removed from 10 s. As cut at 24 frames a second:
+  // each part ends with the frame that was on at the section's start.
+  const asked = keptParts([[1.001, 2], [3.001, 4]], 10);
+  const cut = [[0, 25 / 24], [2, 73 / 24], [4, 10]];
+  assert.deepEqual(asked, [[0, 1.001], [2, 3.001], [4, 10]]);
+  assert.equal(usableParts(cut), cut);
+  // The first frame of the last part is two frames later in the output than the sections
+  // as asked for put it.
+  const at = 50 / 24;
+  assert.ok(Math.abs(outToSrc(cut, at) - 4) < 1e-9, `${outToSrc(cut, at)}`);
+  assert.ok(Math.abs(outToSrc(asked, at) - (4 + 2 / 24 - 0.002)) < 1e-9, `${outToSrc(asked, at)}`);
+  // Inside a part, and past the end.
+  assert.ok(Math.abs(outToSrc(cut, 26 / 24) - (2 + 1 / 24)) < 1e-9);
+  assert.equal(outToSrc(cut, 100), 10);
+  // What is not a list of parts in order is not used.
+  for (const bad of [undefined, null, [], "x", [[1]], [[2, 1]], [[0, 2], [1, 3]], [[0, NaN]], [[-1, 2]], [[0, 1], "x"]]) {
+    assert.equal(usableParts(bad), null, JSON.stringify(bad));
+  }
 });

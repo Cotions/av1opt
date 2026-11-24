@@ -724,6 +724,15 @@ fn sections_ending_between_two_frames_leave_the_rest_where_it_is_looked_for() {
     assert!((t[100] - 100.0 / 24.0).abs() < 0.002, "the last part starts at {:.4} s", t[100]);
     let a = streams(&probe(&out), "audio")[0]["duration"].as_str().unwrap().parse::<f64>().unwrap();
     assert!((a - 292.0 / 24.0).abs() < 0.03, "sound {a:.3} s, picture {:.3} s", 292.0 / 24.0);
+    // The report holds the parts as they were cut, each ending with its last frame: the
+    // page's Compare finds the source's frame for a moment of the output by them.
+    let r = c.report("talk");
+    let parts: Vec<(f64, f64)> = r["kept"].as_array().unwrap().iter().map(|p| (p[0].as_f64().unwrap(), p[1].as_f64().unwrap())).collect();
+    let cut = [(0.0, 25.0 / 24.0), (2.0, 73.0 / 24.0), (4.0, 121.0 / 24.0), (6.0, 169.0 / 24.0), (8.0, 16.0)];
+    assert_eq!(parts.len(), cut.len(), "{parts:?}");
+    for (got, want) in parts.iter().zip(&cut) {
+        assert!((got.0 - want.0).abs() < 1e-3 && (got.1 - want.1).abs() < 1e-3, "{parts:?}");
+    }
 }
 
 #[test]
@@ -1512,6 +1521,26 @@ fn a_picture_inside_longer_sound_keeps_its_place_in_every_container() {
             assert!(verify_scores(&c.report_in(&out_dir, "inside")).iter().all(|v| *v > 80.0), "{name} to {container}");
         }
     }
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn a_video_whose_picture_changes_size_on_the_way_is_refused_with_the_sizes() {
+    let c = Case::new("sizes");
+    // Two recordings joined without encoding them, as a recorder of a live stream leaves them
+    // when the stream changes quality: the file says 320x180, and its second half is 480x270.
+    for (name, size) in [("a.ts", "320x180"), ("b.ts", "480x270")] {
+        c.ffmpeg(&["-f", "lavfi", "-i", &format!("testsrc2=s={size}:r=24:d=6"), "-f", "lavfi", "-i", "sine=f=440:d=6", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "16", "-g", "24", "-pix_fmt", "yuv420p", "-c:a", "aac", "-f", "mpegts", name]);
+    }
+    std::fs::write(c.videos().join("list.txt"), "file a.ts\nfile b.ts\n").unwrap();
+    c.ffmpeg(&["-f", "concat", "-i", "list.txt", "-c", "copy", "-f", "mpegts", "live.ts"]);
+    for part in ["a.ts", "b.ts", "list.txt"] {
+        std::fs::remove_file(c.videos().join(part)).unwrap();
+    }
+    let live = c.videos().join("live.ts");
+    let r = c.encode(&[&live], &[]);
+    r.has("failed 1").has("the picture changes size during the video (320x180, then 480x270)").has("no output was written");
+    assert!(!c.out().join("live.mp4").exists() && !c.out().join("live.av1opt.json").exists());
 }
 
 #[test]
@@ -2997,6 +3026,70 @@ fn sound_keeps_its_place_against_the_picture_when_stretches_are_encoded_again() 
             assert_in_step(&out, &src, "1");
         }
     }
+}
+
+/// A stand-in ffmpeg that rewrites what libvmaf logged for two scored frames of the whole-video
+/// check (frames 300 and 303), and with `always` for two of every stretch scored after that:
+/// what a check reads when a decoder hands it wrecked pictures.
+fn wrecking_two_scored_frames(c: &Case, always: bool) -> PathBuf {
+    // (The log is named in the filter graph, and written where ffmpeg is run.)
+    let wreck = |log: &str, first: u32| {
+        format!(
+            "*log_path={log}*) \"$real\" \"$@\" || exit $?; f=$(printf %s \"$*\" | sed 's/.*log_path=\\([^: ]*\\).*/\\1/'); awk '/\"frameNum\"/ {{ n = $2 + 0 }} /\"vmaf\":/ && n >= {first} && n < {} {{ sub(/[0-9.]+$/, \"55.5\") }} {{ print }}' \"$f\" > wrecked.json && mv wrecked.json \"$f\"; exit 0;;",
+            first + 6
+        )
+    };
+    let stretches = if always { wreck("vmaf-frames-*.json", 60) } else { String::new() };
+    c.stand_in_ffmpeg(&format!("case \"$*\" in\n{}\n{stretches}\nesac", wreck("survey-vmaf.json", 300)))
+}
+
+#[test]
+#[ignore = "needs ffmpeg with libsvtav1 and libvmaf"]
+fn frames_scored_far_below_the_frames_around_them_have_their_stretch_encoded_again() {
+    let c = Case::new("far-below");
+    let src = c.clip("g.mp4", "320x180", 25);
+    let far = |r: &Value| r["whole"]["far_below"].as_array().cloned().unwrap_or_default();
+    let for_frames = |r: &Value| r["whole"]["stretches"].as_array().unwrap().iter().filter(|s| s["for_frames"] == true).cloned().collect::<Vec<_>>();
+
+    // As it comes: no such frame, and nothing said of any.
+    let plain = c.dir.join("out-plain");
+    c.encode_into(&plain, &[&src], &[]).ok().lacks("far below");
+    let r = c.report_in(&plain, "g");
+    assert!(far(&r).is_empty() && for_frames(&r).is_empty(), "{r}");
+
+    // Two scored frames read as wrecked, once: their windows hold the floor all the same (two
+    // of forty at 55 take under two points off), so only the frames give them away. The GOP they
+    // are in is encoded again at the CRF it had, comes back whole, and goes in.
+    let once = c.dir.join("out-once");
+    let ffmpeg = wrecking_two_scored_frames(&c, false);
+    let run = c.encode_into(&once, &[&src], &["--ffmpeg", ffmpeg.to_str().unwrap()]);
+    run.ok().has("2 frames at 0:00:12 scored far below the frames around them (VMAF 55.5 at the lowest among frames at ").has("which is not how a hard scene looks: that stretch is encoded again");
+    run.has(", no frame far below those around it (CRF ").has("which is not how a hard scene looks: that stretch was encoded again");
+    let r = c.report_in(&once, "g");
+    let found = far(&r);
+    assert_eq!(found.len(), 1, "{r}");
+    assert_eq!((found[0]["frames"].as_u64(), found[0]["still"].as_u64(), found[0]["vmaf"].as_f64()), (Some(2), Some(0), Some(55.5)), "{r}");
+    let again = for_frames(&r);
+    assert_eq!(again.len(), 1, "{r}");
+    assert_eq!(again[0]["crf"], r["crf"], "{r}");
+    assert!((again[0]["start_secs"].as_f64().unwrap() - 241.0 / 24.0).abs() < 0.01 && again[0]["frames"] == 241, "{r}");
+    let out = once.join("g.mp4");
+    assert_eq!(frames(&out), frames(&src));
+    assert_in_step(&out, &src, "1");
+    assert_eq!(key_frames(&out), key_frames(&plain.join("g.mp4")));
+
+    // Read as wrecked every time, at any CRF: that is how the picture scores there. Encoded as
+    // it was and five steps lower, and then kept as it was; the video is not failed for it.
+    let always = c.dir.join("out-always");
+    let ffmpeg = wrecking_two_scored_frames(&c, true);
+    let run = c.encode_into(&always, &[&src], &["--ffmpeg", ffmpeg.to_str().unwrap()]);
+    run.ok().has("2 frames at 0:00:12 scored far below the frames around them").has(", 2 frames far below those around them (CRF ");
+    run.has("that stretch was encoded again, and 2 frames still score so: kept as the picture is there");
+    let r = c.report_in(&always, "g");
+    assert_eq!(far(&r)[0]["still"].as_u64(), Some(2), "{r}");
+    assert!(for_frames(&r).is_empty(), "{r}");
+    assert_eq!(run.err.matches(" frames far below those around them (CRF ").count(), 2, "{}", run.err);
+    assert_eq!(frames(&always.join("g.mp4")), frames(&src));
 }
 
 /// Where each GOP of the first video stream starts, by frame number.

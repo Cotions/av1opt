@@ -163,7 +163,7 @@ impl Sections {
         &self.removed
     }
 
-    #[cfg(test)]
+    /// The parts that stay, (start, end) in source seconds.
     pub fn keep(&self) -> &[(f64, f64)] {
         &self.keep
     }

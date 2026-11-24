@@ -101,6 +101,29 @@ const LANDING_OVER: f64 = 0.5;
 /// little low does not send one more GOP after a hundredth of a point.
 const MEAN_EXTRA: f64 = 0.01;
 
+/// A scored frame this far under the median of the scored frames around it was not made so
+/// by a hard scene, where the frames around it are low too: something went wrong with it, in
+/// the encode, or in the decoding of either video for the check. Its GOP is encoded again as
+/// one with a window below the floor is. In one run of four of the same five-minute video,
+/// made while the machine was very busy, eight scored frames in a row read VMAF 9 to 54 among
+/// frames at 91 to 94: the rest of one GOP of the source, which ffmpeg's HEVC decoder had
+/// handed to the check wrecked, without a word (see docs/lessons.md). In the first encodes
+/// of 21 runs on 9 sources (95,000 scored frames) nothing else lay more than 19.2 under, and
+/// the eight lay 38 to 83 under. One such scored frame takes 1.6 off the mean of a
+/// five-second window, which a window at 91 does not show.
+const FAR_BELOW: f64 = 25.0;
+/// The frames around a frame: the scored ones shown within this long of it, either side (at
+/// the ends of the video, the two seconds it begins or ends with). A burst is seen while it is
+/// shorter than half of that; a longer one of wrecked frames takes its window under the floor.
+const AROUND_SECS: f64 = 1.0;
+/// Fewer scored frames around a frame than this say nothing of it.
+const LEAST_AROUND: usize = 6;
+/// A stretch holding a frame far below those around it counts as this far under the floor,
+/// however far under the frame is: how badly a frame is wrecked says nothing of the CRF that
+/// would mend it. The next try is then five CRF steps down, and a frame that scores no better
+/// there is how the picture is (see [`LEVEL_OFF`]).
+const FAR_BELOW_COUNTS: f64 = 3.0;
+
 const TIMES_FILE: &str = "survey-frames.txt";
 const LOG_FILE: &str = "survey-vmaf.json";
 
@@ -258,6 +281,48 @@ impl Scores {
     }
 }
 
+/// The scored frames among frames [from, to) that lie more than [`FAR_BELOW`] under the median
+/// of the scored frames around them (see [`AROUND_SECS`]): the place of each in `scores`, and
+/// that median. A scene of low scores is not found: the frames around its frames are low too.
+fn far_below(secs: &[f64], scores: &[(usize, f64)], from: usize, to: usize) -> Vec<(usize, f64)> {
+    let end = secs[secs.len() - 1];
+    let mut found = Vec::new();
+    let mut around: Vec<f64> = Vec::new();
+    for i in scores.partition_point(|s| s.0 < from)..scores.partition_point(|s| s.0 < to) {
+        // Near either end of the video the frames around are the ones on the other side.
+        let first = (secs[scores[i].0] - AROUND_SECS).min(end - 2.0 * AROUND_SECS).max(0.0);
+        let (a, b) = (scores.partition_point(|s| secs[s.0] < first - 1e-9), scores.partition_point(|s| secs[s.0] <= first + 2.0 * AROUND_SECS + 1e-9));
+        around.clear();
+        around.extend(scores[a..b].iter().filter(|s| s.0 != scores[i].0).map(|s| s.1));
+        if around.len() < LEAST_AROUND {
+            continue;
+        }
+        around.sort_by(f64::total_cmp);
+        // Of two middle ones the lower: the first frame of a low scene has as many high
+        // frames before it as low ones after it, and belongs with the low ones.
+        let median = around[(around.len() - 1) / 2];
+        if scores[i].1 < median - FAR_BELOW {
+            found.push((i, median));
+        }
+    }
+    found
+}
+
+/// How many scored frames of `run` lie far below those around them (see [`far_below`]), with
+/// `new` in place of the run's own frames in `scores`.
+fn far_below_in(secs: &[f64], scores: &[(usize, f64)], new: Option<&[(usize, f64)]>, run: Run) -> usize {
+    match new {
+        Some(new) => far_below(secs, &with_run(scores, new, run), run.start, run.end).len(),
+        None => far_below(secs, scores, run.start, run.end).len(),
+    }
+}
+
+/// `scores` with `new` in place of the frames of `run`.
+fn with_run(scores: &[(usize, f64)], new: &[(usize, f64)], run: Run) -> Vec<(usize, f64)> {
+    let (at, after) = (scores.partition_point(|s| s.0 < run.start), scores.partition_point(|s| s.0 < run.end));
+    scores[..at].iter().chain(new).chain(&scores[after..]).copied().collect()
+}
+
 /// A stretch of the video as frame numbers [start, end), and its mean VMAF.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Window {
@@ -357,18 +422,23 @@ struct Goal {
     least_step: f64,
     /// Whether the stretch's own mean is what counts, rather than its lowest window.
     by_mean: bool,
+    /// The stretch holds frames far below those around them (see [`FAR_BELOW`]): it counts as
+    /// short of the floor while it does, whatever its windows come to.
+    wrecked: bool,
+    /// The first try is at the CRF the stretch stands at.
+    same_first: bool,
 }
 
 impl Goal {
     /// Holding `floor` in the lowest window over the stretch.
     fn holding(floor: f64) -> Goal {
         let aim = floor + AIM_MARGIN;
-        Goal { line: floor, holds_from: floor + ACCEPT, aim, too_much: aim + OVERSHOOT, least_step: 1.0, by_mean: false }
+        Goal { line: floor, holds_from: floor + ACCEPT, aim, too_much: aim + OVERSHOOT, least_step: 1.0, by_mean: false, wrecked: false, same_first: false }
     }
 
     /// Bringing the stretch's own mean to `level`, and no further than that needs.
     fn mean(level: f64) -> Goal {
-        Goal { line: level, holds_from: level - LANDING_SHORT, aim: level, too_much: level + LANDING_OVER, least_step: 0.25, by_mean: true }
+        Goal { line: level, holds_from: level - LANDING_SHORT, aim: level, too_much: level + LANDING_OVER, least_step: 0.25, by_mean: true, wrecked: false, same_first: false }
     }
 }
 
@@ -431,6 +501,8 @@ struct Fixed {
     out_of_reach: bool,
     /// Encoded again for the video's mean, not for the floor.
     for_mean: bool,
+    /// Encoded again for frames far below those around them, its windows holding the floor.
+    for_frames: bool,
 }
 
 /// One stretch that was encoded again, for the report.
@@ -452,6 +524,10 @@ pub struct Stretch {
     /// It stood above the floor, and was encoded again to bring the video's mean to the target.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub for_mean: bool,
+    /// It stood above the floor, and was encoded again for frames that scored far below those
+    /// around them (see [`FarBelow`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub for_frames: bool,
 }
 
 /// The whole-video check and what it led to, for the report.
@@ -477,6 +553,9 @@ pub struct Summary {
     /// came out because they are few (see [`MOST_LEFT_LOW`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub still_low: Vec<LowStretch>,
+    /// Frames the check found far below those around them, by the GOP they are in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub far_below: Vec<FarBelow>,
     /// Mean VMAF of the whole video before anything was encoded again.
     pub mean_before: f64,
     /// What was done beyond the floor to bring the mean to the target.
@@ -499,6 +578,21 @@ pub struct TopUp {
     pub bytes: i64,
 }
 
+/// Scored frames of one GOP that the check found far below the frames around them: not how a
+/// hard scene scores, so the GOP was encoded again whatever its windows came to.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct FarBelow {
+    /// When the first of them is shown, in seconds from the first frame.
+    pub start_secs: f64,
+    /// How many of the scored frames (every [`VMAF_STRIDE`]-th is scored).
+    pub frames: usize,
+    /// The lowest of them, and the median of the scored frames around that one.
+    pub vmaf: f64,
+    pub around: f64,
+    /// How many scored frames of that GOP are far below those around them in the video as kept.
+    pub still: usize,
+}
+
 /// A stretch of the video that stays below the floor: windows that do, run together.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct LowStretch {
@@ -513,6 +607,32 @@ pub struct LowStretch {
 const NAMED_IN_NOTE: usize = 8;
 
 impl Summary {
+    /// What the report says of frames found far below those around them, if there were any.
+    pub fn far_below_note(&self) -> Option<String> {
+        let first = self.far_below.first()?;
+        let frames: usize = self.far_below.iter().map(|f| f.frames).sum();
+        let still: usize = self.far_below.iter().map(|f| f.still).sum();
+        let lowest = self.far_below.iter().copied().min_by(|a, b| a.vmaf.total_cmp(&b.vmaf)).unwrap_or(*first);
+        let places = self.far_below.len();
+        let named: Vec<String> = self.far_below.iter().take(NAMED_IN_NOTE).map(|f| hms(f.start_secs)).collect();
+        let more = if places > NAMED_IN_NOTE { format!(" and {} more places", places - NAMED_IN_NOTE) } else { String::new() };
+        Some(format!(
+            "{frames} frame{} at {}{more} scored far below the frames around {} (VMAF {:.1}{} among frames at {:.1}), which is not how a hard scene looks: {} encoded again{}",
+            if frames == 1 { "" } else { "s" },
+            named.join(", "),
+            if frames == 1 { "it" } else { "them" },
+            lowest.vmaf,
+            if frames == 1 { "" } else { " at the lowest" },
+            lowest.around,
+            if places == 1 { "that stretch was" } else { "those stretches were" },
+            match still {
+                0 => String::new(),
+                1 => ", and 1 frame still scores so: kept as the picture is there".to_string(),
+                n => format!(", and {n} frames still score so: kept as the picture is there"),
+            }
+        ))
+    }
+
     /// What the report says of the stretches kept far below the floor, if there are any.
     pub fn still_low_note(&self) -> Option<String> {
         let count = self.still_low.len();
@@ -592,9 +712,7 @@ fn lowest_over(secs: &[f64], scores: &[(usize, f64)], new: Option<&[(usize, f64)
     let merged: Vec<(usize, f64)>;
     let scores = match new {
         Some(new) => {
-            let at = scores.partition_point(|s| s.0 < run.start);
-            let after = scores.partition_point(|s| s.0 < run.end);
-            merged = scores[..at].iter().chain(new).chain(&scores[after..]).copied().collect();
+            merged = with_run(scores, new, run);
             &merged
         }
         None => scores,
@@ -862,7 +980,13 @@ pub fn plan_mean(survey: &Survey, info: &MediaInfo, floor: f64, target: f64) -> 
 
 fn plan_from(secs: &[f64], scores: &[(usize, f64)], gops: &[usize], floor: f64, target: f64, max_secs: f64) -> MeanPlan {
     let length = secs[secs.len() - 1];
-    let done = imitate(secs, scores, gops, floor, max_secs);
+    // A frame far below those around it has its GOP encoded again whatever its windows come
+    // to, and is taken to land among them.
+    let mut lifted = scores.to_vec();
+    for (i, median) in far_below(secs, scores, 0, secs.len() - 1) {
+        lifted[i].1 = median;
+    }
+    let done = imitate(secs, &lifted, gops, floor, max_secs);
     let mean = done.scores.iter().map(|s| s.1).sum::<f64>() / done.scores.len().max(1) as f64;
     let top_up = (mean < target).then(|| {
         let spare = spare_gops(&done.units, secs.len() - 1, &done.repaired, secs, MAX_GOP_SECS.max(max_secs));
@@ -962,8 +1086,35 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
         "whole video: mean VMAF {mean_before:.2}, lowest {WINDOW_SECS:.0} s {lowest_before:.2}{}",
         if low_count > 0 { format!(", {low_count} of {} stretches below {:.0}", all.len(), c.floor) } else { String::new() }
     );
-    if low_count == 0 && mean_before >= c.target {
-        let summary = Summary { mean_vmaf: mean_before, lowest_vmaf: lowest_before, lowest_before, floor: c.floor, stretches: Vec::new(), near: 0, left: Vec::new(), still_low: Vec::new(), mean_before, top_up: None, secs: 0.0 };
+    // The frames far below those around them, by the GOP they are in.
+    let gop_of = |frame: usize| survey.gops.partition_point(|&g| g <= frame).saturating_sub(1);
+    let mut far: Vec<(usize, FarBelow)> = Vec::new();
+    for (i, median) in far_below(&secs, &scores, 0, frames) {
+        let (frame, vmaf) = scores[i];
+        match far.last_mut() {
+            Some((gop, f)) if *gop == gop_of(frame) => {
+                f.frames += 1;
+                if vmaf < f.vmaf {
+                    (f.vmaf, f.around) = (vmaf, median);
+                }
+            }
+            _ => far.push((gop_of(frame), FarBelow { start_secs: secs[frame], frames: 1, vmaf, around: median, still: 0 })),
+        }
+    }
+    for (_, f) in &far {
+        eprintln!(
+            "{} frame{} at {} scored far below the frames around {} (VMAF {:.1}{} among frames at {:.1}), which is not how a hard scene looks: that stretch is encoded again",
+            f.frames,
+            if f.frames == 1 { "" } else { "s" },
+            hms(f.start_secs),
+            if f.frames == 1 { "it" } else { "them" },
+            f.vmaf,
+            if f.frames == 1 { "" } else { " at the lowest" },
+            f.around
+        );
+    }
+    if low_count == 0 && mean_before >= c.target && far.is_empty() {
+        let summary = Summary { mean_vmaf: mean_before, lowest_vmaf: lowest_before, lowest_before, floor: c.floor, stretches: Vec::new(), near: 0, left: Vec::new(), still_low: Vec::new(), far_below: Vec::new(), mean_before, top_up: None, secs: 0.0 };
         return Ok(Outcome { summary, video: None, scores, secs, differences: Vec::new() });
     }
 
@@ -1013,7 +1164,19 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
         if round >= ROUNDS {
             low.retain(|w| w.vmaf < c.floor - NEAR);
         }
-        let todo = runs(&blame(&low, &units, frames, &sc, c.floor, &held), &units, frames, &secs, max_secs);
+        let mut blamed = blame(&low, &units, frames, &sc, c.floor, &held);
+        // A frame far below those around it marks its unit as a low window does, in the usual
+        // rounds: one that is still so after those is how the picture is.
+        let mut for_frames = false;
+        if round < ROUNDS {
+            for (i, _) in far_below(&secs, &scores, 0, frames) {
+                let u = units.partition_point(|&s| s <= scores[i].0).saturating_sub(1);
+                if !blamed[u] && !held.iter().any(|s| s.overlaps(units[u], units.get(u + 1).copied().unwrap_or(frames))) {
+                    (blamed[u], for_frames) = (true, true);
+                }
+            }
+        }
+        let todo = runs(&blamed, &units, frames, &secs, max_secs);
         if todo.is_empty() {
             break;
         }
@@ -1024,7 +1187,15 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
             bail!("{} frames in a row have no key frame to cut at, too many to encode again on their own; a smaller keyint in --svt-params gives the video more key frames", r.end - r.start);
         }
         let total: f64 = todo.iter().map(|r| secs[r.end] - secs[r.start]).sum();
-        let detail = format!("{} stretch{} ({}) below VMAF {:.0}{}", todo.len(), if todo.len() == 1 { "" } else { "es" }, hms(total), c.floor, if round > 0 { ", again" } else { "" });
+        let detail = format!(
+            "{} stretch{} ({}) below VMAF {:.0}{}{}",
+            todo.len(),
+            if todo.len() == 1 { "" } else { "es" },
+            hms(total),
+            c.floor,
+            if for_frames { " or with frames far below those around them" } else { "" },
+            if round > 0 { ", again" } else { "" }
+        );
         eprintln!("encoding again: {detail}");
         c.tools.emit(Event::Phase { phase: "repairing".into(), detail });
         for (k, run) in todo.iter().enumerate() {
@@ -1033,14 +1204,19 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
             let earlier: Vec<&Fixed> = fixed.iter().filter(|f| f.run.overlaps(run.start, run.end)).collect();
             let from_crf = earlier.iter().map(|f| f.crf).fold(c.crf, f64::min);
             let now = lowest_over(&secs, &scores, None, *run);
-            if now >= c.floor {
+            let wrecked = round < ROUNDS && far_below_in(&secs, &scores, None, *run) > 0;
+            if now >= c.floor && !wrecked {
                 continue;
             }
             let before = earlier.iter().map(|f| f.before).fold(now, f64::min);
-            let f = fix(c, Goal::holding(c.floor), &survey.times, &secs, &scores, *run, serial, from_crf, now, before)?;
+            // A stretch as the one pass made it is first encoded as it was: frames wrecked by
+            // a fault come out whole at the same CRF, for no more bytes.
+            let goal = Goal { wrecked, same_first: wrecked && earlier.is_empty(), ..Goal::holding(c.floor) };
+            let for_frames = wrecked && now >= c.floor && earlier.iter().all(|e| e.for_frames);
+            let f = fix(c, goal, &survey.times, &secs, &scores, *run, serial, from_crf, now, before)?;
             serial += 1;
             // Nothing lower is allowed, or nothing lower helps: what is there stays.
-            let Some(f) = f else {
+            let Some(mut f) = f else {
                 settled.push((*run, serial));
                 match fixed.iter_mut().find(|f| f.run == *run) {
                     Some(f) => f.out_of_reach = true,
@@ -1059,6 +1235,7 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
             if f.out_of_reach {
                 settled.push((*run, serial));
             }
+            f.for_frames = for_frames;
             replaced.push((*run, serial));
             fixed.push(f);
         }
@@ -1111,10 +1288,17 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
     let lowest_at = |run: &Run| after.iter().filter(|w| run.overlaps(w.start, w.end)).map(|w| w.vmaf).fold(f64::INFINITY, f64::min);
     let left: Vec<f64> = left.iter().map(lowest_at).filter(|&v| v < c.floor).collect();
     let Remaining { near, still_low } = Remaining::of(&short_of_floor(&after), c.floor);
+    let far_below: Vec<FarBelow> = far
+        .into_iter()
+        .map(|(gop, f)| {
+            let run = Run { start: survey.gops[gop], end: survey.gops.get(gop + 1).copied().unwrap_or(frames) };
+            FarBelow { still: far_below_in(&secs, &scores, None, run), ..f }
+        })
+        .collect();
     // Nothing was put in place of anything: the encode stays as it is.
     if fixed.is_empty() {
         let _ = std::fs::remove_file(&plain);
-        let summary = Summary { mean_vmaf: mean(&scores), lowest_vmaf: lowest_before, lowest_before, floor: c.floor, stretches: Vec::new(), near: 0, left, still_low, mean_before, top_up: None, secs: 0.0 };
+        let summary = Summary { mean_vmaf: mean(&scores), lowest_vmaf: lowest_before, lowest_before, floor: c.floor, stretches: Vec::new(), near: 0, left, still_low, far_below, mean_before, top_up: None, secs: 0.0 };
         return Ok(Outcome { summary, video: None, scores, secs, differences: Vec::new() });
     }
 
@@ -1134,6 +1318,7 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
             bytes: f.bytes,
             out_of_reach: f.out_of_reach && lowest_at(&f.run) < c.floor,
             for_mean: f.for_mean,
+            for_frames: f.for_frames,
         })
         .collect();
     for f in &fixed {
@@ -1149,7 +1334,7 @@ pub fn repair(c: &Ctx, output: &Path, survey: &Survey) -> Result<Outcome> {
             bytes: lifted().map(|s| s.bytes as i64 - s.bytes_before as i64).sum(),
         }
     });
-    let summary = Summary { mean_vmaf: mean(&scores), lowest_vmaf: lowest_of(&after), lowest_before, floor: c.floor, stretches, near, left, still_low, mean_before, top_up, secs: 0.0 };
+    let summary = Summary { mean_vmaf: mean(&scores), lowest_vmaf: lowest_of(&after), lowest_before, floor: c.floor, stretches, near, left, still_low, far_below, mean_before, top_up, secs: 0.0 };
     Ok(Outcome { summary, video: Some(video), scores, secs, differences })
 }
 
@@ -1171,8 +1356,11 @@ fn fix(c: &Ctx, goal: Goal, times: &Times, secs: &[f64], all: &[(usize, f64)], r
     }
     let at = hms(secs[run.start]);
     let lo = lowest_try(c.crf, c.min_crf);
+    let counted = |lowest: f64, far: usize| counted_with(lowest, far, goal.line);
+    let stood = now;
+    let now = if goal.wrecked { counted(now, 1) } else { now };
     // Nothing to try (it stands at the lowest CRF already): nothing to cut from the source.
-    if next_try(&[(from_crf, now)], goal, lo).0.is_none() {
+    if !goal.same_first && next_try(&[(from_crf, now)], goal, lo).0.is_none() {
         return Ok(None);
     }
     let reference = c.dir.join(format!("repair{serial:04}.ref.mkv"));
@@ -1190,7 +1378,7 @@ fn fix(c: &Ctx, goal: Goal, times: &Times, secs: &[f64], all: &[(usize, f64)], r
     let mut tries: Vec<Try> = Vec::new();
     let mut known = vec![(from_crf, now)];
     let out_of_reach = loop {
-        let (next, out_of_reach) = next_try(&known, goal, lo);
+        let (next, out_of_reach) = if goal.same_first && tries.is_empty() { (Some(from_crf), false) } else { next_try(&known, goal, lo) };
         let Some(crf) = next.filter(|_| tries.len() < TRIES) else { break out_of_reach };
         let file = c.dir.join(format!("repair{serial:04}.{}.ivf", tries.len()));
         let mut args: Vec<String> = ["-y", "-v", "error", "-i", &path_arg(&reference)].map(String::from).to_vec();
@@ -1207,9 +1395,18 @@ fn fix(c: &Ctx, goal: Goal, times: &Times, secs: &[f64], all: &[(usize, f64)], r
         if !lowest.is_finite() {
             bail!("the stretch at {at} could not be scored");
         }
-        let score = if goal.by_mean { scores.iter().map(|s| s.1).sum::<f64>() / scores.len().max(1) as f64 } else { lowest };
-        let safe = !goal.by_mean || lowest >= c.floor.min(lowest_now);
-        eprintln!("  {at} ({:.1} s): CRF {crf} gives VMAF {score:.2} {measure} (CRF {from_crf}: {now:.2})", secs[run.end] - secs[run.start]);
+        // Frames far below those around them in a new encode are no better than in the old.
+        let far = far_below_in(secs, all, Some(&scores), run);
+        let shown = if goal.by_mean { scores.iter().map(|s| s.1).sum::<f64>() / scores.len().max(1) as f64 } else { lowest };
+        let score = if goal.by_mean { shown } else { counted(lowest, far) };
+        let safe = !goal.by_mean || (lowest >= c.floor.min(lowest_now) && far == 0);
+        let frames = match far {
+            _ if !goal.wrecked && (goal.by_mean || far == 0) => String::new(),
+            0 => ", no frame far below those around it".to_string(),
+            1 => ", 1 frame far below those around it".to_string(),
+            n => format!(", {n} frames far below those around them"),
+        };
+        eprintln!("  {at} ({:.1} s): CRF {crf} gives VMAF {shown:.2} {measure}{frames} (CRF {from_crf}: {stood:.2})", secs[run.end] - secs[run.start]);
         known.push((crf, score));
         tries.push(Try { crf, score, safe, file, scores });
     };
@@ -1228,7 +1425,13 @@ fn fix(c: &Ctx, goal: Goal, times: &Times, secs: &[f64], all: &[(usize, f64)], r
     }
     let bytes = ivf_index(&kept.file)?.1.iter().map(|f| f.size as u64).sum();
     let out_of_reach = out_of_reach && !holds(&kept);
-    Ok(Some(Fixed { run, crf: kept.crf, file: kept.file, scores: kept.scores, before, bytes, out_of_reach, for_mean: false }))
+    Ok(Some(Fixed { run, crf: kept.crf, file: kept.file, scores: kept.scores, before, bytes, out_of_reach, for_mean: false, for_frames: false }))
+}
+
+/// What the lowest window over a stretch counts as when `far` of its scored frames lie far
+/// below those around them: short of `floor` by [`FAR_BELOW_COUNTS`] at least.
+fn counted_with(lowest: f64, far: usize, floor: f64) -> f64 {
+    if far > 0 { lowest.min(floor - FAR_BELOW_COUNTS) } else { lowest }
 }
 
 /// The lowest CRF a stretch of a video encoded at `crf` is tried at.
@@ -1701,7 +1904,7 @@ mod tests {
     const KEY: u32 = 4 + 15;
 
     fn fixed(run: Run, file: PathBuf) -> Fixed {
-        Fixed { run, crf: 30.0, file, scores: Vec::new(), before: 80.0, bytes: 0, out_of_reach: false, for_mean: false }
+        Fixed { run, crf: 30.0, file, scores: Vec::new(), before: 80.0, bytes: 0, out_of_reach: false, for_mean: false, for_frames: false }
     }
 
     #[test]
@@ -1984,7 +2187,7 @@ mod tests {
     #[test]
     fn the_note_names_the_stretches_kept_far_below_the_floor() {
         let summary = |still_low: Vec<LowStretch>| Summary {
-            mean_vmaf: 0.0, lowest_vmaf: 0.0, lowest_before: 0.0, floor: 89.0, stretches: Vec::new(), near: 0, left: Vec::new(), still_low, mean_before: 0.0, top_up: None, secs: 0.0,
+            mean_vmaf: 0.0, lowest_vmaf: 0.0, lowest_before: 0.0, floor: 89.0, stretches: Vec::new(), near: 0, left: Vec::new(), still_low, far_below: Vec::new(), mean_before: 0.0, top_up: None, secs: 0.0,
         };
         assert_eq!(summary(Vec::new()).still_low_note(), None);
         let one = summary(vec![LowStretch { start_secs: 725.0, secs: 8.0, vmaf: 85.96 }]).still_low_note().unwrap();
@@ -1999,9 +2202,125 @@ mod tests {
     }
 
     #[test]
+    fn frames_far_below_the_frames_around_them_are_found_and_a_low_scene_is_not() {
+        let s = secs(900);
+        // One scored frame wrecked among frames at 93 takes 1.6 off its windows: none shows it.
+        let one = scored(900, |i| if i == 300 { 15.0 } else { 93.0 });
+        let lowest = windows(&s, &Scores::new(&one), 0, 900).iter().map(|w| w.vmaf).fold(f64::INFINITY, f64::min);
+        assert!(lowest > 91.0, "{lowest}");
+        assert_eq!(far_below(&s, &one, 0, 900), [(100, 93.0)]);
+        // Three in a row.
+        let burst = scored(900, |i| if (300..309).contains(&i) { 15.0 } else { 93.0 });
+        let found = far_below(&s, &burst, 0, 900);
+        assert_eq!(found.iter().map(|f| burst[f.0].0).collect::<Vec<_>>(), [300, 303, 306]);
+        assert!(found.iter().all(|f| f.1 == 93.0), "{found:?}");
+        // Only the frames asked about are looked at; the frames around them are all there.
+        assert_eq!(far_below(&s, &burst, 303, 306).len(), 1);
+        assert_eq!(far_below_in(&s, &burst, None, Run { start: 0, end: 300 }), 0);
+        assert_eq!(far_below_in(&s, &burst, None, Run { start: 300, end: 600 }), 3);
+        // Eight in a row, as the run that showed this had them.
+        assert_eq!(far_below(&s, &scored(900, |i| if (300..324).contains(&i) { 15.0 } else { 93.0 }), 0, 900).len(), 8);
+        // 25 under is the line: just over it counts, just under it does not.
+        assert_eq!(far_below(&s, &scored(900, |i| if i == 300 { 67.9 } else { 93.0 }), 0, 900).len(), 1);
+        assert_eq!(far_below(&s, &scored(900, |i| if i == 300 { 68.1 } else { 93.0 }), 0, 900).len(), 0);
+        // A scene of low scores, however low and however sharp its edges: the frames around
+        // its frames are low too, at its first and last frame as many as are high.
+        for scene in [300..360, 300..336, 0..60, 840..900] {
+            let low = scored(900, |i| if scene.contains(&i) { 40.0 } else { 95.0 });
+            assert_eq!(far_below(&s, &low, 0, 900), [], "{scene:?}");
+        }
+        // One of a second or less cannot be told from a burst: it is encoded again, and
+        // kept as it was if it scores the same.
+        assert_eq!(far_below(&s, &scored(900, |i| if (300..330).contains(&i) { 40.0 } else { 95.0 }), 0, 900).len(), 10);
+        // Scores that swing by 20 from frame to frame, as flat pictures with cuts do.
+        assert_eq!(far_below(&s, &scored(900, |i| if i % 2 == 0 { 100.0 } else { 80.0 }), 0, 900), []);
+    }
+
+    #[test]
+    fn the_first_and_last_frames_are_judged_by_the_two_seconds_beside_them() {
+        let s = secs(900);
+        let found = |f: &dyn Fn(usize) -> f64| far_below(&s, &scored(900, f), 0, 900).iter().map(|x| x.0 * 3).collect::<Vec<_>>();
+        assert_eq!(found(&|i| if i == 0 { 20.0 } else { 93.0 }), [0]);
+        assert_eq!(found(&|i| if i < 9 { 20.0 } else { 93.0 }), [0, 3, 6]);
+        assert_eq!(found(&|i| if i == 897 { 20.0 } else { 93.0 }), [897]);
+        assert_eq!(found(&|i| if i >= 885 { 20.0 } else { 93.0 }), [885, 888, 891, 894, 897]);
+        // A video too short to hold six scored frames beside one says nothing of it.
+        assert_eq!(far_below(&secs(18), &scored(18, |i| if i == 9 { 20.0 } else { 93.0 }), 0, 18), []);
+        assert_eq!(far_below(&secs(21), &scored(21, |i| if i == 9 { 20.0 } else { 93.0 }), 0, 21).len(), 1);
+        // Where frames are scored far apart (a hole in the timestamps), likewise.
+        let holes: Vec<f64> = (0..=900).map(|i| i as f64).collect();
+        assert_eq!(far_below(&holes, &scored(900, |i| if i == 300 { 20.0 } else { 93.0 }), 0, 900), []);
+    }
+
+    #[test]
+    fn a_stretch_encoded_again_is_judged_for_such_frames_with_the_frames_beside_it() {
+        let s = secs(900);
+        let old = scored(900, |i| if (300..309).contains(&i) { 15.0 } else { 93.0 });
+        let run = Run { start: 300, end: 600 };
+        let whole: Vec<(usize, f64)> = scored(900, |_| 93.0).into_iter().filter(|f| (300..600).contains(&f.0)).collect();
+        assert_eq!(far_below_in(&s, &old, Some(&whole), run), 0);
+        // Its own first frame wrecked, the frames before it being the neighbour's.
+        let worse: Vec<(usize, f64)> = whole.iter().map(|&(f, v)| (f, if f == 300 { 30.0 } else { v })).collect();
+        assert_eq!(far_below_in(&s, &old, Some(&worse), run), 1);
+        // While it holds one it counts as three under the floor, whatever its windows say,
+        // and as what they say once it holds none.
+        assert_eq!(counted_with(92.0, 1, 89.0), 86.0);
+        assert_eq!(counted_with(80.0, 1, 89.0), 80.0);
+        assert_eq!(counted_with(92.0, 0, 89.0), 92.0);
+    }
+
+    #[test]
+    fn a_frame_that_stays_far_below_after_five_crf_steps_is_how_the_picture_is() {
+        let goal = Goal { wrecked: true, same_first: true, ..Goal::holding(89.0) };
+        // Encoded as it was and still there: five steps down next.
+        assert_eq!(next_try(&[(38.0, 86.0), (38.0, 86.0)], goal, 22.0), (Some(33.0), false));
+        // No better there: out of reach, and what stood there stays.
+        assert_eq!(next_try(&[(38.0, 86.0), (38.0, 86.0), (33.0, 86.0)], goal, 22.0), (None, true));
+        assert_eq!(try_to_keep(&[(38.0, 86.0, true), (33.0, 86.0, true)], goal, 86.0, true), None);
+        // Whole at the same CRF: that encode is kept, and nothing lower or higher is tried.
+        assert_eq!(next_try(&[(38.0, 86.0), (38.0, 92.0)], goal, 22.0), (None, false));
+        assert_eq!(try_to_keep(&[(38.0, 92.0, true)], goal, 86.0, false), Some(0));
+        // Whole five steps down only: that one is kept.
+        assert_eq!(try_to_keep(&[(38.0, 86.0, true), (33.0, 93.5, true)], goal, 86.0, false), Some(1));
+    }
+
+    #[test]
+    fn frames_far_below_are_foretold_as_landing_among_the_frames_around_them() {
+        let s = secs(900);
+        let gops = [0, 300, 600];
+        let clean = plan_from(&s, &scored(900, |_| 93.0), &gops, 89.0, 93.0, 30.0);
+        let burst = plan_from(&s, &scored(900, |i| if (300..309).contains(&i) { 15.0 } else { 93.0 }), &gops, 89.0, 93.0, 30.0);
+        assert_eq!(burst, clean);
+        assert!((clean.mean - 93.0).abs() < 1e-9 && clean.top_up.is_none(), "{clean:?}");
+    }
+
+    #[test]
+    fn the_note_says_where_frames_scored_far_below_those_around_them() {
+        let summary = |far_below: Vec<FarBelow>| Summary {
+            mean_vmaf: 0.0, lowest_vmaf: 0.0, lowest_before: 0.0, floor: 89.0, stretches: Vec::new(), near: 0, left: Vec::new(), still_low: Vec::new(), far_below, mean_before: 0.0, top_up: None, secs: 0.0,
+        };
+        assert_eq!(summary(Vec::new()).far_below_note(), None);
+        let one = FarBelow { start_secs: 283.6, frames: 8, vmaf: 8.56, around: 93.4, still: 0 };
+        assert_eq!(
+            summary(vec![one]).far_below_note().unwrap(),
+            "8 frames at 0:04:43 scored far below the frames around them (VMAF 8.6 at the lowest among frames at 93.4), which is not how a hard scene looks: that stretch was encoded again"
+        );
+        let flash = FarBelow { start_secs: 12.0, frames: 1, vmaf: 60.0, around: 95.0, still: 1 };
+        assert_eq!(
+            summary(vec![flash]).far_below_note().unwrap(),
+            "1 frame at 0:00:12 scored far below the frames around it (VMAF 60.0 among frames at 95.0), which is not how a hard scene looks: that stretch was encoded again, and 1 frame still scores so: kept as the picture is there"
+        );
+        let both = summary(vec![flash, one]).far_below_note().unwrap();
+        assert!(both.starts_with("9 frames at 0:00:12, 0:04:43 scored far below") && both.contains("(VMAF 8.6 at the lowest among frames at 93.4)") && both.contains("those stretches were encoded again, and 1 frame still"), "{both}");
+        let json = serde_json::to_value(summary(vec![one])).unwrap();
+        assert_eq!(json["far_below"][0]["frames"], 8);
+        assert!(serde_json::to_value(summary(Vec::new())).unwrap().get("far_below").is_none());
+    }
+
+    #[test]
     fn outcome_reads_any_stretch() {
         let o = Outcome {
-            summary: Summary { mean_vmaf: 0.0, lowest_vmaf: 0.0, lowest_before: 0.0, floor: 89.0, stretches: Vec::new(), near: 0, left: Vec::new(), still_low: Vec::new(), mean_before: 0.0, top_up: None, secs: 0.0 },
+            summary: Summary { mean_vmaf: 0.0, lowest_vmaf: 0.0, lowest_before: 0.0, floor: 89.0, stretches: Vec::new(), near: 0, left: Vec::new(), still_low: Vec::new(), far_below: Vec::new(), mean_before: 0.0, top_up: None, secs: 0.0 },
             video: None,
             scores: scored(900, |i| if i < 300 { 90.0 } else { 96.0 }),
             secs: secs(900),
@@ -2212,7 +2531,7 @@ mod tests {
 
     fn kept(frames: usize) -> Outcome {
         Outcome {
-            summary: Summary { mean_vmaf: 0.0, lowest_vmaf: 0.0, lowest_before: 0.0, floor: 89.0, stretches: Vec::new(), near: 0, left: Vec::new(), still_low: Vec::new(), mean_before: 0.0, top_up: None, secs: 0.0 },
+            summary: Summary { mean_vmaf: 0.0, lowest_vmaf: 0.0, lowest_before: 0.0, floor: 89.0, stretches: Vec::new(), near: 0, left: Vec::new(), still_low: Vec::new(), far_below: Vec::new(), mean_before: 0.0, top_up: None, secs: 0.0 },
             video: None,
             scores: scored(frames, |_| 90.0),
             secs: secs(frames),

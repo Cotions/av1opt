@@ -123,7 +123,16 @@ For each file:
    No stretch goes more than 16 CRF below the video's.
    One that more bits don't lift (noise the metric reads as damage, mostly) keeps the
    smallest encode within half a point of the best it got, which can be the one it had
-   already. The report lists each
+   already. A scored frame more than 25 VMAF under the median of the scored frames within a
+   second either side of it marks its group of pictures as well, whatever its windows come
+   to: a hard scene pulls the frames around it down too, and a frame that far down by
+   itself was wrecked on the way (a decoder of the check handing over broken pictures, or
+   the encode holding them; see [lessons](lessons.md)). One such frame takes a point and a
+   half off its windows, which most do not show. That group is first encoded again at the
+   CRF it had, which mends a fault for no more bytes, then once five steps lower; a frame
+   that scores no better there is how the picture is, and the group stays as it was. The
+   log and the report say where such frames were found and how many stayed. A low stretch
+   of a second or less cannot be told from them and goes the same way. The report lists each
    stretch with its CRF, score and bytes before and after, and the mean and the lowest five
    seconds of the whole video. The mean is checked too. Where it is under the target after
    the repairs, the lowest groups of pictures not yet touched are encoded again, lowest
@@ -160,7 +169,10 @@ For each file:
    video of ten seconds or less, once). So it is where stretches can't be encoded again (no
    room for them on the drive, say), and the report then says so. A spot check more than 4
    below the target leads to the same second search, with sections removed as well; a video
-   encoded per scene fails instead. Nothing is written unless all checks pass. The source
+   encoded per scene fails instead. A video whose picture changes size on the way (a
+   recording of a live stream that changed quality, parts joined without encoding them) is
+   refused when the check of the whole video stops at the change: an encode has one size,
+   the first, and would stretch or shrink the rest. Nothing is written unless all checks pass. The source
    has to be as it was, too. It counts as changed if its size is different, or if its
    modification time is more than two seconds off and a fingerprint of its contents (a hash
    of its size and of a megabyte at its start, middle and end) differs as well; a file only
@@ -241,7 +253,7 @@ that remove all of it, or all but a moment, are refused before the encode starts
 refuses them when they are queued. A Dolby Vision file is skipped all the same, and sections
 can't be removed from a file whose sound or subtitles run more than a second past its picture. Per-scene
 mode isn't combined with cuts (one pass instead).
-The report lists the removed sections; an existing output with other sections removed is only
+The report lists the removed sections and the parts kept, as cut on the frames; an existing output with other sections removed is only
 overwritten with `--overwrite`. In the web UI, **Choose sections to remove…** in the encode dialog (one file) has
 a player with Mark start / Mark end (keys I and O), frame stepping, and playback that skips the
 marked parts; Compare maps the cut output back onto the source.

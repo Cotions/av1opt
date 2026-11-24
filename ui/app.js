@@ -319,6 +319,36 @@ function gridOf(rgba) {
   return out;
 }
 
+// Removed (start, end) sections → the kept parts, as the encoder works them out: sorted,
+// merged, clipped to the video, and kept slivers under 0.25 s dropped too.
+const MIN_KEEP = 0.25;
+// What has to stay of the video in all: the server refuses less (MIN_OUTPUT in sections.rs).
+const MIN_OUTPUT = 1;
+function keptParts(removed, duration) {
+  const r = removed.map(([a, b]) => [a, Math.min(b, duration)]).filter(([a, b]) => a < duration && b > a).sort((x, y) => x[0] - y[0]);
+  const keep = [];
+  let t = 0;
+  for (const [a, b] of r) { if (a - t >= MIN_KEEP) keep.push([t, a]); t = Math.max(t, b); }
+  if (duration - t >= MIN_KEEP) keep.push([t, duration]);
+  return keep;
+}
+// Output time → source time for an output made from `keep` parts.
+// The kept parts a report holds, if they are what they should be: (start, end) pairs of
+// numbers, each with some length, in order and not overlapping. Anything else is no parts.
+function usableParts(kept) {
+  if (!Array.isArray(kept) || !kept.length) return null;
+  let t = -Infinity;
+  for (const p of kept) {
+    if (!Array.isArray(p) || p.length !== 2 || !Number.isFinite(p[0]) || !Number.isFinite(p[1]) || p[0] < 0 || p[1] <= p[0] || p[0] < t) return null;
+    t = p[1];
+  }
+  return kept;
+}
+function outToSrc(keep, t) {
+  let base = 0;
+  for (const [a, b] of keep) { if (t < base + (b - a)) return a + Math.max(0, t - base); base += b - a; }
+  return keep.length ? keep[keep.length - 1][1] : t;
+}
 // ---------- end of the part that runs alone ----------
 
 // Compare reads pictures of its videos to line them up, and in Chromium drawing a frame just
@@ -851,26 +881,6 @@ function fmtTime(t) {
   if (f) out += "." + String(f).padStart(2, "0").replace(/0$/, "");
   return out;
 }
-// Removed (start, end) sections → the kept parts, as the encoder works them out: sorted,
-// merged, clipped to the video, and kept slivers under 0.25 s dropped too.
-const MIN_KEEP = 0.25;
-// What has to stay of the video in all: the server refuses less (MIN_OUTPUT in sections.rs).
-const MIN_OUTPUT = 1;
-function keptParts(removed, duration) {
-  const r = removed.map(([a, b]) => [a, Math.min(b, duration)]).filter(([a, b]) => a < duration && b > a).sort((x, y) => x[0] - y[0]);
-  const keep = [];
-  let t = 0;
-  for (const [a, b] of r) { if (a - t >= MIN_KEEP) keep.push([t, a]); t = Math.max(t, b); }
-  if (duration - t >= MIN_KEEP) keep.push([t, duration]);
-  return keep;
-}
-// Output time → source time for an output made from `keep` parts.
-function outToSrc(keep, t) {
-  let base = 0;
-  for (const [a, b] of keep) { if (t < base + (b - a)) return a + Math.max(0, t - base); base += b - a; }
-  return keep.length ? keep[keep.length - 1][1] : t;
-}
-
 // Section picker for the encode dialog (one file): a player with a bar showing what goes,
 // "mark start / mark end" from the playhead, and editable rows. `get()` returns
 // [[start, end], ...] in seconds or throws with a message for the user.
@@ -3148,7 +3158,9 @@ function comparePlayer(root, r) {
   const desc = (i) => `${i.codec || "?"} ${i.width || "?"}×${i.height || "?"}`;
   // Outputs with sections removed: output time t shows source time toSrc(t).
   const removed = r.removed || [];
-  const keep = removed.length && ii.duration_s ? keptParts(removed, ii.duration_s) : null;
+  // The parts as the encode cut them, each on its frames; a report from before they were
+  // written down has only the sections as asked for, which can be a frame off after each.
+  const keep = usableParts(r.kept) || (removed.length && ii.duration_s ? keptParts(removed, ii.duration_s) : null);
   const toSrc = (t) => (keep ? outToSrc(keep, t) : t);
   const srcTime = (t) => Math.max(0, toSrc(t) - srcOff + nudge);
   let split = 0.5, zoom = 1, origin = "50% 50%";

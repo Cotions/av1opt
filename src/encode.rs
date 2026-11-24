@@ -226,6 +226,11 @@ struct Report<'a> {
     /// Source sections left out of the output, (start, end) seconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     removed: Option<&'a [(f64, f64)]>,
+    /// The parts of the source the output is made of, (start, end) seconds, as the encode cut
+    /// them: each starts and ends on a frame. The page's Compare shows the source's frame for
+    /// a moment of the output by these.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kept: Option<&'a [(f64, f64)]>,
     /// Tags av1opt wrote on top of (or instead of) the source's.
     tags: std::collections::BTreeMap<&'a str, &'a str>,
     /// The yt-dlp info file the tags were filled from.
@@ -1237,6 +1242,7 @@ pub fn optimize(tools: &Tools, input: &Path, out_dir: &Path, may_write: &dyn Fn(
         chunks: chunks.as_deref(),
         verify_vmaf: &verify_vmaf,
         removed: cut.as_ref().map(Sections::removed),
+        kept: cut.as_ref().map(Sections::keep),
         tags: meta.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect(),
         info_json: meta.info_json.as_deref(),
         search_secs,
@@ -2668,6 +2674,20 @@ const JOIN_SLACK: f64 = 3.0;
 /// the second: the ffmpeg arguments and what the result holds, with notes of what it cannot keep.
 type Remux<'a> = dyn Fn(&Path, &Path, &mut Vec<String>) -> Result<(Vec<String>, Streams)> + 'a;
 
+/// Why a video whose picture has the `sizes` on its way is not encoded: the encode is made at
+/// one size, `made`, the first the file gives.
+fn sizes_change(sizes: &[(u32, u32)], made: (u32, u32)) -> String {
+    const NAMED: usize = 4;
+    let named: Vec<String> = sizes.iter().take(NAMED).map(|(w, h)| format!("{w}x{h}")).collect();
+    let more = if sizes.len() > NAMED { format!(" and {} more", sizes.len() - NAMED) } else { String::new() };
+    format!(
+        "the picture changes size during the video ({}{more}): an encode holds all of it at one size ({}x{}), which stretches or shrinks the rest, and the result cannot be checked against the source frame by frame",
+        named.join(", then "),
+        made.0,
+        made.1
+    )
+}
+
 /// Verification of a one-pass encode along its whole length: every frame is scored against
 /// the source's, and stretches below the floor are encoded again and put in place (see
 /// [`repair`]). The scores also tell what mean those repairs will leave: where that misses
@@ -2707,6 +2727,11 @@ fn verify_whole(
         }
         Err(e) if crate::events::is_cancelled(&e) => return Err(e),
         Err(e) => {
+            // The check sets frame against frame, and stops where the source's frames change
+            // size. The encode did not stop there: it brought the rest to the first size.
+            if let Some(sizes) = probe::picture_sizes(&tools.ffprobe, input, info.video_index).filter(|s| s.len() > 1) {
+                bail!("{}; {NOT_WRITTEN}", sizes_change(&sizes, (info.width, info.height)));
+            }
             eprintln!("warning: the whole video could not be checked ({}): spot checks instead", why_not(&e));
             return Ok(None);
         }
@@ -2821,7 +2846,7 @@ fn verify_whole(
             }
         }
         // (What was encoded again for the mean has its own note.)
-        let below: Vec<&repair::Stretch> = s.stretches.iter().filter(|x| !x.for_mean).collect();
+        let below: Vec<&repair::Stretch> = s.stretches.iter().filter(|x| !x.for_mean && !x.for_frames).collect();
         if !below.is_empty() {
             let (count, total) = (below.len(), below.iter().map(|x| x.secs).sum::<f64>());
             let (lo, hi) = below.iter().fold((f64::INFINITY, 0.0_f64), |(lo, hi), x| (lo.min(x.crf), hi.max(x.crf)));
@@ -2840,6 +2865,11 @@ fn verify_whole(
             tools.emit(Event::Note { text: n.clone() });
             notes.push(n);
         }
+    }
+    if let Some(n) = s.far_below_note() {
+        eprintln!("note: {n}");
+        tools.emit(Event::Note { text: n.clone() });
+        notes.push(n);
     }
     let short: Vec<f64> = s.stretches.iter().filter(|x| x.out_of_reach).map(|x| x.vmaf).chain(s.left.iter().copied()).collect();
     if let Some(lowest) = short.iter().copied().min_by(f64::total_cmp) {
@@ -2943,6 +2973,16 @@ pub(crate) fn free_bytes(dir: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_video_that_changes_size_is_refused_with_the_sizes_it_has() {
+        assert_eq!(
+            sizes_change(&[(640, 360), (854, 480)], (640, 360)),
+            "the picture changes size during the video (640x360, then 854x480): an encode holds all of it at one size (640x360), which stretches or shrinks the rest, and the result cannot be checked against the source frame by frame"
+        );
+        let many = sizes_change(&[(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)], (1, 1));
+        assert!(many.contains("(1x1, then 2x2, then 3x3, then 4x4 and 2 more)"), "{many}");
+    }
 
     fn options() -> Options {
         Options {

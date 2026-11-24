@@ -41,13 +41,16 @@ header.top {
 }
 .brand { font-weight: 650; letter-spacing: .02em; font-size: 16px; }
 .logo { background: var(--accent); color: #0b1a15; border-radius: 4px; padding: 1px 5px; margin-right: 2px; }
-nav { display: flex; gap: 4px; }
+/* On a narrow window the links scroll inside the bar rather than widen the page past it. */
+nav { display: flex; gap: 4px; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+nav a { flex: none; }
 nav a { color: var(--dim); padding: 6px 12px; border-radius: var(--radius); }
 nav a:hover { color: var(--text); text-decoration: none; background: var(--panel2); }
 nav a.active { color: var(--text); background: var(--panel2); }
 .badge { background: var(--accent); color: #0b1a15; border-radius: 9px; padding: 0 6px; font-size: 11px; font-weight: 600; margin-left: 4px; }
 .badge.held { background: var(--warn); }
-.conn { margin-left: auto; width: 9px; height: 9px; border-radius: 50%; background: var(--bad); }
+@media (max-width: 560px) { header.top { gap: 12px; padding: 0 12px; } }
+.conn { flex: none; margin-left: auto; width: 9px; height: 9px; border-radius: 50%; background: var(--bad); }
 .conn.on { background: var(--accent); }
 
 main { padding: 20px; max-width: 1400px; margin: 0 auto; }
@@ -301,6 +304,8 @@ td .pill:first-child { margin-left: 0; }
 .watch > .row { flex-wrap: nowrap; }
 .watch > .row button, .watch > .row .pill { flex: none; }
 .watch code.path { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; }
+/* A narrow window has no room for both folders and the buttons on one line. */
+@media (max-width: 700px) { .watch > .row { flex-wrap: wrap; } .watch code.path { max-width: 100%; } }
 .watch .sub { margin-top: 4px; font-size: 12px; }
 .watch .sub span[title] { border-bottom: 1px dotted var(--line); cursor: help; }
 .unit.pick input { width: 64px; }

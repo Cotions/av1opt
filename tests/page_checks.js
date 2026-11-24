@@ -1029,6 +1029,19 @@ checks["history: a chart is made only while the view is open"] = async () => {
   assert.strictEqual(page.run("charts"), 1);
 };
 
+// The stand-in has no layout, so this reads the stylesheet. Seen in a browser 390 px wide: the
+// top bar's links widened the page by 278 px (the live-updates dot off the screen, every view
+// scrolling sideways), and a watched folder's two paths shrank to nothing while its buttons
+// stuck out past the panel.
+checks["narrow window: the top bar's links scroll inside it, and a watched folder's line wraps"] = () => {
+  const css = fs.readFileSync(require("path").join(require("path").dirname(process.argv[2]), "style.css"), "utf8");
+  const rule = (selector, within = css) => (within.match(new RegExp(`(^|[}\\s])${selector.replace(/[.*+?^${}()|[\]\\>]/g, "\\$&")}\\s*\\{([^}]*)\\}`, "m")) || [])[2] || "";
+  const nav = rule("nav");
+  assert(/overflow-x:\s*auto/.test(nav) && /min-width:\s*0/.test(nav), `nav { ${nav} }`);
+  const narrow = [...css.matchAll(/@media \(max-width: (\d+)px\) \{(.*)\}\s*$/gm)].filter((m) => Number(m[1]) >= 560).map((m) => m[2]).join("\n");
+  assert(/flex-wrap:\s*wrap/.test(rule(".watch > .row", narrow)), "no narrow-window rule wraps a watched folder's line");
+};
+
 (async () => {
   let failed = 0;
   for (const [name, check] of Object.entries(checks)) {

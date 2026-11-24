@@ -142,7 +142,9 @@ single output files.
   the trash folder itself not there, a drive not mounted just now, it is left as it is). On
   the page, replacing and putting back wait, as "Put right" does, while the encode queue
   holds a file of a pair stopped half-way. Nothing is
-  put right in a folder on ZFS without `--allow-zfs`, a copy is removed only if the file it is
+  put right in a folder on ZFS without `--allow-zfs` (an undo finished so rewrites its report in
+  the output folder, which `--undo` does not write to there either; a replacement's report is
+  rewritten wherever it is, as `replace --apply` does), a copy is removed only if the file it is
   a copy of is still there and is another file (not the same file reached by a second path),
   and a pair that could not be put right makes the run end in failure. Records written by an
   earlier version have no such lines and never set this off; an earlier version reading a

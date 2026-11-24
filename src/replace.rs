@@ -686,20 +686,25 @@ impl CutOff {
         self.left == Left::Emptied { placed: true } && !self.undoing
     }
 
-    /// The folders putting it right writes to.
+    /// The folders putting it right writes to. The report is in the output folder, where the
+    /// AV1 file was before the replacement (`from`), and an undo that is finished rewrites it
+    /// there: as `--undo` does not write to that folder on ZFS without `--allow-zfs` (the AV1
+    /// file goes back to it), neither does this. A replacement written down as gone through
+    /// rewrites it whatever the drive, as `replace --apply` does, which looks only at the
+    /// original's folder: the encode wrote the report there.
     fn folders_written(&self) -> Vec<PathBuf> {
         let folder = |p: &Path| p.parent().unwrap_or(Path::new("/")).to_path_buf();
         let trash_folder = || self.trash.as_deref().map(folder);
         let mut folders = match self.left {
             Left::Nothing if !self.undoing => trash_folder().into_iter().collect(),
             Left::Emptied { .. } => self.av1_back().map(|(at, to)| vec![folder(at), folder(to)]).unwrap_or_default(),
-            Left::Nothing | Left::BothBack | Left::Finished | Left::Unknown => vec![],
+            Left::Nothing | Left::Finished | Left::Unknown => vec![],
             Left::Trashed { .. } => vec![folder(&self.source), folder(&self.dest)],
             Left::Placed => vec![folder(&self.source), folder(&self.dest), folder(&self.from)],
-            Left::CopiedBack | Left::EmptiedWithCopy => vec![folder(&self.from)],
-            Left::TakenOutByHand { copy_placed: true } => vec![folder(&self.dest)],
-            Left::TakenOutByHand { copy_placed: false } => vec![folder(&self.dest), folder(&self.from)],
-            Left::MovedBack => vec![folder(&self.source)],
+            Left::CopiedBack | Left::EmptiedWithCopy | Left::BothBack => vec![folder(&self.from)],
+            Left::TakenOutByHand { copy_placed: true } if !self.undoing => vec![folder(&self.dest)],
+            Left::TakenOutByHand { .. } => vec![folder(&self.dest), folder(&self.from)],
+            Left::MovedBack => vec![folder(&self.source), folder(&self.from)],
         };
         folders.dedup();
         folders
@@ -5934,5 +5939,48 @@ mod tests {
     fn an_undo_stopped_before_its_av1_file_left_the_originals_folder_whose_original_was_taken_out_of_the_trash_by_hand_is_finished() {
         taken_out_by_hand_after("undo:begun", true, false);
         taken_out_by_hand_after("move:copied", true, true);
+    }
+
+    /// An undo finished by putting it right rewrites its report in the output folder: on ZFS
+    /// that is not done without --allow-zfs, as `--undo` does not write there without it. A
+    /// replacement written down as gone through rewrites its report there all the same, as
+    /// `replace --apply` does.
+    #[test]
+    fn putting_right_writes_a_report_on_zfs_only_where_replace_itself_would() {
+        let on_zfs = |dir: &Path| crate::fsguard::ZFS_IN_TESTS.with_borrow_mut(|z| *z = vec![dir.to_path_buf()]);
+        let off = || crate::fsguard::ZFS_IN_TESTS.with_borrow_mut(Vec::clear);
+        // What `replace` itself does with the output folder on ZFS: replaces, and does not put back.
+        let p = Pair::new("zfs-report-plain", false, "a.mkv").unwrap();
+        on_zfs(&p.out);
+        let replaced = p.f.apply(&p.report).map(drop).map_err(|e| format!("{e:#}"));
+        let undone = undo(&p.report, false).map(drop).map_err(|e| format!("{e:#}"));
+        off();
+        assert!(replaced.is_ok() && undone.as_ref().is_err_and(|e| e.contains("is on ZFS")), "{replaced:?} {undone:?}");
+        drop(p);
+        for step in ["undo:moved", "undo:restored"] {
+            let p = Pair::new(&format!("zfs-report-{}", step.replace(':', "-")), false, "a.mkv").unwrap();
+            p.f.apply(&p.report).unwrap();
+            stopped_at(step, || drop(undo(&p.report, true)));
+            let report = std::fs::read(&p.report).unwrap();
+            on_zfs(&p.out);
+            let listed = stopped_for_list(&p.report, &crate::ledger::load()).unwrap();
+            let put = put_right_stopped(&p.report, false).map(drop).map_err(|e| format!("{e:#}"));
+            off();
+            assert!(listed.zfs && put.as_ref().is_err_and(|e| e.contains("without --allow-zfs")), "{step}: {} {put:?}", listed.zfs);
+            assert!(std::fs::read(&p.report).unwrap() == report && crate::ledger::load().under_way(&p.f.lib("a.mp4")).next().is_some(), "{step}: written on ZFS");
+            assert!(step == "undo:restored" || !p.f.lib("a.mp4").exists(), "{step}: the original came back with the report left behind");
+            put_right_stopped(&p.report, true).unwrap();
+            p.as_before();
+        }
+        let p = Pair::new("zfs-report-emptied", false, "a.mkv").unwrap();
+        stopped_at("replace:placed", || drop(p.f.apply(&p.report)));
+        for e in ["files", "info"].iter().flat_map(|d| std::fs::read_dir(p.f.dir.join("Trash").join(d)).unwrap().flatten()) {
+            std::fs::remove_file(e.path()).unwrap();
+        }
+        on_zfs(&p.out);
+        let put = put_right_stopped(&p.report, false).map_err(|e| format!("{e:#}"));
+        off();
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        assert!(put.is_ok() && says_replaced(&p.report), "{put:?}");
     }
 }

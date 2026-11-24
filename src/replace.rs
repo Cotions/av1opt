@@ -445,10 +445,11 @@ impl CutOff {
             // An output made beside its original has its place already, and only the original
             // moves: it is still where it was as long as it is at its one place.
             let still_out = at_from || (from == dest && at_dest);
-            // The original is the first to move: with nothing at its name in the trash and a
-            // file in its place that is not the AV1 file, nothing of this run's was moved (or
-            // it was taken back since), whatever that file is now.
-            if u.trash.as_deref().is_none_or(|t| !taken(t)) && !source_free {
+            // The original is the first to move, and its name in the trash is on record before
+            // it goes: without that name nothing of this run's was moved, wherever the original
+            // is now. With nothing at that name and a file in its place that is not the AV1
+            // file, nothing was moved either (or it was taken back since), whatever that file is.
+            if u.trash.is_none() || (u.trash.as_deref().is_some_and(|t| !taken(t)) && !source_free) {
                 Left::Nothing
             } else if in_trash && source_free && still_out {
                 if from == dest || !taken(dest) {
@@ -1197,9 +1198,12 @@ fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: ToT
         clear_left_behind(&p.dest);
         copy_new(&output, &staged, p.output_bytes)
     };
+    // From here on an error that leaves nothing moved ends the line on record too: nothing is
+    // under way any more, and an original moved by hand afterwards is not this run's doing.
+    let nothing_moved = |e: anyhow::Error| nothing_under_way(&p.source, e);
     let mut staged_first = None;
     if !in_place && p.copy {
-        staged_first = Some(stage()?);
+        staged_first = Some(stage().map_err(nothing_moved)?);
         crate::signals::stop_point("replace:staged");
     }
     // Reading a large original takes minutes, and a write behind the place being read would not
@@ -1208,7 +1212,7 @@ fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: ToT
         if staged_first.is_some() {
             let _ = std::fs::remove_file(&staged);
         }
-        bail!("{CHANGED_WHILE_CHECKED}, so nothing was changed");
+        return Err(nothing_moved(anyhow!("{CHANGED_WHILE_CHECKED}, so nothing was changed")));
     }
     let trashed = match to_trash(&p.source, &|t| crate::ledger::note_trashing(&p.source, t)) {
         Ok(t) => t,
@@ -1216,7 +1220,7 @@ fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: ToT
             if staged_first.is_some() {
                 let _ = std::fs::remove_file(&staged);
             }
-            return Err(e.context("the original could not be moved to the trash; nothing was changed"));
+            return Err(nothing_moved(e.context("the original could not be moved to the trash; nothing was changed")));
         }
     };
     // What went is what was checked, or it comes back.
@@ -1225,7 +1229,7 @@ fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: ToT
             let _ = std::fs::remove_file(&staged);
         }
         return Err(match trash::restore(&trashed, &p.source) {
-            Ok(()) => anyhow!("{CHANGED_WHILE_CHECKED}; it is back in its place"),
+            Ok(()) => nothing_moved(anyhow!("{CHANGED_WHILE_CHECKED}; it is back in its place")),
             Err(b) => anyhow!("{CHANGED_WHILE_CHECKED}, and it is still in the trash at {} ({b:#})", trashed.display()),
         });
     }
@@ -1253,7 +1257,7 @@ fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: ToT
                 let _ = std::fs::remove_file(&staged);
             }
             return Err(match trash::restore(&trashed, &p.source) {
-                Ok(()) => anyhow!("cannot put the AV1 file at {} ({e:#}); the original is back in its place", p.dest.display()),
+                Ok(()) => nothing_moved(anyhow!("cannot put the AV1 file at {} ({e:#}); the original is back in its place", p.dest.display())),
                 Err(b) => anyhow!("cannot put the AV1 file at {} ({e:#}), and the original is still in the trash at {} ({b:#})", p.dest.display(), trashed.display()),
             });
         }
@@ -1390,7 +1394,14 @@ fn undo_watched(report: &Path, allow_zfs: bool, accept: Accept<Replaced>, before
     let undoing = crate::ledger::Undoing { source: &d.source, dest: &d.dest, back_to: &d.from, trash: &d.trash, source_bytes: d.source_bytes, known: &d.original, output_bytes: d.output_bytes, output_sha256: &output_sha256 };
     crate::ledger::note_undoing(&undoing).context("av1opt's own record could not be written, and an undo stopped half-way could not be put right without it, so nothing was moved")?;
     crate::signals::stop_point("undo:begun");
-    let moved = if d.from == d.dest { None } else { Some(move_open(&av1, &d.dest, &d.from, d.output_bytes)?) };
+    // As for a replacement, an error that leaves nothing moved ends the line on record too.
+    let nothing_moved = |e: anyhow::Error| nothing_under_way(&d.source, e);
+    let moved = if d.from == d.dest {
+        None
+    } else {
+        let moved = move_open(&av1, &d.dest, &d.from, d.output_bytes);
+        Some(moved.map_err(|e| if av1.is_at(&d.dest) && std::fs::symlink_metadata(&d.from).is_err() { nothing_moved(e) } else { e })?)
+    };
     crate::signals::stop_point("undo:moved");
     if let Err(e) = trash::restore_if(&d.trash, &d.source, &|m| original.is(m)) {
         // Both go back to where the report says they are, so that this can be tried again.
@@ -1400,7 +1411,7 @@ fn undo_watched(report: &Path, allow_zfs: bool, accept: Accept<Replaced>, before
         };
         let returned = if moved.is_some() { move_open(at_from, &d.from, &d.dest, d.output_bytes).map(drop) } else { Ok(()) };
         return Err(match returned {
-            Ok(()) => e.context(format!("the original is still in the trash at {} and the AV1 file is at {}", d.trash.display(), d.dest.display())),
+            Ok(()) => nothing_moved(e.context(format!("the original is still in the trash at {} and the AV1 file is at {}", d.trash.display(), d.dest.display()))),
             Err(back) => e.context(format!("the original is still in the trash at {}, and the AV1 file is at {} because it could not go back to {} ({back:#})", d.trash.display(), d.from.display(), d.dest.display())),
         });
     }
@@ -1423,6 +1434,16 @@ fn undo_watched(report: &Path, allow_zfs: bool, accept: Accept<Replaced>, before
     }
     write_report(report, &r).context("both files are back, but the report could not be updated, so it still says that the original was replaced; `av1opt replace` or the page sets it right by av1opt's record")?;
     Ok(d)
+}
+
+/// `e`, the error that ended a replacement or an undo of `source` with nothing moved, once
+/// av1opt's record says that nothing is under way for it any more. If that cannot be written,
+/// the next run that looks at the pair finds nothing moved and writes it then.
+fn nothing_under_way(source: &Path, e: anyhow::Error) -> anyhow::Error {
+    if let Err(not) = crate::ledger::note_settled(source) {
+        eprintln!("warning: nothing was moved, but av1opt's own record of that could not be written: {not:#}");
+    }
+    e
 }
 
 /// Whether av1opt's record has a replacement or an undo of the original of `report` under way:
@@ -4831,16 +4852,12 @@ mod tests {
         assert_eq!(std::fs::read(&o).unwrap(), vec![b'o'; 400]);
     }
 
-    // Proofs from the second review of the recovery (brief 16). Each states what should hold
-    // and fails on 6903cb7; run them with `-- --ignored proof_`.
-
     /// A replacement that ends with an error before anything moved (here the trash refuses)
     /// was not stopped half-way: its line on record is closed, and an original moved away by
     /// hand afterwards is "gone", not a stopped run.
     #[test]
-    #[ignore = "fails on 6903cb7: the line stays open and the pair is called stopped half-way"]
-    fn proof_a_replacement_that_failed_before_any_move_is_not_called_stopped_half_way() {
-        let p = Pair::new("proof-refused", false, "a.mkv").unwrap();
+    fn a_replacement_that_failed_before_any_move_is_not_called_stopped_half_way() {
+        let p = Pair::new("failed-refused", false, "a.mkv").unwrap();
         let failed = apply_with(&p.report, true, &|_, _| Err(anyhow!("the trash is not there")));
         assert!(failed.is_err());
         p.as_before();
@@ -4851,6 +4868,59 @@ mod tests {
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
         assert!(!open && said.is_none(), "its line on record is still open: {open}; said of the pair afterwards: {said:?}");
     }
+
+    /// The same of a replacement whose copy to the original's drive fails (the library is
+    /// full, say): the copy is the first thing it does, and nothing stays moved.
+    #[test]
+    fn a_replacement_whose_copy_failed_is_not_called_stopped_half_way() {
+        let Some(p) = Pair::new("failed-copy", true, "a.mkv") else { return crate::tools::skipped("failed-copy", "/dev/shm is not another drive here") };
+        // The original's folder takes no new file, so the hidden copy cannot be made there.
+        set_mode(&p.f.dir.join("lib"), 0o555);
+        let failed = p.f.apply(&p.report).map(drop).map_err(|e| format!("{e:#}"));
+        set_mode(&p.f.dir.join("lib"), 0o755);
+        assert!(failed.as_ref().is_err_and(|e| e.contains("cannot copy")), "{failed:?}");
+        p.as_before();
+        let open = crate::ledger::load().under_way(&p.f.lib("a.mp4")).is_some();
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        assert!(!open, "its line on record is still open");
+    }
+
+    /// An undo that ends with an error and puts back what it moved (here the original's place
+    /// is taken at the last moment) closes its line on record as well.
+    #[test]
+    fn an_undo_that_failed_and_moved_nothing_back_is_not_called_stopped_half_way() {
+        let p = Pair::new("failed-undo", false, "a.mkv").unwrap();
+        p.f.apply(&p.report).unwrap();
+        let taken = || std::fs::write(p.f.lib("a.mp4"), b"someone else's").unwrap();
+        let failed = undo_watched(&p.report, true, &|_| Ok(()), &taken, &|| {});
+        assert!(failed.is_err());
+        std::fs::remove_file(p.f.lib("a.mp4")).unwrap();
+        p.as_replaced();
+        let open = crate::ledger::load().under_way(&p.f.lib("a.mp4")).is_some();
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        assert!(!open, "its line on record is still open");
+    }
+
+    /// A replacement stopped before it wrote down its original's name in the trash had not
+    /// moved the original: whatever became of it afterwards is not that run's doing.
+    #[test]
+    fn a_replacement_stopped_before_its_trash_name_was_on_record_is_not_called_stopped_half_way_whatever_became_of_the_original() {
+        let p = Pair::new("stopped-begun-moved", false, "a.mkv").unwrap();
+        stopped_at("replace:begun", || drop(p.f.apply(&p.report).map(drop)));
+        std::fs::rename(p.f.lib("a.mp4"), p.f.dir.join("kept-elsewhere.mp4")).unwrap();
+        let ledger = crate::ledger::load();
+        let said = stopped_for_list(&p.report, &ledger).map(|s| s.told);
+        let r = read_report(&p.report).unwrap();
+        let left = CutOff::of(&p.report, &r, &ledger, true).map(|c| c.left);
+        let put = set_right(&p.report, true, &mut vec![lock(&p.report).unwrap()]).map_err(|e| format!("{e:#}"));
+        let open = crate::ledger::load().under_way(&p.f.lib("a.mp4")).is_some();
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        assert_eq!((said, left), (None, Some(Left::Nothing)));
+        assert!(put.is_ok() && !open, "{put:?}");
+    }
+
+    // Proofs from the second review of the recovery (brief 16). Each states what should hold
+    // and fails on 6903cb7; run them with `-- --ignored proof_`.
 
     /// A report left behind its replacement (killed between the record's line and the report),
     /// where the record's line of the encode and the report name the two folders through

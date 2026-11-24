@@ -112,7 +112,10 @@ single output files.
   then does what was asked; without it the list says what was stopped half-way and where the
   original is. A pair with no such line, or whose files are no longer as that run would have
   left them (moved by hand since, or not the recorded files), is left as it is and said to
-  be: an original thrown away by hand with its AV1 file kept is "gone", as it is. Nothing is
+  be: an original thrown away by hand with its AV1 file kept is "gone", as it is. A
+  replacement or undo that ends with an error and nothing moved (the trash refuses, the
+  library is full) writes down that it is over, and a replacement stopped before the
+  original's name in the trash was written down had not moved it, wherever it is now. Nothing is
   put right in a folder on ZFS without `--allow-zfs`, a copy is removed only if the file it is
   a copy of is still there and is another file (not the same file reached by a second path),
   and a pair that could not be put right makes the run end in failure. Records written by an

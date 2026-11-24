@@ -3412,8 +3412,11 @@ function comparePlayer(root, r) {
   // ---- the original's place ----
   const rp = r.replace || {};
   // `said` is what the toast says once it is done, or makes it from the server's answer.
+  // The view is drawn again either way: a refusal often means the files changed since it was
+  // drawn (another tab, a terminal), and its buttons would offer what is no longer there.
   const act = async (path, body, said) => {
-    try { const answer = await api(path, body); toast(typeof said === "function" ? said(answer) : said); route(); } catch (e) { toast(e.message, true); }
+    try { const answer = await api(path, body); toast(typeof said === "function" ? said(answer) : said); } catch (e) { toast(e.message, true); }
+    route();
   };
   const replacePanel = r.pair || !rp.state ? null : h("div", { class: "panel" }, h("h3", {}, "Original"),
     rp.state === "ready" ? [

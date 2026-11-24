@@ -787,6 +787,22 @@ checks["compare: Put right says what the server did"] = async () => {
   page.run("leave()");
 };
 
+// Seen with two tabs open on one stopped pair: the second tab's Put right was refused and kept
+// offering the button. A refusal often means the files changed since the view was drawn.
+checks["compare: a refused Put right draws the view again from what the server now says"] = async () => {
+  const refused = "nothing of this pair was stopped half-way";
+  const page = openPage((path, body) => (path === "/api/replace/put-right" && body ? { refuse: refused } : {}));
+  await settled();
+  page.context.__root = page.document.createElement("div");
+  page.run(`var __drawn = 0; route = () => { __drawn++; }; var leave = comparePlayer(__root, { output_path: "/o.mp4", input_path: "/i.mp4", report_path: "/o.av1opt.json", output_info: { fps: 25, duration_s: 10 }, input_info: { fps: 25, duration_s: 10 }, target_vmaf: 93, verify_vmaf: [94], replace: { state: "stopped", can_put_right: true, zfs: false, why: "av1opt was stopped half-way through replacing this original" } })`);
+  await settled();
+  await page.context.__root.named("button", "Put right").click();
+  await settled();
+  assert.strictEqual(lastToast(page), refused);
+  assert.strictEqual(page.run("__drawn"), 1, "the view was not drawn again after the refusal");
+  page.run("leave()");
+};
+
 checks["compare: the output does not play before its source is there to play beside it"] = async () => {
   const page = openPage(() => ({}));
   await settled();

@@ -113,7 +113,10 @@ single output files.
   to the replacement, and one with the AV1 file back in the output folder is finished. A
   replacement that went through, with its report saying so, whose own line on record of that
   could not be written is written down once the trash entry and the AV1 file are read whole
-  and are the recorded files; then it can be put back. `--apply`
+  and are the recorded files; then it can be put back. An original with two outputs (two
+  output folders) is replaced by one run at a time: a run that finds, once its own line is
+  written, a run of another of its outputs under way or stopped half-way leaves the original
+  to that one and says so, and each run's end on record closes its own line only. `--apply`
   then does what was asked; without it the list says what was stopped half-way and where the
   original is. A pair with no such line, or whose files are no longer as that run would have
   left them (moved by hand since, or not the recorded files), is left as it is and said to

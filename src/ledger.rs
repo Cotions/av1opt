@@ -177,7 +177,15 @@ enum Event {
     },
     /// The name the original is about to have in the trash, written once its info file holds
     /// that name and before the original goes there.
-    Trashing { source: PathBuf, trash: PathBuf },
+    Trashing {
+        source: PathBuf,
+        trash: PathBuf,
+        /// Where the AV1 file of that replacement is, which tells it from another one of the
+        /// same original under way at the same time. Lines written before 2026-11-23 have none,
+        /// and are of the replacement begun last.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<PathBuf>,
+    },
     /// Written before the first move of an undo, as [`Event::Replacing`] is.
     Undoing {
         source: PathBuf,
@@ -193,8 +201,16 @@ enum Event {
         output_sha256: String,
     },
     /// The replacement or undo under way for this original was put right, or found to have
-    /// moved nothing: nothing is under way for it any more.
-    Settled { source: PathBuf },
+    /// moved nothing: that run is not under way any more.
+    Settled {
+        source: PathBuf,
+        /// The place in the output folder of the AV1 file of the run that is over (its `from`):
+        /// two outputs of one original can each have a run of their own under way, and one
+        /// that ends must not close the other. Lines written before 2026-11-23 have none, and
+        /// close every run of the original, as they did then.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -282,8 +298,9 @@ pub struct Ledger {
     taken_over: bool,
     /// Why the record on disk was not used.
     problem: Option<String>,
-    /// By original.
-    under_way: HashMap<PathBuf, UnderWay>,
+    /// By original, in the order they were begun: one for each place of an AV1 file (`from`)
+    /// that a run of that original is under way from.
+    under_way: HashMap<PathBuf, Vec<UnderWay>>,
     /// The paths on record as the drive has them, each asked of it once for as long as this
     /// reading of the record is held: a path a report gives is compared with them.
     seen: std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<crate::files::OneFile>>>,
@@ -359,7 +376,7 @@ impl Event {
             Event::Encoded { output, source, .. } | Event::Adopted { output, source, .. } => vec![output, source],
             Event::Replaced { source, output, from, .. } | Event::Replacing { source, from, output, .. } => vec![source, output, from],
             Event::Undone { source, output, back_to } | Event::Undoing { source, output, back_to, .. } => vec![source, output, back_to],
-            Event::Trashing { source, .. } | Event::Settled { source } => vec![source],
+            Event::Trashing { source, from, .. } | Event::Settled { source, from } => std::iter::once(source).chain(from).map(PathBuf::as_path).collect(),
             Event::TakenOver { .. } => vec![],
         }
     }
@@ -383,9 +400,9 @@ impl Event {
                 Event::Adopted { output: r(output), report, source: r(source), original, output_bytes, output_sha256, replaced }
             }
             Event::Replacing { source, from, output, original, output_bytes, output_sha256 } => Event::Replacing { source: r(source), from: r(from), output: r(output), original, output_bytes, output_sha256 },
-            Event::Trashing { source, trash } => Event::Trashing { source: r(source), trash },
+            Event::Trashing { source, trash, from } => Event::Trashing { source: r(source), trash, from: from.map(&mut r) },
             Event::Undoing { source, output, back_to, trash, original, output_bytes, output_sha256 } => Event::Undoing { source: r(source), output: r(output), back_to: r(back_to), trash, original, output_bytes, output_sha256 },
-            Event::Settled { source } => Event::Settled { source: r(source) },
+            Event::Settled { source, from } => Event::Settled { source: r(source), from: from.map(&mut r) },
             e @ Event::TakenOver { .. } => e,
         }
     }
@@ -471,24 +488,29 @@ impl Ledger {
 
     fn take_on(&mut self, event: Event) {
         // What ends a move under way for an original: its end on record, or a new encode in the
-        // place the AV1 file was to come from.
+        // place the AV1 file was to come from. Each ends the run of that place only.
         match &event {
-            Event::Replaced { source, .. } | Event::Undone { source, .. } | Event::Settled { source } => drop(self.under_way.remove(source)),
-            Event::Encoded { source, output, .. } if self.under_way.get(source).is_some_and(|u| u.from == *output) => drop(self.under_way.remove(source)),
+            Event::Replaced { source, from, .. } | Event::Undone { source, back_to: from, .. } | Event::Encoded { source, output: from, .. } | Event::Settled { source, from: Some(from) } => self.end_under_way(source, Some(from)),
+            Event::Settled { source, from: None } => self.end_under_way(source, None),
             _ => {}
         }
         match event {
             Event::Replacing { source, from, output, original, output_bytes, output_sha256 } => {
-                self.under_way.insert(source, UnderWay { undoing: false, from, dest: output, trash: None, original, output_bytes, output_sha256 });
+                self.begin_under_way(source, UnderWay { undoing: false, from, dest: output, trash: None, original, output_bytes, output_sha256 });
             }
-            Event::Trashing { source, trash } => {
+            Event::Trashing { source, trash, from } => {
                 // The last name tried is the one the original went to, if it went.
-                if let Some(u) = self.under_way.get_mut(&source).filter(|u| !u.undoing) {
+                let runs = self.under_way.get_mut(&source).map(|runs| runs.iter_mut()).into_iter().flatten();
+                let run = match &from {
+                    Some(from) => runs.filter(|u| u.from == *from).last(),
+                    None => runs.last(),
+                };
+                if let Some(u) = run.filter(|u| !u.undoing) {
                     u.trash = Some(trash);
                 }
             }
             Event::Undoing { source, output, back_to, trash, original, output_bytes, output_sha256 } => {
-                self.under_way.insert(source, UnderWay { undoing: true, from: back_to, dest: output, trash: Some(trash), original, output_bytes, output_sha256 });
+                self.begin_under_way(source, UnderWay { undoing: true, from: back_to, dest: output, trash: Some(trash), original, output_bytes, output_sha256 });
             }
             Event::Settled { .. } => {}
             Event::Encoded { output, report: _, source, original, output_bytes, output_sha256 } => {
@@ -516,6 +538,23 @@ impl Ledger {
                 }
             }
             Event::TakenOver { .. } => self.taken_over = true,
+        }
+    }
+
+    /// Takes on a run under way for `source`, in place of any earlier one from the same place.
+    fn begin_under_way(&mut self, source: PathBuf, run: UnderWay) {
+        let runs = self.under_way.entry(source).or_default();
+        runs.retain(|u| u.from != run.from);
+        runs.push(run);
+    }
+
+    /// Ends the run under way for `source` from `from`, or with None every run of it.
+    fn end_under_way(&mut self, source: &Path, from: Option<&PathBuf>) {
+        if let Some(runs) = self.under_way.get_mut(source) {
+            runs.retain(|u| from.is_some_and(|f| u.from != *f));
+            if runs.is_empty() {
+                self.under_way.remove(source);
+            }
         }
     }
 
@@ -587,10 +626,10 @@ impl Ledger {
         self.known_as(output).filter(|e| self.of_source(e, source))
     }
 
-    /// The replacement or undo of `source` that was under way when the record was last
-    /// written to, if one was.
-    pub fn under_way(&self, source: &Path) -> Option<&UnderWay> {
-        self.under_way.get(source)
+    /// The replacements and undos of `source` that were under way when the record was last
+    /// written to, the one begun last last: one at most for each place of an AV1 file.
+    pub fn under_way(&self, source: &Path) -> impl Iterator<Item = &UnderWay> {
+        self.under_way.get(source).into_iter().flatten()
     }
 
     /// Whether any replacement or undo was under way when the record was last written to.
@@ -1085,9 +1124,10 @@ pub fn note_replacing(r: &Replacing) -> Result<()> {
     })
 }
 
-/// Records the name the original is about to have in the trash.
-pub fn note_trashing(source: &Path, trash: &Path) -> Result<()> {
-    add_where_kept(Event::Trashing { source: source.to_path_buf(), trash: trash.to_path_buf() })
+/// Records the name the original is about to have in the trash, for the replacement of the
+/// AV1 file at `from`.
+pub fn note_trashing(source: &Path, from: &Path, trash: &Path) -> Result<()> {
+    add_where_kept(Event::Trashing { source: source.to_path_buf(), trash: trash.to_path_buf(), from: Some(from.to_path_buf()) })
 }
 
 /// An undo about to make its first move, as [`Event::Undoing`] records it.
@@ -1115,9 +1155,10 @@ pub fn note_undoing(u: &Undoing) -> Result<()> {
     })
 }
 
-/// Records that nothing is under way for `source` any more.
-pub fn note_settled(source: &Path) -> Result<()> {
-    add_where_kept(Event::Settled { source: source.to_path_buf() })
+/// Records that the run under way for `source` from `from` (the AV1 file's place in the output
+/// folder) is over. Another run of the same original stays under way.
+pub fn note_settled(source: &Path, from: &Path) -> Result<()> {
+    add_where_kept(Event::Settled { source: source.to_path_buf(), from: Some(from.to_path_buf()) })
 }
 
 /// [`add`] for a line a move goes by: with no record to write it to (no data folder) that is an
@@ -1588,7 +1629,7 @@ mod tests {
         let before = FOLDER_SYNCS.with(std::cell::Cell::get);
         s.encoded("a");
         s.encoded("b");
-        note_settled(Path::new("/v/c.mp4")).unwrap();
+        note_settled(Path::new("/v/c.mp4"), Path::new("/o/c.mkv")).unwrap();
         assert_eq!(FOLDER_SYNCS.with(std::cell::Cell::get) - before, 1);
         assert_eq!(std::fs::read_to_string(s.file()).unwrap().lines().count(), 3);
     }
@@ -1605,7 +1646,7 @@ mod tests {
         assert_eq!(loads() - before, 1);
         // What is written meanwhile, by this run or another, is seen without reading it all.
         let (b, b_out) = s.encoded("b");
-        note_settled(&a).unwrap();
+        note_settled(&a, &a_out).unwrap();
         let now = current();
         assert!(now.entry(&b_out, &b).is_some() && now.entry(&a_out, &a).is_some());
         assert_eq!(loads() - before, 1);

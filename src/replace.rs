@@ -431,7 +431,14 @@ impl CutOff {
         // Read as the run that wrote the line read them, with their folders resolved: a
         // report whose folder is reached through a link is still the report of that run.
         let source = file_path(r, "input").ok()?;
-        let u = ledger.under_way(&source)?;
+        // Two outputs of one original can each have a run under way: this report's is the one
+        // whose AV1 file it names.
+        ledger.under_way(&source).find_map(|u| Self::of_run(report, r, &source, u, full))
+    }
+
+    /// [`CutOff::of`] for the run `u` of the original at `source`, if `report` is its report.
+    fn of_run(report: &Path, r: &Value, source: &Path, u: &crate::ledger::UnderWay, full: bool) -> Option<CutOff> {
+        let source = source.to_path_buf();
         if r["output_bytes"].as_u64() != Some(u.output_bytes) {
             return None;
         }
@@ -694,7 +701,7 @@ impl CutOff {
             sync_dir(&folder(to));
             Ok(())
         };
-        let settled = || crate::ledger::note_settled(&self.source).context("the files are as they were, but av1opt's own record of that could not be written");
+        let settled = || crate::ledger::note_settled(&self.source, &self.from).context("the files are as they were, but av1opt's own record of that could not be written");
         match self.left {
             Left::Nothing => {
                 // A stop once the original's name in the trash was reserved leaves an info file
@@ -1377,6 +1384,9 @@ fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: ToT
     };
     let replacing = crate::ledger::Replacing { source: &p.source, from: &p.output, dest: &p.dest, source_bytes: p.source_bytes, known: &p.original, output_bytes: p.output_bytes, output_sha256: &output_sha256 };
     crate::ledger::note_replacing(&replacing).context("av1opt's own record could not be written, and a replacement stopped half-way could not be put right without it, so nothing was changed")?;
+    if let Some(other) = other_run_under_way(&p.source, &p.output) {
+        return Err(nothing_under_way(&p.source, &p.output, anyhow!(other)));
+    }
     crate::signals::stop_point("replace:begun");
     let in_place = p.dest == p.output;
     let staged = staging_name(&p.dest);
@@ -1387,7 +1397,7 @@ fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: ToT
     };
     // From here on an error that leaves nothing moved ends the line on record too: nothing is
     // under way any more, and an original moved by hand afterwards is not this run's doing.
-    let nothing_moved = |e: anyhow::Error| nothing_under_way(&p.source, e);
+    let nothing_moved = |e: anyhow::Error| nothing_under_way(&p.source, &p.output, e);
     let mut staged_first = None;
     if !in_place && p.copy {
         staged_first = Some(stage().map_err(nothing_moved)?);
@@ -1401,7 +1411,7 @@ fn apply_judging(report: &Path, allow_zfs: bool, judging: Judging, to_trash: ToT
         }
         return Err(nothing_moved(anyhow!("{CHANGED_WHILE_CHECKED}, so nothing was changed")));
     }
-    let trashed = match to_trash(&p.source, &|t| crate::ledger::note_trashing(&p.source, t)) {
+    let trashed = match to_trash(&p.source, &|t| crate::ledger::note_trashing(&p.source, &p.output, t)) {
         Ok(t) => t,
         Err(e) => {
             if staged_first.is_some() {
@@ -1582,7 +1592,7 @@ fn undo_watched(report: &Path, allow_zfs: bool, accept: Accept<Replaced>, before
     crate::ledger::note_undoing(&undoing).context("av1opt's own record could not be written, and an undo stopped half-way could not be put right without it, so nothing was moved")?;
     crate::signals::stop_point("undo:begun");
     // As for a replacement, an error that leaves nothing moved ends the line on record too.
-    let nothing_moved = |e: anyhow::Error| nothing_under_way(&d.source, e);
+    let nothing_moved = |e: anyhow::Error| nothing_under_way(&d.source, &d.from, e);
     let moved = if d.from == d.dest {
         None
     } else {
@@ -1624,20 +1634,40 @@ fn undo_watched(report: &Path, allow_zfs: bool, accept: Accept<Replaced>, before
 }
 
 /// `e`, the error that ended a replacement or an undo of `source` with nothing moved, once
-/// av1opt's record says that nothing is under way for it any more. If that cannot be written,
-/// the next run that looks at the pair finds nothing moved and writes it then.
-fn nothing_under_way(source: &Path, e: anyhow::Error) -> anyhow::Error {
-    if let Err(not) = crate::ledger::note_settled(source) {
+/// av1opt's record says that this run (of the AV1 file whose place in the output folder is
+/// `from`) is not under way any more. If that cannot be written, the next run that looks at
+/// the pair finds nothing moved and writes it then.
+fn nothing_under_way(source: &Path, from: &Path, e: anyhow::Error) -> anyhow::Error {
+    if let Err(not) = crate::ledger::note_settled(source, from) {
         eprintln!("warning: nothing was moved, but av1opt's own record of that could not be written: {not:#}");
     }
     e
+}
+
+/// Why a replacement of the original at `source`, of the AV1 file whose place in the output
+/// folder is `from`, whose line is on record now, does not go on: another run of that original
+/// is under way on record, of another output of it (two output folders, two reports, each
+/// locked by its own run, so neither waits for the other). Of two that begin at the same moment
+/// each writes its line before it looks for the other's, so at least one of them sees the
+/// other, and the one that does leaves the original to it. One stopped half-way is left to
+/// whatever puts it right, which goes by its own report: replaced from here meanwhile, it would
+/// be left with its line open and its files not where it would have left them. (An undo needs
+/// no such look: it begins with the original in the trash, where no replacement can take it.)
+fn other_run_under_way(source: &Path, from: &Path) -> Option<String> {
+    let ledger = crate::ledger::current();
+    let other = ledger.under_way(source).find(|u| u.from != from)?;
+    Some(format!(
+        "another {} of this original, with the AV1 file at {}, is under way or was stopped half-way, so nothing was changed; once that one is over or put right (the page's \"Put right\", or `av1opt replace --apply` over its folder), this can be tried again",
+        if other.undoing { "undo" } else { "replacement" },
+        other.from.display()
+    ))
 }
 
 /// Whether av1opt's record has a replacement or an undo of the original of `report` under way:
 /// its line was written before its first move, and nothing after it says it ended.
 fn under_way(report: &Path) -> bool {
     let source = read_report(report).ok().and_then(|r| file_path(&r, "input").ok());
-    source.is_some_and(|s| crate::ledger::current().under_way(&s).is_some())
+    source.is_some_and(|s| crate::ledger::current().under_way(&s).next().is_some())
 }
 
 /// The reports under some folders (never looking into av1opt's own work folders).
@@ -4124,7 +4154,7 @@ mod tests {
         std::fs::rename(&p.report, &kept).unwrap();
         std::fs::remove_dir_all(&p.out).unwrap();
         let done = cut.put_right(&kept, &r, true, &mut held).map_err(|e| format!("{e:#}"));
-        let open = crate::ledger::load().under_way(&p.f.lib("a.mp4")).is_some();
+        let open = crate::ledger::load().under_way(&p.f.lib("a.mp4")).next().is_some();
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
         assert_eq!(done, Ok(Stranded::Undone));
         assert_eq!(std::fs::read(p.f.lib("a.mp4")).unwrap(), vec![b's'; 1000]);
@@ -4162,7 +4192,7 @@ mod tests {
             } else {
                 p.command(undoing);
             }
-            assert!(crate::ledger::load().under_way(&p.f.lib("a.mp4")).is_none(), "{step} {page}");
+            assert!(crate::ledger::load().under_way(&p.f.lib("a.mp4")).next().is_none(), "{step} {page}");
             assert!(stopped_for_list(&p.report, &crate::ledger::load()).is_none(), "{step} {page}");
             let (in_lib, in_out) = (p.f.lib("a.mkv").exists(), p.out.join("a.mkv").exists());
             let same_report = std::fs::read(&p.report).unwrap() == report;
@@ -4182,7 +4212,7 @@ mod tests {
         std::fs::remove_dir_all(p.f.dir.join("Trash")).unwrap();
         let listed = stopped_for_list(&p.report, &crate::ledger::load()).unwrap();
         let put = put_right_stopped(&p.report, true).map_err(|e| format!("{e:#}"));
-        let open = crate::ledger::load().under_way(&p.f.lib("a.mp4")).is_some();
+        let open = crate::ledger::load().under_way(&p.f.lib("a.mp4")).next().is_some();
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
         assert!(!listed.can_put_right && put.is_err() && open, "{} {put:?}", listed.told);
     }
@@ -4213,7 +4243,7 @@ mod tests {
         let page = put_right_stopped(&p.report, false).map(drop).map_err(|e| format!("{e:#}"));
         let set = set_right(&p.report, false, &mut vec![lock(&p.report).unwrap()]).map(drop).map_err(|e| format!("{e:#}"));
         crate::fsguard::ZFS_IN_TESTS.with_borrow_mut(Vec::clear);
-        let open = crate::ledger::load().under_way(&p.f.lib("a.mp4")).is_some();
+        let open = crate::ledger::load().under_way(&p.f.lib("a.mp4")).next().is_some();
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
         assert_eq!(std::fs::read(p.f.lib("a.mp4")).unwrap(), vec![b's'; 1000]);
         for said in [page, set] {
@@ -5231,7 +5261,7 @@ mod tests {
         let failed = apply_with(&p.report, true, &|_, _| Err(anyhow!("the trash is not there")));
         assert!(failed.is_err());
         p.as_before();
-        let open = crate::ledger::load().under_way(&p.f.lib("a.mp4")).is_some();
+        let open = crate::ledger::load().under_way(&p.f.lib("a.mp4")).next().is_some();
         // The person takes the original elsewhere by hand.
         std::fs::rename(p.f.lib("a.mp4"), p.f.dir.join("kept-elsewhere.mp4")).unwrap();
         let said = stopped_for_list(&p.report, &crate::ledger::load()).map(|s| s.told);
@@ -5267,7 +5297,7 @@ mod tests {
                 let said = put_right_stopped(&p.report, true).unwrap();
                 assert!(said.contains("now says"), "{said}");
                 let ledger = crate::ledger::load();
-                assert!(ledger.under_way(&p.f.lib("a.mp4")).is_none() && ledger.check_replaced(&d).is_ok());
+                assert!(ledger.under_way(&p.f.lib("a.mp4")).next().is_none() && ledger.check_replaced(&d).is_ok());
                 undo(&p.report, true).unwrap();
             } else {
                 p.command(true);
@@ -5298,7 +5328,7 @@ mod tests {
         let ledger = crate::ledger::load();
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
         assert!(put.as_ref().is_err_and(|e| e.contains("not where that run would have left them")), "{put:?}");
-        assert!(ledger.under_way(&p.f.lib("a.mp4")).is_some() && ledger.entry(&p.f.lib("a.mkv"), &p.f.lib("a.mp4")).is_none());
+        assert!(ledger.under_way(&p.f.lib("a.mp4")).next().is_some() && ledger.entry(&p.f.lib("a.mkv"), &p.f.lib("a.mp4")).is_none());
         assert!(p.f.lib("a.mkv").exists() && !p.f.lib("a.mp4").exists());
     }
 
@@ -5313,7 +5343,7 @@ mod tests {
         set_mode(&p.f.dir.join("lib"), 0o755);
         assert!(failed.as_ref().is_err_and(|e| e.contains("cannot copy")), "{failed:?}");
         p.as_before();
-        let open = crate::ledger::load().under_way(&p.f.lib("a.mp4")).is_some();
+        let open = crate::ledger::load().under_way(&p.f.lib("a.mp4")).next().is_some();
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
         assert!(!open, "its line on record is still open");
     }
@@ -5329,7 +5359,7 @@ mod tests {
         assert!(failed.is_err());
         std::fs::remove_file(p.f.lib("a.mp4")).unwrap();
         p.as_replaced();
-        let open = crate::ledger::load().under_way(&p.f.lib("a.mp4")).is_some();
+        let open = crate::ledger::load().under_way(&p.f.lib("a.mp4")).next().is_some();
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
         assert!(!open, "its line on record is still open");
     }
@@ -5352,7 +5382,7 @@ mod tests {
             p.as_before();
             let lib: Vec<_> = std::fs::read_dir(p.f.dir.join("lib")).unwrap().flatten().map(|e| e.file_name()).collect();
             assert_eq!(lib, vec![std::ffi::OsString::from("a.mp4")], "{step} {page}");
-            assert!(crate::ledger::load().under_way(&p.f.lib("a.mp4")).is_none());
+            assert!(crate::ledger::load().under_way(&p.f.lib("a.mp4")).next().is_none());
         }
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
     }
@@ -5371,7 +5401,7 @@ mod tests {
             let said = stopped_for_list(&p.report, &ledger).map(|s| s.told);
             let left = CutOff::of(&p.report, &read_report(&p.report).unwrap(), &ledger, true).map(|c| c.left);
             let put = set_right(&p.report, true, &mut vec![lock(&p.report).unwrap()]).map_err(|e| format!("{e:#}"));
-            (said, left, put, crate::ledger::load().under_way(&p.f.lib("a.mp4")).is_some())
+            (said, left, put, crate::ledger::load().under_way(&p.f.lib("a.mp4")).next().is_some())
         };
         std::fs::rename(p.f.lib("a.mp4"), p.f.dir.join("kept-elsewhere.mp4")).unwrap();
         let gone = seen();
@@ -5480,7 +5510,7 @@ mod tests {
             let ledger = crate::ledger::load();
             let record_says: Vec<PathBuf> = [&in_lib, &in_out].into_iter().filter(|o| ledger.entry(o, &p.f.lib("a.mp4")).is_some()).cloned().collect();
             let seen = check(&p.report);
-            eprintln!("{step}: put right said: {done}\n  AV1 file at {}\n  report: output {} replaced {}\n  record has an entry at {record_says:?}\n  check now: {seen:?}\n  under way: {}", at.display(), report_says.display(), r.get("replaced").is_some(), ledger.under_way(&p.f.lib("a.mp4")).is_some());
+            eprintln!("{step}: put right said: {done}\n  AV1 file at {}\n  report: output {} replaced {}\n  record has an entry at {record_says:?}\n  check now: {seen:?}\n  under way: {}", at.display(), report_says.display(), r.get("replaced").is_some(), ledger.under_way(&p.f.lib("a.mp4")).next().is_some());
             if report_says != at || record_says != vec![at.clone()] {
                 wrong.push(format!("{step}: the AV1 file is at {}, the report says {}, the record {record_says:?}", at.display(), report_says.display()));
             }
@@ -5502,7 +5532,7 @@ mod tests {
         stopped_at("recover:report", || drop(put_right_stopped(&p.report, true)));
         let ledger = crate::ledger::load();
         let r = read_report(&p.report).unwrap();
-        let (left, open) = (CutOff::of(&p.report, &r, &ledger, true).map(|c| c.left), ledger.under_way(&p.f.lib("a.mp4")).is_some());
+        let (left, open) = (CutOff::of(&p.report, &r, &ledger, true).map(|c| c.left), ledger.under_way(&p.f.lib("a.mp4")).next().is_some());
         let listed = stopped_for_list(&p.report, &ledger).map(|s| s.can_put_right);
         let put = put_right_stopped(&p.report, true).map_err(|e| format!("{e:#}"));
         let after = crate::ledger::load();
@@ -5512,7 +5542,7 @@ mod tests {
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
         assert!(r["replaced"].is_object() && left == Some(Left::Emptied { placed: true }) && open && listed == Some(true), "{left:?} {open} {listed:?} {r}");
         assert!(put.as_ref().is_ok_and(|said| said.contains("now say that it replaced the original")), "{put:?}");
-        assert!(after.under_way(&p.f.lib("a.mp4")).is_none() && after.entry(&p.f.lib("a.mkv"), &p.f.lib("a.mp4")).is_some_and(|e| e.replaced.is_some()), "the record does not say replaced");
+        assert!(after.under_way(&p.f.lib("a.mp4")).next().is_none() && after.entry(&p.f.lib("a.mkv"), &p.f.lib("a.mp4")).is_some_and(|e| e.replaced.is_some()), "the record does not say replaced");
         assert!(matches!(seen, Check::Replaced(_)) && in_lib, "{seen:?}");
         assert!(back.as_ref().is_err_and(|e| e.contains("no longer in the trash")), "{back:?}");
     }
@@ -5536,7 +5566,7 @@ mod tests {
         let listed = stopped_for_list(&p.report, &ledger).map(|s| (s.can_put_right, s.told));
         let put = put_right_stopped(&p.report, true).map_err(|e| format!("{e:#}"));
         let (in_lib, in_out) = (p.f.lib("a.mkv").exists(), p.out.join("a.mkv").exists());
-        let open = crate::ledger::load().under_way(&p.f.lib("a.mp4")).is_some();
+        let open = crate::ledger::load().under_way(&p.f.lib("a.mp4")).next().is_some();
         let seen = check(&p.report);
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
         let _ = std::fs::remove_dir_all(&p.out);
@@ -5559,7 +5589,7 @@ mod tests {
         let r = read_report(&p.report).unwrap();
         let (listed, by_list, in_full) = (stopped_for_list(&p.report, &ledger).map(|s| s.told), CutOff::of(&p.report, &r, &ledger, false).map(|c| c.left), CutOff::of(&p.report, &r, &ledger, true).map(|c| c.left));
         let put = set_right(&p.report, true, &mut vec![lock(&p.report).unwrap()]).map_err(|e| format!("{e:#}"));
-        let open = crate::ledger::load().under_way(&p.f.lib("a.mp4")).is_some();
+        let open = crate::ledger::load().under_way(&p.f.lib("a.mp4")).next().is_some();
         let kept = std::fs::read(p.f.lib("a.mp4")).unwrap() == vec![b'z'; len];
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
         assert_eq!((listed, by_list, in_full), (None, Some(Left::Nothing), Some(Left::Nothing)));
@@ -5635,7 +5665,7 @@ mod tests {
         std::fs::write(&record, kept).unwrap();
         let listed = stopped_for_list(&p.report, &crate::ledger::load()).map(|s| s.told);
         let put = put_right_stopped(&p.report, true).map_err(|e| format!("{e:#}"));
-        let open = crate::ledger::load().under_way(&p.f.lib("a.mp4")).is_some();
+        let open = crate::ledger::load().under_way(&p.f.lib("a.mp4")).next().is_some();
         let (in_trash, back) = (p.in_trash().len(), p.f.lib("a.mp4").exists());
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
         eprintln!("listed: {listed:?}\nput right: {put:?}\nline still open: {open}; files in the trash: {in_trash}; original back: {back}");
@@ -5660,5 +5690,89 @@ mod tests {
             let (seen, set) = report_behind(&format!("behind-undo-{through_links}"), through_links, true);
             assert!(matches!(&seen, Check::Ready(_)) && set == Ok(Some(Stranded::Undone)), "{through_links}: {seen:?} {set:?}");
         }
+    }
+
+    /// A second output of the original of `f`'s pair `a.mp4`/`a.mkv`, in a folder `out2` of its
+    /// own with its report, on record as made too: two encodes of one original.
+    fn second_output(f: &Fix, report: &Path) -> PathBuf {
+        let out2 = f.dir.join("out2");
+        std::fs::create_dir_all(&out2).unwrap();
+        std::fs::copy(f.out("a.mkv"), out2.join("a.mkv")).unwrap();
+        let mut r = read_report(report).unwrap();
+        r["output"] = json!(out2.join("a.mkv"));
+        let second = out2.join("a.av1opt.json");
+        std::fs::write(&second, serde_json::to_vec(&r).unwrap()).unwrap();
+        on_record(&second);
+        second
+    }
+
+    #[test]
+    fn of_two_runs_on_two_outputs_of_one_original_the_one_that_loses_closes_only_its_own_line() {
+        let f = Fix::new("two-runs");
+        let _record = record_in(&f);
+        let first = f.encode("a.mp4", "a.mkv", 1000, 400);
+        on_record(&first);
+        let second = second_output(&f, &first);
+        // The second run begins while the first is under way: each holds its own report's
+        // lock, so neither waits. It sees the first one's line, and leaves the original to it.
+        let said = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (said_there, other, home) = (said.clone(), second.clone(), f.dir.join("Trash"));
+        let second_run = move || {
+            let done = apply_with(&other, true, &|p, n| trash::trash_with_noting(p, Some(&home), 1000, "2026-11-10T22:15:03".into(), n));
+            *said_there.borrow_mut() = Some(done.map(drop).map_err(|e| format!("{e:#}")));
+        };
+        crate::signals::CHANGE_AT.with(|c| *c.borrow_mut() = Some(("replace:begun", Box::new(second_run))));
+        // And the first is killed with the original in the trash.
+        stopped_at("replace:trashed", || drop(f.apply(&first)));
+        crate::signals::CHANGE_AT.with(|c| *c.borrow_mut() = None);
+        let said = said.borrow_mut().take().expect("the second run did not run");
+        let why = said.expect_err("the second run went on");
+        assert!(why.contains("another replacement of this original") && why.contains(&f.out("a.mkv").display().to_string()), "{why}");
+        assert!(!f.lib("a.mp4").exists() && f.out("a.mkv").exists() && f.dir.join("out2/a.mkv").exists());
+
+        // The line of the second run's end closed its own run only: the first one is still under
+        // way on record, and is put right by the next replacement over its folders.
+        let ledger = crate::ledger::load();
+        let open: Vec<_> = ledger.under_way(&f.lib("a.mp4")).map(|u| (u.from.clone(), u.trash.is_some())).collect();
+        assert_eq!(open, vec![(f.out("a.mkv"), true)]);
+        run_watched(&[f.dir.join("out"), f.dir.join("lib")], true, false, true, false, false, false, &|| {}).unwrap();
+        assert!(says_replaced(&first) && !says_replaced(&second) && crate::ledger::load().under_way(&f.lib("a.mp4")).next().is_none());
+        assert_eq!(std::fs::read(f.lib("a.mkv")).unwrap(), vec![b'o'; 400]);
+        assert!(!f.lib("a.mp4").exists() && !f.out("a.mkv").exists());
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
+
+    #[test]
+    fn a_run_on_a_second_output_of_an_original_waits_for_one_stopped_on_the_first() {
+        let f = Fix::new("two-runs-stopped");
+        let _record = record_in(&f);
+        let first = f.encode("a.mp4", "a.mkv", 1000, 400);
+        on_record(&first);
+        let second = second_output(&f, &first);
+        stopped_at("replace:begun", || drop(f.apply(&first)));
+        let why = f.apply(&second).map(drop).unwrap_err().to_string();
+        assert!(why.contains("another replacement of this original") && why.contains("is under way or was stopped half-way"), "{why}");
+        assert_eq!(std::fs::read(f.lib("a.mp4")).unwrap(), vec![b's'; 1000]);
+        let open: Vec<_> = crate::ledger::load().under_way(&f.lib("a.mp4")).map(|u| u.from.clone()).collect();
+        assert_eq!(open, vec![f.out("a.mkv")]);
+        // Once the first one is put right, the second can go.
+        assert!(matches!(set_right(&first, true, &mut Vec::new()), Ok(Some(Stranded::Undone))));
+        f.apply(&second).unwrap();
+        assert!(says_replaced(&second) && !says_replaced(&first) && f.out("a.mkv").exists() && !f.dir.join("out2/a.mkv").exists());
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
+
+    #[test]
+    fn a_line_of_an_end_written_before_runs_were_told_apart_closes_every_run_of_its_original() {
+        let f = Fix::new("settled-old");
+        let record = record_in(&f);
+        let first = f.encode("a.mp4", "a.mkv", 1000, 400);
+        on_record(&first);
+        stopped_at("replace:begun", || drop(f.apply(&first)));
+        assert!(crate::ledger::load().under_way(&f.lib("a.mp4")).next().is_some());
+        let line = json!({ "format": 1, "time": 0, "event": "settled", "source": f.lib("a.mp4") });
+        crate::files::append_line(&record, &line.to_string(), false).unwrap();
+        assert!(crate::ledger::load().under_way(&f.lib("a.mp4")).next().is_none());
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
     }
 }

@@ -33,7 +33,7 @@ class Element extends Node {
   addEventListener(kind, fn) { (this.listeners[kind] = this.listeners[kind] || []).push(fn); }
   removeEventListener(kind, fn) { this.listeners[kind] = (this.listeners[kind] || []).filter((f) => f !== fn); }
   dispatch(kind) { for (const fn of [...(this.listeners[kind] || [])]) fn({ target: this, preventDefault() {}, stopPropagation() {} }); }
-  click() { if (this.onclick) return this.onclick({ target: this }); for (const fn of this.listeners.click || []) return fn({ target: this, preventDefault() {}, stopPropagation() {} }); }
+  click() { if (this.onclick) return this.onclick({ target: this, currentTarget: this }); for (const fn of this.listeners.click || []) return fn({ target: this, currentTarget: this, preventDefault() {}, stopPropagation() {} }); }
   focus() { this.ownerDocument.activeElement = this; }
   blur() {}
   pause() { if (!this.paused) { this.paused = true; this.dispatch("pause"); } }
@@ -771,6 +771,20 @@ checks["compare: a failed load and a player that cannot start both say why"] = a
   await settled();
   assert(broken.context.__root.textContent.includes("cannot draw it"));
   assert.strictEqual(lastToast(broken), "cannot draw it");
+};
+
+checks["compare: Put right says what the server did"] = async () => {
+  const done = "av1opt had been stopped half-way through replacing this original; the original is back at /i.mp4 and the AV1 file at /o.mp4, as they were before";
+  const page = openPage((path, body) => (path === "/api/replace/put-right" && body ? { done } : {}));
+  await settled();
+  page.context.__root = page.document.createElement("div");
+  page.run(`var leave = comparePlayer(__root, { output_path: "/o.mp4", input_path: "/i.mp4", report_path: "/o.av1opt.json", output_info: { fps: 25, duration_s: 10 }, input_info: { fps: 25, duration_s: 10 }, target_vmaf: 93, verify_vmaf: [94], replace: { state: "stopped", can_put_right: true, zfs: false, why: "av1opt was stopped half-way through replacing this original" } })`);
+  await settled();
+  await page.context.__root.named("button", "Put right").click();
+  await settled();
+  assert.deepStrictEqual(posted(page, "/api/replace/put-right").map((p) => p.body), [{ report: "/o.av1opt.json", allow_zfs: false }]);
+  assert.strictEqual(lastToast(page), done);
+  page.run("leave()");
 };
 
 checks["compare: the output does not play before its source is there to play beside it"] = async () => {

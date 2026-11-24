@@ -3399,8 +3399,9 @@ function comparePlayer(root, r) {
     kv("", i.codec ? `${desc(i)} · ${num(i.fps, 2)} fps${i.hdr ? " HDR" : ""} · ${hms(i.duration_s)} · ${bytes(size)}` : (i.error || "–"))];
   // ---- the original's place ----
   const rp = r.replace || {};
+  // `said` is what the toast says once it is done, or makes it from the server's answer.
   const act = async (path, body, said) => {
-    try { await api(path, body); toast(said); route(); } catch (e) { toast(e.message, true); }
+    try { const answer = await api(path, body); toast(typeof said === "function" ? said(answer) : said); route(); } catch (e) { toast(e.message, true); }
   };
   const replacePanel = r.pair || !rp.state ? null : h("div", { class: "panel" }, h("h3", {}, "Original"),
     rp.state === "ready" ? [
@@ -3468,7 +3469,7 @@ function comparePlayer(root, r) {
           body: [h("p", { class: "warn" }, "Putting these files right writes to a folder on ZFS, which av1opt writes to only when asked. Putting them right here is asking.")],
         })) return;
         btn.disabled = true;
-        try { await act("/api/replace/put-right", { report: r.report_path, allow_zfs: !!rp.zfs }, "Put right"); }
+        try { await act("/api/replace/put-right", { report: r.report_path, allow_zfs: !!rp.zfs }, (answer) => (answer && answer.done) || "Put right"); }
         finally { btn.disabled = false; }
       } }, "Put right")) : null]
     : rp.state === "not_recorded" ? h("p", { class: "dim" }, `${rp.why}.`)

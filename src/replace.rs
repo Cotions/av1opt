@@ -4534,6 +4534,45 @@ mod tests {
         assert_eq!(after, record);
     }
 
+    /// An undo stopped half-way, and since then a file it would act on changed at its size and
+    /// date: the original in the trash (to be taken back once the AV1 file went back), the AV1
+    /// file back in the output folder, or the copy of it on its way to another drive (to be
+    /// removed). None is the recorded file, so the files are not as that run left them, and
+    /// nothing is moved; the same files changed once the recovery looked at them stay too.
+    #[test]
+    fn a_stopped_undo_whose_files_changed_since_is_left_alone() {
+        // Which file of the pair is changed.
+        type Changed<'a> = &'a dyn Fn(&Pair) -> PathBuf;
+        let trash = |p: &Pair| p.f.dir.join("Trash/files/a.mp4");
+        let back = |p: &Pair| p.out.join("a.mkv");
+        let cases: [(&str, &'static str, bool, Changed); 3] =
+            [("undo-wrong-trash", "undo:moved", false, &trash), ("undo-wrong-av1", "undo:moved", false, &back), ("undo-wrong-copy", "move:copied", true, &back)];
+        for (name, step, far, changed) in cases {
+            let Some(p) = stopped_pair(name, step, true, far) else { return crate::tools::skipped(name, "/dev/shm is not another drive here") };
+            let listed = stopped_for_list(&p.report, &crate::ledger::load()).map(|s| s.can_put_right);
+            rewrite_in_place(&changed(&p));
+            let before = files_of(&p);
+            let done = put_right_now(&p);
+            let unchanged = files_of(&p) == before && says_replaced(&p.report);
+            crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+            assert_eq!(listed, Some(true), "{name}: not a step of the undo before the change");
+            assert!(done.as_ref().is_err_and(|e| e.contains("leaves them as they are")), "{name}: {done:?}");
+            assert!(unchanged, "{name}: files or the report were changed");
+        }
+        for (name, step, far, changed, said) in [
+            ("undo-trash-late", "undo:moved", false, &trash as Changed, "the file in the trash is not the original"),
+            ("undo-copy-late", "move:copied", true, &back, "is not a copy of"),
+        ] {
+            let Some(p) = stopped_pair(name, step, true, far) else { return crate::tools::skipped(name, "/dev/shm is not another drive here") };
+            let after = with_rewritten(files_of(&p), &changed(&p));
+            let done = put_right_changing(&p, "recover:checked", changed(&p));
+            let unchanged = files_of(&p) == after;
+            crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+            assert!(done.as_ref().is_err_and(|e| e.contains(said)), "{name}: {done:?}");
+            assert!(unchanged, "{name}: files were moved");
+        }
+    }
+
     /// A pair stopped half-way, and a report that is not the one that run worked from: another
     /// encode's of the same original in another output folder, or the report changed since
     /// (another size, another trash entry or output folder for an undo). The line on record is

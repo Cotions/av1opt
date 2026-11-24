@@ -554,6 +554,7 @@ impl CutOff {
             Left::Nothing => return None,
             Left::Trashed { .. } | Left::Placed if self.from == self.dest => format!("{stopped}: the original is in the trash at {trash}; putting it right takes it back to {source}, and the AV1 file stays at {from}"),
             Left::Trashed { .. } | Left::Placed => format!("{stopped}: the original is in the trash at {trash}; putting it right takes it back to {source}, and the AV1 file back to {from}"),
+            Left::CopiedBack if self.original_gone() => format!("{stopped}, and the original is no longer in the trash at {trash} (the trash was emptied, or it was taken out by hand): there is nothing to put back; the AV1 file is at {dest}, and a copy of it at {from}; putting it right removes that copy"),
             Left::CopiedBack => format!("{stopped}: the AV1 file is still at {dest}, and a copy of it at {from}; putting it right removes that copy"),
             Left::MovedBack => format!("{stopped}: the AV1 file is back at {from}, and the original still in the trash at {trash}; putting it right takes the original back to {source}"),
             Left::BothBack => format!("{stopped}: both files are back, at {source} and {from}; putting it right only writes that down"),
@@ -582,6 +583,7 @@ impl CutOff {
         let now = match self.left {
             Left::Nothing | Left::Unknown => return None,
             Left::Trashed { .. } | Left::Placed => format!("the original is back at {source} and the AV1 file at {from}, as they were before"),
+            Left::CopiedBack if self.original_gone() => format!("the copy at {from} was removed, and the AV1 file is at {dest}; the original was no longer in the trash, so it cannot be put back"),
             Left::CopiedBack => format!("the copy at {from} was removed, and the AV1 file is at {dest}, as it was before"),
             Left::MovedBack | Left::BothBack => format!("the original is back at {source} and the AV1 file at {from}, as the undo was to leave them"),
             Left::Finished => return Some(format!("av1opt's own record now says that {source} was replaced by {dest}, as its report does")),
@@ -612,6 +614,11 @@ impl CutOff {
     /// Whether putting it right writes to a folder on ZFS.
     fn on_zfs(&self) -> bool {
         self.folders_written().iter().any(|f| crate::fsguard::ensure_writable_location(f, false).is_err())
+    }
+
+    /// Nothing is at the original's name in the trash any more, for what is said of a pair.
+    fn original_gone(&self) -> bool {
+        self.trash.as_deref().is_some_and(|t| std::fs::symlink_metadata(t).is_err())
     }
 
     /// Where the AV1 file is and where it goes back to, for an undo whose original is gone
@@ -5534,8 +5541,8 @@ mod tests {
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
         let _ = std::fs::remove_dir_all(&p.out);
         assert!(both && left == Some(Left::CopiedBack), "{both} {left:?}");
-        assert!(listed.as_ref().is_some_and(|(can, told)| *can && told.contains("putting it right removes that copy")), "{listed:?}");
-        assert!(put.is_ok() && in_lib && !in_out && !open && matches!(seen, Check::Replaced(_)), "{put:?} {in_lib} {in_out} {open} {seen:?}");
+        assert!(listed.as_ref().is_some_and(|(can, told)| *can && told.contains("is no longer in the trash") && told.contains("putting it right removes that copy")), "{listed:?}");
+        assert!(put.as_ref().is_ok_and(|said| said.contains("cannot be put back")) && in_lib && !in_out && !open && matches!(seen, Check::Replaced(_)), "{put:?} {in_lib} {in_out} {open} {seen:?}");
     }
 
     /// A replacement stopped before anything moved, whose original was then written over in

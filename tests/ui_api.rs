@@ -1472,6 +1472,27 @@ fn stopped_once_placed(d: &Path) {
     write_record(d, &[encoded, replacing, json!({ "format": 1, "time": 3, "event": "trashing", "source": original, "trash": trash })]);
 }
 
+/// Replacing and putting back both begin by putting right a pair that was stopped half-way,
+/// whatever its report says of it: neither does while the encode queue waits on its files.
+#[test]
+fn a_pair_stopped_half_way_is_not_put_right_by_a_replacement_or_an_undo_while_the_queue_waits_on_it() {
+    for (route, name) in [("/api/replace/undo", "stopped-queued-undo"), ("/api/replace", "stopped-queued-replace")] {
+        let s = Server::start(name, |d| {
+            stopped_once_placed(d);
+            let saved = json!({ "format": 1, "jobs": [{ "inputs": [d.join("videos")], "roots": [], "out_dir": d.join("again"), "options": {} }] });
+            std::fs::create_dir_all(d.join("data/av1opt")).unwrap();
+            std::fs::write(d.join("data/av1opt/ui-queue.json"), saved.to_string()).unwrap();
+        });
+        add_history_folder(&s, "out");
+        let names = ["videos/movie.mp4", "out/movie.mkv", "videos/movie.mkv", "data/Trash/files/movie.mp4", "out/movie.av1opt.json"];
+        let files = || names.map(|n| std::fs::read(s.dir.join(n)).ok());
+        let before = files();
+        let r = s.post(route, &json!({ "report": s.dir.join("out/movie.av1opt.json") }));
+        assert!(r.status == 400 && r.body.contains("is in the encode queue, so nothing was"), "{route}: {} {}", r.status, r.body);
+        assert!(files() == before && before[3].is_some() && before[2].is_some(), "{route}: files were moved");
+    }
+}
+
 #[test]
 fn a_pair_stopped_half_way_is_shown_so_and_put_right_only_when_asked() {
     let s = Server::start("stopped", stopped_once_placed);

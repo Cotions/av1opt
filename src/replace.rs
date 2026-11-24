@@ -601,6 +601,13 @@ impl CutOff {
                 {
                     trash::drop_info_left_alone(trash, &self.source);
                 }
+                // So does a copy of the AV1 file on its way to another drive, hidden beside the
+                // place it was going to: only ever a copy, and one no run is writing any more.
+                // A folder on ZFS is not written to without `allow_zfs`, and the copy stays.
+                let towards = if self.undoing { &self.from } else { &self.dest };
+                if crate::fsguard::ensure_writable_location(&folder(towards), allow_zfs).is_ok() {
+                    clear_left_behind(towards);
+                }
                 settled()?;
                 Ok(if self.undoing { Stranded::Replaced } else { Stranded::Undone })
             }
@@ -4988,6 +4995,29 @@ mod tests {
         let open = crate::ledger::load().under_way(&p.f.lib("a.mp4")).is_some();
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
         assert!(!open, "its line on record is still open");
+    }
+
+    /// A copy to another drive stopped before the original moved leaves a whole hidden copy
+    /// of the AV1 file beside the original. Settling the pair, by `--undo --apply` or the
+    /// page, clears it away, as replacing it again would.
+    #[test]
+    fn a_hidden_copy_of_a_replacement_stopped_before_the_original_moved_is_cleared_when_the_pair_is_settled() {
+        for (step, page) in [("replace:staged", false), ("replace:staged", true), ("trash:info", false), ("trash:info", true)] {
+            let name = format!("settled-copy-{}-{page}", step.replace(':', "-"));
+            let Some(p) = Pair::new(&name, true, "a.mkv") else { return crate::tools::skipped(&name, "/dev/shm is not another drive here") };
+            stopped_at(step, || drop(p.f.apply(&p.report).map(drop)));
+            p.as_if_its_run_had_ended();
+            if page {
+                put_right_stopped(&p.report, true).unwrap();
+            } else {
+                p.command(true);
+            }
+            p.as_before();
+            let lib: Vec<_> = std::fs::read_dir(p.f.dir.join("lib")).unwrap().flatten().map(|e| e.file_name()).collect();
+            assert_eq!(lib, vec![std::ffi::OsString::from("a.mp4")], "{step} {page}");
+            assert!(crate::ledger::load().under_way(&p.f.lib("a.mp4")).is_none());
+        }
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
     }
 
     /// A replacement stopped before it wrote down its original's name in the trash had not

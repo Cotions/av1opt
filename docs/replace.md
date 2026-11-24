@@ -119,12 +119,20 @@ single output files.
   left them (moved by hand since, or not the recorded files), is left as it is and said to
   be: an original thrown away by hand with its AV1 file kept is "gone", as it is. A
   replacement or undo that ends with an error and nothing moved (the trash refuses, the
-  library is full) writes down that it is over, and a replacement stopped before the
-  original's name in the trash was written down had not moved it, wherever it is now. One
+  library is full) writes down that it is over. A replacement stopped before the original's
+  name in the trash was written down had not moved it: with a file still in the original's
+  place it is over, whatever was written into that file since, and with the original gone
+  from its place it is said and left as it is (the line with the name may not have reached
+  the drive, and the original may be in the trash). One
   stopped half-way whose original was since emptied from the trash, with the AV1 file at one
-  of its two places, has nothing left to put back: that is said, and putting it right only
-  writes down that the run is over (with the trash folder itself not there, a drive not
-  mounted just now, it is left as it is). Nothing is
+  of its two places, has nothing left to put back: that is said, and putting it right has
+  the record and the report say where the only video left of the two is. An AV1 file a
+  replacement had placed stays in the original's folder, and the pair is written down as
+  replaced; one an undo had taken back to the output folder goes to the original's folder
+  again, where the record has it; otherwise only the end of the run is written down (with
+  the trash folder itself not there, a drive not mounted just now, it is left as it is). On
+  the page, replacing and putting back wait, as "Put right" does, while the encode queue
+  holds a file of a pair stopped half-way. Nothing is
   put right in a folder on ZFS without `--allow-zfs`, a copy is removed only if the file it is
   a copy of is still there and is another file (not the same file reached by a second path),
   and a pair that could not be put right makes the run end in failure. Records written by an

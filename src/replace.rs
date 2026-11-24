@@ -326,6 +326,8 @@ pub struct Stopped {
     pub can_put_right: bool,
     /// Putting them right writes to a folder on ZFS.
     pub zfs: bool,
+    /// The original, and the two places of the AV1 file: what putting them right may move.
+    pub files: [PathBuf; 3],
 }
 
 /// [`Stopped`] of `report`, if it is a pair stopped with something moved.
@@ -337,7 +339,7 @@ pub fn stopped_for_list(report: &Path, ledger: &crate::ledger::Ledger) -> Option
     let r = read_report(report).ok()?;
     let r = stranded(report, &r, ledger, false).map_or(r, |(fixed, _)| fixed);
     let cut = CutOff::of(report, &r, ledger, false)?;
-    Some(Stopped { told: cut.told()?, can_put_right: cut.left != Left::Unknown, zfs: cut.on_zfs() })
+    Some(Stopped { told: cut.told()?, can_put_right: cut.left != Left::Unknown, zfs: cut.on_zfs(), files: [cut.source.clone(), cut.from.clone(), cut.dest.clone()] })
 }
 
 /// [`put_right_stopped_unless`] with no file in use.
@@ -413,7 +415,9 @@ enum Left {
     Finished,
     /// The original's entry in the trash is gone (the trash was emptied) and the AV1 file is
     /// at one of its two places, in the original's (`placed`) or in the output folder: nothing
-    /// is left to put back, and only the end of the run is left to write down.
+    /// is left to put back. What is left to do is to have the record and the report say where
+    /// the AV1 file is: a replacement that had placed it is written down as gone through, and
+    /// any other run as over (see [`CutOff::av1_back`] for an undo that had taken it back).
     Emptied { placed: bool },
     /// Not as any step of that run leaves them: moved by hand since, or not the files recorded.
     Unknown,
@@ -472,21 +476,28 @@ impl CutOff {
         let at_from = from != dest && !one_file(from, dest) && is_av1(from);
         let left = if finished {
             let source_free = !taken(&source) || (*dest == source && at_dest);
-            if in_trash && source_free && at_dest && (from == dest || !taken(from)) { Left::Finished } else { Left::Unknown }
+            if in_trash && source_free && at_dest && (from == dest || !taken(from)) {
+                Left::Finished
+            } else if emptied && source_free && at_dest && (from == dest || !taken(from)) {
+                // Stopped while being written down as gone through with the trash emptied.
+                Left::Emptied { placed: true }
+            } else {
+                Left::Unknown
+            }
         } else if !u.undoing {
             let source_free = !taken(&source) || (*dest == source && at_dest);
             // An output made beside its original has its place already, and only the original
             // moves: it is still where it was as long as it is at its one place.
             let still_out = at_from || (from == dest && at_dest);
             // The original is the first to move, and its name in the trash is on record before
-            // it goes: without that name, and with the original in its place, nothing of this
-            // run's was moved. (Without the name and with the original gone, the line that had
-            // the name may not have reached the drive, a record on a drive that would not write
-            // it out and then a power cut: the original may be in the trash, so that is said
-            // and nothing is written down as over.) With nothing at that name and a file in
-            // its place that is not the AV1 file, nothing was moved either (or it was taken
-            // back since), whatever that file is.
-            if (u.trash.is_none() && is_original(&source)) || (u.trash.as_deref().is_some_and(|t| !taken(t)) && !source_free) {
+            // it goes. With no name on record, or nothing at that name, and a file in the
+            // original's place that is not the AV1 file, nothing of this run's was moved (or
+            // it was taken back since), whatever that file is: a list and the run that acts
+            // see that alike, without reading the file. (Without the name and with the
+            // original gone, the line that had the name may not have reached the drive, a
+            // record on a drive that would not write it out and then a power cut: the original
+            // may be in the trash, so that is said and nothing is written down as over.)
+            if u.trash.as_deref().is_none_or(|t| !taken(t)) && !source_free {
                 Left::Nothing
             } else if in_trash && source_free && still_out {
                 if from == dest || !taken(dest) {
@@ -511,7 +522,10 @@ impl CutOff {
             // in the place it goes back to and the trash entry still there, it never left.
             if at_dest && u.trash.as_deref().is_some_and(taken) && (from == dest || !taken(from)) {
                 Left::Nothing
-            } else if in_trash && at_dest && at_from {
+            } else if (in_trash || (emptied && (!taken(&source) || *dest == source))) && at_dest && at_from {
+                // With the trash emptied too: a copy made by the undo, or by putting right an
+                // undo whose original was gone (see `av1_back`), across drives and stopped
+                // before the other name went.
                 Left::CopiedBack
             } else if in_trash && at_from && !taken(dest) {
                 Left::MovedBack
@@ -548,6 +562,7 @@ impl CutOff {
                 if placed { &dest } else { &from },
                 match self.av1_back() {
                     Some((_, to)) => format!("takes the AV1 file back to {}, where av1opt's record and the report have it, and writes down that the run is over", to.display()),
+                    None if self.goes_through() => "leaves it there, and writes down in av1opt's record and in the report that it replaced the original".to_string(),
                     None => "only writes down that the run is over".to_string(),
                 }
             ),
@@ -570,6 +585,7 @@ impl CutOff {
             Left::CopiedBack => format!("the copy at {from} was removed, and the AV1 file is at {dest}, as it was before"),
             Left::MovedBack | Left::BothBack => format!("the original is back at {source} and the AV1 file at {from}, as the undo was to leave them"),
             Left::Finished => return Some(format!("av1opt's own record now says that {source} was replaced by {dest}, as its report does")),
+            Left::Emptied { .. } if self.goes_through() => format!("the original was no longer in the trash, so nothing was put back; the AV1 file is at {dest}, and av1opt's own record and the report now say that it replaced the original"),
             Left::Emptied { placed } => format!(
                 "the original was no longer in the trash, so nothing was put back, and av1opt's own record now says that run is over; the AV1 file is at {}",
                 match self.av1_back() {
@@ -598,18 +614,26 @@ impl CutOff {
         self.folders_written().iter().any(|f| crate::fsguard::ensure_writable_location(f, false).is_err())
     }
 
-    /// Where the AV1 file is and where it goes back to, for a pair whose original is gone from
-    /// the trash while the AV1 file had already moved: a replacement that had placed it, or an
-    /// undo that had taken it back. The record and the report still have it at the other place
-    /// (the line and the report that say otherwise come last in a run), and with the run
-    /// written down as over nothing would look at the pair again: the file would lie where
-    /// nothing says it is. None where it is where they have it.
+    /// Where the AV1 file is and where it goes back to, for an undo whose original is gone
+    /// from the trash while the AV1 file had already been taken back to the output folder.
+    /// The record and the report still have it in the original's place (the line and the
+    /// report that say otherwise come last in a run), and that is where the only video left
+    /// of the two belongs: with the run written down as over nothing would look at the pair
+    /// again, and the file would lie where nothing says it is. None for any other pair.
     fn av1_back(&self) -> Option<(&Path, &Path)> {
         match self.left {
-            Left::Emptied { placed: true } if !self.undoing && self.from != self.dest => Some((&self.dest, &self.from)),
             Left::Emptied { placed: false } if self.undoing && self.from != self.dest => Some((&self.from, &self.dest)),
             _ => None,
         }
+    }
+
+    /// A replacement whose original is gone from the trash with the AV1 file already in the
+    /// original's place: nothing can be taken back, the AV1 file is the only video left of the
+    /// two and is where the person asked for it, so the replacement is written down as gone
+    /// through, in the report and then on record. Taking the AV1 file back to the output
+    /// folder would agree with the record as well, and leave the library without the video.
+    fn goes_through(&self) -> bool {
+        self.left == Left::Emptied { placed: true } && !self.undoing
     }
 
     /// The folders putting it right writes to.
@@ -730,6 +754,22 @@ impl CutOff {
                 }
                 write_report_held(report, &r, held).context("both files are back, but the report could not be updated")?;
                 Ok(Stranded::Undone)
+            }
+            Left::Emptied { .. } if self.goes_through() => {
+                let trash = self.trash.as_deref().context("no trash entry on record")?;
+                // The report first: with it written and the run stopped again, the pair is
+                // seen as this same one, and the record is all that is left to write.
+                if r.get("replaced").filter(|d| d.is_object()).is_none() {
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                    let mut r = r.clone();
+                    r["output"] = json!(self.dest);
+                    r["replaced"] = json!({ "time": now, "from": self.from, "trash": trash, "source_mtime": self.original.modified });
+                    write_report_held(report, &r, held).context("the AV1 file is in the original's place, but the report could not be made to say so")?;
+                    crate::signals::stop_point("recover:report");
+                }
+                let replacement = crate::ledger::Replacement { original: &self.source, trash, output: &self.dest, from: &self.from, source_bytes: self.source_bytes, known: &self.original, output_bytes: self.output_bytes };
+                crate::ledger::note_replaced(&replacement).context("the report says that the AV1 file replaced the original, but av1opt's own record of it could not be written")?;
+                Ok(Stranded::Replaced)
             }
             Left::Emptied { .. } => {
                 if let Some((at, to)) = self.av1_back() {
@@ -4087,8 +4127,9 @@ mod tests {
 
     /// A pair stopped half-way whose original's entry in the trash was emptied since: there is
     /// nothing to put back. That is said until it is written down, and then no more. No file
-    /// moves but an AV1 file that had moved already, which goes back to where the record and
-    /// the report have it (see `an_emptied_pair_put_right_has_its_av1_file_where_record_and_report_say_it_is`).
+    /// moves but the AV1 file an undo had taken back, which goes to the original's folder
+    /// again; one a replacement had placed stays, and the report says so from then on (see
+    /// `an_emptied_pair_put_right_has_its_av1_file_where_record_and_report_say_it_is`).
     /// With the trash itself gone (a drive not there just now) it is not written down.
     #[test]
     fn a_pair_stopped_half_way_whose_trash_was_emptied_is_written_down_as_over() {
@@ -4116,14 +4157,17 @@ mod tests {
             }
             assert!(crate::ledger::load().under_way(&p.f.lib("a.mp4")).is_none(), "{step} {page}");
             assert!(stopped_for_list(&p.report, &crate::ledger::load()).is_none(), "{step} {page}");
-            assert!(std::fs::read(&p.report).unwrap() == report, "{step} {page}: the report was rewritten");
             let (in_lib, in_out) = (p.f.lib("a.mkv").exists(), p.out.join("a.mkv").exists());
+            let same_report = std::fs::read(&p.report).unwrap() == report;
             match step {
-                // Placed by the replacement, and taken back to the output folder.
-                "replace:placed" => assert!(in_out && !in_lib && listed.told.contains("takes the AV1 file back to"), "{step} {page}: {}", listed.told),
+                // Placed by the replacement, and left there: the report says replaced now.
+                "replace:placed" => {
+                    assert!(in_lib && !in_out && listed.told.contains("leaves it there"), "{step} {page}: {}", listed.told);
+                    assert!(matches!(check(&p.report), Check::Replaced(_)) && !same_report, "{step} {page}: {:?}", check(&p.report));
+                }
                 // Taken back by the undo, and put in the original's folder again.
-                "undo:moved" => assert!(in_lib && !in_out && listed.told.contains("takes the AV1 file back to"), "{step} {page}: {}", listed.told),
-                _ => assert!(files() == before && listed.told.contains("only writes down"), "{step} {page}: files moved"),
+                "undo:moved" => assert!(in_lib && !in_out && same_report && listed.told.contains("takes the AV1 file back to"), "{step} {page}: {}", listed.told),
+                _ => assert!(files() == before && same_report && listed.told.contains("only writes down"), "{step} {page}: files moved"),
             }
         }
         let p = Pair::new("emptied-trash-gone", false, "a.mkv").unwrap();
@@ -5402,9 +5446,10 @@ mod tests {
 
     /// A replacement stopped once the AV1 file was placed (or an undo stopped once the AV1 file
     /// was back in the output folder), whose original was then emptied from the trash, and put
-    /// right: the AV1 file goes back to the place the record and the report name for it. It
-    /// used to stay where it was, with the run written down as over, so that nothing would
-    /// ever look at the pair again.
+    /// right: the AV1 file is in the original's folder, the only video left of the two, and
+    /// the record and the report both name that place for it. It used to stay where it was
+    /// with the run written down as over and the record and the report naming the other
+    /// place, so that nothing would ever look at the pair again.
     #[test]
     fn an_emptied_pair_put_right_has_its_av1_file_where_record_and_report_say_it_is() {
         let mut wrong = Vec::new();
@@ -5435,6 +5480,98 @@ mod tests {
         }
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
         assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Putting right a replacement whose original was emptied from the trash writes the report
+    /// and then the record. Stopped between the two, it is seen as the same pair again, and
+    /// the record is written: the pair is a replaced one whose original cannot be put back.
+    #[test]
+    fn an_emptied_replacement_stopped_again_between_its_report_and_the_record_is_written_down_all_the_same() {
+        let p = Pair::new("emptied-report-then-stop", false, "a.mkv").unwrap();
+        stopped_at("replace:placed", || drop(p.f.apply(&p.report)));
+        for e in ["files", "info"].iter().flat_map(|d| std::fs::read_dir(p.f.dir.join("Trash").join(d)).unwrap().flatten()) {
+            std::fs::remove_file(e.path()).unwrap();
+        }
+        stopped_at("recover:report", || drop(put_right_stopped(&p.report, true)));
+        let ledger = crate::ledger::load();
+        let r = read_report(&p.report).unwrap();
+        let (left, open) = (CutOff::of(&p.report, &r, &ledger, true).map(|c| c.left), ledger.under_way(&p.f.lib("a.mp4")).is_some());
+        let listed = stopped_for_list(&p.report, &ledger).map(|s| s.can_put_right);
+        let put = put_right_stopped(&p.report, true).map_err(|e| format!("{e:#}"));
+        let after = crate::ledger::load();
+        let seen = check(&p.report);
+        let back = undo(&p.report, true).map(drop).map_err(|e| format!("{e:#}"));
+        let in_lib = p.f.lib("a.mkv").exists();
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        assert!(r["replaced"].is_object() && left == Some(Left::Emptied { placed: true }) && open && listed == Some(true), "{left:?} {open} {listed:?} {r}");
+        assert!(put.as_ref().is_ok_and(|said| said.contains("now say that it replaced the original")), "{put:?}");
+        assert!(after.under_way(&p.f.lib("a.mp4")).is_none() && after.entry(&p.f.lib("a.mkv"), &p.f.lib("a.mp4")).is_some_and(|e| e.replaced.is_some()), "the record does not say replaced");
+        assert!(matches!(seen, Check::Replaced(_)) && in_lib, "{seen:?}");
+        assert!(back.as_ref().is_err_and(|e| e.contains("no longer in the trash")), "{back:?}");
+    }
+
+    /// An undo to another drive whose original was emptied from the trash has its AV1 file
+    /// taken back to the original's folder, by a copy. Stopped with the copy made and the other
+    /// name still there, there is one at each place: the one in the output folder is removed,
+    /// as for an undo stopped there itself, and the pair is not left for someone to sort out.
+    #[test]
+    fn an_emptied_undo_put_right_across_drives_and_stopped_with_a_copy_at_each_place_is_put_right_again() {
+        let Some(p) = Pair::new("emptied-far-copied", true, "a.mkv") else { return };
+        p.f.apply(&p.report).unwrap();
+        stopped_at("undo:moved", || drop(undo(&p.report, true)));
+        for e in ["files", "info"].iter().flat_map(|d| std::fs::read_dir(p.f.dir.join("Trash").join(d)).unwrap().flatten()) {
+            std::fs::remove_file(e.path()).unwrap();
+        }
+        stopped_at("move:copied", || drop(put_right_stopped(&p.report, true)));
+        let both = p.f.lib("a.mkv").exists() && p.out.join("a.mkv").exists();
+        let ledger = crate::ledger::load();
+        let left = CutOff::of(&p.report, &read_report(&p.report).unwrap(), &ledger, true).map(|c| c.left);
+        let listed = stopped_for_list(&p.report, &ledger).map(|s| (s.can_put_right, s.told));
+        let put = put_right_stopped(&p.report, true).map_err(|e| format!("{e:#}"));
+        let (in_lib, in_out) = (p.f.lib("a.mkv").exists(), p.out.join("a.mkv").exists());
+        let open = crate::ledger::load().under_way(&p.f.lib("a.mp4")).is_some();
+        let seen = check(&p.report);
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&p.out);
+        assert!(both && left == Some(Left::CopiedBack), "{both} {left:?}");
+        assert!(listed.as_ref().is_some_and(|(can, told)| *can && told.contains("putting it right removes that copy")), "{listed:?}");
+        assert!(put.is_ok() && in_lib && !in_out && !open && matches!(seen, Check::Replaced(_)), "{put:?} {in_lib} {in_out} {open} {seen:?}");
+    }
+
+    /// A replacement stopped before anything moved, whose original was then written over in
+    /// place at the same size: a list (by sizes) and the run that acts (reading in full) see
+    /// the same thing, nothing moved, and the line is closed. They used to disagree, the list
+    /// showing nothing and every run refusing.
+    #[test]
+    fn a_replacement_stopped_before_it_moved_anything_is_over_whatever_was_written_into_the_original_since() {
+        let p = Pair::new("begun-then-edited", false, "a.mkv").unwrap();
+        stopped_at("replace:begun", || drop(p.f.apply(&p.report).map(drop)));
+        let len = std::fs::metadata(p.f.lib("a.mp4")).unwrap().len() as usize;
+        std::fs::write(p.f.lib("a.mp4"), vec![b'z'; len]).unwrap();
+        let ledger = crate::ledger::load();
+        let r = read_report(&p.report).unwrap();
+        let (listed, by_list, in_full) = (stopped_for_list(&p.report, &ledger).map(|s| s.told), CutOff::of(&p.report, &r, &ledger, false).map(|c| c.left), CutOff::of(&p.report, &r, &ledger, true).map(|c| c.left));
+        let put = set_right(&p.report, true, &mut vec![lock(&p.report).unwrap()]).map_err(|e| format!("{e:#}"));
+        let open = crate::ledger::load().under_way(&p.f.lib("a.mp4")).is_some();
+        let kept = std::fs::read(p.f.lib("a.mp4")).unwrap() == vec![b'z'; len];
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        assert_eq!((listed, by_list, in_full), (None, Some(Left::Nothing), Some(Left::Nothing)));
+        assert!(put.is_ok() && !open && kept, "{put:?} {open} {kept}");
+    }
+
+    /// The page asks its encode queue about the files of a pair stopped half-way before it
+    /// replaces or puts back, since both begin by putting the pair right: the list names the
+    /// three files that may move, also where the report does not show the pair as replaced.
+    #[test]
+    fn a_pair_stopped_half_way_names_the_files_putting_it_right_may_move() {
+        let p = Pair::new("stopped-files", false, "a.mkv").unwrap();
+        stopped_at("replace:placed", || drop(p.f.apply(&p.report)));
+        let ledger = crate::ledger::load();
+        let replaced = matches!(check_for_list_on_record(&p.report, &ledger), Check::Replaced(_));
+        let files = stopped_for_list(&p.report, &ledger).map(|s| s.files);
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+        let named = |f: &PathBuf| files.as_ref().is_some_and(|all| all.iter().any(|x| crate::files::OneFile::of(x) == crate::files::OneFile::of(f) || x == f));
+        assert!(!replaced && named(&p.f.lib("a.mp4")) && named(&p.f.lib("a.mkv")) && named(&p.out.join("a.mkv")), "{replaced} {files:?}");
     }
 
     /// Not a check: leaves pairs on disk (under `TMPDIR`) in each state that writes one of the

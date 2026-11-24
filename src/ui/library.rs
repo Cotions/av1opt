@@ -676,12 +676,25 @@ pub fn replace_original(app: &App, body: &Value) -> Result<Value> {
     {
         bail!("the original is in the encode queue");
     }
+    refuse_stopped_in_queue(app, &report, &ledger, "replaced")?;
     // The record is what says this output and this original belong together, and the output is
     // read here through the very descriptor that makes sure it is the file that gets moved.
     let on_record = |p: &replace::Plan, output: &replace::OpenFile| app.ledger.current().check_ready(p, Some(output));
     let done = if r.accept_changed_date { replace::apply_if_date_accepted(&report, r.allow_zfs, &on_record) } else { replace::apply_if(&report, r.allow_zfs, &on_record) }?;
     let warnings: Vec<&String> = done.warnings.iter().chain(&done.report_behind).collect();
     Ok(json!({ "dest": done.dest, "trash": done.trash, "source_bytes": done.source_bytes, "warnings": warnings }))
+}
+
+/// Refuses where `report` is of a pair stopped half-way (see [`replace::stopped_for_list`]) and
+/// the encode queue is waiting on one of its files: replacing and putting back both begin by
+/// putting such a pair right, which moves those files whatever the report says of the pair.
+fn refuse_stopped_in_queue(app: &App, report: &Path, ledger: &Ledger, done: &str) -> Result<()> {
+    if let Some(stopped) = replace::stopped_for_list(report, ledger)
+        && let Some(busy) = stopped.files.iter().find(|p| crate::ui::jobs::waiting_on(app, p))
+    {
+        bail!("{} is in the encode queue, so nothing was {done}", busy.display());
+    }
+    Ok(())
 }
 
 /// Takes a replaced original back out of the trash and returns the AV1 file to where it was.
@@ -692,11 +705,13 @@ pub fn restore_original(app: &App, body: &Value) -> Result<Value> {
     // As for a replacement, nothing the encode queue is waiting on is moved: an original put
     // back into a folder the queue is about to read would be encoded again, and with
     // `--overwrite` that encode would be written over the AV1 file just taken back.
-    if let Check::Replaced(d) = replace::check_for_list_on_record(&report, &app.ledger.current())
+    let ledger = app.ledger.current();
+    if let Check::Replaced(d) = replace::check_for_list_on_record(&report, &ledger)
         && let Some(busy) = [&d.source, &d.dest, &d.from].into_iter().find(|p| crate::ui::jobs::waiting_on(app, p))
     {
         bail!("{} is in the encode queue, so nothing was put back", busy.display());
     }
+    refuse_stopped_in_queue(app, &report, &ledger, "put back")?;
     let d = replace::undo_if(&report, r.allow_zfs, &|d| app.ledger.current().check_replaced(d))?;
     Ok(json!({ "source": d.source, "output": d.from }))
 }

@@ -425,6 +425,15 @@ enum Left {
     /// video left of the two and the replacement is written down as gone through; the one in
     /// the output folder, a copy of it, goes first.
     EmptiedWithCopy,
+    /// A file in the original's place again with the original's entry in the trash gone (taken
+    /// out of the trash by hand), and the AV1 file still in the original's folder: a
+    /// replacement stopped once it had placed it, or an undo stopped before it had moved it
+    /// (for an undo, the file in the original's place has to be the recorded original). With
+    /// `copy_placed` it is at both places, across drives before the other name went, and the
+    /// one in the original's folder is a copy of the other. The AV1 file goes back to the
+    /// output folder, where the report of a replacement still has it and where an undo was to
+    /// leave it.
+    TakenOutByHand { copy_placed: bool },
     /// Not as any step of that run leaves them: moved by hand since, or not the files recorded.
     Unknown,
 }
@@ -509,8 +518,13 @@ impl CutOff {
             // see that alike, without reading the file. (Without the name and with the
             // original gone, the line that had the name may not have reached the drive, a
             // record on a drive that would not write it out and then a power cut: the original
-            // may be in the trash, so that is said and nothing is written down as over.)
-            if u.trash.as_deref().is_none_or(|t| !taken(t)) && !source_free {
+            // may be in the trash, so that is said and nothing is written down as over.) But with
+            // the AV1 file in the original's folder too, the run had got as far as placing it,
+            // and the original was taken out of the trash by hand since.
+            let placed_here = from != dest && at_dest && (at_from || !taken(from));
+            if u.trash.as_deref().is_none_or(|t| !taken(t)) && !source_free && placed_here {
+                Left::TakenOutByHand { copy_placed: at_from }
+            } else if u.trash.as_deref().is_none_or(|t| !taken(t)) && !source_free {
                 Left::Nothing
             } else if in_trash && source_free && still_out {
                 if from == dest || !taken(dest) {
@@ -550,6 +564,8 @@ impl CutOff {
                 Left::Emptied { placed: true }
             } else if emptied && !taken(&source) && at_from && !taken(dest) {
                 Left::Emptied { placed: false }
+            } else if back && from != dest && *dest != source && at_dest && (at_from || !taken(from)) {
+                Left::TakenOutByHand { copy_placed: at_from }
             } else {
                 Left::Unknown
             }
@@ -582,6 +598,11 @@ impl CutOff {
                     None => "only writes down that the run is over".to_string(),
                 }
             ),
+            Left::TakenOutByHand { copy_placed } => format!(
+                "{stopped}, and {source} is there again, with the original's entry in the trash at {trash} gone (it was taken out by hand): {}{}",
+                if copy_placed { format!("the AV1 file is at {from}, and a copy of it at {dest}; putting it right removes that copy") } else { format!("the AV1 file is at {dest}; putting it right takes it back to {from}") },
+                if self.undoing { ", as the undo was to leave it" } else { "" }
+            ),
             Left::EmptiedWithCopy => format!("{stopped}, and the original is no longer in the trash at {trash} (the trash was emptied, or it was taken out by hand): there is nothing to put back; the AV1 file is at {dest}, and a copy of it at {from}; putting it right removes that copy, and writes down in av1opt's record and in the report that the AV1 file replaced the original"),
             Left::Finished => format!("{} is in the trash at {trash} and the AV1 file at {dest}, as the report says, but av1opt's own record of that replacement was not written (it was stopped, or the record could not be written to); putting it right writes it down, and then the original can be put back", self.source.display()),
             Left::Unknown => format!(
@@ -604,6 +625,11 @@ impl CutOff {
             Left::MovedBack | Left::BothBack => format!("the original is back at {source} and the AV1 file at {from}, as the undo was to leave them"),
             Left::Finished => return Some(format!("av1opt's own record now says that {source} was replaced by {dest}, as its report does")),
             Left::Emptied { .. } if self.goes_through() => format!("the original was no longer in the trash, so nothing was put back; the AV1 file is at {dest}, and av1opt's own record and the report now say that it replaced the original"),
+            Left::TakenOutByHand { copy_placed } => format!(
+                "{}the AV1 file is at {from}, and the original at {source}, where it was taken back to by hand{}",
+                if copy_placed { format!("the copy at {dest} was removed; ") } else { String::new() },
+                if self.undoing { ", as the undo was to leave them" } else { "" }
+            ),
             Left::EmptiedWithCopy => format!("the copy at {from} was removed, and the AV1 file is at {dest}; the original was no longer in the trash, so nothing was put back, and av1opt's own record and the report now say that the AV1 file replaced it"),
             Left::Emptied { placed } => format!(
                 "the original was no longer in the trash, so nothing was put back, and av1opt's own record now says that run is over; the AV1 file is at {}",
@@ -671,6 +697,8 @@ impl CutOff {
             Left::Trashed { .. } => vec![folder(&self.source), folder(&self.dest)],
             Left::Placed => vec![folder(&self.source), folder(&self.dest), folder(&self.from)],
             Left::CopiedBack | Left::EmptiedWithCopy => vec![folder(&self.from)],
+            Left::TakenOutByHand { copy_placed: true } => vec![folder(&self.dest)],
+            Left::TakenOutByHand { copy_placed: false } => vec![folder(&self.dest), folder(&self.from)],
             Left::MovedBack => vec![folder(&self.source)],
         };
         folders.dedup();
@@ -766,17 +794,23 @@ impl CutOff {
                     restore()?;
                     crate::signals::stop_point("recover:restored");
                 }
-                crate::ledger::note_undone(&self.source, &self.dest, &self.from).context("both files are back, but av1opt's own record of that could not be written")?;
-                crate::signals::stop_point("recover:noted");
-                let mut r = r.clone();
-                if file_path(&r["replaced"], "from").is_ok_and(|recorded| recorded != self.from) {
-                    r["superseded"] = json!(true);
+                self.write_down_as_undone(report, r, held)
+            }
+            Left::TakenOutByHand { copy_placed } => {
+                // No file goes over another: the AV1 file only goes back to a free place, and
+                // the one removed is a copy of the one that stays.
+                if copy_placed {
+                    remove_copy(&self.dest, &self.from, self.output_bytes, &self.output_sha256)?;
+                } else {
+                    let out_dir = folder(&self.from);
+                    std::fs::create_dir_all(&out_dir).with_context(|| format!("cannot make {}", out_dir.display()))?;
+                    move_av1(&self.dest, &self.from)?;
                 }
-                r["output"] = json!(self.from);
-                if let Some(o) = r.as_object_mut() {
-                    o.remove("replaced");
+                crate::signals::stop_point("recover:moved");
+                if self.undoing {
+                    return self.write_down_as_undone(report, r, held);
                 }
-                write_report_held(report, &r, held).context("both files are back, but the report could not be updated")?;
+                settled()?;
                 Ok(Stranded::Undone)
             }
             Left::Emptied { .. } if self.goes_through() => self.write_down_as_replaced(report, r, held),
@@ -812,6 +846,22 @@ impl CutOff {
             }
             Left::Unknown => unreachable!("refused above"),
         }
+    }
+
+    /// For an undo with both files back: the record and then the report are made to say so.
+    fn write_down_as_undone(&self, report: &Path, r: &Value, held: &mut Vec<Lock>) -> Result<Stranded> {
+        crate::ledger::note_undone(&self.source, &self.dest, &self.from).context("both files are back, but av1opt's own record of that could not be written")?;
+        crate::signals::stop_point("recover:noted");
+        let mut r = r.clone();
+        if file_path(&r["replaced"], "from").is_ok_and(|recorded| recorded != self.from) {
+            r["superseded"] = json!(true);
+        }
+        r["output"] = json!(self.from);
+        if let Some(o) = r.as_object_mut() {
+            o.remove("replaced");
+        }
+        write_report_held(report, &r, held).context("both files are back, but the report could not be updated")?;
+        Ok(Stranded::Undone)
     }
 
     /// For a replacement whose original is gone from the trash with the AV1 file in the
@@ -5830,5 +5880,59 @@ mod tests {
             assert!(matches!(seen, Check::Replaced(_)) && back.as_ref().is_err_and(|e| e.contains("no longer in the trash")), "{seen:?} {back:?}");
         }
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
+
+    /// A pair stopped half-way at `step` (a replacement, or the undo of one), its original then
+    /// taken out of the trash by hand to its old place: the AV1 file goes back to the output
+    /// folder, by the page or by the command, and the pair is as the encode left it. A
+    /// replacement stopped once it had placed the AV1 file was seen as having moved nothing
+    /// and closed without a word, with the AV1 file left in the original's folder while the
+    /// report and the record named the output folder for it; an undo stopped before it moved
+    /// anything was "not where that run would have left them" for ever.
+    fn taken_out_by_hand_after(step: &'static str, undoing: bool, far: bool) {
+        for page in [true, false] {
+            let name = format!("by-hand-{}-{far}-{page}", step.replace(':', "-"));
+            let Some(p) = Pair::new(&name, far, "a.mkv") else { return crate::tools::skipped(&name, "/dev/shm is not another drive here") };
+            if undoing {
+                p.f.apply(&p.report).unwrap();
+                stopped_at(step, || drop(undo(&p.report, true)));
+            } else {
+                stopped_at(step, || drop(p.f.apply(&p.report)));
+            }
+            p.as_if_its_run_had_ended();
+            let trash = p.f.dir.join("Trash");
+            let went: Vec<PathBuf> = std::fs::read_dir(trash.join("files")).unwrap().flatten().map(|e| e.path()).collect();
+            assert_eq!(went.len(), 1, "{step}: the original is not in the trash");
+            std::fs::rename(&went[0], p.f.lib("a.mp4")).unwrap();
+            for e in std::fs::read_dir(trash.join("info")).unwrap().flatten() {
+                std::fs::remove_file(e.path()).unwrap();
+            }
+            let copied = p.f.lib("a.mkv").exists() && p.out.join("a.mkv").exists();
+            let listed = stopped_for_list(&p.report, &crate::ledger::load()).unwrap();
+            assert!(listed.can_put_right && listed.told.contains("it was taken out by hand"), "{step}: {}", listed.told);
+            assert!(listed.told.contains(if copied { "putting it right removes that copy" } else { "putting it right takes it back to" }), "{step}: {}", listed.told);
+            if page {
+                let done = put_right_stopped(&p.report, true).unwrap();
+                assert!(done.contains("where it was taken back to by hand"), "{step}: {done}");
+            } else {
+                p.command(true);
+            }
+            assert!(crate::ledger::load().under_way(&p.f.lib("a.mp4")).next().is_none(), "{step} {page}");
+            p.as_before();
+        }
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
+
+    #[test]
+    fn a_replacement_stopped_with_the_av1_file_placed_whose_original_was_taken_out_of_the_trash_by_hand_has_its_av1_file_put_back() {
+        taken_out_by_hand_after("replace:placed", false, false);
+        taken_out_by_hand_after("replace:placed", false, true);
+        taken_out_by_hand_after("replace:removed", false, true);
+    }
+
+    #[test]
+    fn an_undo_stopped_before_its_av1_file_left_the_originals_folder_whose_original_was_taken_out_of_the_trash_by_hand_is_finished() {
+        taken_out_by_hand_after("undo:begun", true, false);
+        taken_out_by_hand_after("move:copied", true, true);
     }
 }

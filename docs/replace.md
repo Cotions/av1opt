@@ -126,7 +126,12 @@ single output files.
   name in the trash was written down had not moved it: with a file still in the original's
   place it is over, whatever was written into that file since, and with the original gone
   from its place it is said and left as it is (the line with the name may not have reached
-  the drive, and the original may be in the trash). One
+  the drive, and the original may be in the trash). One stopped half-way whose original was
+  since taken out of the trash by hand to its place, with the AV1 file still in the
+  original's folder (a replacement that had placed it, an undo that had not taken it back
+  yet), has the AV1 file taken back to the output folder (a copy of it left in the
+  original's folder by a move across drives is removed instead), and an undo is then written
+  down as done. One
   stopped half-way whose original was since emptied from the trash, with the AV1 file at one
   of its two places, has nothing left to put back: that is said, and putting it right has
   the record and the report say where the only video left of the two is. An AV1 file a

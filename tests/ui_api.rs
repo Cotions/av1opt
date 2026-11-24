@@ -1493,6 +1493,29 @@ fn a_pair_stopped_half_way_is_not_put_right_by_a_replacement_or_an_undo_while_th
     }
 }
 
+/// A job that names the library through a link to its folder waits on the same files as one
+/// that names the folder itself, and they are not moved either: the replace code asks with
+/// folders resolved, and the queue holds a job's files resolved too.
+#[test]
+fn a_pair_stopped_half_way_is_not_put_right_while_the_queue_waits_on_it_through_a_link_to_its_folder() {
+    for (route, name) in [("/api/replace/put-right", "stopped-linked-put-right"), ("/api/replace/undo", "stopped-linked-undo"), ("/api/replace", "stopped-linked-replace")] {
+        let s = Server::start(name, |d| {
+            stopped_once_placed(d);
+            std::os::unix::fs::symlink(d.join("videos"), d.join("library")).unwrap();
+            let saved = json!({ "format": 1, "jobs": [{ "inputs": [d.join("library")], "roots": [], "out_dir": d.join("again"), "options": {} }] });
+            std::fs::create_dir_all(d.join("data/av1opt")).unwrap();
+            std::fs::write(d.join("data/av1opt/ui-queue.json"), saved.to_string()).unwrap();
+        });
+        add_history_folder(&s, "out");
+        let names = ["videos/movie.mp4", "out/movie.mkv", "videos/movie.mkv", "data/Trash/files/movie.mp4", "out/movie.av1opt.json"];
+        let files = || names.map(|n| std::fs::read(s.dir.join(n)).ok());
+        let before = files();
+        let r = s.post(route, &json!({ "report": s.dir.join("out/movie.av1opt.json") }));
+        assert!(r.status == 400 && r.body.contains("is in the encode queue"), "{route}: {} {}", r.status, r.body);
+        assert!(files() == before && before[3].is_some() && before[2].is_some(), "{route}: files were moved");
+    }
+}
+
 #[test]
 fn a_pair_stopped_half_way_is_shown_so_and_put_right_only_when_asked() {
     let s = Server::start("stopped", stopped_once_placed);

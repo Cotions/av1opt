@@ -293,17 +293,63 @@ pub fn encoding(app: &App) -> bool {
     app.jobs.jobs.lock().unwrap().iter().any(|j| j.status == "running")
 }
 
-/// True while a queued or running job still has `input` to encode.
+/// What the queued and running jobs still have to encode, as they were when it was taken: ask
+/// it with [`Waiting::has`]. A job in the queue has its files with their paths resolved, but a
+/// saved job still on its way back at the start keeps its inputs as the person typed them,
+/// through a link to a folder, say, while the replace code asks with folders resolved: what is
+/// asked and what the queue holds are compared with their folders resolved (see
+/// [`crate::files::in_real_folder`]). Each folder of the queue is asked of the drive once, when
+/// it is taken, and with no lock of the queue held, so a long queue, a watched folder that asks
+/// of each of its videos, and a folder on a drive that does not answer cost the queue nothing.
+pub struct Waiting {
+    /// The files of the jobs still to be encoded, as the jobs have them and resolved.
+    files: std::collections::HashSet<PathBuf>,
+    /// What a saved job not back yet names (its files or a folder above them), as it has them
+    /// and resolved.
+    under: Vec<PathBuf>,
+}
+
+impl Waiting {
+    pub fn now(app: &App) -> Waiting {
+        let typed: Vec<PathBuf> = {
+            let jobs = app.jobs.jobs.lock().unwrap();
+            let pending = jobs.iter().filter(|j| matches!(j.status.as_str(), "queued" | "running"));
+            pending.flat_map(|j| j.files.iter().filter(|f| matches!(f.status.as_str(), "pending" | "running")).map(|f| f.input.clone())).collect()
+        };
+        let named: Vec<PathBuf> = {
+            let saved = app.jobs.to_restore.lock().unwrap();
+            saved.iter().flat_map(|j| j["inputs"].as_array().into_iter().flatten().filter_map(Value::as_str).map(PathBuf::from)).collect()
+        };
+        Waiting::of(typed, named)
+    }
+
+    /// Of the files of jobs in the queue, `typed`, and what saved jobs not back yet name, `named`.
+    fn of(typed: Vec<PathBuf>, named: Vec<PathBuf>) -> Waiting {
+        let mut folders: std::collections::HashMap<PathBuf, PathBuf> = std::collections::HashMap::new();
+        let mut real = |p: &Path| match (p.parent(), p.file_name()) {
+            (Some(d), Some(name)) if !d.as_os_str().is_empty() => folders.entry(d.to_path_buf()).or_insert_with(|| std::fs::canonicalize(d).unwrap_or_else(|_| d.to_path_buf())).join(name),
+            _ => p.to_path_buf(),
+        };
+        let mut files = std::collections::HashSet::new();
+        for p in typed {
+            files.insert(real(&p));
+            files.insert(p);
+        }
+        // A folder named is resolved whole: it is the folder itself that may be a link.
+        let under = named.into_iter().flat_map(|p| [std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone()), p]).collect();
+        Waiting { files, under }
+    }
+
+    /// True while a queued or running job still has `input` to encode.
+    pub fn has(&self, input: &Path) -> bool {
+        let named = |p: &Path| self.files.contains(p) || self.under.iter().any(|u| p.starts_with(u));
+        named(input) || named(&crate::files::in_real_folder(input))
+    }
+}
+
+/// True while a queued or running job still has `input` to encode (see [`Waiting`]).
 pub fn waiting_on(app: &App, input: &Path) -> bool {
-    let queued = {
-        let jobs = app.jobs.jobs.lock().unwrap();
-        jobs.iter()
-            .filter(|j| matches!(j.status.as_str(), "queued" | "running"))
-            .any(|j| j.files.iter().any(|f| matches!(f.status.as_str(), "pending" | "running") && f.input == input))
-    };
-    // A saved job not back yet names its files or a folder above them.
-    let names = |j: &Value| j["inputs"].as_array().is_some_and(|l| l.iter().filter_map(Value::as_str).any(|p| input.starts_with(p)));
-    queued || app.jobs.to_restore.lock().unwrap().iter().any(names)
+    Waiting::now(app).has(input)
 }
 
 /// True once the server is stopping: no new work may start.
@@ -1309,6 +1355,26 @@ fn outcome_of_run(mut summary: batch::Summary, out_dir: &Path, place: Option<&Ou
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_queue_waits_on_a_file_named_through_a_link_to_its_folder_whichever_side_has_the_link() {
+        let dir = std::env::temp_dir().join(format!("av1opt-waiting-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("videos")).unwrap();
+        std::fs::write(dir.join("videos/a.mkv"), b"x").unwrap();
+        std::os::unix::fs::symlink(dir.join("videos"), dir.join("library")).unwrap();
+        let real = std::fs::canonicalize(dir.join("videos")).unwrap().join("a.mkv");
+        // A saved job not back yet that names the folder through the link, and the replace code
+        // asking with the folder resolved.
+        assert!(Waiting::of(Vec::new(), vec![dir.join("library")]).has(&real));
+        assert!(Waiting::of(Vec::new(), vec![dir.join("library/a.mkv")]).has(&real));
+        // A file of a job, and a question through the link.
+        assert!(Waiting::of(vec![real.clone()], Vec::new()).has(&dir.join("library/a.mkv")));
+        assert!(Waiting::of(vec![dir.join("library/a.mkv")], Vec::new()).has(&real));
+        // Other files are not waited on.
+        assert!(!Waiting::of(vec![real.clone()], vec![dir.join("library")]).has(&dir.join("other/a.mkv")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn job(id: u64, status: &str, dropped: &[&str]) -> Job {
         Job {

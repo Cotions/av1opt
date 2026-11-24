@@ -458,7 +458,8 @@ fn judge(app: &App, w: &Watch, model: &Model, ready: Vec<PathBuf>) -> Result<Jud
     if let Some(problem) = crate::batch::out_dir_problem(&w.out_dir, w.out_dir_place.as_ref()) {
         return Err(problem);
     }
-    let (waiting, ready): (Vec<_>, Vec<_>) = ready.into_iter().partition(|p| jobs::waiting_on(app, p));
+    let queue = jobs::Waiting::now(app);
+    let (waiting, ready): (Vec<_>, Vec<_>) = ready.into_iter().partition(|p| queue.has(p));
     let (results, _) = crate::scan::collect(&ready, &app.ffprobe(), app.cfg.jobs, w.options.min_savings, model, &|_, _| {})?;
     // "Encode anyway" is about the gain expected. AV1 is left even so: an output that took
     // its original's place in this folder would be encoded again, and again after that.

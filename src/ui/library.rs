@@ -692,9 +692,9 @@ pub fn replace_original(app: &App, body: &Value) -> Result<Value> {
 /// the encode queue is waiting on one of its files: replacing and putting back both begin by
 /// putting such a pair right, which moves those files whatever the report says of the pair.
 fn refuse_stopped_in_queue(app: &App, report: &Path, ledger: &Ledger, done: &str) -> Result<()> {
-    if let Some(stopped) = replace::stopped_for_list(report, ledger)
-        && let Some(busy) = stopped.files.iter().find(|p| crate::ui::jobs::waiting_on(app, p))
-    {
+    let Some(stopped) = replace::stopped_for_list(report, ledger) else { return Ok(()) };
+    let waiting = crate::ui::jobs::Waiting::now(app);
+    if let Some(busy) = stopped.files.iter().find(|p| waiting.has(p)) {
         bail!("{} is in the encode queue, so nothing was {done}", busy.display());
     }
     Ok(())
@@ -709,10 +709,11 @@ pub fn restore_original(app: &App, body: &Value) -> Result<Value> {
     // back into a folder the queue is about to read would be encoded again, and with
     // `--overwrite` that encode would be written over the AV1 file just taken back.
     let ledger = app.ledger.current();
-    if let Check::Replaced(d) = replace::check_for_list_on_record(&report, &ledger)
-        && let Some(busy) = [&d.source, &d.dest, &d.from].into_iter().find(|p| crate::ui::jobs::waiting_on(app, p))
-    {
-        bail!("{} is in the encode queue, so nothing was put back", busy.display());
+    if let Check::Replaced(d) = replace::check_for_list_on_record(&report, &ledger) {
+        let waiting = crate::ui::jobs::Waiting::now(app);
+        if let Some(busy) = [&d.source, &d.dest, &d.from].into_iter().find(|p| waiting.has(p)) {
+            bail!("{} is in the encode queue, so nothing was put back", busy.display());
+        }
     }
     refuse_stopped_in_queue(app, &report, &ledger, "put back")?;
     let d = replace::undo_if(&report, r.allow_zfs, &|d| app.ledger.current().check_replaced(d))?;
@@ -725,7 +726,8 @@ pub fn put_right_stopped(app: &App, body: &Value) -> Result<Value> {
     let r: ReplaceRequest = serde_json::from_value(body.clone())?;
     let report = known_report(app, &r.report)?;
     // As for a replacement, nothing the encode queue is waiting on is moved.
-    let done = replace::put_right_stopped_unless(&report, r.allow_zfs, &|p| crate::ui::jobs::waiting_on(app, p))?;
+    let waiting = crate::ui::jobs::Waiting::now(app);
+    let done = replace::put_right_stopped_unless(&report, r.allow_zfs, &|p| waiting.has(p))?;
     Ok(json!({ "done": done }))
 }
 

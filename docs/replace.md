@@ -131,7 +131,8 @@ single output files.
   of its two places, has nothing left to put back: that is said, and putting it right has
   the record and the report say where the only video left of the two is. An AV1 file a
   replacement had placed stays in the original's folder, and the pair is written down as
-  replaced; one an undo had taken back to the output folder goes to the original's folder
+  replaced (one copied there from another drive, with the AV1 file still in the output folder
+  too, keeps the one in the library, and the other, a copy of it, is removed); one an undo had taken back to the output folder goes to the original's folder
   again, where the record has it; otherwise only the end of the run is written down (with
   the trash folder itself not there, a drive not mounted just now, it is left as it is). On
   the page, replacing and putting back wait, as "Put right" does, while the encode queue

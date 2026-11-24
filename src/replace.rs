@@ -419,6 +419,12 @@ enum Left {
     /// the AV1 file is: a replacement that had placed it is written down as gone through, and
     /// any other run as over (see [`CutOff::av1_back`] for an undo that had taken it back).
     Emptied { placed: bool },
+    /// A replacement across drives stopped with the copy of the AV1 file in the original's
+    /// place and the AV1 file still in the output folder, whose original's entry in the trash is
+    /// gone since. As with [`Left::Emptied`] and the AV1 file placed, the library keeps the only
+    /// video left of the two and the replacement is written down as gone through; the one in
+    /// the output folder, a copy of it, goes first.
+    EmptiedWithCopy,
     /// Not as any step of that run leaves them: moved by hand since, or not the files recorded.
     Unknown,
 }
@@ -520,6 +526,8 @@ impl CutOff {
                 Left::Emptied { placed: false }
             } else if emptied && source_free && at_dest && from != dest && !taken(from) {
                 Left::Emptied { placed: true }
+            } else if emptied && source_free && at_dest && at_from {
+                Left::EmptiedWithCopy
             } else {
                 Left::Unknown
             }
@@ -574,6 +582,7 @@ impl CutOff {
                     None => "only writes down that the run is over".to_string(),
                 }
             ),
+            Left::EmptiedWithCopy => format!("{stopped}, and the original is no longer in the trash at {trash} (the trash was emptied, or it was taken out by hand): there is nothing to put back; the AV1 file is at {dest}, and a copy of it at {from}; putting it right removes that copy, and writes down in av1opt's record and in the report that the AV1 file replaced the original"),
             Left::Finished => format!("{} is in the trash at {trash} and the AV1 file at {dest}, as the report says, but av1opt's own record of that replacement was not written (it was stopped, or the record could not be written to); putting it right writes it down, and then the original can be put back", self.source.display()),
             Left::Unknown => format!(
                 "{stopped}, and the files are not where that run would have left them (moved or changed since), so av1opt leaves them as they are: the original was at {source} on its way to {trash}, and the AV1 file at {} on its way to {}",
@@ -595,6 +604,7 @@ impl CutOff {
             Left::MovedBack | Left::BothBack => format!("the original is back at {source} and the AV1 file at {from}, as the undo was to leave them"),
             Left::Finished => return Some(format!("av1opt's own record now says that {source} was replaced by {dest}, as its report does")),
             Left::Emptied { .. } if self.goes_through() => format!("the original was no longer in the trash, so nothing was put back; the AV1 file is at {dest}, and av1opt's own record and the report now say that it replaced the original"),
+            Left::EmptiedWithCopy => format!("the copy at {from} was removed, and the AV1 file is at {dest}; the original was no longer in the trash, so nothing was put back, and av1opt's own record and the report now say that the AV1 file replaced it"),
             Left::Emptied { placed } => format!(
                 "the original was no longer in the trash, so nothing was put back, and av1opt's own record now says that run is over; the AV1 file is at {}",
                 match self.av1_back() {
@@ -660,7 +670,7 @@ impl CutOff {
             Left::Nothing | Left::BothBack | Left::Finished | Left::Unknown => vec![],
             Left::Trashed { .. } => vec![folder(&self.source), folder(&self.dest)],
             Left::Placed => vec![folder(&self.source), folder(&self.dest), folder(&self.from)],
-            Left::CopiedBack => vec![folder(&self.from)],
+            Left::CopiedBack | Left::EmptiedWithCopy => vec![folder(&self.from)],
             Left::MovedBack => vec![folder(&self.source)],
         };
         folders.dedup();
@@ -769,21 +779,11 @@ impl CutOff {
                 write_report_held(report, &r, held).context("both files are back, but the report could not be updated")?;
                 Ok(Stranded::Undone)
             }
-            Left::Emptied { .. } if self.goes_through() => {
-                let trash = self.trash.as_deref().context("no trash entry on record")?;
-                // The report first: with it written and the run stopped again, the pair is
-                // seen as this same one, and the record is all that is left to write.
-                if r.get("replaced").filter(|d| d.is_object()).is_none() {
-                    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
-                    let mut r = r.clone();
-                    r["output"] = json!(self.dest);
-                    r["replaced"] = json!({ "time": now, "from": self.from, "trash": trash, "source_mtime": self.original.modified });
-                    write_report_held(report, &r, held).context("the AV1 file is in the original's place, but the report could not be made to say so")?;
-                    crate::signals::stop_point("recover:report");
-                }
-                let replacement = crate::ledger::Replacement { original: &self.source, trash, output: &self.dest, from: &self.from, source_bytes: self.source_bytes, known: &self.original, output_bytes: self.output_bytes };
-                crate::ledger::note_replaced(&replacement).context("the report says that the AV1 file replaced the original, but av1opt's own record of it could not be written")?;
-                Ok(Stranded::Replaced)
+            Left::Emptied { .. } if self.goes_through() => self.write_down_as_replaced(report, r, held),
+            Left::EmptiedWithCopy => {
+                remove_copy(&self.from, &self.dest, self.output_bytes, &self.output_sha256)?;
+                crate::signals::stop_point("recover:moved");
+                self.write_down_as_replaced(report, r, held)
             }
             Left::Emptied { .. } => {
                 if let Some((at, to)) = self.av1_back() {
@@ -812,6 +812,26 @@ impl CutOff {
             }
             Left::Unknown => unreachable!("refused above"),
         }
+    }
+
+    /// For a replacement whose original is gone from the trash with the AV1 file in the
+    /// original's place and nowhere else (see [`CutOff::goes_through`]): the report and then the
+    /// record are made to say that it replaced the original.
+    fn write_down_as_replaced(&self, report: &Path, r: &Value, held: &mut Vec<Lock>) -> Result<Stranded> {
+        let trash = self.trash.as_deref().context("no trash entry on record")?;
+        // The report first: with it written and the run stopped again, the pair is seen as
+        // this same one, and the record is all that is left to write.
+        if r.get("replaced").filter(|d| d.is_object()).is_none() {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            let mut r = r.clone();
+            r["output"] = json!(self.dest);
+            r["replaced"] = json!({ "time": now, "from": self.from, "trash": trash, "source_mtime": self.original.modified });
+            write_report_held(report, &r, held).context("the AV1 file is in the original's place, but the report could not be made to say so")?;
+            crate::signals::stop_point("recover:report");
+        }
+        let replacement = crate::ledger::Replacement { original: &self.source, trash, output: &self.dest, from: &self.from, source_bytes: self.source_bytes, known: &self.original, output_bytes: self.output_bytes };
+        crate::ledger::note_replaced(&replacement).context("the report says that the AV1 file replaced the original, but av1opt's own record of it could not be written")?;
+        Ok(Stranded::Replaced)
     }
 }
 
@@ -5773,6 +5793,42 @@ mod tests {
         let line = json!({ "format": 1, "time": 0, "event": "settled", "source": f.lib("a.mp4") });
         crate::files::append_line(&record, &line.to_string(), false).unwrap();
         assert!(crate::ledger::load().under_way(&f.lib("a.mp4")).next().is_none());
+        crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
+    }
+
+    /// A replacement to another drive stopped with the copy in the original's place and the AV1
+    /// file still in the output folder, whose original was then emptied from the trash: the
+    /// library keeps the AV1 file, the one in the output folder (a copy of it) is removed, and
+    /// the report and the record say that it replaced the original. It used to be said to be
+    /// "not where that run would have left them" and left open for ever.
+    #[test]
+    fn an_emptied_replacement_across_drives_stopped_with_a_copy_at_each_place_keeps_the_one_in_the_library() {
+        for page in [true, false] {
+            let Some(p) = Pair::new(&format!("emptied-far-placed-{page}"), true, "a.mkv") else { return crate::tools::skipped("emptied-far-placed", "/dev/shm is not another drive here") };
+            stopped_at("replace:placed", || drop(p.f.apply(&p.report)));
+            for e in ["files", "info"].iter().flat_map(|d| std::fs::read_dir(p.f.dir.join("Trash").join(d)).unwrap().flatten()) {
+                std::fs::remove_file(e.path()).unwrap();
+            }
+            let both = p.f.lib("a.mkv").exists() && p.out.join("a.mkv").exists();
+            let ledger = crate::ledger::load();
+            let cut = CutOff::of(&p.report, &read_report(&p.report).unwrap(), &ledger, true).unwrap();
+            let listed = stopped_for_list(&p.report, &ledger).unwrap();
+            assert!(both && cut.left == Left::EmptiedWithCopy && cut.folders_written() == vec![p.out.clone()], "{both} {:?} {:?}", cut.left, cut.folders_written());
+            assert!(listed.can_put_right && listed.told.contains("putting it right removes that copy, and writes down"), "{}", listed.told);
+            if page {
+                let done = put_right_stopped(&p.report, true).unwrap();
+                assert!(done.contains(&format!("the copy at {} was removed", p.out.join("a.mkv").display())) && done.contains("replaced it"), "{done}");
+            } else {
+                p.command(false);
+            }
+            let after = crate::ledger::load();
+            let seen = check(&p.report);
+            let back = undo(&p.report, true).map(drop).map_err(|e| format!("{e:#}"));
+            assert_eq!(std::fs::read(p.f.lib("a.mkv")).unwrap(), vec![b'o'; 400]);
+            assert!(!p.out.join("a.mkv").exists() && after.under_way(&p.f.lib("a.mp4")).next().is_none(), "{page}");
+            assert!(after.entry(&p.f.lib("a.mkv"), &p.f.lib("a.mp4")).is_some_and(|e| e.replaced.is_some()), "{page}: the record does not say replaced");
+            assert!(matches!(seen, Check::Replaced(_)) && back.as_ref().is_err_and(|e| e.contains("no longer in the trash")), "{seen:?} {back:?}");
+        }
         crate::ledger::TEST_FOLDER.with(|d| *d.borrow_mut() = None);
     }
 }
